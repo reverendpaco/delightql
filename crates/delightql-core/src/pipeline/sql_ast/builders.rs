@@ -5,7 +5,6 @@ use super::ordering::{Limit, OrderTerm};
 use super::query::{QueryExpression, SelectStatement};
 use super::select_items::SelectItem;
 use super::table::TableExpression;
-use crate::pipeline::transformer::builder::publication::Checked;
 
 pub struct SelectBuilder {
     distinct: bool,
@@ -107,42 +106,11 @@ impl SelectBuilder {
         self.limit.as_ref()
     }
 
-    /// The list as it stands, for a caller that must state a fact about it
-    /// before building.
-    pub(in crate::pipeline) fn items(&self) -> &[SelectItem] {
-        &self.select_list
-    }
-
-    /// Build a statement that produces the publication `checked` states.
-    ///
-    /// The fact is re-checked against this list, so it is not a badge that
-    /// can be lifted off one statement and stamped onto another: a fact
-    /// borrowed from elsewhere names a scope and outputs this list does not
-    /// produce, and the door refuses. Stating the fact is the authority's,
-    /// because only the authority can construct one.
-    pub(in crate::pipeline) fn publishing(
-        self,
-        checked: Checked,
-    ) -> Result<SelectStatement, String> {
-        checked.verify(&self.select_list)?;
-        self.stand_at(checked.at(), checked)
-    }
-
-    /// Rebuild `previous` with reshaped clauses, keeping the publication it
-    /// was proven to produce.
-    ///
-    /// The rewriters below the transformer flatten wrappers, merge WHEREs and
-    /// move joins; none of that may move an output. The new list is held to
-    /// the fact the old statement CARRIES, not to the old list — comparing
-    /// lists would let a statement whose fact had already drifted pass on the
-    /// drift.
     pub(in crate::pipeline) fn rebuilding(
         self,
         previous: &SelectStatement,
     ) -> Result<SelectStatement, String> {
-        let checked = previous.checked.clone();
-        checked.verify(&self.select_list)?;
-        self.stand_at(checked.at(), checked)
+        self.stand_at(previous.at())
     }
 
     /// Build a fresh statement standing at `at`, its publication read off
@@ -153,8 +121,7 @@ impl SelectBuilder {
         self,
         at: crate::names::ScopeId,
     ) -> Result<SelectStatement, String> {
-        let checked = Checked::of(at, &self.select_list);
-        self.stand_at(at, checked)
+        self.stand_at(at)
     }
 
     /// Restand `previous` at another scope, its unnamed reads re-expressed
@@ -173,13 +140,7 @@ impl SelectBuilder {
         previous: &SelectStatement,
     ) -> Result<SelectStatement, String> {
         let named = |items: &[SelectItem]| -> Vec<Option<crate::names::ColId>> {
-            items
-                .iter()
-                .map(|item| match item {
-                    SelectItem::Expression { alias, .. } => *alias,
-                    SelectItem::Star { .. } => None,
-                })
-                .collect()
+            items.iter().map(SelectItem::printed_alias).collect()
         };
         if named(&previous.select_list) != named(&self.select_list) {
             return Err(format!(
@@ -198,17 +159,10 @@ impl SelectBuilder {
                 width(&previous.select_list)
             ));
         }
-        let checked = Checked::of(at, &self.select_list);
-        self.stand_at(at, checked)
+        self.stand_at(at)
     }
 
-    /// Stamp a scope onto a list. Private, and reachable only through a door
-    /// that has established what the list publishes.
-    fn stand_at(
-        self,
-        at: crate::names::ScopeId,
-        checked: Checked,
-    ) -> Result<SelectStatement, String> {
+    fn stand_at(self, at: crate::names::ScopeId) -> Result<SelectStatement, String> {
         if self.select_list.is_empty() {
             return Err("SELECT statement requires at least one select item".to_string());
         }
@@ -219,7 +173,6 @@ impl SelectBuilder {
 
         Ok(SelectStatement {
             at,
-            checked,
             distinct: self.distinct,
             select_list: self.select_list,
             from: self.from,

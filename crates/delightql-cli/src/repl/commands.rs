@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 /// Shared REPL command handler
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::time::Instant;
 
 use super::info_panel::SharedReplState;
 use crate::args::Stage;
-use crate::bug_report::SessionLog;
 use crate::connection::ConnectionManager;
 use crate::output_format::OutputFormat;
-use crate::version_info;
 use delightql_backends::SqliteExecutor;
 use std::sync::Arc;
 
@@ -24,25 +22,31 @@ pub struct ReplCapture {
 /// State maintained across REPL interactions
 pub struct ReplState {
     pub db_path: Option<String>,
-    pub output_format: OutputFormat,
     pub last_query: Option<String>,
     pub last_execution_time: Option<std::time::Duration>,
-    pub target_stage: Option<Stage>, // Which stage to output (None = Results)
     pub shared_info: SharedReplState, // Shared with multi-pane TUI
-    pub sql_mode: bool,              // Whether to bypass DelightQL parsing and execute SQL directly
     pub db_connection: ConnectionManager, // Persistent database connection
     pub dql_handle: Arc<std::sync::Mutex<Box<dyn delightql_core::api::DqlHandle>>>, // Persistent DqlHandle (wrapped in Arc<Mutex> for thread-safe mutation)
-    pub show_meta_output: bool, // Whether to show meta-command output (verbose/quiet control)
-    pub zebra_mode: Option<usize>, // Number of colors for zebra striping columns (None = off)
-    pub no_headers: bool,       // Whether to suppress headers in results output
+    /// The typed operational configuration — the one authority. Private to
+    /// this module; every mutation crosses the typed operations below, which
+    /// also project the option row and refresh the TUI snapshot.
+    config: super::config::ReplConfig,
     pub name_generator: super::name_generator::ReplNameGenerator,
     pub captures: Vec<ReplCapture>,
     pub repl_namespace_initialized: bool,
-    pub session_log: SessionLog,
-    pub multiline: bool, // Whether Enter accumulates lines (true) or submits immediately (false)
+    /// The live client database. `None` only when its construction failed at
+    /// startup — the REPL then runs with `repl::*` unavailable, loudly.
+    pub repl_db: Option<Arc<crate::client::database::ClientDatabase>>,
+    /// Whether the `repl::*` namespace is currently installed over the live
+    /// database. Cleared by a Core session reset until the remount succeeds.
+    pub repl_namespace_available: bool,
+    /// The parser containment boundary. The interactive entry point replaces
+    /// this with a highlights-aware controller before any probe runs.
+    pub parser_worker: Arc<super::parser_worker::ParserWorkerController>,
 }
 
 impl ReplState {
+    /// The interactive state over the PROCESS's client database.
     pub fn new(db_path: Option<String>, output_format: OutputFormat) -> Result<Self> {
         Self::new_with_connection(db_path, output_format, None)
     }
@@ -51,6 +55,23 @@ impl ReplState {
         db_path: Option<String>,
         output_format: OutputFormat,
         connection: Option<ConnectionManager>,
+    ) -> Result<Self> {
+        Self::new_over(
+            db_path,
+            output_format,
+            connection,
+            crate::client::context::process_database(),
+        )
+    }
+
+    /// The same over a NAMED client database. The state never chooses its
+    /// database: production hands it the process's one; a test hands it a
+    /// private one so ledgers do not bleed between states in one process.
+    pub fn new_over(
+        db_path: Option<String>,
+        output_format: OutputFormat,
+        connection: Option<ConnectionManager>,
+        repl_db: Option<Arc<crate::client::database::ClientDatabase>>,
     ) -> Result<Self> {
         // Create DqlHandle via factory-only open
         let db_connection = if let Some(conn) = connection {
@@ -61,7 +82,11 @@ impl ReplState {
             ConnectionManager::new_memory()?
         };
 
-        let mut handle = crate::connection::open_handle()?;
+        // Mounted by the ordinary handle opener like every other mode;
+        // `None` when the in-memory engine refused, which degrades
+        // `repl::*` loudly and never blocks access to the user's database.
+        let (mut handle, repl_namespace_available) =
+            crate::connection::open_handle_over(repl_db.clone())?;
 
         // mount! the user database as "main" if specified
         if let Some(ref path) = db_path {
@@ -74,44 +99,186 @@ impl ReplState {
 
         let dql_handle = Arc::new(std::sync::Mutex::new(handle));
 
-        let session_log = SessionLog::new(std::env::args().collect(), db_path.clone());
         let shared_info = SharedReplState::new(std::env::args().collect(), db_path.clone());
 
-        Ok(Self {
+        // ONE configuration authority: the controller takes this config's
+        // budgets and its SHARED helper policy, then the same config moves
+        // into the state — startup cannot mint two authorities.
+        let config = super::config::ReplConfig::new(output_format);
+        let parser_worker = Arc::new(super::parser_worker::ParserWorkerController::new(
+            *config.parser_budgets(),
+            Arc::clone(config.editor_helper_policy()),
+            repl_db.clone(),
+            None,
+        ));
+
+        let mut state = Self {
             db_path,
-            output_format,
             last_query: None,
             last_execution_time: None,
-            target_stage: None, // Default to Results
             shared_info,
-            sql_mode: false, // Default to DelightQL mode
             db_connection,
             dql_handle,
-            show_meta_output: true, // Default to verbose (will be overridden as needed)
-            zebra_mode: None,       // Default to no zebra coloring
-            no_headers: false,      // Default to showing headers
+            config,
             name_generator: super::name_generator::ReplNameGenerator::new(),
             captures: Vec::new(),
             repl_namespace_initialized: false,
-            session_log,
-            multiline: true, // Default to multiline mode on
-        })
+            parser_worker,
+            repl_db,
+            repl_namespace_available,
+        };
+        state.seed_config_options();
+        state.sync_shared_config();
+        Ok(state)
     }
 
-    /// Sync current config into shared_info for TUI display
-    pub fn sync_shared_config(&mut self) {
-        let output_format = format!("{:?}", self.output_format);
-        let target_stage = match self.target_stage {
-            None => "results".to_string(),
-            Some(ref s) => format!("{:?}", s).to_lowercase(),
+    /// The typed configuration, read-only. Mutation crosses the operations
+    /// below.
+    pub fn config(&self) -> &super::config::ReplConfig {
+        &self.config
+    }
+
+    /// Seed every `repl::config.option` row from the typed state.
+    fn seed_config_options(&self) {
+        let Some(db) = &self.repl_db else { return };
+        for (name, value, kind, default) in self.config.option_rows() {
+            if let crate::client::database::WriteOutcome::Lost(reason) = db.set_option(
+                name,
+                Some(value),
+                kind,
+                Some(default.to_string()),
+                "startup",
+            ) {
+                crate::client::incident::warning(
+                    "ledger",
+                    crate::client::incident::hierarchy::LEDGER_WRITE_LOST,
+                    format!("repl::config.option '{name}' seed failed ({reason})"),
+                );
+            }
+        }
+    }
+
+    /// Re-project ONE option row from the typed state. A lost write is loud;
+    /// terminal behavior still follows the typed value, and a queued write
+    /// retries before the next prompt — the row never silently claims an old
+    /// value without a warning.
+    fn project_config_option(&self, name: &'static str, source: &str) {
+        let Some(db) = &self.repl_db else { return };
+        let Some((_, value, kind, default)) = self
+            .config
+            .option_rows()
+            .into_iter()
+            .find(|(n, ..)| *n == name)
+        else {
+            return;
         };
+        if let crate::client::database::WriteOutcome::Lost(reason) =
+            db.set_option(name, Some(value), kind, Some(default.to_string()), source)
+        {
+            crate::client::incident::warning(
+                "ledger",
+                crate::client::incident::hierarchy::LEDGER_WRITE_LOST,
+                format!(
+                    "repl::config.option '{name}' projection failed ({reason}); \
+                     the typed value stands"
+                ),
+            );
+        }
+    }
+
+    // --- typed configuration operations: validate, change the typed value,
+    // --- project the option row, refresh the TUI snapshot — one act.
+
+    pub fn set_output_format(&mut self, format: OutputFormat, source: &str) {
+        self.config.set_output_format(format);
+        self.project_config_option("output_format", source);
+        self.sync_shared_config();
+    }
+
+    pub fn set_target_stage(&mut self, stage: Option<Stage>, source: &str) {
+        self.config.set_target_stage(stage);
+        self.project_config_option("target_stage", source);
+        self.sync_shared_config();
+    }
+
+    pub fn set_input_mode_sql(&mut self, sql: bool, source: &str) {
+        self.config.set_input_mode_sql(sql);
+        self.project_config_option("input_mode", source);
+        self.sync_shared_config();
+    }
+
+    pub fn set_zebra_mode(&mut self, colors: usize, source: &str) -> Result<(), String> {
+        self.config.set_zebra_mode(colors)?;
+        self.project_config_option("zebra_columns", source);
+        self.sync_shared_config();
+        Ok(())
+    }
+
+    pub fn set_no_headers(&mut self, no_headers: bool, source: &str) {
+        self.config.set_no_headers(no_headers);
+        self.project_config_option("headers", source);
+        self.sync_shared_config();
+    }
+
+    pub fn set_show_meta_output(&mut self, show: bool, source: &str) {
+        self.config.set_show_meta_output(show);
+        self.project_config_option("meta_output", source);
+        self.sync_shared_config();
+    }
+
+    pub fn set_multiline(&mut self, multiline: bool, source: &str) {
+        self.config.set_multiline(multiline);
+        self.project_config_option("multiline", source);
+        self.sync_shared_config();
+    }
+
+    /// Manual breaker control: change the shared policy, project the row,
+    /// refresh the snapshot — one act. Enabling arms the breaker again.
+    pub fn set_editor_parser_helpers(&mut self, enabled: bool, source: &str) {
+        self.config.set_editor_parser_helpers(enabled);
+        self.project_config_option("editor_parser_helpers", source);
+        self.sync_shared_config();
+    }
+
+    /// Refresh the WHOLE TUI snapshot before a launch: the config fields
+    /// and the Window C history ring, both projected from their authorities
+    /// (the typed config, the input ledger). The snapshot is a presentation
+    /// cache; nothing reads it back.
+    pub fn prepare_tui_snapshot(&mut self) {
+        self.sync_shared_config();
+        if let Some(db) = &self.repl_db {
+            if let Ok(rows) = db.history_rows() {
+                let entries: Vec<super::info_panel::QueryHistoryEntry> = rows
+                    .into_iter()
+                    .filter(|row| row.kind == "dql" && row.outcome == "succeeded")
+                    .filter_map(|row| {
+                        row.generated_sql
+                            .map(|sql| super::info_panel::QueryHistoryEntry {
+                                dql: row.input,
+                                sql,
+                            })
+                    })
+                    .collect();
+                let start = entries.len().saturating_sub(50);
+                self.shared_info.query_history = entries[start..].to_vec();
+            }
+        }
+    }
+
+    /// Sync current config into shared_info for TUI display. The snapshot
+    /// is a presentation cache written FROM the typed state, never an
+    /// authority.
+    pub fn sync_shared_config(&mut self) {
+        let output_format = self.config.output_format_rendered();
+        let target_stage = self.config.target_stage_rendered().to_string();
         self.shared_info.sync_config(
             &output_format,
             &target_stage,
-            self.sql_mode,
-            self.zebra_mode,
-            self.no_headers,
-            self.multiline,
+            self.config.sql_mode(),
+            self.config.zebra_mode(),
+            self.config.no_headers(),
+            self.config.multiline(),
+            self.config.editor_helpers_enabled(),
         );
     }
 }
@@ -178,7 +345,9 @@ pub fn recover_repl_session(
             Err(failure) => {
                 return ReplRecovery::Terminal {
                     incident,
-                    failure: format!("the session was reset but '{path}' failed to re-mount: {failure}"),
+                    failure: format!(
+                        "the session was reset but '{path}' failed to re-mount: {failure}"
+                    ),
                 }
             }
         }
@@ -196,11 +365,34 @@ pub fn recover_repl_session(
 /// session. Returns `Exit` exactly when recovery failed.
 pub fn prompt_recovery_boundary(repl_state: &mut ReplState) -> CommandResult {
     let decision = {
-        let mut handle = repl_state.dql_handle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut handle = repl_state
+            .dql_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         recover_repl_session(&mut **handle, repl_state.db_path.as_deref())
     };
     match decision {
-        ReplRecovery::NotNeeded => CommandResult::Continue,
+        ReplRecovery::NotNeeded => {
+            // The prompt boundary is also the pending-write boundary: a
+            // write queued behind a busy connection flushes before the next
+            // prompt, and a loss is loud — never a silent disappearance
+            // from repl::*, dumps, and bug reports.
+            if let Some(db) = &repl_state.repl_db {
+                db.drain_panics();
+                let (_, lost, reason) = db.flush_pending();
+                if lost > 0 {
+                    crate::client::incident::warning(
+                        "ledger",
+                        crate::client::incident::hierarchy::LEDGER_WRITE_LOST,
+                        format!(
+                            "{lost} pending repl-database writes were lost ({})",
+                            reason.unwrap_or_default()
+                        ),
+                    );
+                }
+            }
+            CommandResult::Continue
+        }
         ReplRecovery::Recovered {
             incident,
             rebuilt,
@@ -216,6 +408,35 @@ pub fn prompt_recovery_boundary(repl_state: &mut ReplState) -> CommandResult {
             // replaced session's catalog.
             repl_state.repl_namespace_initialized = false;
             repl_state.captures.clear();
+            // The live client database survived the reset; the catalog
+            // mapping did not. Remount, reinstall the projections, verify,
+            // and flush pending client writes — all before another prompt.
+            // Failure is degraded client diagnostics, never disguised as a
+            // successful restoration and never a reason to block the user's
+            // database.
+            repl_state.repl_namespace_available = false;
+            if let Some(db) = repl_state.repl_db.clone() {
+                let reinstall = {
+                    let mut handle = repl_state
+                        .dql_handle
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    crate::client::mount::install_repl_namespace(&mut **handle)
+                };
+                match reinstall {
+                    Ok(()) => repl_state.repl_namespace_available = true,
+                    Err(e) => {
+                        eprintln!("!! degraded: the repl::* namespace could not be restored ({e})")
+                    }
+                }
+                let (_, lost_writes, reason) = db.flush_pending();
+                if lost_writes > 0 {
+                    eprintln!(
+                        "!! degraded: {lost_writes} pending repl-database writes were lost ({})",
+                        reason.unwrap_or_default()
+                    );
+                }
+            }
             CommandResult::Continue
         }
         ReplRecovery::Terminal { incident, failure } => {
@@ -252,32 +473,130 @@ pub struct DotCommand {
 /// `registry_and_dispatch_agree`. Adding an arm without a row (or a row
 /// without an arm) fails that test — there is no second source to drift.
 pub const DOT_COMMANDS: &[DotCommand] = &[
-    DotCommand { name: ".help", aliases: &[], args: "", section: "General", summary: "Show this help message", example: "" },
-    DotCommand { name: ".exit", aliases: &[".quit"], args: "", section: "General", summary: "Exit the REPL", example: "" },
-    DotCommand { name: ".version", aliases: &[], args: "", section: "General", summary: "Show version information", example: "" },
-    DotCommand { name: ".info", aliases: &[], args: "", section: "Display & Output", summary: "Show multi-pane TUI (Ctrl+T toggles while typing)", example: "" },
-    DotCommand { name: ".format", aliases: &[], args: "[FORMAT]", section: "Display & Output", summary: "Set or show output format (table, json, csv, tsv, list)", example: "" },
-    DotCommand { name: ".zebra", aliases: &[], args: "[0-4]", section: "Display & Output", summary: "Column coloring (0=off [default], 2=blue/cyan, 3=RWB, 4=RWBG)", example: "" },
-    DotCommand { name: ".to", aliases: &[], args: "[STAGE]", section: "Display & Output", summary: "Show output stage (cst, ast-unresolved, ast-resolved, etc.)", example: "" },
-    DotCommand { name: ".attach", aliases: &[], args: "'path' to \"namespace\"", section: "Database Operations", summary: "Attach external database and import entities", example: ".attach 'nba.db' to \"sports::nba\"" },
-    DotCommand { name: ".enlist", aliases: &[], args: "<namespace> [in <target>]", section: "Database Operations", summary: "Enlist namespace entities (default target: main)", example: ".enlist import::nba" },
-    DotCommand { name: ".delist", aliases: &[], args: "<namespace> [from <target>]", section: "Database Operations", summary: "Delist namespace (remove from scope)", example: ".delist import::nba" },
-    DotCommand { name: ".dql", aliases: &[], args: "[query]", section: "Mode Commands", summary: "Switch to DQL mode (default); with a query, execute one-off", example: "" },
-    DotCommand { name: ".sql", aliases: &[], args: "[query]", section: "Mode Commands", summary: "Switch to SQL mode; with a query, execute one-off", example: "" },
-    DotCommand { name: ".multiline", aliases: &[], args: "[on|off]", section: "Mode Commands", summary: "Toggle multiline input mode (default: on)", example: "" },
-    DotCommand { name: ".file", aliases: &[], args: "<path>", section: "File & Diagnostics", summary: "Execute queries from a file", example: "" },
-    DotCommand { name: ".bug", aliases: &[], args: "", section: "File & Diagnostics", summary: "Create a bug report tarball from this session", example: "" },
+    DotCommand {
+        name: ".help",
+        aliases: &[],
+        args: "",
+        section: "General",
+        summary: "Show this help message",
+        example: "",
+    },
+    DotCommand {
+        name: ".exit",
+        aliases: &[".quit"],
+        args: "",
+        section: "General",
+        summary: "Exit the REPL",
+        example: "",
+    },
+    DotCommand {
+        name: ".info",
+        aliases: &[],
+        args: "",
+        section: "Display & Output",
+        summary: "Show the multi-pane TUI (Ctrl-X, t toggles while typing; a lone `.` too)",
+        example: "",
+    },
+    DotCommand {
+        name: ".format",
+        aliases: &[],
+        args: "[FORMAT]",
+        section: "Display & Output",
+        summary: "Set or show output format (table, json, csv, tsv, list)",
+        example: "",
+    },
+    DotCommand {
+        name: ".zebra",
+        aliases: &[],
+        args: "[0-4]",
+        section: "Display & Output",
+        summary: "Column coloring (0=off [default], 2=blue/cyan, 3=RWB, 4=RWBG)",
+        example: "",
+    },
+    DotCommand {
+        name: ".to",
+        aliases: &[],
+        args: "[STAGE]",
+        section: "Display & Output",
+        summary: "Show output stage (cst, ast-unresolved, ast-resolved, etc.)",
+        example: "",
+    },
+    DotCommand {
+        name: ".dql",
+        aliases: &[],
+        args: "[query]",
+        section: "Mode Commands",
+        summary: "Switch to DQL mode (default); with a query, execute one-off",
+        example: "",
+    },
+    DotCommand {
+        name: ".sql",
+        aliases: &[],
+        args: "[query]",
+        section: "Mode Commands",
+        summary: "Switch to SQL mode; with a query, execute one-off",
+        example: "",
+    },
+    DotCommand {
+        name: ".multiline",
+        aliases: &[],
+        args: "[on|off]",
+        section: "Mode Commands",
+        summary: "Toggle multiline input mode (default: on)",
+        example: "",
+    },
+    DotCommand {
+        name: ".bug",
+        aliases: &[],
+        args: "[description…]",
+        section: "File & Diagnostics",
+        summary: "Write this session's error.log, context and replay-script, plus the databases and DDL it used, as bug-<stamp>.tgz",
+        example: ".bug the join drops rows after the second pipe",
+    },
+    DotCommand {
+        name: ".repl",
+        aliases: &[],
+        args: "helpers [status|on|off]",
+        section: "File & Diagnostics",
+        summary: "Inspect or control the optional parser helpers (coloring, parse-aware prompt, continuation navigation); submission preflight stays on",
+        example: ".repl helpers status",
+    },
 ];
 
 /// Every spelling the dispatcher accepts (names + aliases), in registry
 /// order — the projection consumed by tab completion and the surface rows.
+/// The registry projected into `repl::surface.dot_command` rows: one per
+/// accepted spelling, aliases pointing at the canonical spelling.
+pub fn dot_command_surface() -> Vec<crate::client::database::SurfaceRow> {
+    use crate::client::database::SurfaceRow;
+    DOT_COMMANDS
+        .iter()
+        .flat_map(|cmd| {
+            let row = |spelling: &'static str, is_alias: bool| SurfaceRow {
+                spelling,
+                canonical_name: cmd.name,
+                is_alias,
+                args: cmd.args,
+                section: cmd.section,
+                summary: cmd.summary,
+                example: cmd.example,
+            };
+            std::iter::once(row(cmd.name, false))
+                .chain(cmd.aliases.iter().map(move |alias| row(alias, true)))
+        })
+        .collect()
+}
+
 pub fn dot_command_spellings() -> impl Iterator<Item = &'static str> {
     DOT_COMMANDS
         .iter()
         .flat_map(|c| std::iter::once(c.name).chain(c.aliases.iter().copied()))
 }
 
-/// Handle dot commands
+/// Handle a dot command, recorded in the one ordered input ledger: the row
+/// opens as `started` before dispatch, and closes with the dispatched
+/// outcome — an unknown spelling is `refused`, an error is `failed`, and
+/// `.exit` closes successfully before the client exits.
 pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<CommandResult> {
     let cmd = cmd.trim();
     let parts: Vec<&str> = cmd.split_whitespace().collect();
@@ -286,15 +605,53 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
         return Ok(CommandResult::Continue);
     }
 
-    // Log every dot command to the session log
-    repl_state.session_log.log_dot_command(cmd);
+    use crate::client::database::{InputKind, InputOutcome};
+    let ledger_id = repl_state.repl_db.as_ref().map(|db| {
+        let (id, outcome) = db.record_input(InputKind::DotCommand, cmd);
+        note_lost_ledger_write(&outcome);
+        id
+    });
+    let known = dot_command_spellings().any(|spelling| spelling == parts[0]);
+    let started = Instant::now();
 
+    let result = dispatch_dot_command(cmd, &parts, repl_state);
+
+    if let (Some(id), Some(db)) = (ledger_id, repl_state.repl_db.clone()) {
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let (outcome, error) = match (&result, known) {
+            (Err(e), _) => (InputOutcome::Failed, Some(e.to_string())),
+            (Ok(_), false) => (InputOutcome::Refused, None),
+            (Ok(_), true) => (InputOutcome::Succeeded, None),
+        };
+        note_lost_ledger_write(&db.close_input(id, outcome, error, None, Some(elapsed_ms)));
+    }
+    result
+}
+
+/// History write failures are loud and bounded, and never change dispatch:
+/// a lost row costs one warning line, nothing else.
+fn note_lost_ledger_write(outcome: &crate::client::database::WriteOutcome) {
+    if let crate::client::database::WriteOutcome::Lost(reason) = outcome {
+        crate::client::incident::warning(
+            "ledger",
+            crate::client::incident::hierarchy::LEDGER_WRITE_LOST,
+            format!("a repl::history.input write was lost ({reason})"),
+        );
+    }
+}
+
+/// The dispatcher proper — the arms the registry is welded to.
+fn dispatch_dot_command(
+    cmd: &str,
+    parts: &[&str],
+    repl_state: &mut ReplState,
+) -> Result<CommandResult> {
     match parts[0] {
         ".exit" | ".quit" => Ok(CommandResult::Exit),
 
         ".info" => {
             // Switch to multi-pane TUI
-            repl_state.sync_shared_config();
+            repl_state.prepare_tui_snapshot();
             let handle = repl_state.dql_handle.clone();
             let connection = repl_state.db_connection.clone();
             let final_window_position = super::multi_pane_tui::run_multi_pane_tui(
@@ -313,17 +670,12 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
             Ok(CommandResult::Continue)
         }
 
-        ".version" => {
-            println!("{}", version_info::get_version_info());
-            Ok(CommandResult::Continue)
-        }
-
         ".format" => {
             if parts.len() > 1 {
                 match OutputFormat::from_str(parts[1]) {
                     Some(format) => {
-                        repl_state.output_format = format;
-                        if repl_state.show_meta_output {
+                        repl_state.set_output_format(format, ".format");
+                        if repl_state.config().show_meta_output() {
                             println!("Output format set to: {:?}", format);
                         }
                     }
@@ -335,8 +687,11 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
                         );
                     }
                 }
-            } else if repl_state.show_meta_output {
-                println!("Current output format: {:?}", repl_state.output_format);
+            } else if repl_state.config().show_meta_output() {
+                println!(
+                    "Current output format: {:?}",
+                    repl_state.config().output_format()
+                );
                 println!(
                     "Available formats: {}",
                     OutputFormat::all_formats().join(", ")
@@ -349,19 +704,18 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
             if parts.len() > 1 {
                 // Execute one-off SQL query while staying in current mode
                 let sql_query = cmd[4..].trim(); // Skip ".sql" prefix
-                if repl_state.show_meta_output {
+                if repl_state.config().show_meta_output() {
                     println!("Executing SQL: {}", sql_query);
                 }
-                execute_sql_directly(
-                    sql_query,
-                    &repl_state.db_connection,
-                    repl_state.zebra_mode,
-                    repl_state.target_stage.as_ref(),
-                )?;
+                // One-off in a NAMED mode, through the ledger-owning road —
+                // the submission gets its own `sql` row beside this
+                // dot-command row, exactly as `.dql` one-offs do.
+                let dummy_flag = std::sync::atomic::AtomicBool::new(false);
+                process_query_in_mode(sql_query, repl_state, &dummy_flag, true)?;
             } else {
                 // Set SQL mode explicitly
-                repl_state.sql_mode = true;
-                if repl_state.show_meta_output {
+                repl_state.set_input_mode_sql(true, ".sql");
+                if repl_state.config().show_meta_output() {
                     println!("SQL mode enabled - queries will be executed as raw SQL");
                 }
             }
@@ -372,34 +726,19 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
             if parts.len() > 1 {
                 // Execute one-off DQL query while staying in current mode
                 let dql_query = cmd[4..].trim(); // Skip ".dql" prefix
-                if repl_state.show_meta_output {
+                if repl_state.config().show_meta_output() {
                     println!("Executing DQL: {}", dql_query);
                 }
-                // Temporarily execute in DQL mode
-                let saved_mode = repl_state.sql_mode;
-                repl_state.sql_mode = false;
-                // Note: For now we pass a dummy flag, will need to pass the global one
+                // One-off: the mode is named for this execution, not flipped
+                // in the configuration.
                 let dummy_flag = std::sync::atomic::AtomicBool::new(false);
-                let result = process_query(dql_query, repl_state, &dummy_flag);
-                repl_state.sql_mode = saved_mode;
-                result?;
+                process_query_in_mode(dql_query, repl_state, &dummy_flag, false)?;
             } else {
                 // Set DQL mode explicitly
-                repl_state.sql_mode = false;
-                if repl_state.show_meta_output {
+                repl_state.set_input_mode_sql(false, ".dql");
+                if repl_state.config().show_meta_output() {
                     println!("DQL mode enabled - queries will be parsed as DelightQL");
                 }
-            }
-            Ok(CommandResult::Continue)
-        }
-
-        ".file" => {
-            if parts.len() > 1 {
-                let file_path = parts[1..].join(" "); // Handle file paths with spaces
-                execute_file(&file_path, repl_state)?;
-            } else {
-                eprintln!("Usage: .file <path>");
-                eprintln!("Example: .file queries/my_query.dql");
             }
             Ok(CommandResult::Continue)
         }
@@ -407,23 +746,25 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
         ".zebra" => {
             if parts.len() > 1 {
                 match parts[1].parse::<usize>() {
-                    Ok(0) | Ok(1) => {
-                        // 0 or 1 means turn off zebra mode
-                        repl_state.zebra_mode = None;
-                        if repl_state.show_meta_output {
-                            println!("Zebra mode disabled");
-                        }
-                    }
-                    Ok(n) if (2..=4).contains(&n) => {
-                        repl_state.zebra_mode = Some(n);
-                        if repl_state.show_meta_output {
-                            let color_desc = match n {
-                                2 => "blue and cyan",
-                                3 => "red, white, and blue",
-                                4 => "red, white, blue, and green",
-                                _ => unreachable!(),
-                            };
-                            println!("Zebra mode enabled with {} colors: {}", n, color_desc);
+                    Ok(n) if n <= 4 => {
+                        // The typed operation validates; 0/1 disables.
+                        let _ = repl_state.set_zebra_mode(n, ".zebra");
+                        if repl_state.config().show_meta_output() {
+                            match repl_state.config().zebra_mode() {
+                                None => println!("Zebra mode disabled"),
+                                Some(n) => {
+                                    let color_desc = match n {
+                                        2 => "blue and cyan",
+                                        3 => "red, white, and blue",
+                                        4 => "red, white, blue, and green",
+                                        _ => unreachable!(),
+                                    };
+                                    println!(
+                                        "Zebra mode enabled with {} colors: {}",
+                                        n, color_desc
+                                    );
+                                }
+                            }
                         }
                     }
                     Ok(_) => {
@@ -440,8 +781,8 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
                 }
             } else {
                 // Show current zebra mode
-                if repl_state.show_meta_output {
-                    match repl_state.zebra_mode {
+                if repl_state.config().show_meta_output() {
+                    match repl_state.config().zebra_mode() {
                         None => println!("Zebra mode is disabled"),
                         Some(n) => {
                             let color_desc = match n {
@@ -458,100 +799,62 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
             Ok(CommandResult::Continue)
         }
 
-        ".attach" => {
-            // Delegate to attach module — routes through session protocol via mount!()
-            match crate::attach::handle_attach_command(
-                cmd,
-                &mut **repl_state.dql_handle.lock().unwrap(),
-            ) {
-                Ok(true) => {
-                    // Command was handled successfully
-                    Ok(CommandResult::Continue)
-                }
-                Ok(false) => {
-                    // Not an attach command (shouldn't happen since we checked)
-                    eprintln!("Internal error: attach command not recognized");
-                    Ok(CommandResult::Continue)
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    Ok(CommandResult::Continue)
-                }
-            }
-        }
-
-        ".enlist" => match handle_enlist_command(cmd, repl_state) {
-            Ok(()) => Ok(CommandResult::Continue),
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                Ok(CommandResult::Continue)
-            }
-        },
-
-        ".delist" => match handle_delist_command(cmd, repl_state) {
-            Ok(()) => Ok(CommandResult::Continue),
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                Ok(CommandResult::Continue)
-            }
-        },
-
         ".to" => {
             if parts.len() > 1 {
                 // Parse the stage
                 let stage_str = parts[1];
                 match stage_str {
                     "cst" => {
-                        repl_state.target_stage = Some(Stage::Cst);
-                        if repl_state.show_meta_output {
+                        repl_state.set_target_stage(Some(Stage::Cst), ".to");
+                        if repl_state.config().show_meta_output() {
                             println!("Output stage set to: CST");
                         }
                     }
                     "ast-unresolved" => {
-                        repl_state.target_stage = Some(Stage::AstUnresolved);
-                        if repl_state.show_meta_output {
+                        repl_state.set_target_stage(Some(Stage::AstUnresolved), ".to");
+                        if repl_state.config().show_meta_output() {
                             println!("Output stage set to: Unresolved AST");
                         }
                     }
                     "ast-resolved" => {
-                        repl_state.target_stage = Some(Stage::AstResolved);
-                        if repl_state.show_meta_output {
+                        repl_state.set_target_stage(Some(Stage::AstResolved), ".to");
+                        if repl_state.config().show_meta_output() {
                             println!("Output stage set to: Resolved AST");
                         }
                     }
                     "ast-refined" => {
-                        repl_state.target_stage = Some(Stage::AstRefined);
-                        if repl_state.show_meta_output {
+                        repl_state.set_target_stage(Some(Stage::AstRefined), ".to");
+                        if repl_state.config().show_meta_output() {
                             println!("Output stage set to: Refined AST");
                         }
                     }
                     "ast-sql" | "sql-ast" => {
-                        repl_state.target_stage = Some(Stage::AstSql);
-                        if repl_state.show_meta_output {
+                        repl_state.set_target_stage(Some(Stage::AstSql), ".to");
+                        if repl_state.config().show_meta_output() {
                             println!("Output stage set to: SQL AST");
                         }
                     }
                     "sql" => {
-                        repl_state.target_stage = Some(Stage::Sql);
-                        if repl_state.show_meta_output {
+                        repl_state.set_target_stage(Some(Stage::Sql), ".to");
+                        if repl_state.config().show_meta_output() {
                             println!("Output stage set to: SQL");
                         }
                     }
                     "results" => {
-                        repl_state.target_stage = None; // None means Results
-                        if repl_state.show_meta_output {
+                        repl_state.set_target_stage(None, ".to");
+                        if repl_state.config().show_meta_output() {
                             println!("Output stage set to: Results (default)");
                         }
                     }
                     "hash" => {
-                        repl_state.target_stage = Some(Stage::Hash);
-                        if repl_state.show_meta_output {
+                        repl_state.set_target_stage(Some(Stage::Hash), ".to");
+                        if repl_state.config().show_meta_output() {
                             println!("Output stage set to: Hash");
                         }
                     }
                     "fingerprint" => {
-                        repl_state.target_stage = Some(Stage::Fingerprint);
-                        if repl_state.show_meta_output {
+                        repl_state.set_target_stage(Some(Stage::Fingerprint), ".to");
+                        if repl_state.config().show_meta_output() {
                             println!("Output stage set to: Fingerprint");
                         }
                     }
@@ -562,8 +865,8 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
                 }
             } else {
                 // Show current stage
-                if repl_state.show_meta_output {
-                    match repl_state.target_stage {
+                if repl_state.config().show_meta_output() {
+                    match repl_state.config().target_stage() {
                         None => println!("Current output stage: Results (default)"),
                         Some(Stage::Cst) => println!("Current output stage: CST"),
                         Some(Stage::AstUnresolved) => {
@@ -586,26 +889,38 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
         }
 
         ".bug" => {
-            handle_bug_command(repl_state)?;
+            // The description is the rest of the line, verbatim.
+            let description = cmd.trim_start().strip_prefix(".bug").unwrap_or("").trim();
+            handle_bug_command(repl_state, description)?;
             Ok(CommandResult::Continue)
         }
 
         ".multiline" => {
             if parts.len() > 1 {
                 match parts[1] {
-                    "on" => repl_state.multiline = true,
-                    "off" => repl_state.multiline = false,
+                    "on" => repl_state.set_multiline(true, ".multiline"),
+                    "off" => repl_state.set_multiline(false, ".multiline"),
                     _ => eprintln!("Usage: .multiline [on|off]"),
                 }
             } else {
-                repl_state.multiline = !repl_state.multiline;
+                let toggled = !repl_state.config().multiline();
+                repl_state.set_multiline(toggled, ".multiline");
             }
-            if repl_state.show_meta_output {
+            if repl_state.config().show_meta_output() {
                 println!(
                     "Multiline mode: {}",
-                    if repl_state.multiline { "on" } else { "off" }
+                    if repl_state.config().multiline() {
+                        "on"
+                    } else {
+                        "off"
+                    }
                 );
             }
+            Ok(CommandResult::Continue)
+        }
+
+        ".repl" => {
+            handle_repl_command(parts, repl_state);
             Ok(CommandResult::Continue)
         }
 
@@ -617,173 +932,97 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
     }
 }
 
-/// Handle .enlist command - enlist a namespace (route through session protocol)
-///
-/// Syntax: .enlist <namespace>
-///
-/// Example:
-///   .enlist import::nba           # Enlists import::nba into main
-fn handle_enlist_command(cmd: &str, repl_state: &ReplState) -> Result<()> {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-
-    if parts.len() < 2 {
-        anyhow::bail!("Usage: .enlist <namespace>\nExample: .enlist import::nba");
-    }
-
-    if parts.len() > 2 {
-        anyhow::bail!("Usage: .enlist <namespace>\nExample: .enlist import::nba");
-    }
-
-    let namespace = parts[1].trim_matches('"');
-
-    // Route through the session protocol — enlist!() is a DQL pseudo-predicate
-    // handled by the effect executor. A higher-order directive writes both
-    // groups: `(arguments)(receipt access)`. A lone group is receipt access by
-    // position, so dropping the `(*)` binds zero arguments and refuses on arity.
-    let dql = format!("enlist!(\"{}\")(*)", namespace);
-    let mut handle = repl_state.dql_handle.lock().unwrap();
-    let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
-    crate::exec_ng::run_dql_query(&dql, &mut *session)?;
-
-    println!("✓ Enlisted {} into main", namespace);
-    println!(
-        "  Entities from {} are now accessible without namespace prefix",
-        namespace
-    );
-
-    Ok(())
-}
-
-/// Handle .delist command - delist a namespace (route through session protocol)
-///
-/// Syntax: .delist <namespace>
-///
-/// Example:
-///   .delist import::nba            # Delists import::nba from main
-fn handle_delist_command(cmd: &str, repl_state: &ReplState) -> Result<()> {
-    let parts_vec: Vec<&str> = cmd.split_whitespace().collect();
-
-    if parts_vec.len() < 2 {
-        anyhow::bail!("Usage: .delist <namespace>\nExample: .delist import::nba");
-    }
-
-    if parts_vec.len() > 2 {
-        anyhow::bail!("Usage: .delist <namespace>\nExample: .delist import::nba");
-    }
-
-    let namespace = parts_vec[1].trim_matches('"');
-
-    // Route through the session protocol — delist!() is a DQL pseudo-predicate
-    // handled by the effect executor. A higher-order directive writes both
-    // groups: `(arguments)(receipt access)`. A lone group is receipt access by
-    // position, so dropping the `(*)` binds zero arguments and refuses on arity.
-    let dql = format!("delist!(\"{}\")(*)", namespace);
-    let mut handle = repl_state.dql_handle.lock().unwrap();
-    let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
-    crate::exec_ng::run_dql_query(&dql, &mut *session)?;
-
-    println!("✓ Delisted {} from main", namespace);
-
-    Ok(())
-}
-
-/// Handle .bug command — create a bug report tarball from the current session
-fn handle_bug_command(repl_state: &mut ReplState) -> Result<()> {
-    use std::io::{self, BufRead};
-
-    // Prompt for description
-    println!("Bug description (end with empty line):");
-    let stdin = io::stdin();
-    let mut description_lines = Vec::new();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.is_empty() {
-            break;
-        }
-        description_lines.push(line);
-    }
-    let description = description_lines.join("\n");
-
-    // Prompt for title
-    println!("One-word title:");
-    let mut title = String::new();
-    io::stdin().read_line(&mut title)?;
-    let title = title.trim().to_string();
-
-    if title.is_empty() {
-        eprintln!("Title cannot be empty");
-        return Ok(());
-    }
-
-    // Sanitize title for filesystem
-    let title: String = title
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
+/// `.repl dump <path>` — the one road by which the live client database
+/// reaches disk outside a bug report. The dump is a snapshot: it can contain
+/// sensitive literals and paths (authored inputs, exact timed-out text —
+/// deliberately unredacted, because a transformed input is not a faithful
+/// reproducer), and the live database continues collecting afterwards. A
+/// failed dump leaves the live database untouched.
+fn handle_repl_command(parts: &[&str], repl_state: &mut ReplState) {
+    match parts {
+        // The omitted action reads as `status`.
+        [_, "helpers"] | [_, "helpers", "status"] => {
+            let state = if repl_state.config().editor_helpers_enabled() {
+                "on"
             } else {
-                '_'
-            }
-        })
-        .collect();
-
-    let db_type = repl_state.db_connection.database_type();
-
-    // Gather resources through the session protocol — query the cartridge table
-    // via DQL instead of directly accessing the bootstrap connection.
-    let (ddl_files, db_files) = {
-        let mut handle = repl_state.dql_handle.lock().unwrap();
-        let dql = "sys::cartridges.cartridge(*) |> (source_uri, source_type_enum)";
-        let query_result = {
-            let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
-            crate::exec_ng::run_dql_query(dql, &mut *session)
-        };
-        match query_result {
-            Ok(results) => {
-                // Find column indices
-                let uri_col = results
-                    .columns
-                    .iter()
-                    .position(|c| c == "source_uri")
-                    .unwrap_or(0);
-                let kind_col = results
-                    .columns
-                    .iter()
-                    .position(|c| c == "source_type_enum")
-                    .unwrap_or(1);
-                crate::bug_report::gather_resources_from_rows(
-                    &results.rows,
-                    uri_col,
-                    kind_col,
-                    &repl_state.db_path,
-                )
-            }
-            Err(_) => {
-                // Fallback: just include the primary database if available
-                let mut db_files = Vec::new();
-                if let Some(ref p) = repl_state.db_path {
-                    let primary = std::path::PathBuf::from(p);
-                    if primary.exists() {
-                        db_files.push(primary);
-                    }
-                }
-                (Vec::new(), db_files)
+                "off"
+            };
+            println!(
+                "Optional parser helpers (prompt well-formedness, syntax coloring, \
+                 continuation navigation): {state}"
+            );
+            println!("Submission safety preflight: always on");
+        }
+        [_, "helpers", "on"] => {
+            repl_state.set_editor_parser_helpers(true, ".repl helpers");
+            if repl_state.config().show_meta_output() {
+                println!("Optional parser helpers re-enabled; the breaker is armed again.");
             }
         }
-    };
-
-    match crate::bug_report::create_bug_tarball(
-        &title,
-        &description,
-        &repl_state.session_log,
-        ddl_files,
-        db_files,
-        db_type,
-    ) {
-        Ok(path) => println!("Bug report saved to: {}", path),
-        Err(e) => eprintln!("Failed to create bug report: {}", e),
+        [_, "helpers", "off"] => {
+            repl_state.set_editor_parser_helpers(false, ".repl helpers");
+            if repl_state.config().show_meta_output() {
+                println!(
+                    "Optional parser helpers disabled. Submission safety preflight \
+                     remains enabled."
+                );
+            }
+        }
+        _ => {
+            eprintln!("Usage: .repl helpers [status|on|off]");
+            eprintln!(
+                "dump writes a snapshot of the live REPL database (inputs, configuration,                  timeout evidence). The snapshot can contain sensitive literals and                  paths from this session."
+            );
+            eprintln!(
+                "helpers inspects or sets the optional parser assistance (prompt                  well-formedness, syntax coloring, continuation navigation).                  Submission safety preflight is not configurable."
+            );
+        }
     }
+}
 
+
+/// `.bug [description…]`: the session files now, the client database
+/// serialized, and every database and DDL file the session mounted, as
+/// one tarball beside the session files. The words become an info row
+/// so they travel in error.log with the incidents they describe.
+fn handle_bug_command(repl_state: &mut ReplState, description: &str) -> Result<()> {
+    let Some(db) = repl_state.repl_db.clone() else {
+        crate::client::incident::error(
+            "dot_command",
+            crate::client::incident::hierarchy::DATABASE_UNAVAILABLE,
+            "no client database this session; there is nothing to report from".to_string(),
+        );
+        return Ok(());
+    };
+    let primary = repl_state.db_path.clone().map(std::path::PathBuf::from);
+    let report = {
+        let mut handle = repl_state
+            .dql_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::client::bug::write_bug_report(
+            &db,
+            &mut **handle,
+            (!description.is_empty()).then_some(description),
+            primary.as_deref(),
+        )
+    };
+    match report {
+        Ok(report) => {
+            println!("bug report: {}", report.archive.display());
+            println!(
+                "  {} database file(s), {} DDL file(s), repl.sqlite, and the session files",
+                report.databases.len(),
+                report.ddl_files.len()
+            );
+            println!("  replay with: dql query --replay-repl {}", report.archive.display());
+        }
+        Err(e) => crate::client::incident::error(
+            "dot_command",
+            crate::client::incident::hierarchy::CONFIG,
+            format!("the bug report could not be written: {e}"),
+        ),
+    }
     Ok(())
 }
 
@@ -824,7 +1063,9 @@ fn print_help() {
     println!("  Enter (empty line) Submit accumulated query (multiline on)");
     println!("  Alt+Enter          Insert newline within current line");
     println!("  Ctrl+C             Cancel partial input (multiline on)");
-    println!("  Ctrl+T             Toggle multi-pane TUI (H/J/K/L to navigate)");
+    println!("  Ctrl-X, t          Toggle multi-pane TUI (H/J/K/L to navigate)");
+    println!("  Ctrl-B / Ctrl-F    Jump to the previous / next continuation");
+    println!("  Ctrl-X, d / D      Delete to the next / previous continuation");
     println!();
     println!("Query Examples:");
     println!("  users(*) |> (name, email)");
@@ -837,11 +1078,23 @@ fn print_help() {
     println!("  sys::ns.activated_entity(*)        List entity activations");
 }
 
-/// Process a query using the new pipeline
+/// Process a query using the new pipeline, in the configured input mode.
 pub fn process_query(
     query: &str,
     repl_state: &mut ReplState,
     interrupted_flag: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let sql_mode = repl_state.config().sql_mode();
+    process_query_in_mode(query, repl_state, interrupted_flag, sql_mode)
+}
+
+/// The same, in a NAMED mode — the `.dql`/`.sql` one-offs execute in their
+/// own mode without flipping the configuration.
+pub fn process_query_in_mode(
+    query: &str,
+    repl_state: &mut ReplState,
+    interrupted_flag: &std::sync::atomic::AtomicBool,
+    sql_mode: bool,
 ) -> Result<()> {
     use std::sync::{atomic::Ordering, mpsc};
     use std::thread;
@@ -849,23 +1102,151 @@ pub fn process_query(
 
     let start_time = Instant::now();
 
-    // Store the query for session log
     repl_state.last_query = Some(query.to_string());
+
+    // The one ordered ledger: the submission opens as `started` and closes
+    // with its dispatched outcome below.
+    let ledger_kind = if sql_mode {
+        crate::client::database::InputKind::Sql
+    } else {
+        crate::client::database::InputKind::Dql
+    };
+    let ledger_id = repl_state.repl_db.as_ref().map(|db| {
+        let (id, outcome) = db.record_input(ledger_kind, query);
+        note_lost_ledger_write(&outcome);
+        id
+    });
+    let close_ledger = |repl_state: &ReplState,
+                        outcome: crate::client::database::InputOutcome,
+                        error: Option<String>,
+                        sql: Option<String>,
+                        elapsed_ms: Option<f64>| {
+        if let (Some(id), Some(db)) = (ledger_id, repl_state.repl_db.as_ref()) {
+            note_lost_ledger_write(&db.close_input(id, outcome, error, sql, elapsed_ms));
+        }
+    };
 
     // Update shared info for multi-pane TUI
     repl_state.shared_info.update(query, None);
+
+    // Submission preflight: the EXACT submitted bytes, at the exact entrance
+    // the compiler will take, parsed inside the containment worker BEFORE
+    // the in-process compiler sees them. The gate FAILS CLOSED: only a
+    // validated Preflight answer admits the bytes to the in-process
+    // compiler — whatever the verdict, the compiler is the judge of
+    // defects. A timeout refuses with its incident recorded; a worker that
+    // cannot serve (after one bounded retry against the already-spawned
+    // replacement) refuses DISTINCTLY, because the in-process parser is
+    // unkillable and crossing it without a containment verdict is exactly
+    // the freeze this boundary exists to prevent.
+    if !sql_mode {
+        use super::parser_worker::ProbeOutcome;
+        use super::worker::WorkerResult;
+        let mut refusal: Option<String> = None;
+        for attempt in 0..2 {
+            match repl_state.parser_worker.probe(
+                super::config::ReplParserOperation::SubmissionPreflight,
+                query,
+                None,
+            ) {
+                ProbeOutcome::Answer(WorkerResult::Preflight { .. }) => {
+                    refusal = None;
+                    break;
+                }
+                ProbeOutcome::TimedOut => {
+                    refusal = Some("submission preflight exceeded its parser budget".to_string());
+                    break;
+                }
+                // The worker panicked on these exact bytes and said so; the
+                // in-process parser reads the same bytes through the same
+                // code, so crossing it would be the freeze this boundary
+                // exists to prevent — with a panic in place of a freeze.
+                ProbeOutcome::Panicked { message, recorded } => {
+                    let record = match recorded {
+                        crate::client::database::IncidentRecordOutcome::Recorded {
+                            incident_id,
+                        } => format!("repl::errors.incident #{incident_id}"),
+                        crate::client::database::IncidentRecordOutcome::Queued { .. } => {
+                            "repl::errors.incident (pending)".to_string()
+                        }
+                        crate::client::database::IncidentRecordOutcome::Lost(reason) => {
+                            format!("NOT recorded: {reason}")
+                        }
+                    };
+                    refusal = Some(format!(
+                        "the parser worker panicked on this submission ({message}); \
+                         see {record}"
+                    ));
+                    break;
+                }
+                // probe() never answers Disabled for the mandatory
+                // preflight — the breaker is not consulted for it. If it
+                // ever did, the gate still fails CLOSED.
+                ProbeOutcome::Disabled => {
+                    refusal = Some("the parser containment worker is unavailable".to_string());
+                    break;
+                }
+                // A probe that could not serve replaced its worker; one
+                // retry meets the replacement, then the gate closes.
+                ProbeOutcome::Unavailable | ProbeOutcome::Answer(_) if attempt == 0 => {
+                    refusal = Some("the parser containment worker is unavailable".to_string());
+                }
+                ProbeOutcome::Unavailable | ProbeOutcome::Answer(_) => {
+                    refusal = Some("the parser containment worker is unavailable".to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(reason) = refusal {
+            // The refusal is its own incident: the submission never
+            // reached the compiler, so nothing else records that it was
+            // turned away, or why.
+            let said = if reason.contains("budget") {
+                "the parser preflight for this submission exceeded its budget; \
+                 the submission is refused and its exact input is recorded in \
+                 repl::errors.incident"
+                    .to_string()
+            } else if reason.contains("panicked") {
+                format!("{reason}; the submission is refused")
+            } else {
+                "the parser containment worker is unavailable, so this \
+                 submission cannot be preflighted; it is refused rather than \
+                 handed to the in-process parser without a verdict"
+                    .to_string()
+            };
+            eprintln!("error: {said}");
+            if let Some(db) = &repl_state.repl_db {
+                use crate::client::incident::{hierarchy, Incident, IncidentKind};
+                let mut incident = Incident::plain(
+                    IncidentKind::Error,
+                    "preflight",
+                    hierarchy::PREFLIGHT_REFUSED,
+                    said,
+                );
+                incident.input = Some(query.to_string());
+                db.record_incident(incident);
+            }
+            close_ledger(
+                repl_state,
+                crate::client::database::InputOutcome::Refused,
+                Some(reason),
+                None,
+                Some(start_time.elapsed().as_secs_f64() * 1000.0),
+            );
+            return Ok(());
+        }
+    }
 
     // Reset the interrupted flag before starting
     interrupted_flag.store(false, Ordering::Relaxed);
 
     // Clone what we need for the thread
     let query_str = query.to_string();
-    let target_stage = repl_state.target_stage;
-    let output_format = repl_state.output_format;
-    let sql_mode = repl_state.sql_mode;
+    let target_stage = repl_state.config().target_stage();
+    let output_format = repl_state.config().output_format();
     let db_connection = repl_state.db_connection.clone(); // Clone the connection
-    let zebra_mode = repl_state.zebra_mode; // Copy zebra mode
-    let no_headers = repl_state.no_headers; // Copy no_headers option
+    let zebra_mode = repl_state.config().zebra_mode();
+    let no_headers = repl_state.config().no_headers();
     let dql_handle = Arc::clone(&repl_state.dql_handle); // Clone Arc reference for thread
 
     // Get interrupt handle BEFORE spawning thread (SQLite only)
@@ -888,15 +1269,23 @@ pub fn process_query(
         }
     };
 
-    // Execute query in a separate thread (stacker grows the stack on demand)
+    // Execute query in a separate thread (stacker grows the stack on demand).
+    // Named, so a panic's incident row names its road; caught, so the
+    // ledger closes with the panic's own words rather than "disconnected".
     let (tx, rx) = mpsc::channel();
-    let query_thread = thread::spawn(move || {
+    let query_thread = thread::Builder::new().name("query".to_string()).spawn(move || {
+        let run_all = || -> Result<Option<crate::exec_ng::ResultMetadata>> {
         // Now we can use the cloned connection in the thread
         let result = if sql_mode {
             // For SQL mode, we'll execute directly without thread interruption for now
             // This means Ctrl-C won't work for SQL queries yet
-            execute_sql_directly(&query_str, &db_connection, zebra_mode, Some(&Stage::Sql))
-                .map(|_| None)
+            execute_sql_directly(
+                &query_str,
+                &db_connection,
+                zebra_mode,
+                target_stage.as_ref().or(Some(&Stage::Sql)),
+            )
+            .map(|_| None)
         // SQL doesn't return metadata
         } else {
             crate::exec_ng::ZEBRA_MODE.with(|z| *z.borrow_mut() = zebra_mode);
@@ -916,14 +1305,40 @@ pub fn process_query(
             };
             run()
         };
+        result
+        };
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_all)) {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "panic with non-string payload".to_string()
+                };
+                Err(anyhow::anyhow!(
+                    "[{}] the query thread panicked: {message}",
+                    crate::client::incident::PANIC_URI
+                ))
+            }
+        };
         let _ = tx.send(result);
-    });
+    })
+    .expect("the query thread spawns");
 
     // Wait for query completion or interruption
     loop {
         // Check if interrupted
         if interrupted_flag.load(Ordering::Relaxed) {
             println!("Query execution interrupted");
+            close_ledger(
+                repl_state,
+                crate::client::database::InputOutcome::Interrupted,
+                None,
+                None,
+                Some(start_time.elapsed().as_secs_f64() * 1000.0),
+            );
 
             // Interrupt the SQLite connection using the handle we got earlier
             if let Some(ref handle) = interrupt_handle {
@@ -967,16 +1382,13 @@ pub fn process_query(
 
                 match result {
                     Ok(_metadata) => {
-                        // Push to query history for TUI Window C
-                        if let Some(ref sql) = last_sql {
-                            repl_state
-                                .shared_info
-                                .push_history(query.to_string(), sql.clone());
-                        }
-
-                        repl_state
-                            .session_log
-                            .log_query(query, last_sql, Some(execution_ms), None);
+                        close_ledger(
+                            repl_state,
+                            crate::client::database::InputOutcome::Succeeded,
+                            None,
+                            last_sql,
+                            Some(execution_ms),
+                        );
 
                         // TODO: revisit repl capture — currently chokes on (~~ddl ~~) annotations
                         // because it re-parses raw input text without grammar-aware handling.
@@ -989,11 +1401,12 @@ pub fn process_query(
                         return Ok(());
                     }
                     Err(e) => {
-                        repl_state.session_log.log_query(
-                            query,
+                        close_ledger(
+                            repl_state,
+                            crate::client::database::InputOutcome::Failed,
+                            Some(e.to_string()),
                             last_sql,
                             Some(execution_ms),
-                            Some(e.to_string()),
                         );
                         return Err(e);
                     }
@@ -1006,6 +1419,13 @@ pub fn process_query(
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 // Thread panicked or disconnected
+                close_ledger(
+                    repl_state,
+                    crate::client::database::InputOutcome::Failed,
+                    Some("query execution thread disconnected".to_string()),
+                    None,
+                    Some(start_time.elapsed().as_secs_f64() * 1000.0),
+                );
                 return Err(anyhow::anyhow!(
                     "Query execution thread disconnected unexpectedly"
                 ));
@@ -1016,103 +1436,6 @@ pub fn process_query(
 
 // Helper function to execute query and return metadata
 
-/// Execute queries from a file
-fn execute_file(file_path: &str, repl_state: &mut ReplState) -> Result<()> {
-    use std::fs;
-    use std::path::Path;
-
-    let path = Path::new(file_path);
-
-    // Check if file exists
-    if !path.exists() {
-        return Err(anyhow::anyhow!("File not found: {}", file_path));
-    }
-
-    // Read the file contents
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("Failed to read file: {}", file_path))?;
-
-    if repl_state.show_meta_output {
-        println!("Executing queries from: {}", file_path);
-    }
-
-    // Determine if it's SQL or DQL based on file extension or current mode
-    let is_sql = if path.extension().and_then(|s| s.to_str()) == Some("sql") {
-        true
-    } else if path.extension().and_then(|s| s.to_str()) == Some("dql") {
-        false
-    } else {
-        // Use current mode if extension is ambiguous
-        repl_state.sql_mode
-    };
-
-    // Split contents into individual queries (by semicolon or double newline for DQL)
-    let queries = if is_sql {
-        // SQL: split by semicolon
-        contents
-            .split(';')
-            .map(|q| q.trim())
-            .filter(|q| !q.is_empty())
-            .collect::<Vec<_>>()
-    } else {
-        // DQL: each query is typically on its own line or separated by blank lines
-        contents
-            .split("\n\n")
-            .map(|q| q.trim())
-            .filter(|q| !q.is_empty())
-            .collect::<Vec<_>>()
-    };
-
-    // Execute each query
-    let mut executed_count = 0;
-    let mut error_count = 0;
-
-    for (i, query) in queries.iter().enumerate() {
-        // Skip pure comment queries
-        if query
-            .lines()
-            .all(|line| line.trim().is_empty() || line.trim().starts_with("--"))
-        {
-            continue;
-        }
-
-        if repl_state.show_meta_output && queries.len() > 1 {
-            println!("\n--- Query {} of {} ---", i + 1, queries.len());
-        }
-
-        // Execute the query
-        let result = if is_sql {
-            execute_sql_directly(
-                query,
-                &repl_state.db_connection,
-                repl_state.zebra_mode,
-                Some(&Stage::Sql),
-            )
-        } else {
-            // For DQL, use the process_query function
-            let dummy_flag = std::sync::atomic::AtomicBool::new(false);
-            process_query(query, repl_state, &dummy_flag)
-        };
-
-        match result {
-            Ok(_) => executed_count += 1,
-            Err(e) => {
-                error_count += 1;
-                eprintln!("Error in query {}: {}", i + 1, e);
-                // Continue with next query instead of failing completely
-            }
-        }
-    }
-
-    if repl_state.show_meta_output {
-        println!("\nExecuted {} queries successfully", executed_count);
-        if error_count > 0 {
-            println!("{} queries failed", error_count);
-        }
-    }
-
-    Ok(())
-}
 
 /// Get ANSI color code based on zebra mode and column index
 fn get_zebra_color(zebra_mode: Option<usize>, col_index: usize) -> &'static str {
@@ -1313,7 +1636,9 @@ mod registry_tests {
         const SRC: &str = include_str!("commands.rs");
         let mut arm_spellings = std::collections::BTreeSet::new();
         for line in SRC.lines() {
-            let Some(arrow) = line.find("=>") else { continue };
+            let Some(arrow) = line.find("=>") else {
+                continue;
+            };
             let head = &line[..arrow];
             // Quoted literals in the arm head: ".exit" | ".quit"
             let mut parts = head.split('"');
@@ -1358,7 +1683,7 @@ mod recovery_boundary_tests {
     use super::*;
     use delightql_core::api::{
         DqlHandle, DqlSession, FetchResult, QueryResult, ServerRelay, SessionHealthReport,
-        SessionRecovery, SessionHooks,
+        SessionHooks, SessionRecovery,
     };
     use std::sync::{Arc, Mutex};
 
@@ -1476,7 +1801,10 @@ mod recovery_boundary_tests {
             }
             _ => panic!("a successful reset over no database is a recovery"),
         }
-        assert!(queries.lock().unwrap().is_empty(), "no database, no re-mount");
+        assert!(
+            queries.lock().unwrap().is_empty(),
+            "no database, no re-mount"
+        );
 
         // With a database, the re-mount is issued into the replaced session;
         // the scripted session refuses it, and a failed re-mount is a failed

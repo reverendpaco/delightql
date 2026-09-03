@@ -126,6 +126,12 @@ pub enum Command {
         /// Set a config for this session (hierarchy=STATE); repeatable
         #[arg(long = "config")]
         options: Vec<String>,
+
+        /// Re-run a recorded session through the real terminal: a
+        /// replay-script.<MS> file, or a bug-<MS>.tgz from `.bug`
+        #[cfg(feature = "repl")]
+        #[arg(long, value_name = "SCRIPT|TARBALL", conflicts_with_all = ["query", "file"])]
+        replay_repl: Option<PathBuf>,
     },
 
     /// Format/prettify DelightQL code
@@ -226,6 +232,21 @@ pub enum Command {
     Target {
         #[command(subcommand)]
         action: TargetCommand,
+    },
+
+    /// Hidden implementation channel: the REPL's parser containment worker.
+    /// Spawned by the interactive client from its own executable; framed
+    /// stdin/stdout protocol, no compatibility promise, absent from help.
+    #[cfg(feature = "repl")]
+    #[command(hide = true, name = "__repl-parser-worker")]
+    ReplParserWorker {
+        /// Parent-minted worker generation this process serves.
+        #[arg(long)]
+        generation: u64,
+
+        /// Path to highlights.scm, mirroring the parent's configuration
+        #[arg(long)]
+        highlights: Option<PathBuf>,
     },
 
     /// Start the internal relay-protocol server on a Unix socket (no compatibility promise; see man dql-server)
@@ -445,7 +466,7 @@ impl DebugOptions {
                 "+features" => opts.features = true,
                 "+timing" => opts.timing = true,
                 _ if part.starts_with('+') => {
-                    eprintln!("Warning: Unknown debug option: {}", part);
+                    crate::client::incident::warning("argument", crate::client::incident::hierarchy::ARGUMENT, format!("unknown debug option: {part}"));
                 }
                 _ => {}
             }

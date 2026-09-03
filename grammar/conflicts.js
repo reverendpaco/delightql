@@ -4,8 +4,11 @@ module.exports = $ => [
   // The subject now stands OUTSIDE the heading, so every named form shares the
   // bare `predicate_identifier` prefix and forks on the token after it.
   [$.fact_form, $.fact_function, $.fo_rule, $.ho_fact_form, $.ho_rule, $.relation_name, $.sigma_rule],
-  [$.relation_name, $.standard_cte],
+  // A query-scoped binding's head and a relation read share the bare name;
+  // the group after it — heading, or parameter group — tells them apart.
+  [$.relation_name, $.standard_cte, $.ho_cte],
   [$.declared_relation_param, $.open_relation_param, $.predicate_identifier],
+  [$.rule_param, $.declared_relation_param, $.open_relation_param, $.predicate_identifier],
   [$.callee, $.relation_name],
   [$.mutation_source],
   [$.namespace],
@@ -45,12 +48,24 @@ module.exports = $ => [
   // them apart.
   [$.ho_argument_reference, $.domain_expression],
   [$.ho_argument, $.non_infix_application],
+  [$.residual_designator, $.argumentative_functor, $.interior_functor],
   [$.head_term, $.named_reference],
   // `f!(1 as x` — a CTE head naming its supplied constant and a slot the
   // ruled teaching refuses share the term and the `as`; the group's role is
   // settled by what closes it.
   [$.head_term, $.non_infix_application],
   [$.head_term, $.scalar_param, $.sigma_rule],
+  // `p(x)…` in a let block: a heading term and a scalar formal share the
+  // name; the group after the parens decides.
+  [$.head_term, $.scalar_param],
+  // `p(x)…`, `p(1)…`, `p(f(x))…` in a let block: the first group of a
+  // query-scoped binding is either a heading (standard_cte) or a parameter
+  // group (ho_cte), and its terms are heading terms, formals, or — read as a
+  // relation's own argument row — a call's arguments; the group after the
+  // parens decides.
+  [$.head_term, $.ho_param],
+  [$.head_term, $.scalar_param, $.named_reference],
+  [$.ho_argument, $.head_term, $.ho_param, $.non_infix_application],
   [$.head_term, $.ho_argument_reference, $.named_reference],
   [$.head_term, $.ho_argument, $.non_infix_application],
   [$.fact_datum, $.head_term],
@@ -72,9 +87,12 @@ module.exports = $ => [
   [$.conjunction_expression, $.disjunction_expression],
   [$.out_value, $.parenthesized_operand],
   [$.out_value, $.probe_row],
-  [$.parenthesized_truth, $.truth_as_value],
-  [$.existence, $.exists_as_column],
-  [$.window_spec],
+  // THE CROSSING'S TWO STRATA. After a complete non-infix truth (`+f(x)`)
+  // the parser does not know whether it is the whole truth or the left
+  // operand of a comparison; after `(x > 1)` it does not know whether the
+  // parens group a truth or cross a value. The token after decides.
+  [$.crossed_truth, $.truth_expression],
+  [$._infix_crossing, $.truth_expression],
   [$.disregarded, $.skipped],
   [$.composition_input, $.landing],
   [$.domain_hole, $.non_infix_application],

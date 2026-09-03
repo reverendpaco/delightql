@@ -64,8 +64,26 @@ pub enum JoinType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum JoinCondition {
     On(DomainExpression),
-    Using(Vec<crate::names::ColId>),
-    Natural,
+    /// A correspondence: pairs of exact physical slots that are ONE value.
+    /// The condition is their equality, spelled from each slot's own
+    /// identity (`ON l.a = r.b`), and the published heading keeps one slot
+    /// of each pair. Never a `USING`: that spelling joins by NAME, and the
+    /// two slots of a pair need not share one — a poisoned mint on one
+    /// side beside an authored name on the other is one value still.
+    Merge(Vec<MergedSlots>),
+    /// A DELIBERATE cross: the semantic join carried an explicit Cartesian
+    /// judgment. Renders with no ON clause where the dialect accepts that
+    /// spelling; `bare_join` legalizes it to CROSS JOIN / ON TRUE
+    /// elsewhere. Never a default — no lowering arm produces this from a
+    /// missing correlation.
+    Cartesian,
+}
+
+/// The two exact physical slots one correspondence position merges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergedSlots {
+    pub left: crate::names::ColId,
+    pub right: crate::names::ColId,
 }
 
 // Smart constructors for TableExpression

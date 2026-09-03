@@ -13,7 +13,6 @@
 //! on the SQL text would break on any rendering change; a pin on the alias of
 //! a select item breaks only when the decision changes.
 
-use crate::pipeline::asts::core::OutValue;
 use crate::pipeline::asts::resolved as ast_resolved;
 use crate::pipeline::Pipeline;
 use crate::system::DelightQLSystem;
@@ -123,10 +122,10 @@ fn resolved_items(source: &str) -> Vec<ast_resolved::OutItem> {
         .unwrap_or_else(|error| panic!("{source} failed to resolve: {error}"));
     let chain = &resolved.body;
     chain
-        .continuations
+        .continuations()
         .iter()
         .rev()
-        .find_map(|continuation| match continuation {
+        .find_map(|continuation| match continuation.form() {
             ast_resolved::Continuation::Pipe {
                 operator: ast_resolved::PipeOp::Project(items),
                 ..
@@ -145,10 +144,10 @@ fn resolved_reduction_items(source: &str) -> Vec<ast_resolved::ReductionItem> {
         .unwrap_or_else(|error| panic!("{source} failed to resolve: {error}"));
     let chain = &resolved.body;
     chain
-        .continuations
+        .continuations()
         .iter()
         .rev()
-        .find_map(|continuation| match continuation {
+        .find_map(|continuation| match continuation.form() {
             ast_resolved::Continuation::Pipe {
                 operator:
                     ast_resolved::PipeOp::Group(ast_resolved::GroupSpec::Reduce { reductions, .. }),
@@ -178,10 +177,8 @@ fn ordinary_and_induced_empty_record_expansions_agree() {
         panic!("expected one ordinary empty-record item, got {ordinary:?}");
     };
     assert!(matches!(
-        ordinary.expr.domain(),
-        Some(DomainExpression::Application(
-            FunctionApplication::Standard(_)
-        ))
+        ordinary.expr,
+        DomainExpression::Application(FunctionApplication::Standard(_))
     ));
 
     let induced = resolved_reduction_items(induced_source);
@@ -190,8 +187,8 @@ fn ordinary_and_induced_empty_record_expansions_agree() {
     else {
         panic!("expected one induced empty-record item, got {induced:?}");
     };
-    let Some(DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(record)))) =
-        induced.expr.domain()
+    let DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(record))) =
+        &induced.expr
     else {
         panic!("expected an outer record, got {:?}", induced.expr);
     };
@@ -279,7 +276,7 @@ fn a_spread_expands_into_one_item_per_column_it_covers() {
             panic!("a resolved publication list holds no spread: {item:?}");
         };
         assert_eq!(one.naming, None, "an expansion answers to no authored name");
-        assert!(one.output.is_some(), "every expansion publishes a column");
+        let _published_port = one.output();
     }
     assert_eq!(
         published("users(*) |> (*)"),
@@ -296,18 +293,75 @@ fn each_resolved_item_carries_the_occurrence_it_publishes() {
     let outputs: Vec<_> = items
         .iter()
         .map(|item| match item {
-            ast_resolved::OutItem::One(one) => one.output,
+            ast_resolved::OutItem::One(one) => one.output(),
             ast_resolved::OutItem::Many(_) | ast_resolved::OutItem::Whole => {
                 panic!("no enumeration here")
             }
         })
         .collect();
-    assert!(
-        outputs.iter().all(Option::is_some),
-        "each item publishes a column",
-    );
-    let distinct: std::collections::HashSet<_> = outputs.iter().flatten().collect();
+    let distinct: std::collections::HashSet<_> = outputs.iter().copied().collect();
     assert_eq!(distinct.len(), 3, "three items publish three occurrences");
+}
+
+/// REPEATING ONE VALUE PUBLISHES SIBLING OCCURRENCES. The source lineage is
+/// shared, but neither output is the other output seen through a later
+/// boundary. Consumers selecting a position must preserve this distinction
+/// instead of widening an exact target to progenitor equality.
+#[test]
+fn repeated_publications_are_distinct_occurrences_of_one_value() {
+    let mut system = world();
+    let mut pipeline = Pipeline::new("_(\"a\") as q |> (q.*, q.*)", &mut system);
+    let resolved = pipeline
+        .execute_to_query_resolved()
+        .expect("the repeated publication resolves");
+    let (items, relation) = resolved
+        .body
+        .continuations()
+        .iter()
+        .rev()
+        .find_map(|step| match step.form() {
+            ast_resolved::Continuation::Pipe {
+                operator: ast_resolved::PipeOp::Project(items),
+                ..
+            } => Some((items, *step.result())),
+            _ => None,
+        })
+        .expect("the query ends in a projection");
+    let outputs: Vec<_> = items
+        .iter()
+        .map(|item| match item {
+            ast_resolved::OutItem::One(one) => *one.output(),
+            ast_resolved::OutItem::Many(_) | ast_resolved::OutItem::Whole => {
+                panic!("a resolved publication list holds no spread")
+            }
+        })
+        .collect();
+    let [first, second] = outputs.as_slice() else {
+        panic!("the two authored spreads publish two occurrences: {outputs:?}");
+    };
+
+    assert_ne!(first, second, "two positions own two occurrences");
+    let authority = pipeline
+        .epoch
+        .planning()
+        .expect("the epoch is open")
+        .authority();
+    let first_ancestors = authority
+        .ancestors_into(&relation, *first)
+        .expect("the first publication records its ancestry");
+    let second_ancestors = authority
+        .ancestors_into(&relation, *second)
+        .expect("the second publication records its ancestry");
+    assert!(
+        first_ancestors
+            .iter()
+            .any(|ancestor| second_ancestors.contains(ancestor)),
+        "the sibling occurrences retain their common source lineage",
+    );
+    assert!(
+        !first_ancestors.contains(second) && !second_ancestors.contains(first),
+        "siblings are not one occurrence crossing a boundary",
+    );
 }
 
 /// A TRANSFORM WRITES INTO THE SLOT IT NAMED. Resolution addresses the target
@@ -323,12 +377,15 @@ fn a_transform_item_carries_the_column_it_writes() {
         .expect("the transform resolves");
     let chain = &resolved.body;
     let transformations = chain
-        .continuations
+        .continuations()
         .iter()
-        .find_map(|continuation| match continuation {
+        .find_map(|continuation| match continuation.form() {
             ast_resolved::Continuation::Pipe {
                 operator:
-                    ast_resolved::PipeOp::Transform { items: transformations, .. },
+                    ast_resolved::PipeOp::Transform {
+                        items: transformations,
+                        ..
+                    },
                 ..
             } => Some(transformations.clone()),
             _ => None,
@@ -337,10 +394,7 @@ fn a_transform_item_carries_the_column_it_writes() {
     let item = transformations.first();
     assert_eq!(transformations.len(), 1, "expected one transform item");
     assert_eq!(item.naming.as_str(), "name");
-    assert!(
-        item.output.is_some(),
-        "the target the resolver found travels as the item's output",
-    );
+    let _resolved_target = item.output();
 
     // And the whole heading survives, with the covered slot rewritten in place.
     assert_eq!(
@@ -498,11 +552,11 @@ fn an_ordinal_and_a_name_converge_on_one_resolved_occurrence() {
             panic!("expected one published item in {source:?}, got {items:?}");
         };
         match &one.expr {
-            OutValue::Domain(ast_resolved::DomainExpression::Reference(
+            ast_resolved::DomainExpression::Reference(
                 crate::pipeline::asts::core::Reference::Named(
                     crate::pipeline::asts::core::NamedReference(occurrence),
                 ),
-            )) => occurrence.column,
+            ) => occurrence.column,
             other => panic!("expected a resolved named reference, got {other:?}"),
         }
     };
@@ -572,7 +626,7 @@ fn an_argument_spread_that_addresses_nothing_refuses_before_lowering() {
     };
     let unknown_scope = refusal("users(*) as u |> (coalesce:(nope.*))");
     assert!(
-        unknown_scope.contains("nope.*") && unknown_scope.contains("not in scope"),
+        unknown_scope.contains("nope.*") && unknown_scope.contains("not a scope here"),
         "the glob's refusal names the scope nobody declared: {unknown_scope}",
     );
     let no_match = refusal("users(*) |> (coalesce:(/zzz/))");
@@ -618,7 +672,7 @@ fn a_qualified_glob_argument_naming_no_scope_refuses_before_lowering() {
         .expect_err("a glob naming no live scope has nothing to expand");
     let message = error.to_string();
     assert!(
-        message.contains("nope.*") && message.contains("not in scope"),
+        message.contains("nope.*") && message.contains("not a scope here"),
         "the refusal names the scope nobody declared: {message}",
     );
 }
@@ -634,9 +688,9 @@ fn a_resolved_argument_row_carries_no_authored_spread() {
         let [ast_resolved::OutItem::One(one)] = items.as_slice() else {
             panic!("expected one published item in {source:?}, got {items:?}");
         };
-        let OutValue::Domain(ast_resolved::DomainExpression::Application(
+        let ast_resolved::DomainExpression::Application(
             ast_resolved::FunctionApplication::Standard(application),
-        )) = &one.expr
+        ) = &one.expr
         else {
             panic!("expected an application, got {:?}", one.expr);
         };
@@ -678,12 +732,12 @@ fn a_resolved_argument_row_carries_no_authored_spread() {
 /// THE CROSSING SURVIVES RESOLUTION AS A CROSSING.
 ///
 /// A crossed slot and an authored `_` are different slots, and the resolved
-/// access must still say which was written. Reading the crossing back as a
-/// domain term made both arrive as `Anon`: the restriction still filtered,
-/// but the access no longer recorded what occupied the position.
+/// access must still say which was written: the crossed slot resolves to a
+/// constraining term that is the crossing, and the authored `_` alone
+/// resolves to `Anon`.
 #[test]
 fn a_crossed_slot_stays_a_crossed_constraint_after_resolution() {
-    use crate::pipeline::asts::core::{Slot, SlotConstraint};
+    use crate::pipeline::asts::core::{DomainExpression, FunctionApplication, Slot};
 
     let mut system = world();
     let source = r#"users(("x" = "x"), b, _, _)"#;
@@ -693,9 +747,9 @@ fn a_crossed_slot_stays_a_crossed_constraint_after_resolution() {
         .unwrap_or_else(|error| panic!("{source} failed to resolve: {error}"));
     let chain = &resolved.body;
     let slots = chain
-        .continuations
+        .continuations()
         .iter()
-        .find_map(|continuation| match continuation {
+        .find_map(|continuation| match continuation.form() {
             ast_resolved::Continuation::Access {
                 access: crate::pipeline::asts::core::Access::Slots(slots),
                 ..
@@ -707,7 +761,8 @@ fn a_crossed_slot_stays_a_crossed_constraint_after_resolution() {
     assert!(
         matches!(
             slots.first(),
-            Slot::Constraint(SlotConstraint::Truth { .. })
+            Slot::Constraint(term)
+                if matches!(**term, DomainExpression::Application(FunctionApplication::Crossed(_)))
         ),
         "the crossed slot resolved to {:?}",
         slots.first()
@@ -721,21 +776,26 @@ fn a_crossed_slot_stays_a_crossed_constraint_after_resolution() {
     );
 }
 
-/// THE TRUTH BOUNDARY, AT THE PHASES THAT FOLLOW.
+/// THE CROSSING IS ONE CARRIER IN EVERY PHASE.
 ///
 /// The unresolved half of this is pinned over the normalized tree; this is
 /// the other half, and it needs a run through the resolver and the refiner
-/// because a phase fold is exactly where a broad value wrapper used to be
-/// rebuilt. Every crossing a resolved or refined tree holds stands at one of
-/// the three carriers, and no value beside them is a truth read as a value.
+/// because a phase fold is exactly where a second carrier would be minted or
+/// a crossing dropped. Each bound tree holds exactly the crossings the
+/// source authored — neither erased nor duplicated. A crossed SLOT counts
+/// twice by the pattern law, not by duplication: the access keeps the
+/// authored slot whole, and the restriction the slot became carries the
+/// same crossing, exactly as a ground slot term is kept and becomes a
+/// filter.
 #[test]
-fn no_value_in_a_resolved_or_refined_tree_is_a_truth_read_as_one() {
+fn a_crossing_survives_resolution_and_refinement_as_one_crossing() {
     use crate::lispy::ToLispy;
 
-    for source in [
-        r#"users(*) |> (name, (age > 18) as adult)"#,
-        r#"users(("x" = "x"), b, _, _)"#,
-        r#"users(*) |> (name, +orders(, user_id = id) as has)"#,
+    for (source, expected) in [
+        (r#"users(*) |> (name, (age > 18) as adult)"#, 1),
+        (r#"users(("x" = "x"), b, _, _)"#, 2),
+        (r#"users(*) |> (name, +orders(, user_id = id) as has)"#, 1),
+        (r#"users(*) |> (name, ((age > 18) = true) as adult)"#, 2),
     ] {
         let mut system = world();
         let mut pipeline = Pipeline::new(source, &mut system);
@@ -743,61 +803,115 @@ fn no_value_in_a_resolved_or_refined_tree_is_a_truth_read_as_one() {
             .execute_to_query_resolved()
             .unwrap_or_else(|error| panic!("{source} failed to resolve: {error}"))
             .to_lispy();
-        every_crossing_is_licensed(source, "resolved", &resolved);
+        assert_eq!(
+            resolved.matches("(crossed ").count(),
+            expected,
+            "{source:?} resolved with the wrong number of crossings: {resolved}"
+        );
 
         let refined = pipeline
             .execute_to_ast_refined()
             .unwrap_or_else(|error| panic!("{source} failed to refine: {error}"))
             .expect("a relational query refines to a chain")
             .to_lispy();
-        every_crossing_is_licensed(source, "refined", &refined);
-    }
-}
-
-/// The nearest position tag left of a crossing is the position that admitted
-/// it, and all three render their crossing arm as `<position>:truth`.
-fn every_crossing_is_licensed(source: &str, phase: &str, tree: &str) {
-    let rendered: String = tree.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        rendered.contains("truth_as_value"),
-        "{source:?} carries no crossing at {phase}"
-    );
-    for (at, _) in rendered.match_indices("truth_as_value") {
-        let before = &rendered[..at];
-        let nearest = ["out_value:", "argument_value:", "slot_constraint:"]
-            .iter()
-            .filter_map(|tag| before.rfind(tag).map(|from| &before[from..]))
-            .min_by_key(|tail| tail.len());
-        assert!(
-            nearest.is_some_and(|tail| tail.starts_with("out_value:truth")
-                || tail.starts_with("argument_value:truth")
-                || tail.starts_with("slot_constraint:truth")),
-            "{source:?} carries a {phase} crossing at an unlicensed position: …{}",
-            &before[before.len().saturating_sub(80)..]
+        assert_eq!(
+            refined.matches("(crossed ").count(),
+            expected,
+            "{source:?} refined with the wrong number of crossings: {refined}"
         );
     }
 }
 
+/// THE SCOPE JUDGMENT IS TOTAL ACROSS BOTH FAMILIES.
+///
+/// Whether a relation of its own scope stands beneath a value is the walk's
+/// judgment, and it reaches a scalarized interior beneath a comparison's
+/// operand, a comparison beneath a crossing, and an existence beneath a
+/// crossing alike. A hand enumeration exhaustive over one family stopped at
+/// the boundary to the other.
+#[test]
+fn the_scope_judgment_reaches_through_crossings_and_operands() {
+    let published = |source: &str| {
+        let items = resolved_items(source);
+        let [ast_resolved::OutItem::One(one)] = items.as_slice() else {
+            panic!("expected one published item in {source:?}, got {items:?}");
+        };
+        one.expr.clone()
+    };
+    // A plain comparison encloses nothing.
+    assert!(!published("users(*) |> ((age > 18) as adult)").nests_relation());
+    // A scalarized relation is a scope of its own.
+    assert!(published("users(*) |> ((_:(, users(*) ~> count:(*))) as n)").nests_relation());
+    // ... and so is a comparison OVER one, crossed into value position.
+    assert!(
+        published("users(*) |> ((_:(, users(*) ~> count:(*)) > 0) as positive)").nests_relation()
+    );
+    // An existence interior beneath a crossing is reached the same way.
+    assert!(published("users(*) |> ((+orders(, user_id = id) = true) as has)").nests_relation());
+    // The truth itself answers for the interiors beneath its reads.
+    let ast_resolved::DomainExpression::Application(ast_resolved::FunctionApplication::Crossed(
+        crossing,
+    )) = published("users(*) |> ((_:(, users(*) ~> count:(*)) > 0) as positive)")
+    else {
+        panic!("a crossed comparison was published");
+    };
+    assert!(crossing.truth().nests_relation());
+}
+
+/// A CROSSED PIVOT KEY READS ITS COLUMN LIKE ARITHMETIC DOES.
+///
+/// The pivot's key witness is found by the columns the key reads. An
+/// arithmetic key `(v + 1)` reads `v` and finds the IN witness on `v`; its
+/// values cannot name columns, which is the refusal it earns. A crossed key
+/// `(v > 5)` reads the same column and must earn the same refusal — not
+/// "requires a matching IN predicate", which is what a walker that stopped
+/// at the crossing answered.
+#[test]
+fn a_crossed_pivot_key_reads_its_column_like_arithmetic() {
+    let refusal = |source: &str| {
+        let mut system = world();
+        let mut pipeline = Pipeline::new(source, &mut system);
+        pipeline
+            .execute_to_query_resolved()
+            .expect_err("a numeric-valued pivot key cannot name output columns")
+            .to_string()
+    };
+    let arithmetic =
+        refusal(r#"_(d, v @ 1, 5; 1, 7; 2, 1), v in (5; 7; 1) |> %(d ~> d of (v + 1))"#);
+    let crossed = refusal(r#"_(d, v @ 1, 5; 1, 7; 2, 1), v in (5; 7; 1) |> %(d ~> d of (v > 5))"#);
+    assert!(
+        arithmetic.contains("cannot name output columns"),
+        "the arithmetic key finds its witness: {arithmetic}"
+    );
+    assert!(
+        crossed.contains("cannot name output columns"),
+        "the crossed key must find the same witness: {crossed}"
+    );
+    assert!(
+        !crossed.contains("requires a matching IN predicate"),
+        "a crossed key is not blind to the column it reads: {crossed}"
+    );
+}
+
 /// A BIN RELATION'S ARGUMENTS KEEP THEIR POSITIONS.
 ///
-/// A slot the executable cannot take is refused where it stands. Dropping it
-/// handed the executable a shorter row and promoted every later argument one
-/// place left, so a two-argument call arrived as a one-argument call and the
-/// arity complaint named the wrong problem.
+/// A crossed truth is a value and reaches the executable in its own
+/// position, where the executable's own argument law judges it. Dropping it
+/// would hand the executable a shorter row and promote every later argument
+/// one place left, so the arity complaint would name the wrong problem.
 #[test]
-fn a_crossed_bin_argument_is_refused_in_its_own_position() {
+fn a_crossed_bin_argument_reaches_the_executable_in_its_own_position() {
     let mut system = world();
     let source = r#"sys::execution.compile(("cst" = "cst"), "users(*)")"#;
     let mut pipeline = Pipeline::new(source, &mut system);
     let error = pipeline
         .execute_to_sql()
-        .expect_err("a truth crossing is not a value this executable takes")
+        .expect_err("a comparison is not the string literal this executable takes")
         .to_string();
     assert!(
-        error.contains("argument 1"),
-        "the refusal must name the position that carried the crossing: {error}"
+        error.contains("must be a string literal"),
+        "the executable's own argument law must judge the crossing: {error}"
     );
-    // The old behaviour deleted the crossing and complained about arity.
     assert!(
         !error.contains("got 1"),
         "the crossing must not be dropped and the later argument promoted: {error}"

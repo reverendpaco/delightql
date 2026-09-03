@@ -7,7 +7,7 @@
 //! stay in place; removing one there also changes the join's exposed scope
 //! and needs a separate structural proof.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::Result;
 use crate::names::ColId;
@@ -18,7 +18,116 @@ use crate::pipeline::sql_ast::{
 use super::visitor::{apply_transformer, QueryTransformer};
 
 pub(super) fn pass_cleanup(stmt: SqlStatement) -> Result<SqlStatement> {
+    let mut stmt = stmt;
+    deduplicate_visible_ctes(&mut stmt);
     apply_transformer(stmt, &mut CollapseTransformer)
+}
+
+fn deduplicate_visible_ctes(stmt: &mut SqlStatement) {
+    use crate::pipeline::sql_ast::walk::{visit_expression_mut, visit_query, SqlVisitorMut};
+    use crate::pipeline::sql_ast::Cte;
+
+    struct RemoveVisible<'a> {
+        visible: &'a HashSet<crate::names::ScopeId>,
+    }
+
+    impl SqlVisitorMut for RemoveVisible<'_> {
+        fn query(&mut self, query: &mut QueryExpression) {
+            let QueryExpression::WithCte { ctes, query: body } = query else {
+                return;
+            };
+            let mut visible = self.visible.clone();
+            deduplicate_list(ctes, &mut visible);
+            remove_from_query(body, &visible);
+            if ctes.is_empty() {
+                *query =
+                    std::mem::replace(body, Box::new(QueryExpression::Values { rows: Vec::new() }))
+                        .as_ref()
+                        .clone();
+            }
+        }
+    }
+
+    fn remove_from_query(query: &mut QueryExpression, visible: &HashSet<crate::names::ScopeId>) {
+        visit_query(query, &mut RemoveVisible { visible });
+    }
+
+    fn remove_from_expression(
+        expression: &mut DomainExpression,
+        visible: &HashSet<crate::names::ScopeId>,
+    ) {
+        visit_expression_mut(expression, &mut RemoveVisible { visible });
+    }
+
+    fn deduplicate_list(ctes: &mut Vec<Cte>, visible: &mut HashSet<crate::names::ScopeId>) {
+        let mut kept = Vec::with_capacity(ctes.len());
+        for mut cte in std::mem::take(ctes) {
+            if visible.contains(&cte.scope()) {
+                continue;
+            }
+            for part in cte.parts_mut() {
+                remove_from_query(part, visible);
+            }
+            visible.insert(cte.scope());
+            kept.push(cte);
+        }
+        *ctes = kept;
+    }
+
+    let mut visible = HashSet::new();
+    match stmt {
+        SqlStatement::DropTempTable { .. } => {}
+        SqlStatement::Query { with_clause, query }
+        | SqlStatement::CreateTempTable {
+            with_clause, query, ..
+        }
+        | SqlStatement::CreateTempView {
+            with_clause, query, ..
+        } => {
+            if let Some(ctes) = with_clause {
+                deduplicate_list(ctes, &mut visible);
+            }
+            remove_from_query(query, &visible);
+        }
+        SqlStatement::Insert {
+            with_clause,
+            source,
+            ..
+        } => {
+            if let Some(ctes) = with_clause {
+                deduplicate_list(ctes, &mut visible);
+            }
+            remove_from_query(source, &visible);
+        }
+        SqlStatement::Delete {
+            with_clause,
+            where_clause,
+            ..
+        } => {
+            if let Some(ctes) = with_clause {
+                deduplicate_list(ctes, &mut visible);
+            }
+            if let Some(expression) = where_clause {
+                remove_from_expression(expression, &visible);
+            }
+        }
+        SqlStatement::Update {
+            with_clause,
+            set_clause,
+            where_clause,
+            ..
+        } => {
+            if let Some(ctes) = with_clause {
+                deduplicate_list(ctes, &mut visible);
+            }
+            for (_, expression) in set_clause {
+                remove_from_expression(expression, &visible);
+            }
+            if let Some(expression) = where_clause {
+                remove_from_expression(expression, &visible);
+            }
+        }
+    }
 }
 
 struct CollapseTransformer;
@@ -131,7 +240,7 @@ fn a_definition_would_be_written_twice(
 ) -> bool {
     let mut reads: HashMap<ColId, usize> = HashMap::new();
     for item in outer.select_list() {
-        if let SelectItem::Expression { expr, .. } = item {
+        if let Some(expr) = item.expr() {
             count_reads(expr, &mut reads);
         }
     }
@@ -159,13 +268,10 @@ fn count_reads(expr: &DomainExpression, reads: &mut HashMap<ColId, usize>) {
 fn output_definitions(select_list: &[SelectItem]) -> Option<HashMap<ColId, DomainExpression>> {
     let mut definitions = HashMap::new();
     for item in select_list {
-        let SelectItem::Expression { expr, alias } = item else {
+        let SelectItem::Publishing { expr, slot, .. } = item else {
             return None;
         };
-        let output = alias.or_else(|| match expr {
-            DomainExpression::Column(column) => Some(*column),
-            _ => None,
-        })?;
+        let output = *slot;
         if definitions.insert(output, expr.clone()).is_some() {
             return None;
         }
@@ -179,12 +285,9 @@ fn rewrite_select_list(
 ) -> Option<Vec<SelectItem>> {
     items
         .iter()
-        .map(|item| match item {
-            SelectItem::Expression { expr, alias } => Some(SelectItem::Expression {
-                expr: rewrite_expr(expr, definitions)?,
-                alias: *alias,
-            }),
-            SelectItem::Star { .. } => None,
+        .map(|item| {
+            let expr = item.expr()?;
+            Some(item.with_expr(rewrite_expr(expr, definitions)?))
         })
         .collect()
 }
@@ -286,10 +389,12 @@ fn rewrite_expr(
         },
         DomainExpression::PredicateRewrite {
             name,
+            namespace,
             args,
             negated,
         } => DomainExpression::PredicateRewrite {
             name: name.clone(),
+            namespace: namespace.clone(),
             args: rewrite_exprs(args, definitions)?,
             negated: *negated,
         },
@@ -313,10 +418,7 @@ fn rewrite_exprs(
 }
 
 fn select_item_contains_window_or_aggregate(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::Expression { expr, .. } => contains_window_or_aggregate(expr),
-        SelectItem::Star { .. } => false,
-    }
+    item.expr().is_some_and(contains_window_or_aggregate)
 }
 
 fn contains_window_or_aggregate(expr: &DomainExpression) -> bool {

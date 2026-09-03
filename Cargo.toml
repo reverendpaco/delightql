@@ -24,7 +24,10 @@ default-members = [
 # delightql-cst is a member but NOT a default member: its build script runs the
 # pinned tree-sitter CLI, so building it requires that CLI on PATH. Build it
 # explicitly: `cargo build -p delightql-cst`.
+# delightql-architecture-tests is also explicit-only: it launches child Cargo
+# checks and belongs to major-series closure, not the default developer loop.
 members = [
+    "crates/delightql-architecture-tests",
     "crates/delightql-buildinfo",
     "crates/delightql-core",
     "crates/delightql-cst",

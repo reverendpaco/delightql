@@ -12,19 +12,19 @@
 //! surviving sigma call became a `PredicateRewrite` and SQL generation died
 //! with "Unknown predicate rewrite: 'customers'". This hit BOTH the plain
 //! pipeline and effect-rule bodies compiled under
-//! `resolution_namespace = Some(<consulted ns>)` (the filing's plain-works
+//! the consulted declaration's world (the filing's plain-works
 //! claim held only for main-connection tables).
 //!
 //! Red-first: every affected-shape test in this file was observed failing
 //! without the enlisted-guard probe ("Unknown predicate rewrite: 'customers'" /
 //! "'helper'"); the control was green before and after.
 
-use super::{resolve_query_inline, ResolutionConfig};
+use super::{resolve_query_with, ResolutionConfig};
 use crate::bin_cartridge::prelude::consult::execute_consult;
 use crate::pipeline::compiled_query::{CompiledPlan, PlanEntry};
 use crate::pipeline::effect_transformer::compile_namespace_main;
 use crate::pipeline::{ast_unresolved, danger_gates, generator, refiner, transformer};
-use crate::resolution::EntityRegistry;
+use crate::resolution::ResolverCore;
 use crate::system::DelightQLSystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
@@ -105,27 +105,36 @@ fn enlisted_world() -> DelightQLSystem {
 
 fn compile_plain(source: &str, system: &DelightQLSystem) -> crate::error::Result<String> {
     let tree = crate::pipeline::parse::query_sequence(source).expect("source should parse");
-    let mut normalized =
+    let normalized =
         crate::pipeline::parse::normalize_sequence(&tree).expect("source should normalize");
-    assert_eq!(normalized.queries.len(), 1, "one statement expected");
-    let query: ast_unresolved::Query = normalized.queries.remove(0).query;
+    let mut queries = normalized.into_queries();
+    assert_eq!(queries.len(), 1, "one statement expected");
+    let query: ast_unresolved::Query = queries.remove(0).query;
     let schema = system.get_schema()?;
-    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
-    let mut registry =
-        EntityRegistry::new_with_system(schema, system, std::rc::Rc::clone(&identities));
-    let config = ResolutionConfig::default();
-    let (resolved, _bubbled) = resolve_query_inline(query, &mut registry, None, &config, None)?;
+    let identities = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let mut registry = ResolverCore::new_with_system(schema, system, &identities);
+    let mut env = crate::defuse::environment::Environment::Use(
+        crate::defuse::environment::UseEnvironment::session(&registry.consult, "home")?,
+    );
+    let mut fold = super::resolver_fold::ResolverFold::new(
+        &mut registry,
+        &mut env,
+        ResolutionConfig::default(),
+    );
+    let resolved = resolve_query_with(&mut fold, query)?.into_query();
+    drop(fold);
     let gates = danger_gates::DangerGateMap::with_defaults();
-    let refined =
-        refiner::refine_query_with_gates(resolved, gates.clone(), std::rc::Rc::clone(&identities))?;
+    let refined = refiner::refine_query_with_gates(resolved, gates.clone(), &identities)?;
+    let names_handle = identities.names();
     let ctx = transformer::TransformCtx {
-        identities: std::rc::Rc::clone(&identities),
-        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&identities)),
-        outer_columns: vec![],
+        relations: identities.seal(),
+        identities: std::rc::Rc::clone(&names_handle),
+        outer_sites: Vec::new(),
+        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&names_handle)),
         danger_gates: gates,
     };
     let sql_ast = transformer::transform(refined, &ctx)?.without_obligations()?;
-    let names = generator::baptise_statements(&identities, &[&sql_ast])
+    let names = generator::baptise_statements(&names_handle, &[&sql_ast])
         .map_err(|e| e.into_delightql_error("enlisted-guard SQL naming failed"))?;
     generator::SqlGenerator::new(&names)
         .generate_statement(&sql_ast)
@@ -138,7 +147,7 @@ fn compile_plain(source: &str, system: &DelightQLSystem) -> crate::error::Result
 }
 
 /// Consult `source` into namespace `fx` and compile its `main!` into a plan
-/// (the effect path: bodies resolve under `resolution_namespace = Some("fx")`).
+/// (the effect path: bodies resolve in the consulted declaration's world).
 fn plan_for(source: &str, system: &mut DelightQLSystem) -> crate::error::Result<CompiledPlan> {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("fx.dql");
@@ -199,7 +208,8 @@ fn assert_correlated_exists(sql: &str, negated: bool) {
 fn effect_body_bare_enlisted_guard_compiles_to_correlated_exists() {
     let mut system = enlisted_world();
     let plan = plan_for(
-        "main!(*) :- maindb.orders(*), +customers(customer_id), amount > 0 \
+        "?- enlist!(\"maindb\")(*)\n\
+         main!(*) :- maindb.orders(*), +customers(customer_id), amount > 0 \
          |> insert!(maindb.orders(*))(*)\n",
         &mut system,
     )
@@ -218,7 +228,8 @@ fn effect_body_bare_enlisted_guard_compiles_to_correlated_exists() {
 fn effect_body_bare_enlisted_antijoin_guard_compiles() {
     let mut system = enlisted_world();
     let plan = plan_for(
-        "main!(*) :- maindb.orders(*), \\+customers(customer_id) \
+        "?- enlist!(\"maindb\")(*)\n\
+         main!(*) :- maindb.orders(*), \\+customers(customer_id) \
          |> insert!(maindb.orders(*))(*)\n",
         &mut system,
     )
@@ -233,7 +244,8 @@ fn effect_body_bare_enlisted_antijoin_guard_compiles() {
 fn effect_body_bare_enlisted_relation_read_still_resolves() {
     let mut system = enlisted_world();
     let plan = plan_for(
-        "main!(*) :-\n\
+        "?- enlist!(\"maindb\")(*)\n\
+         main!(*) :-\n\
          \x20   customers(*) |> temp_table!(snap(*))(*) : s!\n\
          \x20   s!(*) |> returning!(*)\n",
         &mut system,
@@ -254,7 +266,8 @@ fn effect_body_bare_enlisted_relation_read_still_resolves() {
 fn effect_body_guard_on_same_file_pure_rule_compiles() {
     let mut system = enlisted_world();
     let plan = plan_for(
-        "helper(*) :- customers(*), region = \"EU\"\n\
+        "?- enlist!(\"maindb\")(*)\n\
+         helper(*) :- customers(*), region = \"EU\"\n\
          main!(*) :- maindb.orders(*), +helper(customer_id) \
          |> insert!(maindb.orders(*))(*)\n",
         &mut system,
@@ -344,7 +357,7 @@ fn consulted_view_body_with_bare_enlisted_guard_expands() {
     let path = dir.path().join("vx.dql");
     std::fs::write(
         &path,
-        "valid(*) :- maindb.orders(*), +customers(customer_id), amount > 0\n",
+        "?- enlist!(\"maindb\")(*)\nvalid(*) :- maindb.orders(*), +customers(customer_id), amount > 0\n",
     )
     .expect("write consult file");
     execute_consult(&mut system, path.to_str().unwrap(), "vx", None).expect("view file consults");
@@ -354,3 +367,4 @@ fn consulted_view_body_with_bare_enlisted_guard_expands() {
         .expect("a consulted view body carrying the bare enlisted guard must compile");
     assert_correlated_exists(&sql, false);
 }
+

@@ -123,15 +123,16 @@ impl<'t> Formatter<'t> {
                 self.echo(reduction);
                 Ok(())
             }
-            cst::OperatorContinuation::StageBoundary(boundary) => {
-                match boundary {
-                    // `as name` carries its own keyword; the space is ours.
-                    cst::StageBoundary::StageName(name) => {
-                        self.output.write(" ");
-                        self.echo(name);
-                    }
-                    cst::StageBoundary::Materialize(materialize) => self.echo(materialize),
-                }
+            // `as name` carries its own keyword; the space is ours.
+            cst::OperatorContinuation::StageName(name) => {
+                self.output.write(" ");
+                self.echo(name);
+                Ok(())
+            }
+            // `as name(slots)` — the same keyword, the same space.
+            cst::OperatorContinuation::ArgumentativeStage(stage) => {
+                self.output.write(" ");
+                self.echo(stage);
                 Ok(())
             }
         }

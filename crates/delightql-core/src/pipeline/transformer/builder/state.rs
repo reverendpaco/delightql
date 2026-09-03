@@ -4,7 +4,7 @@
 //!
 //! Four states with well-defined transitions. The builder's public methods
 //! trigger transitions internally — callers never see this enum. Every state
-//! carries the same [`Publication`], so what a state advertises and what its
+//! carries the same [`SqlLayout`], so what a state advertises and what its
 //! statement emits are one value, not two that have to be kept in step.
 
 use crate::error::Result;
@@ -12,8 +12,8 @@ use crate::pipeline::sql_ast::{
     DomainExpression, OrderTerm, QueryExpression, SelectBuilder, SelectItem, TableExpression,
 };
 
+use super::layout::{Hygiene, SqlLayout};
 use super::names::NameGenerator;
-use super::publication::{Hygiene, Publication};
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -58,7 +58,7 @@ pub(super) enum BuilderState {
     /// - `join` → Segment (both tables in FROM)
     Table {
         table: TableExpression,
-        scope: Publication,
+        scope: SqlLayout,
     },
 
     /// Flat accumulation: FROM + WHERE + ORDER BY + LIMIT, no SELECT list.
@@ -75,7 +75,7 @@ pub(super) enum BuilderState {
         /// The row clause this level carries, whole. A cap with no
         /// offset, an offset with no cap, or both — the SQL AST's own shape.
         row_clause: Option<crate::pipeline::sql_ast::ordering::Limit>,
-        scope: Publication,
+        scope: SqlLayout,
     },
 
     /// SELECT statement being assembled via SelectBuilder.
@@ -94,7 +94,7 @@ pub(super) enum BuilderState {
         has_projection: bool,
         /// Whether GROUP BY has been set.
         has_group_by: bool,
-        scope: Publication,
+        scope: SqlLayout,
     },
 
     /// Frozen query expression. Further operations require wrapping.
@@ -107,13 +107,22 @@ pub(super) enum BuilderState {
     /// - `to_sql` → emit (with accumulated CTEs if any)
     Frozen {
         query: QueryExpression,
-        scope: Publication,
+        scope: SqlLayout,
     },
 }
 
 impl BuilderState {
     /// What this state publishes.
-    pub(super) fn publication(&self) -> &Publication {
+    pub(super) fn publication(&self) -> &SqlLayout {
+        match self {
+            Self::Table { scope, .. }
+            | Self::Segment { scope, .. }
+            | Self::Select { scope, .. }
+            | Self::Frozen { scope, .. } => scope,
+        }
+    }
+
+    pub(super) fn publication_mut(&mut self) -> &mut SqlLayout {
         match self {
             Self::Table { scope, .. }
             | Self::Segment { scope, .. }
@@ -237,8 +246,26 @@ impl BuilderState {
                 row_clause: None,
                 scope,
             }),
+            // A BOUND SEALS WHAT FOLLOWS IT. A predicate added beside a
+            // row clause would be applied BEFORE the bound it was written
+            // after, so a level that already carries one gets a level of its
+            // own for the filter.
+            Self::Segment {
+                row_clause: Some(_),
+                ..
+            } => self.wrap_as_subquery(names),
             Self::Segment { .. } => Ok(self),
-            Self::Select { has_group_by, .. } if !has_group_by => Ok(self),
+            Self::Select {
+                select,
+                has_projection,
+                has_group_by,
+                scope,
+            } if !has_group_by && select.limit_clause().is_none() => Ok(Self::Select {
+                select,
+                has_projection,
+                has_group_by,
+                scope,
+            }),
             Self::Select { .. } => self.wrap_as_subquery(names),
             Self::Frozen { .. } => self.wrap_preserving_name(names),
         }
@@ -301,69 +328,23 @@ impl BuilderState {
 
 /// The occurrence the wrapping alias publishes for one output of its body.
 ///
-/// A rewrite is a lookup, not a search, and the tiers are tried in order of how
-/// much they assume. The output's own occurrence, if a pair carries it, is the
-/// answer and cannot be ambiguous — an occurrence appears at most once as a
-/// source. Only when no pair names it exactly do value and then published name
-/// stand in, and those two can genuinely fail to pick: `(id as a, id as b)`
-/// projects one column into two slots, so both pairs answer to the same value
-/// while standing for different outputs. Sameness of value is not identity of
-/// occurrence, and reaching for it first makes that pair unwrappable.
-///
-/// Two pairs answering to one output on a tier that cannot tell them apart is a
-/// heading that cannot be republished, and an output no tier answers to is one
-/// the wrapper does not carry — both refuse. Leaving such an output alone is
-/// the tempting move and the wrong one: it strands an occurrence of the inner
-/// scope inside a statement that now claims to produce the outer one.
+/// The pair list names exact emitted occurrences. Value, spelling, and owner
+/// are not evidence that a different occurrence is the same output.
 fn rename_target(
     output: crate::names::ColId,
     aliases: &[(crate::names::ColId, crate::names::ColId)],
-    identities: &crate::names::Registry,
 ) -> Result<crate::names::ColId> {
-    // An occurrence appears at most once as a source, so this tier cannot be
-    // ambiguous — but the pair list is a slice and does not carry that. Taking
-    // the first match asserts the invariant instead of checking it, and where
-    // it fails the wrapper silently renames one of two outputs to the other's
-    // target. Enumerate, like the tiers below.
     let mut exact = aliases
         .iter()
         .filter(|(source, _)| *source == output)
         .map(|(_, target)| *target);
     match (exact.next(), exact.next()) {
-        (Some(target), None) => return Ok(target),
-        (Some(_), Some(_)) => {
-            return Err(crate::error::DelightQLError::parse_error(format!(
-                "subquery output {output:?} is paired more than once by the alias wrapping it"
-            )))
-        }
-        (None, _) => {}
-    }
-
-    let mut by_value = aliases
-        .iter()
-        .filter(|(source, _)| identities.same_value(*source, output))
-        .map(|(_, target)| *target);
-    match (by_value.next(), by_value.next()) {
-        (Some(target), None) => return Ok(target),
-        (Some(_), Some(_)) => {
-            return Err(crate::error::DelightQLError::parse_error(format!(
-                "subquery output {output:?} has more than one rename target by value"
-            )))
-        }
-        (None, _) => {}
-    }
-
-    let mut by_name = aliases
-        .iter()
-        .filter(|(source, _)| identities.published_sym(*source) == identities.published_sym(output))
-        .map(|(_, target)| *target);
-    match (by_name.next(), by_name.next()) {
         (Some(target), None) => Ok(target),
         (Some(_), Some(_)) => Err(crate::error::DelightQLError::parse_error(format!(
-            "subquery output {output:?} has more than one rename target by name"
+            "subquery output {output:?} is paired more than once by the alias wrapping it"
         ))),
         (None, _) => Err(crate::error::DelightQLError::parse_error(format!(
-            "subquery output {output:?} answers to no column of the alias wrapping it"
+            "subquery output {output:?} has no exact target in the alias wrapping it"
         ))),
     }
 }
@@ -377,11 +358,11 @@ fn rename_target(
 /// The two are one act, which is why every output is resolved before any of
 /// them — and before the stamp — moves: a statement half-way through this is
 /// exactly the state the pairing exists to rule out.
-pub(in crate::pipeline::transformer) fn rewrite_output_aliases(
+pub(in crate::pipeline) fn rewrite_output_aliases(
     query: &mut QueryExpression,
     alias: crate::names::ScopeId,
     aliases: &[(crate::names::ColId, crate::names::ColId)],
-    identities: &crate::names::Registry,
+    _identities: &crate::names::Registry,
 ) -> Result<()> {
     match query {
         QueryExpression::Select(statement) => {
@@ -394,16 +375,16 @@ pub(in crate::pipeline::transformer) fn rewrite_output_aliases(
             // that spells no alias. Re-publishing it spells the alias out.
             statement
                 .republish(alias, |output| {
-                    rename_target(output, aliases, identities).map_err(|error| error.to_string())
+                    rename_target(output, aliases).map_err(|error| error.to_string())
                 })
                 .map_err(crate::error::DelightQLError::parse_error)?;
         }
         QueryExpression::SetOperation { left, right, .. } => {
-            rewrite_output_aliases(left, alias, aliases, identities)?;
-            rewrite_output_aliases(right, alias, aliases, identities)?;
+            rewrite_output_aliases(left, alias, aliases, _identities)?;
+            rewrite_output_aliases(right, alias, aliases, _identities)?;
         }
         QueryExpression::WithCte { query, .. } => {
-            rewrite_output_aliases(query, alias, aliases, identities)?
+            rewrite_output_aliases(query, alias, aliases, _identities)?
         }
         QueryExpression::Values { .. } => {}
     }

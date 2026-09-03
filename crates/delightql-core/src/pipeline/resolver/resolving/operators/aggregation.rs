@@ -2,14 +2,11 @@
 // Copyright 2026 Daniel Eklund
 
 use crate::error::{DelightQLError, Result};
-use crate::names::{Addressing, ColId, ColumnOrigin, Computation, Hint, Registry, ValueFacts};
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
+use crate::pipeline::resolver::{PivotInWitness, PivotInWitnesses};
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
-use super::super::column_extraction::{
-    extract_provided_column_for_item, extract_provided_column_for_reduction, mint_projection_scope,
-};
 use crate::pipeline::asts::core::{NamedReference, Reference};
 
 /// Resolve publication items and keep, per resolved item, the authored label
@@ -18,9 +15,9 @@ use crate::pipeline::asts::core::{NamedReference, Reference};
 fn resolve_published_items(
     fold: &mut ResolverFold,
     items: Vec<ast_unresolved::OutItem>,
-    available: &[ColId],
+    available: &[crate::relation::PortId],
 ) -> Result<(
-    Vec<ast_resolved::OutItem>,
+    Vec<super::super::domain_expressions::projection::PendingOutItem>,
     Vec<(Option<delightql_types::SqlIdentifier>, bool)>,
 )> {
     let mut resolved = Vec::new();
@@ -50,8 +47,8 @@ fn resolve_published_items(
 }
 
 fn check_duplicate_user_names(
-    identities: &Registry,
-    output: &[ColId],
+    identities: &crate::relation::Planning,
+    output: &[crate::relation::PortId],
     intents: &[(Option<delightql_types::SqlIdentifier>, bool)],
 ) -> Result<()> {
     let mut seen = Vec::new();
@@ -62,10 +59,13 @@ fn check_duplicate_user_names(
         let Some(authored_name) = authored_name else {
             continue;
         };
-        let canonical = identities.published_sym(*column).unwrap_or_else(|| {
-            identities
-                .canonical(identities.intern(authored_name.as_str(), authored_name.is_stropped()))
-        });
+        let canonical = identities
+            .published_sym(column.column())
+            .unwrap_or_else(|| {
+                identities.canonical(
+                    identities.intern(authored_name.as_str(), authored_name.is_stropped()),
+                )
+            });
         if seen.contains(&canonical) {
             return Err(DelightQLError::validation_error_categorized(
                 "constraint",
@@ -84,23 +84,21 @@ fn check_duplicate_user_names(
 
 /// The same, over what an arm COMPUTES.
 fn collect_result_lvars(
-    result: &crate::pipeline::asts::core::OutValue<crate::pipeline::asts::core::Resolved>,
-    output: &mut Vec<ColId>,
+    result: &crate::pipeline::asts::core::DomainExpression<crate::pipeline::asts::core::Resolved>,
+    output: &mut Vec<crate::relation::PortId>,
 ) {
-    use crate::pipeline::asts::core::OutValue;
-    match result {
-        OutValue::Domain(value) => collect_lvars(value, output),
-        // A crossing carries a TRUTH, whose own columns are reached by the
-        // truth walk beside this one.
-        OutValue::Truth(_) => {}
-    }
+    collect_lvars(result, output)
 }
 
-fn collect_lvars(expression: &ast_resolved::DomainExpression, output: &mut Vec<ColId>) {
+fn collect_lvars(
+    expression: &ast_resolved::DomainExpression,
+    output: &mut Vec<crate::relation::PortId>,
+) {
     match expression {
         ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { column, .. },
         ))) => output.push(*column),
+        ast_resolved::DomainExpression::Reference(Reference::Physical(_)) => {}
         ast_resolved::DomainExpression::Application(function) => match function {
             ast_resolved::FunctionApplication::Ground(_)
             | ast_resolved::FunctionApplication::Open(_)
@@ -121,6 +119,13 @@ fn collect_lvars(expression: &ast_resolved::DomainExpression, output: &mut Vec<C
             ast_resolved::FunctionApplication::Infix(infix) => {
                 collect_lvars(&infix.left, output);
                 collect_lvars(&infix.right, output);
+            }
+            // A crossed truth reads the values its truth reads at this
+            // scope, exactly as an arithmetic operand reads its operands.
+            ast_resolved::FunctionApplication::Crossed(crossing) => {
+                for operand in crossing.truth().scalar_operands() {
+                    collect_lvars(operand, output);
+                }
             }
             ast_resolved::FunctionApplication::Template(template) => {
                 for part in template.parts() {
@@ -147,10 +152,12 @@ fn collect_lvars(expression: &ast_resolved::DomainExpression, output: &mut Vec<C
                         }
                         default
                     }
-                    // A condition names its own columns through the truth
-                    // walk; this collector reads results.
+                    // A condition reads its values the way a result does.
                     ast_resolved::CaseExpression::Searched { arms, default } => {
                         for arm in arms.iter() {
+                            for operand in arm.condition.scalar_operands() {
+                                collect_lvars(operand, output);
+                            }
                             collect_lvars(&arm.result, output);
                         }
                         default
@@ -171,7 +178,7 @@ fn collect_lvars(expression: &ast_resolved::DomainExpression, output: &mut Vec<C
                 crate::pipeline::asts::core::Enclyph::Tuple(tuple),
             ) => {
                 for element in tuple.elements.iter() {
-                    collect_lvars(element, output);
+                    collect_lvars(element.value(), output);
                 }
             }
             ast_resolved::FunctionApplication::Enclyph(
@@ -189,9 +196,9 @@ fn collect_lvars(expression: &ast_resolved::DomainExpression, output: &mut Vec<C
 
 fn pivot_values_for(
     expression: &ast_resolved::DomainExpression,
-    pivot_in_values: &std::collections::HashMap<crate::names::Sym, Vec<String>>,
-    identities: &Registry,
-) -> Option<(ColId, Vec<String>)> {
+    pivot_in_values: &PivotInWitnesses,
+    identities: &crate::relation::Planning,
+) -> PivotValueJudgment {
     let mut columns = Vec::new();
     collect_lvars(expression, &mut columns);
     // Both halves of the match, because refusing tells them apart and the
@@ -203,7 +210,7 @@ fn pivot_values_for(
         columns,
         columns
             .iter()
-            .map(|column| identities.published_sym(*column))
+            .map(|column| identities.published_sym(column.column()))
             .collect::<Vec<_>>(),
         pivot_in_values.keys().collect::<Vec<_>>()
     );
@@ -213,19 +220,44 @@ fn pivot_values_for(
         // search there would let an unnameable candidate hide a later one
         // that matches, which is the treatment a merely non-matching
         // candidate already gets.
-        let Some(published) = identities.published_sym(column) else {
+        let Some(published) = identities.published_sym(column.column()) else {
             continue;
         };
-        if let Some(values) = pivot_in_values.get(&published) {
-            return Some((column, values.clone()));
+        if let Some(witness) = pivot_in_values.get(&published) {
+            return match witness {
+                PivotInWitness::ColumnNames(values) => {
+                    PivotValueJudgment::Ready(column, values.clone())
+                }
+                PivotInWitness::UnnameableValues => PivotValueJudgment::Unnameable(column),
+            };
         }
     }
-    None
+    PivotValueJudgment::Missing
+}
+
+enum PivotValueJudgment {
+    Ready(crate::relation::PortId, Vec<String>),
+    Unnameable(crate::relation::PortId),
+    Missing,
+}
+
+fn pivot_key_teaching(
+    key: crate::relation::PortId,
+    identities: &crate::relation::Planning,
+) -> String {
+    let mut teaching = String::new();
+    let mut sink = crate::names::Teaching(&mut teaching);
+    if let Some(spelling) = identities.published(key.column()) {
+        identities.write(spelling, &mut sink);
+    } else {
+        identities.write_ordinal_report(key.column(), &mut sink);
+    }
+    teaching
 }
 
 fn expand_pivot_template(
     expression: &ast_resolved::DomainExpression,
-    source: ColId,
+    source: crate::relation::PortId,
     value: &str,
 ) -> Option<String> {
     match expression {
@@ -254,36 +286,45 @@ fn expand_pivot_template(
 /// The record's own members name the interior's columns, in written order;
 /// an induced member's target is the level beneath it. A published value
 /// that is not a record has no interior heading to attach.
-fn attach_record_interior(
-    identities: &Registry,
-    owner: ColId,
+pub(crate) fn attach_record_interior(
+    authority: &crate::relation::SemanticBuilder<'_>,
+    owner: crate::relation::PortId,
     expression: &ast_resolved::DomainExpression,
-) -> bool {
+) -> Result<bool> {
     use crate::pipeline::asts::core::Enclyph;
 
     let ast_resolved::DomainExpression::Application(ast_resolved::FunctionApplication::Enclyph(
         Enclyph::Record(record),
     )) = expression
     else {
-        return false;
+        return Ok(false);
     };
-    attach_record_columns(identities, owner, record);
-    true
+    let body = record_relation(authority, record)?;
+    authority.derive(crate::relation::RelForm::Interior(
+        crate::relation::form::InteriorSpec { owner, body },
+    ))?;
+    Ok(true)
 }
 
-fn attach_record_columns(identities: &Registry, owner: ColId, record: &ast_resolved::Record) {
+fn record_relation(
+    authority: &crate::relation::SemanticBuilder<'_>,
+    record: &ast_resolved::Record,
+) -> Result<crate::relation::SemanticRelation> {
     use crate::pipeline::asts::core::{Enclyph, NamedReference, RecordMember};
 
-    let scope = identities.mint_interior_scope(owner, Hint::None);
-    let mut position = 0_u32;
-    for member in record.members.iter() {
-        let (published, nested) = match member {
-            RecordMember::SelfKeyed(NamedReference(occurrence)) => {
-                (identities.published(occurrence.column), None)
+    let mut slots = Vec::new();
+    let mut nested = Vec::new();
+    for (position, member) in record.members.iter().enumerate() {
+        let (published, child) = match member {
+            RecordMember::SelfKeyed(NamedReference(occurrence)) => (
+                authority.names().published(occurrence.column.column()),
+                None,
+            ),
+            RecordMember::Keyed { key, .. } | RecordMember::Metadata { key, .. } => {
+                (Some(authority.names().intern(key, false)), None)
             }
-            RecordMember::Keyed { key, .. } => (Some(identities.intern(key, false)), None),
             RecordMember::Induced { key, value } => (
-                Some(identities.intern(key, false)),
+                Some(authority.names().intern(key, false)),
                 match value.as_ref() {
                     // A tuple publishes by position and names nothing, so it
                     // contributes no interior heading.
@@ -294,24 +335,38 @@ fn attach_record_columns(identities: &Registry, owner: ColId, record: &ast_resol
             ),
             RecordMember::Spread(spread) => spread.expanded(),
         };
-        let child = identities.mint_column(
-            scope,
-            ColumnOrigin::Bound { position },
-            published,
-            Addressing::Published,
-            ValueFacts::default(),
-        );
-        position += 1;
-        if let Some(nested) = nested {
-            attach_record_columns(identities, child, nested);
+        slots.push(crate::relation::form::AnonymousSlot::Declared {
+            position: position as u32,
+            named: published,
+        });
+        nested.push(child);
+    }
+    let relation = authority.derive(crate::relation::RelForm::Anonymous(
+        crate::relation::form::AnonymousSpec {
+            shape: crate::relation::form::AnonymousShape::Tabular,
+            slots: &slots,
+            answers_to: None,
+        },
+    ))?;
+    let ports = authority.interface(&relation)?.ports().to_vec();
+    for (owner, child) in ports.into_iter().zip(nested) {
+        if let Some(child) = child {
+            let body = record_relation(authority, child)?;
+            authority.derive(crate::relation::RelForm::Interior(
+                crate::relation::form::InteriorSpec { owner, body },
+            ))?;
         }
     }
+    Ok(relation)
 }
 
-fn duplicate_published(identities: &Registry, columns: &[ColId]) -> Option<crate::names::Sym> {
+fn duplicate_published(
+    identities: &crate::relation::Planning,
+    columns: &[crate::relation::PortId],
+) -> Option<crate::names::Sym> {
     let mut seen = Vec::new();
     for column in columns {
-        if let Some(name) = identities.published_sym(*column) {
+        if let Some(name) = identities.published_sym(column.column()) {
             if seen.iter().any(|seen_name| *seen_name == name) {
                 return Some(name);
             }
@@ -324,36 +379,21 @@ fn duplicate_published(identities: &Registry, columns: &[ColId]) -> Option<crate
 pub(super) fn resolve_group_via_fold(
     fold: &mut ResolverFold,
     spec: ast_unresolved::GroupSpec,
-    available: &[ColId],
-    pivot_in_values: &std::collections::HashMap<crate::names::Sym, Vec<String>>,
-) -> Result<(ast_resolved::PipeOp, Vec<ColId>)> {
-    let output_scope = mint_projection_scope(&fold.registry.identities, available);
-    let (spec, output) = match spec {
+    available: &[crate::relation::PortId],
+    input: crate::relation::SemanticRelation,
+    pivot_in_values: &PivotInWitnesses,
+) -> Result<(ast_resolved::Step, Vec<crate::relation::PortId>)> {
+    use crate::relation::pending::{Delegate, GroupShape, Pending, Reduction};
+
+    let (step, pivot_names, output, distinct, intents) = match spec {
         ast_unresolved::GroupSpec::Distinct { keys } => {
-            let (resolved, intents) = resolve_published_items(fold, keys.into_vec(), available)?;
-            let mut resolved = resolved;
-            let mut output = Vec::new();
-            for (position, item) in resolved.iter_mut().enumerate() {
-                if let Some(column) = extract_provided_column_for_item(
-                    item,
-                    position,
-                    &fold.registry.identities,
-                    output_scope,
-                ) {
-                    output.push(column);
-                    if let ast_resolved::OutItem::One(one) = item {
-                        one.output = Some(column);
-                    }
-                }
-            }
-            check_duplicate_user_names(&fold.registry.identities, &output, &intents)?;
-            (
-                ast_resolved::GroupSpec::Distinct {
-                    keys: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(resolved)
-                        .expect("the authored distinct keys were nonempty"),
-                },
-                output,
-            )
+            let (pending, intents) = resolve_published_items(fold, keys.into_vec(), available)?;
+            let (step, output) = fold.core.identities.authority().bind(Pending::Group {
+                input,
+                keys: pending,
+                shape: GroupShape::Distinct,
+            })?;
+            (step, Vec::new(), output, true, intents)
         }
         ast_unresolved::GroupSpec::Reduce {
             keys,
@@ -363,13 +403,11 @@ pub(super) fn resolve_group_via_fold(
             // Delegates and the other reduction members take two resolution
             // roads (the delegate's outputs publish LAST, after every other
             // reduction), so the one nonempty family splits here and is
-            // reassembled below in that published order.
+            // reassembled by the authority in that published order.
             let (delegates, reductions): (Vec<_>, Vec<_>) = reductions
                 .into_vec()
                 .into_iter()
-                .partition(|item| {
-                    matches!(item, ast_unresolved::ReductionItem::Delegate(_))
-                });
+                .partition(|item| matches!(item, ast_unresolved::ReductionItem::Delegate(_)));
             let delegates: Vec<ast_unresolved::DelegateSpec> = delegates
                 .into_iter()
                 .map(|item| match item {
@@ -377,34 +415,106 @@ pub(super) fn resolve_group_via_fold(
                     _ => unreachable!("the partition selected delegates"),
                 })
                 .collect();
-            let mut by = super::super::domain_expressions::projection::resolve_out_items_via_fold(
-                fold,
-                keys,
-                available,
-                false,
+            let by = super::super::domain_expressions::projection::resolve_out_items_via_fold(
+                fold, keys, available, false,
             )?;
-            let mut on =
-                super::super::domain_expressions::projection::resolve_reduction_items_via_fold(
-                    fold,
-                    reductions,
-                    available,
-                )?;
+            // REDUCTION-SLOT MEMBERS RESOLVE UNDER THE REDUCING GRADE:
+            // the position's expectation is present while each member's
+            // value — and any consulted definition it opens — resolves.
+            let prior_grade = std::mem::replace(
+                &mut fold.position_grade,
+                crate::defuse::bound_use::CallableGrade::Reducing,
+            );
+            let on = super::super::domain_expressions::projection::resolve_reduction_items_via_fold(
+                fold, reductions, available,
+            );
+            fold.position_grade = prior_grade;
+            let mut on = on?;
+
+            // GRADE AGREEMENT AT THE REDUCTION SLOT (the implicit-
+            // aggregation clause), judged with the GROUP KEYS in hand: a
+            // bare key column is constant per group and licenses itself;
+            // every other row-column occurrence must stand under a
+            // reducing absorber. Judged from the VALUE THAT RESOLVED,
+            // never the authored spelling — an enlisted DQL definition
+            // named `sum` is its own per-row body, and an absorber
+            // somewhere does not license per-row reads elsewhere.
+            {
+                use crate::pipeline::asts::core::Reference;
+                let group_keys: std::collections::HashSet<crate::relation::PortId> = by
+                    .iter()
+                    .filter_map(|key| match key {
+                        crate::relation::pending::Position::Authored { expr, .. }
+                        | crate::relation::pending::Position::Expanded { expr, .. } => match expr {
+                            crate::pipeline::asts::resolved::DomainExpression::Reference(
+                                Reference::Named(named),
+                            ) => Some(named.column().column),
+                            _ => None,
+                        },
+                        crate::relation::pending::Position::Whole => None,
+                    })
+                    .collect();
+                for item in on.iter() {
+                    let Reduction::Out(
+                        crate::relation::pending::Position::Authored { expr, naming }
+                        | crate::relation::pending::Position::Expanded { expr, naming },
+                    ) = item
+                    else {
+                        continue;
+                    };
+                    let value = expr;
+                    match crate::defuse::bound_use::judge_grade(
+                        fold.core,
+                        crate::defuse::bound_use::CallableGrade::Reducing,
+                        &group_keys,
+                        value,
+                    ) {
+                        crate::defuse::bound_use::ReductionStanding::Lawful => {}
+                        crate::defuse::bound_use::ReductionStanding::PerRow => {
+                            let label = naming
+                                .as_ref()
+                                .map(|name| format!("'{name}'"))
+                                .unwrap_or_else(|| "this member".to_string());
+                            return Err(DelightQLError::validation_error_categorized(
+                                "constraint/implicit_aggregation",
+                                format!(
+                                    "the group has many rows and the member {label} has one \
+                                     slot: a value with one answer per row cannot stand alone \
+                                     in a reduction, and there is no implicit aggregation, ever"
+                                ),
+                                "write the reduction, e.g. `sum:(expr)`",
+                            ));
+                        }
+                    }
+                }
+            }
 
             // THE IN IS THE HEADING WITNESS, read here where the group's
             // membership predicates are in scope.
             for item in on.iter_mut() {
-                if let ast_resolved::ReductionItem::Pivot(pivot) = item {
-                    let (source, values) = pivot_values_for(
+                if let Reduction::Pivot(pivot) = item {
+                    let (source, values) = match pivot_values_for(
                         &pivot.pivot_key,
                         pivot_in_values,
-                        &fold.registry.identities,
-                    )
-                    .ok_or_else(|| {
-                        DelightQLError::validation_error(
-                            "Pivot key requires a matching IN predicate",
-                            "Add an IN predicate with literal values for a referenced column",
-                        )
-                    })?;
+                        &fold.core.identities,
+                    ) {
+                        PivotValueJudgment::Ready(source, values) => (source, values),
+                        PivotValueJudgment::Unnameable(source) => {
+                            let key = pivot_key_teaching(source, &fold.core.identities);
+                            return Err(DelightQLError::validation_error(
+                                format!(
+                                    "Pivot key '{key}' has a matching IN predicate whose values cannot name output columns"
+                                ),
+                                "Use string values for the pivot heading until the numeric-key ruling is settled",
+                            ));
+                        }
+                        PivotValueJudgment::Missing => {
+                            return Err(DelightQLError::validation_error(
+                                "Pivot key requires a matching IN predicate",
+                                "Add an IN predicate with literal values for a referenced column",
+                            ))
+                        }
+                    };
                     let mut expanded = Vec::new();
                     for value in values {
                         expanded.push(
@@ -414,103 +524,6 @@ pub(super) fn resolve_group_via_fold(
                     }
                     pivot.values = expanded;
                 }
-            }
-
-            let plan =
-                super::super::tree_group_analysis::analyze_tree_groups_for_ctes(&mut by, &mut on)?;
-
-            let mut output = Vec::new();
-            for (position, item) in by.iter_mut().enumerate() {
-                let column = extract_provided_column_for_item(
-                    item,
-                    position,
-                    &fold.registry.identities,
-                    output_scope,
-                );
-                if let Some(column) = column {
-                    output.push(column);
-                }
-                if let ast_resolved::OutItem::One(one) = item {
-                    one.output = column;
-                }
-            }
-
-            let base = by.len();
-            let mut pivot_outputs = Vec::new();
-            for (position, item) in on.iter_mut().enumerate() {
-                // A pivot publishes ONE column per value its key's membership
-                // predicate named, so its item publishes none of its own.
-                let pivot_values = match item {
-                    ast_resolved::ReductionItem::Pivot(pivot) => Some(pivot.values.clone()),
-                    ast_resolved::ReductionItem::Out(_)
-                    | ast_resolved::ReductionItem::Metadata(_)
-                    | ast_resolved::ReductionItem::Delegate(_) => None,
-                };
-                if let Some(pivot_values) = pivot_values {
-                    for value in &pivot_values {
-                        let spelling = fold.registry.identities.intern(value, false);
-                        let column = fold.registry.identities.mint_column(
-                            output_scope,
-                            ColumnOrigin::Computed {
-                                via: Computation::Aggregate,
-                            },
-                            Some(spelling),
-                            Addressing::Published,
-                            ValueFacts::default(),
-                        );
-                        output.push(column);
-                        pivot_outputs.push(column);
-                    }
-                    if let Some(ast_resolved::OutItem::One(one)) = item.out_item_mut() {
-                        one.output = None;
-                    }
-                    continue;
-                }
-                let column = extract_provided_column_for_reduction(
-                    item,
-                    base + position,
-                    &fold.registry.identities,
-                    output_scope,
-                );
-                if let Some(column) = column {
-                    if let Some(expression) = item.domain_value() {
-                        attach_record_interior(&fold.registry.identities, column, expression);
-                    }
-                    output.push(column);
-                }
-                match item {
-                    ast_resolved::ReductionItem::Out(ast_resolved::OutItem::One(one)) => {
-                        one.output = column
-                    }
-                    ast_resolved::ReductionItem::Metadata(metadata) => metadata.output = column,
-                    // A spread, the whole, a pivot and a delegate each
-                    // publish something other than one output of their own.
-                    ast_resolved::ReductionItem::Out(_)
-                    | ast_resolved::ReductionItem::Pivot(_)
-                    | ast_resolved::ReductionItem::Delegate(_) => {
-                    }
-                }
-            }
-
-            if let Some(duplicate) = duplicate_published(&fold.registry.identities, &output) {
-                // Pivot values become output identifiers. When their
-                // normalized spellings collide, the refusal must identify
-                // the pivot road so a format string is an actionable repair;
-                // ordinary grouped-output collisions keep the general
-                // projection diagnosis below.
-                if pivot_outputs.iter().any(|column| {
-                    fold.registry.identities.published_sym(*column) == Some(duplicate)
-                }) {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "constraint/pivot",
-                        "Duplicate pivot column name",
-                        "Disambiguate pivot values with a format string",
-                    ));
-                }
-                return Err(DelightQLError::validation_error(
-                    "Duplicate output name in grouped projection",
-                    "Rename one output or disambiguate pivot values with a format string",
-                ));
             }
 
             let mut resolved_delegates = Vec::with_capacity(delegates.len());
@@ -544,66 +557,83 @@ pub(super) fn resolve_group_via_fold(
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                resolved_delegates.push(ast_resolved::DelegateSpec { payload, order });
+                resolved_delegates.push(Delegate { payload, order });
             }
 
-            let mut seen: Vec<_> = output
-                .iter()
-                .filter_map(|column| fold.registry.identities.published_sym(*column))
-                .collect();
-            let mut position = by.len() + on.len();
-            for delegate in &mut resolved_delegates {
-                for item in &mut delegate.payload {
-                    let column = extract_provided_column_for_item(
-                        item,
-                        position,
-                        &fold.registry.identities,
-                        output_scope,
-                    );
-                    let column = column.filter(|column| {
-                        fold.registry
-                            .identities
-                            .published_sym(*column)
-                            .is_none_or(|name| {
-                                if seen.contains(&name) {
-                                    false
-                                } else {
-                                    seen.push(name);
-                                    true
-                                }
-                            })
-                    });
-                    if let Some(column) = column {
-                        output.push(column);
+            // OUTWARD-ACTING: a metadata group summarizes the group of
+            // rows its record stands for. With no keys written, `~> {`
+            // makes one record PER ROW, and a single row is not a group.
+            if by.is_empty() {
+                for item in &on {
+                    let Reduction::Out(out) = item else { continue };
+                    let Some(crate::pipeline::asts::core::DomainExpression::Application(
+                        crate::pipeline::asts::core::FunctionApplication::Enclyph(
+                            crate::pipeline::asts::core::Enclyph::Record(record),
+                        ),
+                    )) = out.value()
+                    else {
+                        continue;
+                    };
+                    if let Some(key) = record.members.iter().find_map(|member| match member {
+                        ast_resolved::RecordMember::Metadata { key, .. } => Some(key.clone()),
+                        _ => None,
+                    }) {
+                        return Err(DelightQLError::validation_error_categorized(
+                            "constraint/metadata_per_row",
+                            format!(
+                                "`~> {{` makes one record PER ROW, and the metadata group \
+                                 '{key}' inside it has no group of rows to summarize"
+                            ),
+                            "write the grouping keys, so the record stands for a group: \
+                             `%(keys ~> {{ … }})`",
+                        ));
                     }
-                    if let ast_resolved::OutItem::One(one) = item {
-                        one.output = column;
-                    }
-                    position += 1;
                 }
             }
 
-            let mut reductions = on;
-            reductions.extend(
-                resolved_delegates
-                    .into_iter()
-                    .map(ast_resolved::ReductionItem::Delegate),
-            );
-            (
-                ast_resolved::GroupSpec::Reduce {
-                    keys: by,
-                    reductions: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(reductions)
-                        .expect("the authored reduction was nonempty"),
-                    plan,
+            // What the duplicate check below needs to know about pivots,
+            // read off the description before the authority consumes it.
+            let pivot_names: Vec<crate::names::Sym> = on
+                .iter()
+                .filter_map(|item| match item {
+                    Reduction::Pivot(pivot) => Some(&pivot.values),
+                    Reduction::Out(_) | Reduction::Metadata { .. } => None,
+                })
+                .flatten()
+                .map(|value| {
+                    fold.core
+                        .identities
+                        .canonical(fold.core.identities.intern(value, false))
+                })
+                .collect();
+
+            let (step, output) = fold.core.identities.authority().bind(Pending::Group {
+                input,
+                keys: by,
+                shape: GroupShape::Reduce {
+                    reductions: on,
+                    delegates: resolved_delegates,
                 },
-                output,
-            )
+            })?;
+            (step, pivot_names, output, false, Vec::new())
         }
     };
+    if distinct {
+        check_duplicate_user_names(&fold.core.identities, &output, &intents)?;
+    }
+    if let Some(duplicate) = duplicate_published(&fold.core.identities, &output) {
+        if pivot_names.contains(&duplicate) {
+            return Err(DelightQLError::validation_error_categorized(
+                "constraint/pivot",
+                "Duplicate pivot column name",
+                "Disambiguate pivot values with a format string",
+            ));
+        }
+        return Err(DelightQLError::validation_error(
+            "Duplicate output name in grouped projection",
+            "Rename one output or disambiguate pivot values with a format string",
+        ));
+    }
 
-    Ok((
-        ast_resolved::PipeOp::Group(spec),
-        output,
-    ))
+    Ok((step, output))
 }
-

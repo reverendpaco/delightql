@@ -91,17 +91,9 @@ data(x, y) :- source_b(*)
 
 ## Disjunctive Rules: Union Semantics by head form {.dqlh}
 
-Glob heads and argumentative heads use different union strategies:
-
-| Strategy                              |  Alignment               |
-|---------------------------------------|--------------------------|
-| Glob head (smart union corresponding) |  by name, NULLs for gaps |
-| Argumentative head                    |  positional AND by name  |
-
-Glob heads use *smart union corresponding*: columns align by name
-across clauses, and columns missing from a clause are filled with
-`NULL`. This permits clauses with different source tables and column
-sets.
+Glob heads and argumentative heads use the exact same union strategy.
+Both syntaxes must publish exactly the same heading: identical column names in identical order.
+The programmer must explicitly reconcile disagreement across multiple bodies.
 
 
 ### Column naming with ground terms {.dqlh}
@@ -109,7 +101,7 @@ sets.
 Argumentative heads require strict agreement: every clause must have
 the same number of positions, and **free variables at each position
 must use the same name across all clauses**. If clause 1 has
-`(name, age)` and clause 2 has `(age, name)`  then this is
+`(name , age)` and clause 2 has `(age , name)`  then this is
 an error.
 
 Ground terms (constants) are nameless -- they do not contribute a

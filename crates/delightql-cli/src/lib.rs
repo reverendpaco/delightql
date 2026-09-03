@@ -6,7 +6,7 @@
 // Core modules (always available)
 pub mod args;
 pub mod attach;
-pub mod bug_report;
+pub mod client;
 pub mod commands;
 pub mod connection;
 pub mod connection_factory;

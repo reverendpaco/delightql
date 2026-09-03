@@ -34,7 +34,6 @@ use crate::pipeline::asts::core::literals::LiteralValue;
 use crate::pipeline::asts::core::metadata::NamespacePath;
 use crate::pipeline::asts::core::specs::{GroupSpec, OneOut, OutItem, ReductionItem};
 use crate::pipeline::asts::core::FunctionApplication;
-use crate::pipeline::asts::core::OutValue;
 use crate::pipeline::asts::core::RecordMember;
 use crate::pipeline::asts::unresolved::*;
 use crate::pipeline::compiled_query::{EffectStep, TypedEffectPlan};
@@ -106,7 +105,9 @@ impl EffectExecutable for ExplainRunPredicate {
             ));
         }
         let path = match &arguments[0] {
-            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => s.clone(),
+            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
+                s.clone()
+            }
             other => {
                 return Err(DelightQLError::database_error(
                     format!("explain_run() file_path must be a string literal, got {other:?}"),
@@ -173,19 +174,26 @@ fn namespace_from_path(path: &str) -> String {
 /// construction is what makes `requires` a schema-known interior for
 /// drills; a step with no edges contributes one all-NULL requirement row,
 /// which the tree-group constructor ELIDES into the empty interior.
-fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Grelex {
+fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> GroundForm {
     let pipe = |source: Chain, operator: PipeOp| {
-        source.then(Continuation::Pipe {
+        source.then(Step::authored(Continuation::Pipe {
             operator: operator,
             named: None,
-            cpr_schema: (),
-        })
+        }))
     };
 
     let step_expr = |ordinal: usize, step: &EffectStep| -> Chain {
         let (step_kind, action_kind) = step.kind().projection_kinds();
-        let s = |v: &str| DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(v.to_string()),));
-        let n = |v: usize| DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Number(v.to_string()),));
+        let s = |v: &str| {
+            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(
+                v.to_string(),
+            )))
+        };
+        let n = |v: usize| {
+            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Number(
+                v.to_string(),
+            )))
+        };
         let flat_headers: Vec<DomainExpression> = [
             "plan_id",
             "step_id",
@@ -202,8 +210,10 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Grele
         .collect();
         let sql_display = step.sql_display();
         let route = match step.route {
-            Some(c) => DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Number(c.to_string()),)),
-            None => DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null,)),
+            Some(c) => DomainExpression::Application(FunctionApplication::Ground(
+                LiteralValue::Number(c.to_string()),
+            )),
+            None => DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null)),
         };
         let flat = AnonTable::from_values(
             Some(flat_headers),
@@ -218,7 +228,6 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Grele
                 route,
                 s(&sql_display),
             ]],
-            (),
         )
         .expect("an explain step has one nonempty row");
 
@@ -231,7 +240,9 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Grele
             // elides it into the empty interior `[]` — `always` is the
             // absence of edges, kept schema-known.
             vec![(0..4)
-                .map(|_| DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null,)))
+                .map(|_| {
+                    DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null))
+                })
                 .collect()]
         } else {
             step.requirements
@@ -249,38 +260,40 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Grele
                 })
                 .collect()
         };
-        let req_src = AnonTable::from_values(Some(req_headers), req_rows, ())
+        let req_src = AnonTable::from_values(Some(req_headers), req_rows)
             .expect("an explain requirement source has a nonempty row");
         let grouped = pipe(
-            Chain::ground(Grelex::Literal(AnonRelation::plain(req_src))),
+            Chain::authored(GroundForm::Literal(AnonRelation::plain(req_src))),
             PipeOp::Group(GroupSpec::Reduce {
-                    plan: ReductionPlan::empty(),
-                    keys: Vec::new(),
-                    reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(OutItem::One(OneOut {
-                        expr: OutValue::Domain(DomainExpression::Application(
-                            FunctionApplication::Enclyph(
-                                crate::pipeline::asts::core::Enclyph::Record(
-                                    crate::pipeline::asts::core::Record::plain(
-                                        crate::pipeline::asts::vocabulary::Vec1::new(RecordMember::Spread(
+                plan: ReductionPlan::empty(),
+                keys: Vec::new(),
+                reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::Application(FunctionApplication::Enclyph(
+                            crate::pipeline::asts::core::Enclyph::Record(
+                                crate::pipeline::asts::core::Record::plain(
+                                    crate::pipeline::asts::vocabulary::Vec1::new(
+                                        RecordMember::Spread(
                                             crate::pipeline::asts::core::Spread::Glob(
                                                 crate::pipeline::asts::core::Glob::whole(),
                                             ),
-                                        )),
+                                        ),
                                     ),
                                 ),
                             ),
                         )),
-                        naming: Some("requires".into()),
-                        output: (),
-                    }))),
-                }),
+                        Some("requires".into()),
+                    )),
+                )),
+            }),
         );
-        Chain::ground(Grelex::Literal(AnonRelation::plain(flat))).then(Continuation::Member {
-            rhs: grouped,
-            correlation: None,
-            join_type: None,
-            cpr_schema: (),
-        })
+        Chain::authored(GroundForm::Literal(AnonRelation::plain(flat))).then(Step::authored(
+            Continuation::Member {
+                rhs: grouped,
+                correlation: None,
+                join_type: None,
+            },
+        ))
     };
 
     let arms: Vec<Chain> = typed
@@ -296,12 +309,11 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Grele
             crate::pipeline::asts::core::expressions::SetOperator::UnionCorresponding,
             arm,
             (),
-            (),
         );
     }
 
     let identifier = alias.as_deref().unwrap_or("explain_run");
-    Grelex::Reference(Relation::InnerRelation {
+    GroundForm::Reference(Relation::InnerRelation {
         pattern: InnerRelationPattern::Indeterminate {
             identifier: crate::pipeline::asts::core::expressions::helpers::QualifiedName {
                 namespace_path: NamespacePath::empty(),
@@ -309,9 +321,7 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Grele
             },
             subquery: Box::new(unioned),
         },
-        preminted_scope: None,
         alias: alias.map(Into::into),
         outer: false,
-        cpr_schema: (),
     })
 }

@@ -16,13 +16,12 @@
 //! - **The citation.** `:f` is the OTHER nullary; it normalizes to the
 //!   zero-argument application and is never ground.
 
-use super::landing::{self, Landing};
+use super::landing;
 use super::Normalizer;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::expressions::ValueTemplatePart;
 use crate::pipeline::asts::core::ArgumentValue;
 use crate::pipeline::asts::core::Callable;
-use crate::pipeline::asts::core::TruthAsValue;
 use crate::pipeline::asts::core::{
     AuthoredColumn, ColumnOrdinal, ColumnRange, DomainExpression, Enclyph, FunctionApplication,
     FunctorCall, Glob, LiteralValue, NamespacePath, Path, PathStep, PureCall, Record, RecordMember,
@@ -35,46 +34,6 @@ use delightql_types::SqlIdentifier;
 
 type Domex = DomainExpression<Unresolved>;
 type Argument = crate::pipeline::asts::core::operators::ScalarArgument<Unresolved>;
-
-/// The pre-carved existence spelling, when THAT is what stands here.
-///
-/// `+f( … )` in value position is the crossing wearing its own surface, and
-/// an occurrence never has two: the three positions that admit a crossing
-/// read it as one, and every other value position refuses it. Parentheses
-/// are admission, so the ones written around it are the crossing's own.
-pub(crate) fn pre_carved_existence<'t>(
-    node: cst::FunctionApplication<'t>,
-) -> Option<cst::ExistsAsColumn<'t>> {
-    let mut application = node;
-    loop {
-        let cst::FunctionApplication::NonInfixApplication(non_infix) = application else {
-            return None;
-        };
-        if let cst::NonInfixApplication::RelationLike(cst::RelationLike::ExistsAsColumn(
-            existence,
-        )) = non_infix
-        {
-            return Some(existence);
-        }
-        let cst::NonInfixApplication::ParenthesizedOperand(parens) = non_infix else {
-            return None;
-        };
-        let cst::DomainExpression::FunctionApplication(inner) = parens.child()? else {
-            return None;
-        };
-        application = inner;
-    }
-}
-
-/// The same, read off a whole domain expression.
-pub(crate) fn pre_carved_existence_value<'t>(
-    node: cst::DomainExpression<'t>,
-) -> Option<cst::ExistsAsColumn<'t>> {
-    let cst::DomainExpression::FunctionApplication(application) = node else {
-        return None;
-    };
-    pre_carved_existence(application)
-}
 
 impl<'t> Normalizer<'t> {
     // -----------------------------------------------------------------
@@ -119,22 +78,14 @@ impl<'t> Normalizer<'t> {
         }
     }
 
-    /// A reference in VALUE position. A scalar FORMAL standing here becomes
-    /// the value the call site supplied; everywhere a reference addresses a
-    /// column and nothing else, the position reads `reference` instead.
+    /// A reference in VALUE position. A scalar FORMAL standing here stays a
+    /// reference: the body's formal frame — the caller-resolved actual —
+    /// answers it at resolution, so no caller syntax is spliced into the
+    /// body. Everywhere a reference addresses a column and nothing else, the
+    /// position reads `reference` instead.
     pub(crate) fn reference_expression(&mut self, node: cst::Reference<'t>) -> Result<Domex> {
         if let cst::Reference::NamedReference(reference) = node {
             let column = self.authored_column(reference)?;
-            // A qualified name addresses somebody else's column and is
-            // never a formal.
-            if column.qualifier.is_none() {
-                if let Some(supplied) = self
-                    .bindings()
-                    .and_then(|bindings| bindings.scalar_params.get(column.name.as_str()))
-                {
-                    return Ok(supplied.clone());
-                }
-            }
             return Ok(DomainExpression::Reference(Reference::Named(
                 NamedReference(column),
             )));
@@ -296,6 +247,9 @@ impl<'t> Normalizer<'t> {
             cst::FunctionApplication::NonInfixApplication(application) => {
                 self.non_infix_application(application)
             }
+            // The whole-value stratum of the crossing: an infix truth read
+            // as a value. Same mint as the operand stratum.
+            cst::FunctionApplication::CrossedTruth(crossed) => self.crossed_truth(crossed),
         }
     }
 
@@ -350,6 +304,9 @@ impl<'t> Normalizer<'t> {
                 let inner = self.require(parens.child(), "parentheses enclose an expression")?;
                 self.domain_expression(inner)
             }
+            // The operand stratum of the crossing: a non-infix truth read as
+            // a value, standing wherever an operand stands.
+            cst::NonInfixApplication::CrossedTruth(crossed) => self.crossed_truth(crossed),
             // THE TWO-ANAPHOR LAW, at the application position: `@` is what
             // flows in, whatever root it stands under; the position that
             // applies the enclosing body spends it.
@@ -388,13 +345,7 @@ impl<'t> Normalizer<'t> {
                 let call = FunctorCall::scalar(self.plain_reference(callee)?, Vec::new());
                 StandardApplication::plain(self.seal_pure(call)?)
             }
-            cst::FunctorLike::WindowApplication(window) => {
-                let call = self.require(window.call(), "a window application has a call")?;
-                let mut application = self.standard_application(call)?;
-                let spec = self.require(window.child(), "a window application has a spec")?;
-                application.window = Some(self.window_spec(spec)?);
-                application
-            }
+            cst::FunctorLike::WindowApplication(window) => self.window_application(window)?,
         };
         Ok(DomainExpression::Application(
             FunctionApplication::Standard(application),
@@ -409,31 +360,67 @@ impl<'t> Normalizer<'t> {
         node: cst::StandardApplication<'t>,
     ) -> Result<StandardApplication<Unresolved>> {
         let callee = self.require(node.callee(), "an application names a callee")?;
-        let callee = self.require(callee.child(), "a callee is a predicate identifier")?;
-        let reference = self.plain_reference(callee)?;
-
         let mut arguments = Vec::new();
         let mut guard = None;
         for child in node.children() {
             match child {
-                cst::StandardApplicationChild::Argument(argument) => {
-                    arguments.push(self.argument(argument)?)
-                }
+                cst::StandardApplicationChild::Argument(argument) => arguments.push(argument),
                 cst::StandardApplicationChild::Guard(node) => guard = Some(node),
                 cst::StandardApplicationChild::CommaSigil(_) => {}
             }
         }
-        let guard = match guard {
-            Some(guard) => {
-                Some(Box::new(self.guard(guard)?))
+        self.application(callee, arguments, guard, None)
+    }
+
+    /// A windowed application is the same application with the spec its
+    /// enclosure carries: the parens close over arguments, guard and window
+    /// together, so the spec can belong to no other call.
+    fn window_application(
+        &mut self,
+        node: cst::WindowApplication<'t>,
+    ) -> Result<StandardApplication<Unresolved>> {
+        let callee = self.require(node.callee(), "an application names a callee")?;
+        let mut arguments = Vec::new();
+        let mut guard = None;
+        for child in node.children() {
+            match child {
+                cst::WindowApplicationChild::Argument(argument) => arguments.push(argument),
+                cst::WindowApplicationChild::Guard(node) => guard = Some(node),
+                cst::WindowApplicationChild::CommaSigil(_) => {}
             }
+        }
+        let window = self.require(node.window(), "a window application has a spec")?;
+        self.application(callee, arguments, guard, Some(window))
+    }
+
+    /// The one builder behind both spellings: with or without a window, the
+    /// callee, the argument row and the guard are read the same way.
+    fn application(
+        &mut self,
+        callee: cst::Callee<'t>,
+        arguments: Vec<cst::Argument<'t>>,
+        guard: Option<cst::Guard<'t>>,
+        window: Option<cst::WindowSpec<'t>>,
+    ) -> Result<StandardApplication<Unresolved>> {
+        let callee = self.require(callee.child(), "a callee is a predicate identifier")?;
+        let reference = self.plain_reference(callee)?;
+        let arguments = arguments
+            .into_iter()
+            .map(|argument| self.argument(argument))
+            .collect::<Result<Vec<_>>>()?;
+        let guard = match guard {
+            Some(guard) => Some(Box::new(self.guard(guard)?)),
+            None => None,
+        };
+        let window = match window {
+            Some(spec) => Some(self.window_spec(spec)?),
             None => None,
         };
         let call = self.seal_pure(FunctorCall::scalar_application(reference, arguments))?;
         Ok(StandardApplication {
             call,
             guard,
-            window: None,
+            window,
         })
     }
 
@@ -454,25 +441,12 @@ impl<'t> Normalizer<'t> {
                     }
                 }
                 let value = self.require(value, "an argument has a value")?;
-                // The pre-carved existence spelling is a CROSSING at a
-                // position that admits one, so it is built as one here. It
-                // is not a domain value that happens to contain a truth.
-                if let Some(existence) = pre_carved_existence_value(value) {
-                    return Ok(Argument::Value(ArgumentValue::Truth(TruthAsValue(
-                        self.exists_as_column(existence)?,
-                    ))));
-                }
                 let value = self.domain_expression(value)?;
                 // `%` MODIFIES THIS ARGUMENT. It is argument data, so it
                 // rides on the argument's value and cannot be manufactured
                 // anywhere a domain expression stands.
-                Ok(Argument::Value(ArgumentValue::Domain { distinct, value }))
+                Ok(Argument::Value(ArgumentValue { distinct, value }))
             }
-            // CROSSING LAW's argument admission: the truth is read as a
-            // VALUE here, never as a predicate over the row.
-            cst::Argument::TruthAsValue(truth) => Ok(Argument::Value(ArgumentValue::Truth(
-                TruthAsValue(self.truth_as_value_truth(truth)?),
-            ))),
             // AN ARGUMENT MAY ENUMERATE: `count:(*)`, `f:(/re/)`. It stands
             // for the several values it covers and computes none.
             cst::Argument::Spread(spread) => Ok(Argument::Spread(self.spread(spread)?)),
@@ -696,13 +670,10 @@ impl<'t> Normalizer<'t> {
                 let application = self.open_functor(functor)?;
                 self.one_slot_with_a_row(application, &written)
             }
-            // A window function is a function, and its spec attaches where it
-            // attaches everywhere else: to the application.
+            // A window function is a function, and its spec is enclosed where
+            // it is enclosed everywhere else: inside the application's parens.
             cst::Callable::OpenWindowFunctor(window) => {
-                let functor = self.require(window.call(), "a windowed callable has a call")?;
-                let mut application = self.open_functor(functor)?;
-                let spec = self.require(window.child(), "a window application has a spec")?;
-                application.window = Some(self.window_spec(spec)?);
+                let application = self.open_window_functor(window)?;
                 self.one_slot_with_a_row(application, &written)
             }
             // A template in callable position is the open string: it carries
@@ -756,32 +727,71 @@ impl<'t> Normalizer<'t> {
         node: cst::OpenFunctor<'t>,
     ) -> Result<StandardApplication<Unresolved>> {
         let callee = self.require(node.callee(), "an open functor names a callee")?;
-        let callee = self.require(callee.child(), "a callee is a predicate identifier")?;
-        let reference = self.plain_reference(callee)?;
-        let mut arguments = Vec::new();
+        let mut expressions = Vec::new();
         let mut guard = None;
         for child in node.children() {
             match child {
-                cst::OpenFunctorChild::OpenExpression(expression) => {
-                    arguments.push(Argument::plain(self.open_expression(expression)?))
-                }
+                cst::OpenFunctorChild::OpenExpression(expression) => expressions.push(expression),
                 cst::OpenFunctorChild::Guard(node) => guard = Some(node),
                 cst::OpenFunctorChild::CommaSigil(_) => {}
             }
         }
-        // Zero holes means implicit landing: `x /-> upper:(y)` is
-        // `upper(x, y)`. The position that applies the callable supplies the
-        // slot, so the elision is honoured by leaving the argument row as
-        // written.
+        self.open_application(callee, expressions, guard, None)
+    }
+
+    /// The windowed open functor: the same open row, with the spec its
+    /// enclosure carries.
+    fn open_window_functor(
+        &mut self,
+        node: cst::OpenWindowFunctor<'t>,
+    ) -> Result<StandardApplication<Unresolved>> {
+        let callee = self.require(node.callee(), "an open functor names a callee")?;
+        let mut expressions = Vec::new();
+        let mut guard = None;
+        for child in node.children() {
+            match child {
+                cst::OpenWindowFunctorChild::OpenExpression(expression) => {
+                    expressions.push(expression)
+                }
+                cst::OpenWindowFunctorChild::Guard(node) => guard = Some(node),
+                cst::OpenWindowFunctorChild::CommaSigil(_) => {}
+            }
+        }
+        let window = self.require(node.window(), "a windowed callable has a spec")?;
+        self.open_application(callee, expressions, guard, Some(window))
+    }
+
+    /// The one builder behind both open spellings.
+    ///
+    /// Zero holes means implicit landing: `x /-> upper:(y)` is `upper(x, y)`.
+    /// The position that applies the callable supplies the slot, so the
+    /// elision is honoured by leaving the argument row as written.
+    fn open_application(
+        &mut self,
+        callee: cst::Callee<'t>,
+        expressions: Vec<cst::OpenExpression<'t>>,
+        guard: Option<cst::Guard<'t>>,
+        window: Option<cst::WindowSpec<'t>>,
+    ) -> Result<StandardApplication<Unresolved>> {
+        let callee = self.require(callee.child(), "a callee is a predicate identifier")?;
+        let reference = self.plain_reference(callee)?;
+        let mut arguments = Vec::new();
+        for expression in expressions {
+            arguments.push(Argument::plain(self.open_expression(expression)?));
+        }
         let guard = match guard {
             Some(guard) => Some(Box::new(self.guard(guard)?)),
+            None => None,
+        };
+        let window = match window {
+            Some(spec) => Some(self.window_spec(spec)?),
             None => None,
         };
         let call = self.seal_pure(FunctorCall::scalar_application(reference, arguments))?;
         Ok(StandardApplication {
             call,
             guard,
-            window: None,
+            window,
         })
     }
 
@@ -833,7 +843,8 @@ impl<'t> Normalizer<'t> {
     // -----------------------------------------------------------------
 
     /// THE SUBSTITUTION LAW at value level, SPENT HERE. `/->` lands the
-    /// flowing value first, `/->>` last, and a written `@` overrides both.
+    /// flowing value at the argument row's final place, and a written `@`
+    /// overrides that.
     ///
     /// The pipe does not survive this boundary. Each step becomes the
     /// ordinary application it denotes, so a piped call and a directly
@@ -886,40 +897,30 @@ has no reading. Parenthesize the operand the pipe receives."
         node: cst::FunctionPipeStep<'t>,
         flowing: Domex,
     ) -> Result<Domex> {
-        let mut landing = None;
         let mut callable = None;
         for child in node.children() {
             match child {
-                cst::FunctionPipeStepChild::HoleChoice(choice) => {
-                    landing = Some(match choice {
-                        cst::HoleChoice::FunctionPipeFirst(_) => Landing::First,
-                        cst::HoleChoice::FunctionPipeLast(_) => Landing::Last,
-                    })
-                }
+                cst::FunctionPipeStepChild::FunctionPipeOperator(_) => {}
                 cst::FunctionPipeStepChild::Callable(node) => callable = Some(node),
             }
         }
-        let landing = self.require(landing, "a function-pipe step chooses a landing")?;
         let callable = self.require(callable, "a function-pipe step has a callable")?;
-        self.apply_callable(callable, flowing, landing)
+        self.apply_callable(callable, flowing)
     }
 
     /// A CALLABLE, APPLIED. The one place the value level spends a landing.
     ///
     /// The slot was judged where the callable was built, so this only spends
-    /// it: a form with an argument row and no written slot takes the
-    /// implicit landing its sigil chose, and everything else receives the
-    /// value where the author wrote it.
+    /// it: a form with an argument row and no written slot takes the default
+    /// landing, and everything else receives the value where the author
+    /// wrote it.
     pub(crate) fn apply_callable(
         &mut self,
         node: cst::Callable<'t>,
         flowing: Domex,
-        landing: Landing,
     ) -> Result<Domex> {
         match self.callable(node)? {
-            Callable::Functor(application) => {
-                self.land_in_application(application, flowing, landing)
-            }
+            Callable::Functor(application) => self.land_in_application(application, flowing),
             Callable::String(template) => {
                 let parts = template.into_parts();
                 let spent = landing::spend(
@@ -964,11 +965,10 @@ has no reading. Parenthesize the operand the pipe receives."
         &mut self,
         mut application: StandardApplication<Unresolved>,
         flowing: Domex,
-        landing: Landing,
     ) -> Result<Domex> {
         let application = match landing::holes_in_application(&application)? {
-            // ZERO HOLES: the implicit landing per the step's sigil. This is
-            // why `x /-> upper:(y)` means `upper(x, y)`.
+            // ZERO HOLES: the default landing, the row's final place. This
+            // is why `x /-> upper:(y)` means `upper(y, x)`.
             0 => {
                 use crate::pipeline::asts::core::operators::CallArguments;
                 let call = application.call_mut();
@@ -982,8 +982,10 @@ has no reading. Parenthesize the operand the pipe receives."
                         ));
                     }
                 };
-                call.arguments =
-                    CallArguments::Scalar(landing.thread(Argument::plain(flowing), arguments));
+                call.arguments = CallArguments::Scalar(landing::land_final(
+                    Argument::plain(flowing),
+                    arguments,
+                ));
                 application
             }
             _ => landing::spend_in_application(application, &flowing)?,
@@ -1143,8 +1145,13 @@ has no reading. Parenthesize the operand the pipe receives."
                 for child in tuple.children() {
                     match child {
                         cst::TupleChild::DomainExpression(expression) => {
-                            elements.push(self.domain_expression(expression)?)
+                            elements.push(crate::pipeline::asts::core::TupleElement::Value(
+                                self.domain_expression(expression)?,
+                            ))
                         }
+                        cst::TupleChild::Spread(spread) => elements.push(
+                            crate::pipeline::asts::core::TupleElement::Spread(self.spread(spread)?),
+                        ),
                         cst::TupleChild::CommaSigil(_) => {}
                     }
                 }
@@ -1162,6 +1169,26 @@ has no reading. Parenthesize the operand the pipe receives."
     /// and a pattern's binders, reaches and anaphor have no derivation here.
     fn record_member(&mut self, node: cst::RecordMember<'t>) -> Result<RecordMember<Unresolved>> {
         match node {
+            // FN.22 (amended): a metadata group may stand as an induced
+            // member's body, under a fixed key. The key is the name; the
+            // group's own naming has no place here by grammar.
+            cst::RecordMember::KeyedMetadata(member) => {
+                let mut key = None;
+                let mut group = None;
+                for child in member.children() {
+                    match child {
+                        cst::KeyedMetadataChild::Key(node) => key = Some(self.key(node)?),
+                        cst::KeyedMetadataChild::MetadataGroup(node) => {
+                            let (built, _naming) = self.metadata_group(node)?;
+                            group = Some(built);
+                        }
+                    }
+                }
+                Ok(RecordMember::Metadata {
+                    key: self.require(key, "a keyed metadata member has a key")?,
+                    group: Box::new(self.require(group, "a keyed metadata member has a group")?),
+                })
+            }
             cst::RecordMember::KeyedValue(member) => {
                 let mut key = None;
                 let mut value = None;
@@ -1256,15 +1283,24 @@ has no reading. Parenthesize the operand the pipe receives."
                 let (identifier, passthrough) = self.relation_identifier(callee)?;
                 let interior =
                     self.require(subquery.interior(), "an inner form has an interior")?;
-                // `ho_part as on every functor`: the relation the inner form
-                // names may be one the caller parameterizes, and it is the
-                // same relation.
-                let base = match subquery.ho_part() {
-                    Some(part) => {
+                // COLON-FIRST: the relation the inner form names may be one
+                // the caller parameterizes — `foo:(args)(, continuation)` —
+                // and it is the same relation.
+                let base = match subquery.arguments() {
+                    Some(row) => {
+                        let arguments = row
+                            .children()
+                            .filter_map(|child| match child {
+                                cst::InnerArgumentRowChild::HoArgument(argument) => {
+                                    Some(self.one_ho_argument(argument))
+                                }
+                                cst::InnerArgumentRowChild::CommaSigil(_) => None,
+                            })
+                            .collect::<Result<Vec<_>>>()?;
                         let reference = self.relation_reference(callee)?;
-                        self.higher_order_call(
+                        self.higher_order_call_with(
                             reference,
-                            part,
+                            arguments,
                             Access::All,
                             Vec::new(),
                             crate::pipeline::asts::vocabulary::FunctorMarks::default(),
@@ -1323,22 +1359,6 @@ has no reading. Parenthesize the operand the pipe receives."
                             body: Box::new(body),
                         },
                     ),
-                ))
-            }
-            // Existence entering value position IS the truth-compression:
-            // the adapter's one pre-carved special case. It is a CROSSING,
-            // and a crossing has three homes — an out item's value, an
-            // argument, a slot constraint — each of which reads this
-            // spelling before the value road is taken. Reaching here means
-            // it was written where no crossing is admitted, and there is no
-            // value for it to become.
-            cst::RelationLike::ExistsAsColumn(_) => {
-                Err(DelightQLError::validation_error_categorized(
-                    "crossing/position",
-                    "existence entering value position is the crossing, and a crossing \
-                     stands at an out item's value, an argument, or a slot constraint",
-                    "publish or argue it — `+orders(, user_id = id) as has` — or write it \
-                     in truth position, where it needs no crossing at all",
                 ))
             }
             // THE MODE IS THE COMPRESSION — a column pick on a call that is
@@ -1416,17 +1436,30 @@ has no reading. Parenthesize the operand the pipe receives."
             // travels WITH the bound rather than beside it.
             cst::Compression::BoundToOne(_) => {
                 let mut chain = chain;
-                let ordering = match chain.continuations.last() {
+                let ordering = match chain
+                    .continuations()
+                    .last()
+                    .map(crate::pipeline::asts::core::Step::form)
+                {
+                    // An ordering already carrying a bound is a finished
+                    // membership act; the compression then selects one of
+                    // ITS members and owns no ordering.
                     Some(Continuation::Structural(
                         crate::pipeline::asts::core::StructuralStep {
-                            form: crate::pipeline::asts::core::StructuralForm::Ordering { .. },
+                            form:
+                                crate::pipeline::asts::core::StructuralForm::Ordering {
+                                    bound: None,
+                                    ..
+                                },
                             ..
                         },
-                    )) => match chain.continuations.pop() {
+                    )) => match chain.continuations_mut().pop().map(|step| step.into_form()) {
                         Some(Continuation::Structural(
                             crate::pipeline::asts::core::StructuralStep {
                                 form:
-                                    crate::pipeline::asts::core::StructuralForm::Ordering { specs },
+                                    crate::pipeline::asts::core::StructuralForm::Ordering {
+                                        specs, ..
+                                    },
                                 ..
                             },
                         )) => specs,
@@ -1437,12 +1470,7 @@ has no reading. Parenthesize the operand the pipe receives."
                 (chain, Scalarization::BoundToOne { ordering })
             }
         };
-        Ok(ScalarizedRelation {
-            body,
-            scalarization,
-            scope: (),
-            output: (),
-        })
+        Ok(ScalarizedRelation::authored(body, scalarization))
     }
 
     /// A path never evaluates alone: it travels only into the positions that
@@ -1514,19 +1542,20 @@ fn binary_operator(text: &str) -> Option<crate::pipeline::asts::vocabulary::BinO
     })
 }
 
-/// The comparison vocabulary. `=` and `!=` are the language's null-safe pair;
-/// `==` and `!==` are the engine's own answer, unknown-on-null included. They
-/// are distinct operators wherever they are lowered. `<>` is a TARGET's
-/// spelling of the traditional inequality, written by the generator on the
-/// dialects that want it and never read from a source.
+/// The AUTHORED comparison vocabulary. `=` and `!=` are the language's
+/// null-safe pair. The engine's own three-valued equality (`CmpOp::Equal`,
+/// `CmpOp::NotEqual`) has no authored glyph: it is constructed by the
+/// compiler for correspondence and by the prelude predicates `sql_eq` /
+/// `sql_ne`, and a source spelling `==` / `!==` is a retired token the parse
+/// diagnoses, never one this decoder admits. `<>` is a TARGET's spelling of
+/// the traditional inequality, written by the generator on the dialects that
+/// want it and never read from a source.
 pub(crate) fn comparison_operator(text: &str) -> Option<crate::pipeline::asts::vocabulary::CmpOp> {
     use crate::pipeline::asts::vocabulary::CmpOp;
 
     Some(match text {
         "=" => CmpOp::NullSafeEqual,
         "!=" => CmpOp::NullSafeNotEqual,
-        "==" => CmpOp::Equal,
-        "!==" => CmpOp::NotEqual,
         "<" => CmpOp::LessThan,
         "<=" => CmpOp::LessThanOrEqual,
         ">" => CmpOp::GreaterThan,

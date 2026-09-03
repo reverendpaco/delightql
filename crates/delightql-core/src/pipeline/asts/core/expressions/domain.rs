@@ -33,6 +33,20 @@ pub enum DomainHole {
     CompositionInput,
 }
 
+/// A FORMAL'S SLOT inside a CLOSED callable actual: the caller resolved
+/// the code it handed over, and what remains open is exactly the inputs
+/// the invocation will supply — one hole per declared formal, by position.
+/// The invocation substitutes every hole before the value travels on; a
+/// hole surviving to refinement is an unapplied composition input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormalHole(pub u32);
+
+impl crate::lispy::ToLispy for FormalHole {
+    fn to_lispy(&self) -> String {
+        format!("(formal_hole {})", self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum DomainExpression<P: Phase = Unresolved> {
     /// The one carrier that addresses a column, by name or by position.

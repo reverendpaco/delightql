@@ -32,6 +32,9 @@ users(*), age > 30 : adults
 adults(*)
 ```
 
+> Note: post-labeling can only be used on lower-order relational predicates.
+> Common function expressions and higher-order CTEs must be  pre-labeled.
+
 These syntaxes may be intermixed:
 
 ```delightql

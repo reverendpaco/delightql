@@ -19,7 +19,7 @@
 use crate::pipeline::generator::SqlDialect;
 use crate::pipeline::sql_ast::ordering::Limit;
 use crate::pipeline::sql_ast::{
-    walk, QueryExpression, SelectItem, SelectStatement, SqlStatement, TableExpression,
+    walk, QueryExpression, SelectStatement, SqlStatement, TableExpression,
 };
 
 /// Does this target keep its bound inside the ordering's block?
@@ -100,7 +100,7 @@ fn sink_bound_into_ordered_body(select: &mut SelectStatement) {
         || !select
             .select_list()
             .iter()
-            .all(|item| matches!(item, SelectItem::Expression { .. }))
+            .all(|item| item.expr().is_some())
     {
         return;
     }

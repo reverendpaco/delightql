@@ -68,7 +68,10 @@ fn continuations_are_matched_exhaustively() {
             Continuation::OperatorContinuation(OperatorContinuation::PostfixOperator(_)) => {
                 "postfix"
             }
-            Continuation::OperatorContinuation(OperatorContinuation::StageBoundary(_)) => "stage",
+            Continuation::OperatorContinuation(OperatorContinuation::StageName(_)) => "stage",
+            Continuation::OperatorContinuation(OperatorContinuation::ArgumentativeStage(_)) => {
+                "argumentative_stage"
+            }
             Continuation::OperatorContinuation(OperatorContinuation::SingletonReduction(_)) => {
                 "reduction"
             }

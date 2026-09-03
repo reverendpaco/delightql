@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Sigma-predicate rule guards must resolve under a consulted scope
-//! (`resolution_namespace = Some(ns)`), not just through namespaces
+//! Sigma-predicate rule guards must resolve under their consulted
+//! declaration's own world, not just through namespaces
 //! enlisted into main.
 //!
 //! Bug pinned here: a same-file SIGMA-PREDICATE rule
 //! (`tiny(col) :- col < 2`, entity_type 9) used as a guard inside an effect
 //! body — `…, +tiny(amount) |> …` — dies at SQL generation with
 //! "Unknown predicate rewrite: 'tiny'" unless the guard resolves under its
-//! own consulted scope. `lookup_enlisted_sigma`
-//! (resolution/registry.rs) searches only namespaces enlisted into MAIN, so
+//! own consulted scope. A main-only enlisted-sigma lookup
+//! searches only namespaces enlisted into MAIN, so
 //! a sigma rule is invisible while its own file's body compiles unless that
 //! scope is also consulted; and entity_type 9 is invisible to
-//! `resolve_entity_with_alias`'s consulted branch, so the enlisted-guard
+//! the relation ladder's consulted branch, so the enlisted-guard
 //! fix's relation probe cannot catch it either (nor should it — sigma
 //! rules expand to their boolean body via `expand_consulted_sigma`, never
 //! to an EXISTS over a relation).
@@ -21,12 +21,12 @@
 //! file die with "Unknown predicate rewrite: 'tiny'"; the controls hold
 //! either way, which is what makes them controls.
 
-use super::{resolve_query_inline, ResolutionConfig};
+use super::{resolve_query_with, ResolutionConfig};
 use crate::bin_cartridge::prelude::consult::execute_consult;
 use crate::pipeline::compiled_query::{CompiledPlan, PlanEntry};
 use crate::pipeline::effect_transformer::compile_namespace_main;
 use crate::pipeline::{ast_unresolved, danger_gates, generator, refiner, transformer};
-use crate::resolution::EntityRegistry;
+use crate::resolution::ResolverCore;
 use crate::system::DelightQLSystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
@@ -109,7 +109,7 @@ fn consult_into(source: &str, ns: &str, system: &mut DelightQLSystem) {
 }
 
 /// Consult `source` into namespace `fx` and compile its `main!` into a plan
-/// (the effect path: bodies resolve under `resolution_namespace = Some("fx")`).
+/// (the effect path: bodies resolve in the consulted declaration's world).
 fn plan_for(source: &str, system: &mut DelightQLSystem) -> crate::error::Result<CompiledPlan> {
     consult_into(source, "fx", system);
     compile_namespace_main(system, "fx")
@@ -132,27 +132,36 @@ fn plan_sql(plan: &CompiledPlan) -> String {
 
 fn compile_plain(source: &str, system: &DelightQLSystem) -> crate::error::Result<String> {
     let tree = crate::pipeline::parse::query_sequence(source).expect("source should parse");
-    let mut normalized =
+    let normalized =
         crate::pipeline::parse::normalize_sequence(&tree).expect("source should normalize");
-    assert_eq!(normalized.queries.len(), 1, "one statement expected");
-    let query: ast_unresolved::Query = normalized.queries.remove(0).query;
+    let mut queries = normalized.into_queries();
+    assert_eq!(queries.len(), 1, "one statement expected");
+    let query: ast_unresolved::Query = queries.remove(0).query;
     let schema = system.get_schema()?;
-    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
-    let mut registry =
-        EntityRegistry::new_with_system(schema, system, std::rc::Rc::clone(&identities));
-    let config = ResolutionConfig::default();
-    let (resolved, _bubbled) = resolve_query_inline(query, &mut registry, None, &config, None)?;
+    let identities = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let mut registry = ResolverCore::new_with_system(schema, system, &identities);
+    let mut env = crate::defuse::environment::Environment::Use(
+        crate::defuse::environment::UseEnvironment::session(&registry.consult, "home")?,
+    );
+    let mut fold = super::resolver_fold::ResolverFold::new(
+        &mut registry,
+        &mut env,
+        ResolutionConfig::default(),
+    );
+    let resolved = resolve_query_with(&mut fold, query)?.into_query();
+    drop(fold);
     let gates = danger_gates::DangerGateMap::with_defaults();
-    let refined =
-        refiner::refine_query_with_gates(resolved, gates.clone(), std::rc::Rc::clone(&identities))?;
+    let refined = refiner::refine_query_with_gates(resolved, gates.clone(), &identities)?;
+    let names_handle = identities.names();
     let ctx = transformer::TransformCtx {
-        identities: std::rc::Rc::clone(&identities),
-        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&identities)),
-        outer_columns: vec![],
+        relations: identities.seal(),
+        identities: std::rc::Rc::clone(&names_handle),
+        outer_sites: Vec::new(),
+        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&names_handle)),
         danger_gates: gates,
     };
     let sql_ast = transformer::transform(refined, &ctx)?.without_obligations()?;
-    let names = generator::baptise_statements(&identities, &[&sql_ast])
+    let names = generator::baptise_statements(&names_handle, &[&sql_ast])
         .map_err(|e| e.into_delightql_error("sigma-guard SQL naming failed"))?;
     generator::SqlGenerator::new(&names)
         .generate_statement(&sql_ast)

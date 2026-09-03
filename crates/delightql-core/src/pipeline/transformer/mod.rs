@@ -21,11 +21,11 @@ mod descend;
 mod dml;
 mod plan;
 mod relational;
+pub(in crate::pipeline) use relational::lower_cte_binding;
 mod scalar;
 mod tree_group;
 
 pub use plan::Mutation;
-
 
 use crate::error::Result;
 use crate::pipeline::asts::refined as ast_refined;
@@ -46,21 +46,26 @@ use builder::NameGenerator;
 /// Only holds entities declared *in the query text* (CFEs). DDL entities
 /// arrive pre-resolved in the AST: views as `ConsultedView` nodes with
 /// the body inlined, functions pre-expanded by the resolver.
+pub(crate) use relational::BranchLayout;
+
+pub(crate) fn output_relation(
+    query: &crate::pipeline::ast_refined::Query,
+) -> crate::relation::SemanticRelation {
+    *relational::extract_relation(&query.body)
+}
+
 pub(crate) struct TransformCtx {
+    /// Read-only semantic evidence. Construction was consumed before this
+    /// context could be formed.
+    pub(super) relations: crate::relation::Relations,
     /// The compilation's append-only scope and column identity arena.
     pub(super) identities: std::rc::Rc<crate::names::Registry>,
+    /// Exact physical sites visible outside a scalar subquery.
+    pub(super) outer_sites: Vec<crate::sql_binding::SqlSiteId>,
     /// Shared name generator. Interior-mutable (Arc<AtomicUsize>), so
     /// cloning is cheap and all paths share the same counter. Scalar
     /// lowering uses this for subquery descent (InnerExists, a scalarized relation).
     pub(super) names: NameGenerator,
-    /// Outer scope columns for correlated subqueries.
-    ///
-    /// When entering a scalar subquery, the enclosing scope's columns are
-    /// snapshotted here. `s_lower_lvar` checks this on inner-scope miss,
-    /// so correlated references (e.g., `users.id` inside an orders subquery)
-    /// resolve through the same qualify logic as everything else — no
-    /// caller-side passthrough needed.
-    pub(super) outer_columns: Vec<crate::pipeline::asts::core::ColumnMetadata>,
     /// Danger gates for this query (controls opt-in behaviors like min_multiplicity).
     pub(crate) danger_gates: crate::pipeline::danger_gates::DangerGateMap,
 }
@@ -70,14 +75,12 @@ impl TransformCtx {
     ///
     /// The outer scope's columns are captured so that `s_lower_lvar` can
     /// resolve correlated references without a caller-side passthrough.
-    pub(super) fn with_outer_scope(
-        &self,
-        columns: Vec<crate::pipeline::asts::core::ColumnMetadata>,
-    ) -> TransformCtx {
+    pub(super) fn with_outer_scope(&self, qualify: &dyn builder::Qualify) -> TransformCtx {
         TransformCtx {
+            relations: self.relations.clone(),
             identities: std::rc::Rc::clone(&self.identities),
+            outer_sites: qualify.sql_sites(),
             names: self.names.fork(),
-            outer_columns: columns,
             danger_gates: self.danger_gates.clone(),
         }
     }
@@ -125,7 +128,7 @@ pub(crate) struct Lowered {
     pub(crate) prepare: Vec<SqlStatement>,
     /// The temporary relations `prepare` creates, for the road to remove
     /// when it is done with them.
-    pub(crate) staged: Vec<crate::names::ScopeId>,
+    pub(crate) staged: Vec<crate::relation::SemanticRelation>,
 }
 
 /// A read the statement may not run without, and what its failure means.
@@ -134,6 +137,7 @@ pub(crate) struct Lowered {
 /// road that runs the check is the road that must report it, and a message
 /// written where the check is consumed would be a second authority on what
 /// the check is for.
+#[derive(Clone)]
 pub(crate) struct Obligation {
     pub(crate) statement: SqlStatement,
     pub(crate) refusal: crate::pipeline::compiled_query::Refusal,
@@ -200,7 +204,8 @@ pub(super) fn transform_with_names(
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<QueryExpression> {
-    let ast_refined::Query { cfes: (), ctes, body } = query;
+    let ast_refined::Query { locals, body } = query;
+    let ctes = locals.into_ctes();
     let sql_ctes: Vec<crate::pipeline::sql_ast::Cte> = ctes
         .into_iter()
         .map(|binding| relational::lower_cte_binding(binding, names, ctx))

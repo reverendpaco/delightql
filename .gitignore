@@ -6,6 +6,7 @@
 !crates/**/*.sql
 !crates/**/*.dql
 !crates/**/*.toml
+!crates/**/tests/fixtures/**
 !crates/tree-sitter-highlight/README.md
 !grammar/grammar.js
 !grammar/tokens.js

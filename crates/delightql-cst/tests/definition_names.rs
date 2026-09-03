@@ -120,6 +120,31 @@ fn a_query_scoped_binding_spells_its_subject_the_same_way() {
     ));
 }
 
+/// The query-scoped PARAMETERIZED binding — a CHOE — spells its subject the
+/// same way, and its two groups stay the rule's own: the parameters are
+/// `ho_param`s and the head is the heading's terms, so a typed consumer reads
+/// one shape whether the neck is `:` or `:-`.
+#[test]
+fn a_query_scoped_parameterized_binding_spells_its_subject_the_same_way() {
+    let tree = admits("twice(T(*), n)(*): T(*) twice(users(*), 2)(*)");
+    let cte = delightql_cst::walk(&tree)
+        .find_map(|n| HoCte::cast(n.node()))
+        .expect("a query-scoped parameterized binding");
+    let name = cte.name().expect("a binding names its subject");
+    assert_eq!(tree.text(name.name().expect("a subject has a name")), "twice");
+    assert_eq!(
+        cte.children()
+            .filter(|child| matches!(child, HoCteChild::HoParam(_)))
+            .count(),
+        2,
+        "the parameter group is the rule's own ho_params"
+    );
+    assert!(
+        cte.head().any(|item| matches!(item, HoCteHead::Glob(_))),
+        "the head group is the heading's own terms"
+    );
+}
+
 /// ONE AUTHORED SPELLING PER `rule_form` MEMBER — the inventory every
 /// highlight claim below is measured against.
 ///

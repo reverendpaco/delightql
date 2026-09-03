@@ -11,10 +11,8 @@
 //! a bare name silently pick the first arm that published it.
 
 use crate::pipeline::asts::core::ColumnOccurrence;
-use std::rc::Rc;
 
 use crate::error::{DelightQLError, Result};
-use crate::names::{ColId, Registry, ScopeId};
 use crate::pipeline::asts::core::Comparison;
 use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::resolved;
@@ -23,7 +21,12 @@ use crate::pipeline::asts::vocabulary::CmpOp;
 /// The arms one bag run combines: arm 0 is the chain the run stands on and
 /// arm `k` is the `k`th step's arm.
 pub(super) struct RunArms {
-    scopes: Vec<ScopeId>,
+    relations: Vec<crate::relation::SemanticRelation>,
+    /// The set relations the run's steps publish, innermost first. A
+    /// reference bound at a run's OUTPUT heading stands above the arm
+    /// whose contribution cell carries its value, and the matrix the set's
+    /// construction wrote is what says which.
+    results: Vec<crate::relation::SemanticRelation>,
 }
 
 impl RunArms {
@@ -32,19 +35,64 @@ impl RunArms {
         let run = expr
             .trailing_bag_run()
             .ok_or_else(|| DelightQLError::parse_error("a bag run was expected here"))?;
-        let mut scopes = Vec::with_capacity(run.arms());
-        scopes.push(arm_scope(&resolved::Chain {
-            head: expr.head.clone(),
-            continuations: expr.continuations[..run.base].to_vec(),
-        }));
+        let mut relations = Vec::with_capacity(run.arms());
+        let mut results = Vec::with_capacity(run.steps);
+        relations.push(arm_relation(&expr.prefix(run.base)));
         for step in 0..run.steps {
-            let resolved::Continuation::BagOp { arm, .. } = &expr.continuations[run.base + step]
-            else {
+            let at = &expr.continuations()[run.base + step];
+            let resolved::Continuation::BagOp { arm, .. } = at.form() else {
                 unreachable!("the run's steps are bag steps")
             };
-            scopes.push(arm_scope(arm));
+            relations.push(arm_relation(arm));
+            results.push(*at.result());
         }
-        Ok(RunArms { scopes })
+        Ok(RunArms { relations, results })
+    }
+
+    /// Follow a reference bound at a run's OUTPUT heading down to the one
+    /// arm whose cell contributes its value. The walk reads the
+    /// contribution matrices the set construction wrote — never position,
+    /// spelling, or a pad. A value more than one operand contributes is an
+    /// ambiguity, not an owner.
+    fn carried_output(
+        &self,
+        port: crate::relation::PortId,
+        identities: &crate::relation::Planning,
+    ) -> Result<Carried> {
+        let mut port = port;
+        let mut walked = false;
+        'walk: loop {
+            for result in &self.results {
+                let Some(matrix) = crate::relation::contributions(identities, result)? else {
+                    continue;
+                };
+                let Some(output) = matrix.outputs().iter().find(|slot| slot.result() == port)
+                else {
+                    continue;
+                };
+                let contributing: Vec<crate::relation::PortId> = output
+                    .by_arm()
+                    .iter()
+                    .filter_map(|cell| match cell {
+                        crate::relation::set::Contribution::Port(p) => Some(*p),
+                        crate::relation::set::Contribution::Padding(_) => None,
+                    })
+                    .collect();
+                match contributing.as_slice() {
+                    [one] => {
+                        port = *one;
+                        walked = true;
+                        continue 'walk;
+                    }
+                    [] => return Ok(Carried::No),
+                    _ => return Ok(Carried::Several),
+                }
+            }
+            return Ok(match walked {
+                true => Carried::One(port),
+                false => Carried::No,
+            });
+        }
     }
 
     /// The one arm a resolved column reads, when exactly one does.
@@ -53,41 +101,58 @@ impl RunArms {
     /// bound at the run's OUTPUT heading stands above the arm that carries
     /// its value, and a reference bound inside an arm stands below the
     /// heading its own operand published.
-    fn of_column(&self, column: ColId, identities: &Registry) -> Option<usize> {
-        if let Some(arm) = self.of_scope(identities.scope_of(column), identities) {
-            return Some(arm);
-        }
-        // "Exactly one arm owns this" is a claim about every arm. An arm
-        // whose dimensions the target never published cannot be shown to
-        // own the column OR to be free of it, so no arm can be named the
-        // sole owner while one is in the run.
-        let mut owners: Vec<usize> = Vec::new();
-        for (arm, scope) in self.scopes.iter().enumerate() {
-            match identities.heading(*scope) {
-                crate::names::HeadingKnowledge::Opaque => return None,
-                crate::names::HeadingKnowledge::Known(heading) => {
-                    if heading.iter().any(|export| {
-                        identities.republishes(*export, column)
-                            || identities.republishes(column, *export)
-                    }) {
-                        owners.push(arm);
-                    }
-                }
-            }
-        }
+    fn of_port(
+        &self,
+        port: crate::relation::PortId,
+        identities: &crate::relation::Planning,
+    ) -> Option<usize> {
+        let authority = identities.authority();
+        let owners: Vec<usize> = self
+            .relations
+            .iter()
+            .enumerate()
+            .filter_map(|(arm, relation)| {
+                authority
+                    .interface(relation)
+                    .ok()
+                    .filter(|interface| !interface.is_opaque() && interface.ports().contains(&port))
+                    .map(|_| arm)
+            })
+            .collect();
         match owners.as_slice() {
             [arm] => Some(*arm),
             _ => None,
         }
     }
 
+    /// The arm a reference reads, through either direction of the record:
+    /// an arm's own port directly, or a run-output port through the
+    /// contribution walk.
+    fn arm_and_port(
+        &self,
+        port: crate::relation::PortId,
+        identities: &crate::relation::Planning,
+    ) -> Result<Attributed> {
+        if let Some(arm) = self.of_port(port, identities) {
+            return Ok(Attributed::Arm(arm));
+        }
+        Ok(match self.carried_output(port, identities)? {
+            Carried::One(carried) => match self.of_port(carried, identities) {
+                Some(arm) => Attributed::Arm(arm),
+                None => Attributed::No,
+            },
+            Carried::Several => Attributed::Shared,
+            Carried::No => Attributed::No,
+        })
+    }
+
     /// The one arm a scope belongs to, when exactly one does.
-    fn of_scope(&self, scope: ScopeId, identities: &Registry) -> Option<usize> {
+    fn of_relation(&self, relation: crate::relation::SemanticRelation) -> Option<usize> {
         let owners: Vec<usize> = self
-            .scopes
+            .relations
             .iter()
             .enumerate()
-            .filter(|(_, arm)| **arm == scope || identities.contains_scope(**arm, scope))
+            .filter(|(_, arm)| **arm == relation)
             .map(|(arm, _)| arm)
             .collect();
         match owners.as_slice() {
@@ -97,13 +162,26 @@ impl RunArms {
     }
 }
 
-fn arm_scope(chain: &resolved::Chain) -> ScopeId {
-    crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(chain)
+fn arm_relation(chain: &resolved::Chain) -> crate::relation::SemanticRelation {
+    chain.semantic_relation()
 }
 
-/// The scope a chain publishes.
-pub(super) fn published_scope(chain: &resolved::Chain) -> ScopeId {
-    arm_scope(chain)
+/// Where one reference's value comes from, read off the record.
+enum Carried {
+    One(crate::relation::PortId),
+    /// More than one operand contributes the value.
+    Several,
+    No,
+}
+
+/// What one reference of a conjunct attributes to.
+enum Attributed {
+    Arm(usize),
+    /// The value is carried by more than one operand: attributable to no
+    /// single arm, and an ambiguity the moment the conjunct is otherwise a
+    /// correlation.
+    Shared,
+    No,
 }
 
 /// What one conjunct standing on the run turns out to be.
@@ -129,13 +207,93 @@ pub(super) enum Related {
 pub(super) fn related(
     conjunct: &resolved::TruthExpression,
     arms: &RunArms,
-    identities: &Registry,
-) -> Related {
+    identities: &crate::relation::Planning,
+) -> Result<Related> {
     let mut named: Vec<usize> = Vec::new();
-    if !collect_arms(conjunct, arms, identities, &mut named) {
-        return Related::Whole;
+    let mut shared = false;
+    let all = collect_arms(conjunct, arms, identities, &mut named, &mut shared)?;
+    // A conjunct that names an arm AND reads a value more than one operand
+    // contributes is a correlation with no stated pairing: the shared value
+    // would silently bind whichever arm minted the merged column. A
+    // conjunct whose every reference is shared names no arm at all and
+    // stays what it always was — one condition over the finished relation.
+    if shared && !named.is_empty() {
+        return Err(DelightQLError::validation_error_categorized(
+            "resolution/setop/correlation/shared",
+            "a set-operation correlation reads a value that is carried by \
+             more than one operand, so which arm it correlates is unstated",
+            "qualify the reference with the arm it means: \
+             `x(*) as a ; y(*) as b, a.k = b.k`",
+        ));
     }
-    pair(named)
+    if !all {
+        return Ok(Related::Whole);
+    }
+    Ok(pair(named))
+}
+
+/// Restate a claimed correlation over the arms' OWN headings: every
+/// reference bound at the run's output moves to the port the contributing
+/// arm published, following the contribution record. The lowering binds a
+/// correlation against the two arm sites, so an output-bound occurrence has
+/// no site there and a pad is never addressable.
+pub(super) fn rebind_to_arms(
+    predicate: &mut resolved::TruthExpression,
+    arms: &RunArms,
+    identities: &crate::relation::Planning,
+) -> Result<()> {
+    use resolved::TruthExpression as Boolean;
+    match predicate {
+        Boolean::Comparison(Comparison { left, right, .. }) => {
+            rebind_domain(left, arms, identities)?;
+            rebind_domain(right, arms, identities)?;
+        }
+        Boolean::Conjunction(parts) => {
+            for part in parts.iter_mut() {
+                rebind_to_arms(part, arms, identities)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rebind_domain(
+    expr: &mut resolved::DomainExpression,
+    arms: &RunArms,
+    identities: &crate::relation::Planning,
+) -> Result<()> {
+    use resolved::DomainExpression as Domain;
+    match expr {
+        Domain::Reference(Reference::Named(NamedReference(occurrence))) => {
+            if arms.of_port(occurrence.column, identities).is_none() {
+                if let Carried::One(carried) = arms.carried_output(occurrence.column, identities)? {
+                    occurrence.column = carried;
+                }
+            }
+        }
+        Domain::Application(function) => match function {
+            resolved::FunctionApplication::Standard(application) => {
+                for argument in application.call_mut().arguments.scalar_members_mut() {
+                    if let Some(domain) = argument.scalar_domain_mut() {
+                        rebind_domain(domain, arms, identities)?;
+                    }
+                }
+            }
+            resolved::FunctionApplication::Infix(infix) => {
+                rebind_domain(&mut infix.left, arms, identities)?;
+                rebind_domain(&mut infix.right, arms, identities)?;
+            }
+            resolved::FunctionApplication::Crossed(crossing) => {
+                for operand in crossing.scalar_operands_mut() {
+                    rebind_domain(operand, arms, identities)?;
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    Ok(())
 }
 
 /// What a whole-heading correlation relates.
@@ -147,12 +305,12 @@ pub(super) fn related(
 pub(super) fn related_whole(
     whole: &resolved::WholeHeading,
     arms: &RunArms,
-    identities: &Registry,
+    _identities: &crate::relation::Planning,
 ) -> Related {
     let (left, right) = whole.arms();
     let mut named: Vec<usize> = Vec::new();
     for scope in [left, right] {
-        match arms.of_scope(*scope, identities) {
+        match arms.of_relation(*scope) {
             Some(arm) => {
                 if !named.contains(&arm) {
                     named.push(arm);
@@ -226,18 +384,27 @@ pub(super) fn refuse_unowned_whole_heading() -> DelightQLError {
 fn collect_arms(
     predicate: &resolved::TruthExpression,
     arms: &RunArms,
-    identities: &Registry,
+    identities: &crate::relation::Planning,
     out: &mut Vec<usize>,
-) -> bool {
+    shared: &mut bool,
+) -> Result<bool> {
     use resolved::TruthExpression as Boolean;
-    match predicate {
+    Ok(match predicate {
         Boolean::Comparison(Comparison { left, right, .. }) => {
-            collect_domain_arms(left, arms, identities, out)
-                && collect_domain_arms(right, arms, identities, out)
+            // Both sides are read even when one already failed to
+            // attribute: a shared value beside a named arm is the refusal,
+            // and short-circuiting would hide the arm that names it.
+            let left = collect_domain_arms(left, arms, identities, out, shared)?;
+            let right = collect_domain_arms(right, arms, identities, out, shared)?;
+            left && right
         }
-        Boolean::Conjunction(parts) => parts
-            .iter()
-            .all(|part| collect_arms(part, arms, identities, out)),
+        Boolean::Conjunction(parts) => {
+            let mut all = true;
+            for part in parts.iter() {
+                all = collect_arms(part, arms, identities, out, shared)? && all;
+            }
+            all
+        }
         // Everything else is a filter over the finished relation, not a
         // correlation: disjunction, negation, membership, and the subquery
         // predicates each stand on the one heading the run publishes.
@@ -247,7 +414,7 @@ fn collect_arms(
         | Boolean::Existence { .. }
         | Boolean::RelationalMembership { .. }
         | Boolean::Sigma { .. } => false,
-    }
+    })
 }
 
 /// Collect the arms one side of a comparison names.
@@ -260,50 +427,71 @@ fn collect_arms(
 fn collect_domain_arms(
     expr: &resolved::DomainExpression,
     arms: &RunArms,
-    identities: &Registry,
+    identities: &crate::relation::Planning,
     out: &mut Vec<usize>,
-) -> bool {
+    shared: &mut bool,
+) -> Result<bool> {
     use resolved::DomainExpression as Domain;
-    match expr {
+    // A relation beneath the value brings its own scope; its references are
+    // not this walk's to enumerate, so the side is not attributable.
+    if expr.nests_relation() {
+        return Ok(false);
+    }
+    Ok(match expr {
         Domain::Reference(Reference::Named(NamedReference(ColumnOccurrence {
             column, ..
-        }))) => match arms.of_column(*column, identities) {
-            Some(arm) => {
+        }))) => match arms.arm_and_port(*column, identities)? {
+            Attributed::Arm(arm) => {
                 if !out.contains(&arm) {
                     out.push(arm);
                 }
                 true
             }
-            None => false,
+            Attributed::Shared => {
+                *shared = true;
+                false
+            }
+            Attributed::No => false,
         },
         Domain::Application(function) => match function {
             resolved::FunctionApplication::Ground(_) => true,
             resolved::FunctionApplication::Standard(application) => {
                 ({
                     let arguments = &application.call().arguments;
-                    // A relational argument brings its own scope; a
-                    // correlation reading one is not a pair of arms. A
-                    // crossed argument brings its own truth.
-                    arguments.relations().next().is_none()
-                        && arguments
-                            .value_domains()
-                            .all(|argument| collect_domain_arms(argument, arms, identities, out))
+                    let mut all = true;
+                    for argument in arguments.value_domains() {
+                        all = collect_domain_arms(argument, arms, identities, out, shared)? && all;
+                    }
+                    all
                 }) && application.guard.is_none()
             }
             resolved::FunctionApplication::Enclyph(
                 crate::pipeline::asts::core::Enclyph::Tuple(tuple),
-            ) => tuple
-                .elements
-                .iter()
-                .all(|element| collect_domain_arms(element, arms, identities, out)),
+            ) => {
+                let mut all = true;
+                for element in tuple.elements.iter() {
+                    all =
+                        collect_domain_arms(element.value(), arms, identities, out, shared)? && all;
+                }
+                all
+            }
             resolved::FunctionApplication::Infix(infix) => {
-                collect_domain_arms(&infix.left, arms, identities, out)
-                    && collect_domain_arms(&infix.right, arms, identities, out)
+                let left = collect_domain_arms(&infix.left, arms, identities, out, shared)?;
+                let right = collect_domain_arms(&infix.right, arms, identities, out, shared)?;
+                left && right
+            }
+            // A crossed truth's reads are its truth's reads.
+            resolved::FunctionApplication::Crossed(crossing) => {
+                let mut all = true;
+                for operand in crossing.truth().scalar_operands() {
+                    all = collect_domain_arms(operand, arms, identities, out, shared)? && all;
+                }
+                all
             }
             _ => false,
         },
         _ => false,
-    }
+    })
 }
 
 /// Refuse a bare correlation reference more than one arm publishes.
@@ -315,30 +503,35 @@ fn collect_domain_arms(
 pub(super) fn refuse_ambiguous_bare_reference(
     predicate: &resolved::TruthExpression,
     arms: &RunArms,
-    identities: &Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<()> {
     let mut ambiguous = false;
-    walk_bare_references(predicate, &mut |column| {
-        let Some(name) = identities.published_sym(column) else {
+    walk_bare_references(predicate, &mut |port| {
+        let Some(name) = identities.published_sym(port.column()) else {
             return;
         };
         // Likewise "only one arm carries this name": an arm nobody
         // enumerated might carry it too, so the reference is not shown to
         // be unambiguous and is refused as ambiguous rather than let by.
         let mut carriers = 0usize;
-        for scope in &arms.scopes {
-            match identities.heading(*scope) {
-                crate::names::HeadingKnowledge::Opaque => {
+        for relation in &arms.relations {
+            match identities.authority().interface(relation) {
+                Ok(interface) if interface.is_opaque() => {
                     ambiguous = true;
                     return;
                 }
-                crate::names::HeadingKnowledge::Known(heading) => {
-                    if heading
+                Ok(interface) => {
+                    if interface
+                        .ports()
                         .iter()
-                        .any(|candidate| identities.published_sym(*candidate) == Some(name))
+                        .any(|candidate| identities.published_sym(candidate.column()) == Some(name))
                     {
                         carriers += 1;
                     }
+                }
+                Err(_) => {
+                    ambiguous = true;
+                    return;
                 }
             }
         }
@@ -357,7 +550,10 @@ pub(super) fn refuse_ambiguous_bare_reference(
     Ok(())
 }
 
-fn walk_bare_references(predicate: &resolved::TruthExpression, note: &mut dyn FnMut(ColId)) {
+fn walk_bare_references(
+    predicate: &resolved::TruthExpression,
+    note: &mut dyn FnMut(crate::relation::PortId),
+) {
     use resolved::TruthExpression as Boolean;
     match predicate {
         Boolean::Comparison(Comparison { left, right, .. }) => {
@@ -376,7 +572,10 @@ fn walk_bare_references(predicate: &resolved::TruthExpression, note: &mut dyn Fn
     }
 }
 
-fn walk_bare_domain(expr: &resolved::DomainExpression, note: &mut dyn FnMut(ColId)) {
+fn walk_bare_domain(
+    expr: &resolved::DomainExpression,
+    note: &mut dyn FnMut(crate::relation::PortId),
+) {
     use resolved::DomainExpression as Domain;
     match expr {
         Domain::Reference(Reference::Named(NamedReference(ColumnOccurrence {
@@ -398,12 +597,17 @@ fn walk_bare_domain(expr: &resolved::DomainExpression, note: &mut dyn FnMut(ColI
                 crate::pipeline::asts::core::Enclyph::Tuple(tuple),
             ) => {
                 for element in tuple.elements.iter() {
-                    walk_bare_domain(element, note);
+                    walk_bare_domain(element.value(), note);
                 }
             }
             resolved::FunctionApplication::Infix(infix) => {
                 walk_bare_domain(&infix.left, note);
                 walk_bare_domain(&infix.right, note);
+            }
+            resolved::FunctionApplication::Crossed(crossing) => {
+                for operand in crossing.truth().scalar_operands() {
+                    walk_bare_domain(operand, note);
+                }
             }
             _ => {}
         },
@@ -450,52 +654,45 @@ fn is_unqualified(expr: &resolved::DomainExpression) -> bool {
     }
 }
 
-/// The whole-tuple correlation a BARE minus stands on.
+/// The anti-match predicate a bare minus carries.
 ///
-/// Minus is minus: the rows of the left operand with no corresponding row
-/// in the right, duplicates preserved and nulls matching nulls. That is the
-/// anti-semijoin over every column, so a bare minus is a CORRELATED minus
-/// whose predicate this fills in — bare and correlated never became two
-/// roads.
+/// Reads the ONE pairing the authority proved when it built the minus: which
+/// left dimension answers which right one. It is not recomputed here — the
+/// pairing decides what the result publishes and what this predicate
+/// compares, and two roads deriving it separately are two authorities that
+/// can disagree about a heading they both call exact.
 pub(super) fn whole_tuple_correlation(
-    left: ScopeId,
-    arm: ScopeId,
-    identities: &Rc<Registry>,
+    result: crate::relation::SemanticRelation,
+    identities: &crate::relation::Planning,
 ) -> Result<resolved::TruthExpression> {
-    let left_columns = identities.known_heading(left)?.to_vec();
-    let arm_columns = identities.known_heading(arm)?.to_vec();
-    let matched = identities.corresponding_slots(&left_columns, &arm_columns)?;
-    let mut comparisons = Vec::with_capacity(left_columns.len());
-    for (left_column, arm_column) in left_columns.iter().zip(matched) {
-        let Some(arm_column) = arm_column else {
-            return Err(DelightQLError::validation_error_categorized(
-                "resolution/setop/minus_heading",
-                "minus aligns by name and the right operand does not publish every name the left does",
-                "rename the right operand's columns to match the left: `left(*) - right(|> *(other as name))`",
-            ));
-        };
-        comparisons.push(resolved::TruthExpression::Comparison(Comparison {
-            // Nulls match nulls here: the probe asks whether a matching row
-            // is PRESENT, and a null-blind `=` would keep every null-bearing
-            // row the right operand plainly contains.
-            operator: CmpOp::NullSafeEqual,
-            left: Box::new(resolved::DomainExpression::Reference(Reference::Named(
-                NamedReference(ColumnOccurrence {
-                    column: *left_column,
-                    explicit_qualifier: true,
-                }),
-            ))),
-            right: Box::new(resolved::DomainExpression::Reference(Reference::Named(
-                NamedReference(ColumnOccurrence {
-                    column: arm_column,
-                    explicit_qualifier: true,
-                }),
-            ))),
-        }));
-    }
+    let anti_match = crate::relation::anti_match(identities, &result)?.ok_or_else(|| {
+        DelightQLError::validation_error_categorized(
+            crate::uri_registry::subcat::RESOLUTION_SETOP_MINUS_HEADING,
+            "a minus was refined without the exact pairing its construction proved",
+            "this is a compiler fault: report the query",
+        )
+    })?;
+    let comparisons = anti_match
+        .pairs()
+        .iter()
+        .map(|pair| {
+            resolved::TruthExpression::Comparison(Comparison {
+                // Nulls match nulls here: the probe asks whether a matching
+                // row is PRESENT, and a null-blind `=` would keep every
+                // null-bearing row the right operand plainly contains.
+                operator: CmpOp::NullSafeEqual,
+                left: Box::new(resolved::DomainExpression::Reference(Reference::Named(
+                    NamedReference(ColumnOccurrence::engine_qualified(pair.left())),
+                ))),
+                right: Box::new(resolved::DomainExpression::Reference(Reference::Named(
+                    NamedReference(ColumnOccurrence::engine_qualified(pair.right())),
+                ))),
+            })
+        })
+        .collect();
     resolved::TruthExpression::all(comparisons).ok_or_else(|| {
         DelightQLError::validation_error_categorized(
-            "resolution/setop/minus_heading",
+            crate::uri_registry::subcat::RESOLUTION_SETOP_MINUS_HEADING,
             "minus has no columns to compare",
             "both operands must publish at least one column",
         )
@@ -507,41 +704,56 @@ mod tests {
     //! What the correlation-owner law admits and what it refuses.
 
     use super::*;
-    use crate::names::{Addressing, ColumnOrigin, Hint, ScopeOrigin, ValueFacts};
+    use crate::relation::PortId;
 
-    fn lvar(column: ColId, explicit_qualifier: bool) -> resolved::DomainExpression {
-        resolved::DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
-            column,
-            explicit_qualifier,
-        })))
+    fn lvar(column: PortId, explicit_qualifier: bool) -> resolved::DomainExpression {
+        resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            if explicit_qualifier {
+                ColumnOccurrence::engine_qualified(column)
+            } else {
+                ColumnOccurrence::engine(column)
+            },
+        )))
     }
 
-    fn column_of(registry: &Registry, scope_name: &str, column_name: &str) -> ColId {
-        let scope = registry.mint_scope(
-            ScopeOrigin::AnonRelation,
-            Hint::User(registry.intern(scope_name, false)),
-            None,
-        );
-        registry.mint_column(
-            scope,
-            ColumnOrigin::Bound { position: 0 },
-            Some(registry.intern(column_name, false)),
-            Addressing::Published,
-            ValueFacts::default(),
-        )
+    fn column_of(
+        registry: &crate::relation::Planning,
+        scope_name: &str,
+        column_name: &str,
+    ) -> PortId {
+        let answer = registry.intern(scope_name, false);
+        let named = registry.intern(column_name, false);
+        let relation = registry
+            .authority()
+            .derive(crate::relation::RelForm::Anonymous(
+                crate::relation::form::AnonymousSpec {
+                    shape: crate::relation::form::AnonymousShape::Tabular,
+                    slots: &[crate::relation::form::AnonymousSlot::Binder {
+                        position: 0,
+                        named,
+                        declared_type: None,
+                        shape: crate::names::ValueShape::Unknown,
+                    }],
+                    answers_to: Some(answer),
+                },
+            ))
+            .unwrap();
+        crate::relation::published_ports(registry, &relation).unwrap()[0]
     }
 
     fn call_of(name: &str, argument: resolved::DomainExpression) -> resolved::DomainExpression {
-        let registry = Registry::new(&[]);
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         resolved::DomainExpression::Application(resolved::FunctionApplication::Standard(
             crate::pipeline::asts::core::StandardApplication::plain(
                 crate::pipeline::asts::core::PureCall::from_inner(
                     crate::pipeline::asts::core::FunctorCall {
                         callee: registry.mint_function(registry.intern(name, false), Vec::new()),
                         arguments: crate::pipeline::asts::core::operators::CallArguments::Scalar(
-                            vec![crate::pipeline::asts::core::operators::ScalarArgument::plain(
-                                argument,
-                            )],
+                            vec![
+                                crate::pipeline::asts::core::operators::ScalarArgument::plain(
+                                    argument,
+                                ),
+                            ],
                         ),
                         marks: Default::default(),
                     },
@@ -565,7 +777,7 @@ mod tests {
     /// say which operand each side reads.
     #[test]
     fn both_sides_bare_refuses() {
-        let registry = Registry::new(&[]);
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         let column = column_of(&registry, "x", "v");
         assert!(refuse_unqualified_correlation(&equality(
             lvar(column, false),
@@ -579,7 +791,7 @@ mod tests {
     /// per-column intersection.
     #[test]
     fn a_computed_side_is_not_bare() {
-        let registry = Registry::new(&[]);
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         let left = column_of(&registry, "x", "v");
         let right = column_of(&registry, "y", "v");
         assert!(refuse_unqualified_correlation(&equality(
@@ -598,68 +810,11 @@ mod tests {
     /// One qualified side is enough: the pair is stated.
     #[test]
     fn one_qualified_side_is_enough() {
-        let registry = Registry::new(&[]);
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         let left = column_of(&registry, "x", "v");
         let right = column_of(&registry, "y", "v");
         assert!(
             refuse_unqualified_correlation(&equality(lvar(left, false), lvar(right, true))).is_ok()
         );
-    }
-
-    /// An arm whose dimensions the target never published could own the
-    /// column too, so no other arm may be named its sole owner.
-    #[test]
-    fn an_opaque_arm_stops_a_unique_owner_conclusion() {
-        let registry = Registry::new(&[]);
-        // A column bound outside the run, republished by one arm. Ownership
-        // is decided by reading the arms' headings, which is the road an
-        // opaque arm breaks.
-        let source = column_of(&registry, "source", "v");
-        let known = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::None, None);
-        registry.republish_column(
-            source,
-            known,
-            crate::names::Republish::Passthrough,
-            registry.published(source),
-            Addressing::Published,
-            |_| {},
-        );
-        let other = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::None, None);
-        let opaque = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::None, None);
-        registry.mark_heading_opaque(opaque);
-
-        // With both arms enumerable, the arm that republishes it owns it.
-        let settled = RunArms {
-            scopes: vec![known, other],
-        };
-        assert_eq!(settled.of_column(source, &registry), Some(0));
-
-        // With one arm opaque, no arm is shown to be the only owner.
-        let unsettled = RunArms {
-            scopes: vec![known, opaque],
-        };
-        assert_eq!(unsettled.of_column(source, &registry), None);
-    }
-
-    /// Likewise "only one arm carries this name": an arm nobody enumerated
-    /// might carry it too, so the reference is refused rather than let by.
-    #[test]
-    fn an_opaque_arm_stops_a_non_ambiguity_conclusion() {
-        let registry = Registry::new(&[]);
-        let carried = column_of(&registry, "known", "v");
-        let known = registry.scope_of(carried);
-        let opaque = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::None, None);
-        registry.mark_heading_opaque(opaque);
-        let predicate = equality(lvar(carried, false), lvar(carried, false));
-
-        let settled = RunArms {
-            scopes: vec![known],
-        };
-        assert!(refuse_ambiguous_bare_reference(&predicate, &settled, &registry).is_ok());
-
-        let unsettled = RunArms {
-            scopes: vec![known, opaque],
-        };
-        assert!(refuse_ambiguous_bare_reference(&predicate, &unsettled, &registry).is_err());
     }
 }

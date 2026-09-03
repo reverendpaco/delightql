@@ -15,7 +15,16 @@ pub type Query = crate::pipeline::asts::core::Query<crate::pipeline::asts::core:
 pub type CteBinding =
     crate::pipeline::asts::core::CteBinding<crate::pipeline::asts::core::Resolved>;
 pub type Chain = crate::pipeline::asts::core::Chain<crate::pipeline::asts::core::Resolved>;
+pub type GroundForm =
+    crate::pipeline::asts::core::GroundForm<crate::pipeline::asts::core::Resolved>;
+pub type Step = crate::pipeline::asts::core::Step<crate::pipeline::asts::core::Resolved>;
 pub type Grelex = crate::pipeline::asts::core::Grelex<crate::pipeline::asts::core::Resolved>;
+#[allow(dead_code)]
+pub type Peel = crate::pipeline::asts::core::Peel<crate::pipeline::asts::core::Resolved>;
+#[allow(dead_code)]
+#[allow(dead_code)]
+pub type Transparent =
+    crate::pipeline::asts::core::Transparent<crate::pipeline::asts::core::Resolved>;
 pub type Continuation =
     crate::pipeline::asts::core::Continuation<crate::pipeline::asts::core::Resolved>;
 pub type StructuralStep =
@@ -79,9 +88,6 @@ pub type SigmaApplication =
     crate::pipeline::asts::core::SigmaApplication<crate::pipeline::asts::core::Resolved>;
 pub type ArgumentValue =
     crate::pipeline::asts::core::ArgumentValue<crate::pipeline::asts::core::Resolved>;
-pub type OutValue = crate::pipeline::asts::core::OutValue<crate::pipeline::asts::core::Resolved>;
-pub type SlotConstraint =
-    crate::pipeline::asts::core::SlotConstraint<crate::pipeline::asts::core::Resolved>;
 pub type CaseExpression =
     crate::pipeline::asts::core::expressions::CaseExpression<crate::pipeline::asts::core::Resolved>;
 pub type ValueTemplate =
@@ -93,16 +99,9 @@ pub type PipeOp = crate::pipeline::asts::core::PipeOp<crate::pipeline::asts::cor
 pub type GroupSpec = crate::pipeline::asts::core::GroupSpec<crate::pipeline::asts::core::Resolved>;
 pub type OrderingSpec =
     crate::pipeline::asts::core::OrderingSpec<crate::pipeline::asts::core::Resolved>;
-pub type DelegateSpec =
-    crate::pipeline::asts::core::DelegateSpec<crate::pipeline::asts::core::Resolved>;
 pub type OutItem = crate::pipeline::asts::core::OutItem<crate::pipeline::asts::core::Resolved>;
 pub type ReductionItem =
     crate::pipeline::asts::core::ReductionItem<crate::pipeline::asts::core::Resolved>;
-pub type MetadataOut =
-    crate::pipeline::asts::core::MetadataOut<crate::pipeline::asts::core::Resolved>;
-pub type OneOut = crate::pipeline::asts::core::OneOut<crate::pipeline::asts::core::Resolved>;
-pub type NamedOutItem =
-    crate::pipeline::asts::core::NamedOutItem<crate::pipeline::asts::core::Resolved>;
 pub type RenameSpec =
     crate::pipeline::asts::core::RenameSpec<crate::pipeline::asts::core::Resolved>;
 pub type RepositionSpec =
@@ -115,8 +114,6 @@ pub type WindowFrame =
     crate::pipeline::asts::core::WindowFrame<crate::pipeline::asts::core::Resolved>;
 pub type FrameBound =
     crate::pipeline::asts::core::FrameBound<crate::pipeline::asts::core::Resolved>;
-pub type HoArgument =
-    crate::pipeline::asts::core::operators::HoArgument<crate::pipeline::asts::core::Resolved>;
 pub type ScalarArgument =
     crate::pipeline::asts::core::operators::ScalarArgument<crate::pipeline::asts::core::Resolved>;
 pub type CallArguments =
@@ -138,7 +135,6 @@ pub use crate::pipeline::asts::core::{
     ColumnMetadata,
     // Supporting types
     CteOrigin,
-    DestructureMapping,
     FilterOrigin,
     LiteralValue,
     NamespacePath,

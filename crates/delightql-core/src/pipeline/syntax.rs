@@ -14,6 +14,6 @@
 
 pub use delightql_cst::cst;
 pub use delightql_cst::{
-    outermost, walk, CompanionColumn, Defect, DefectKind, Parser, Root,
-    SyntaxTree, Token, TypedNode,
+    outermost, walk, CompanionColumn, Defect, DefectKind, Parser, Root, SyntaxTree, Token,
+    TypedNode,
 };

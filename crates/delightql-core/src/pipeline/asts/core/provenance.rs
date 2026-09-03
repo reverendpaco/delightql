@@ -16,26 +16,3 @@ impl Default for CteOrigin {
         CteOrigin::UserDefined
     }
 }
-
-/// Whose scope resolves a CTE's names. This is independent of `CteOrigin`:
-/// caller-side carriers contain caller-authored terms, while clause-body
-/// wrappers contain entity-authored terms.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CteResolutionOwner {
-    /// Resolve under the scope the resolver is already in: the entity's
-    /// own scope inside a definition, the query's scope at top level.
-    Entity,
-    /// A carrier for caller-authored terms. The authored namespace is carried
-    /// on the term itself: `None` is the interactive/prompt scope, `Some(ns)`
-    /// is a definition authored in `ns`. Resolution never has to recover this
-    /// fact from a name or a second ambient config field.
-    Caller {
-        resolution_namespace: Option<String>,
-    },
-}
-
-impl Default for CteResolutionOwner {
-    fn default() -> Self {
-        CteResolutionOwner::Entity
-    }
-}

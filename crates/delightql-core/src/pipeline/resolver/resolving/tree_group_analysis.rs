@@ -33,10 +33,12 @@ fn has_nested_reductions(expr: &ast::DomainExpression) -> bool {
     match expr {
         ast::DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(
             record,
-        ))) => record
-            .members
-            .iter()
-            .any(|member| matches!(member, ast::RecordMember::Induced { .. })),
+        ))) => record.members.iter().any(|member| {
+            matches!(
+                member,
+                ast::RecordMember::Induced { .. } | ast::RecordMember::Metadata { .. }
+            )
+        }),
         _ => false,
     }
 }
@@ -49,13 +51,15 @@ fn tree_group_of(item: &mut ast::ReductionItem) -> Option<TreeGroup<'_>> {
         // A pivot rotates values into columns; a delegate selects a
         // representative row: neither builds a tree.
         ast::ReductionItem::Pivot(_) | ast::ReductionItem::Delegate(_) => None,
-        ast::ReductionItem::Out(item) => match item.domain_value_mut()? {
+        ast::ReductionItem::Out(item) => match item.value_mut()? {
             ast::DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(
                 record,
-            ))) if record
-                .members
-                .iter()
-                .any(|member| matches!(member, ast::RecordMember::Induced { .. })) =>
+            ))) if record.members.iter().any(|member| {
+                matches!(
+                    member,
+                    ast::RecordMember::Induced { .. } | ast::RecordMember::Metadata { .. }
+                )
+            }) =>
             {
                 Some(TreeGroup::Record(record))
             }
@@ -78,10 +82,7 @@ fn extract_inner_grouping_keys_with_names(
                     ast::RecordMember::SelfKeyed(NamedReference(occurrence)) => Some((
                         None,
                         ast::DomainExpression::Reference(Reference::Named(NamedReference(
-                            ColumnOccurrence {
-                                column: occurrence.column,
-                                explicit_qualifier: false,
-                            },
+                            ColumnOccurrence::engine(occurrence.column),
                         ))),
                     )),
                     ast::RecordMember::Keyed { key, value } => {
@@ -100,8 +101,8 @@ fn extract_inner_grouping_keys_with_names(
                         }
                     }
                     // An induced member is an aggregation target, not a
-                    // dimension.
-                    ast::RecordMember::Induced { .. } => None,
+                    // dimension; so is a metadata group.
+                    ast::RecordMember::Induced { .. } | ast::RecordMember::Metadata { .. } => None,
                     ast::RecordMember::Spread(spread) => spread.expanded(),
                 })
                 .collect()
@@ -114,10 +115,9 @@ fn extract_inner_grouping_keys_with_names(
 fn metadata_key(group: &ast::MetadataGroup) -> (Option<String>, ast::DomainExpression) {
     (
         None,
-        ast::DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
-            column: group.key.column,
-            explicit_qualifier: false,
-        }))),
+        ast::DomainExpression::Reference(Reference::Named(NamedReference(
+            ColumnOccurrence::engine(group.key.column),
+        ))),
     )
 }
 
@@ -144,7 +144,7 @@ fn collect_tree_groups_needing_ctes<'a>(
     // output stamp alone. A spread publishes no value to analyze, and a
     // metadata level has no derivation as a group key.
     for (item_index, item) in keys.iter_mut().enumerate() {
-        let Some(expr) = item.domain_value_mut() else {
+        let Some(expr) = item.value_mut() else {
             continue;
         };
         let ast::DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(
@@ -153,11 +153,12 @@ fn collect_tree_groups_needing_ctes<'a>(
         else {
             continue;
         };
-        if record
-            .members
-            .iter()
-            .any(|member| matches!(member, ast::RecordMember::Induced { .. }))
-        {
+        if record.members.iter().any(|member| {
+            matches!(
+                member,
+                ast::RecordMember::Induced { .. } | ast::RecordMember::Metadata { .. }
+            )
+        }) {
             result.push(TreeGroupToAnalyze {
                 group: TreeGroup::Record(record),
                 location: TreeGroupLocation::InKeys,
@@ -190,11 +191,9 @@ fn populate_nested_metadata_cte_requirements(
     location: TreeGroupLocation,
     accumulated_keys: Vec<(Option<String>, ast::DomainExpression)>,
 ) -> Result<()> {
-    let this_key =
-        ast::DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
-            column: group.key.column,
-            explicit_qualifier: false,
-        })));
+    let this_key = ast::DomainExpression::Reference(Reference::Named(NamedReference(
+        ColumnOccurrence::engine(group.key.column),
+    )));
 
     // Accumulated keys for this level = parent's keys + this key (a metadata
     // level's key has no key name).
@@ -307,7 +306,8 @@ fn extract_nested_member_info(expr: &ast::DomainExpression) -> Vec<NestedMemberC
                 .members
                 .iter()
                 .filter_map(|member| match member {
-                    ast::RecordMember::Induced { key, .. } => {
+                    ast::RecordMember::Induced { key, .. }
+                    | ast::RecordMember::Metadata { key, .. } => {
                         Some(NestedMemberCteInfo { key: key.clone() })
                     }
                     // No other member re-enters reduction, so none needs a CTE.
@@ -344,7 +344,7 @@ pub fn analyze_tree_groups_for_ctes(
     // construction (a key is a publication item; reach the value it publishes).
     let mut outer_grouping_keys: Vec<(Option<String>, ast::DomainExpression)> = Vec::new();
     for item in keys.iter() {
-        let Some(expr) = item.domain_value() else {
+        let Some(expr) = item.value() else {
             continue;
         };
         if has_nested_reductions(expr) {

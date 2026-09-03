@@ -4,7 +4,7 @@
 //
 // Three phases with shared core structures:
 // - unresolved: Direct output from parser
-// - resolved: With symbol resolution and cpr_schema
+// - resolved: With symbol resolution and result
 // - refined: Restructured for SQL generation
 
 pub mod core; // Public - needed for SQL AST provenance

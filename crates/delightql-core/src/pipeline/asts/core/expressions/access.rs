@@ -16,7 +16,6 @@ use super::super::literals::LiteralValue;
 use super::super::{Phase, Unresolved};
 use super::domain::DomainExpression;
 use super::references::{NamedReference, Reference};
-use super::truth::SlotConstraint;
 use crate::pipeline::asts::vocabulary::Vec1;
 use crate::{lispy::ToLispy, ToLispy};
 use delightql_types::SqlIdentifier;
@@ -71,12 +70,13 @@ pub enum Slot<P: Phase = Unresolved> {
     /// computes a term the column must unify with.
     #[lispy("slot:reuse")]
     Reuse(NamedReference<P>),
-    /// A ground term, a compound application, or the licensed truth
-    /// crossing. It CONSTRAINS the position and names nothing — the slot is
-    /// consumed as a filter. An enumeration, a path, or an open hole is not
-    /// a `SlotConstraint`, so none can stand here.
+    /// A ground term or a compound application — a crossed truth among
+    /// them. It CONSTRAINS the position and names nothing: the column
+    /// unifies with the term null-safely, and the slot is consumed as a
+    /// filter. An enumeration, a path, or an open hole is not a term, so
+    /// none can stand here.
     #[lispy("slot:constraint")]
-    Constraint(SlotConstraint<P>),
+    Constraint(Box<DomainExpression<P>>),
 }
 
 impl<P: Phase> Slot<P> {
@@ -88,20 +88,17 @@ impl<P: Phase> Slot<P> {
             DomainExpression::Reference(Reference::Named(NamedReference(column))) => {
                 P::classify_column(column)
             }
-            DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Open(
-                leaf,
-            )) => P::classify_open_slot(leaf),
-            other => Slot::Constraint(SlotConstraint::Value(Box::new(other))),
+            DomainExpression::Application(
+                crate::pipeline::asts::core::FunctionApplication::Open(leaf),
+            ) => P::classify_open_slot(leaf),
+            other => Slot::Constraint(Box::new(other)),
         }
     }
 
     /// The slot as the DOMAIN term it was classified from.
     ///
-    /// PARTIAL, and it says so. A crossed truth is not a domain expression
-    /// and has no reading as one, so this answers `None` there rather than
-    /// inventing a term. Substituting the disregarded anaphor made a walk
-    /// that reads slots through this helper lose the crossing — and every
-    /// subquery beneath it — while looking like a total conversion.
+    /// PARTIAL only where the anonymous slot has no term in this phase:
+    /// every constraining term, a crossed truth included, reads back whole.
     pub fn term(&self) -> Option<DomainExpression<P>>
     where
         P: Clone,
@@ -120,8 +117,7 @@ impl<P: Phase> Slot<P> {
             Slot::Reuse(reference) => {
                 Some(DomainExpression::Reference(Reference::Named(reference)))
             }
-            Slot::Constraint(SlotConstraint::Value(term)) => Some(*term),
-            Slot::Constraint(SlotConstraint::Truth { .. }) => None,
+            Slot::Constraint(term) => Some(*term),
         }
     }
 
@@ -136,18 +132,7 @@ impl<P: Phase> Slot<P> {
     /// The term a non-binding slot constrains its position with.
     pub fn constraint(&self) -> Option<&DomainExpression<P>> {
         match self {
-            Slot::Constraint(SlotConstraint::Value(term)) => Some(term),
-            Slot::Constraint(SlotConstraint::Truth { .. })
-            | Slot::Bind(_)
-            | Slot::Anon
-            | Slot::Reuse(_) => None,
-        }
-    }
-
-    /// The whole constraint this slot carries, crossing included.
-    pub fn constraint_spec(&self) -> Option<&SlotConstraint<P>> {
-        match self {
-            Slot::Constraint(constraint) => Some(constraint),
+            Slot::Constraint(term) => Some(term),
             Slot::Bind(_) | Slot::Anon | Slot::Reuse(_) => None,
         }
     }
@@ -163,7 +148,9 @@ impl<P: Phase> Slot<P> {
     /// The literal a ground slot constrains its position to.
     pub fn ground(&self) -> Option<&LiteralValue> {
         match self.constraint() {
-            Some(DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(value))) => Some(value),
+            Some(DomainExpression::Application(
+                crate::pipeline::asts::core::FunctionApplication::Ground(value),
+            )) => Some(value),
             _ => None,
         }
     }
@@ -244,12 +231,20 @@ mod tests {
 
     #[test]
     fn a_slot_that_names_nothing_refuses_the_binding_list() {
-        let anonymous =
-            Access::from_terms(vec![lvar("a"), DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Open(crate::pipeline::asts::core::DomainHole::Disregarded))]);
+        let anonymous = Access::from_terms(vec![
+            lvar("a"),
+            DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Open(
+                crate::pipeline::asts::core::DomainHole::Disregarded,
+            )),
+        ]);
         assert!(anonymous.binders().is_none());
         let ground = Access::from_terms(vec![
             lvar("a"),
-            DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::Number("30".into()),)),
+            DomainExpression::Application(
+                crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::Number(
+                    "30".into(),
+                )),
+            ),
         ]);
         assert!(ground.binders().is_none());
         assert!(ground
@@ -263,8 +258,14 @@ mod tests {
     fn classification_and_reconstruction_agree() {
         for term in [
             lvar("a"),
-            DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Open(crate::pipeline::asts::core::DomainHole::Disregarded)),
-            DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::Number("30".into()),)),
+            DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Open(
+                crate::pipeline::asts::core::DomainHole::Disregarded,
+            )),
+            DomainExpression::Application(
+                crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::Number(
+                    "30".into(),
+                )),
+            ),
         ] {
             assert_eq!(Slot::classify(term.clone()).term(), Some(term));
         }

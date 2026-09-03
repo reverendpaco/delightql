@@ -274,7 +274,6 @@ impl DqlHandleImpl {
     }
 
     /// Get shared access to the underlying system (crate-internal only).
-    #[allow(dead_code)]
     pub(crate) fn system(&self) -> &DelightQLSystem {
         &self.system
     }

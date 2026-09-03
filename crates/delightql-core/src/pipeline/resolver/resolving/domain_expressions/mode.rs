@@ -10,11 +10,7 @@
 //! same road and no width has a second semantics.
 
 use crate::error::{DelightQLError, Result};
-use crate::names::{Addressing, ColumnOrigin, Hint, ScopeOrigin, ValueFacts};
-use crate::pipeline::asts::core::{
-    AuthoredColumn, ColumnOccurrence, FactFunctionMode, FieldSelect, ModeWitness, QualifiedName,
-    Resolved, Unresolved,
-};
+use crate::pipeline::asts::core::{AuthoredColumn, ColumnOccurrence, FieldSelect, ModeWitness};
 use crate::pipeline::asts::{resolved as ast_resolved, unresolved as ast_unresolved};
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::resolution::registry::DeclaredMode;
@@ -42,18 +38,13 @@ pub(in crate::pipeline::resolver) fn resolve_mode_call(
     let reference = &application.call().callee;
     let name = reference.name_text();
     let namespace = reference.namespace_fq();
-    let scope = fold.config.resolution_namespace.clone();
-
-    let declared = if matches!(picked, Picked::Whole) && !fold.registry.consult.any_declared_mode()?
-    {
+    let declared = if matches!(picked, Picked::Whole) && !fold.core.consult.any_declared_mode()? {
         None
     } else {
-        fold.registry
-            .consult
-            .lookup_declared_mode(&name, namespace.as_deref(), scope.as_deref())?
+        crate::defuse::bound_use::use_declared_mode(fold, &name, namespace.as_deref())?
     };
 
-    let Some((entity, declaration)) = declared else {
+    let Some(mode_use) = declared else {
         return match picked {
             // An ordinary call. The pick is what makes a declaration
             // mandatory, and there is none here.
@@ -71,6 +62,8 @@ pub(in crate::pipeline::resolver) fn resolve_mode_call(
         };
     };
 
+    let declaration = mode_use.declaration.clone();
+    let entity_identity = mode_use.identity.clone();
     let arguments = application.call().arguments.scalar_members().len();
     if arguments != declaration.inputs.len() {
         return Err(DelightQLError::validation_error_categorized(
@@ -78,7 +71,11 @@ pub(in crate::pipeline::resolver) fn resolve_mode_call(
             format!(
                 "'{name}' declares {} input{}, and the call supplies {arguments}",
                 declaration.inputs.len(),
-                if declaration.inputs.len() == 1 { "" } else { "s" }
+                if declaration.inputs.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ),
             "a mode-compressed call supplies exactly the declared inputs, in order",
         ));
@@ -121,56 +118,19 @@ pub(in crate::pipeline::resolver) fn resolve_mode_call(
         }
     };
 
-    // The DECLARATION comes from the catalog; the ARMS come from the clause
-    // source, the same road every other body is read by. The two must agree
-    // about width, and a catalog that disagrees with the definition it was
-    // written from is a corruption, not a user error.
-    let group = crate::ddl::reconstruct::group(&entity.definition)?;
-    let Some(authored) = group.declared_mode() else {
-        return Err(DelightQLError::database_error(
-            "corrupt catalog: an entity declares a functional dependency and its stored \
-             definition is not a fact function",
-            name.to_string(),
-        ));
-    };
-    // THE TWO READINGS ARE ONE DECLARATION. The catalog chose the selected
-    // POSITION and the source supplies the expression at that position, so
-    // they must agree about every name, its stropping, its role and its
-    // order — equal widths under different names would select the wrong
-    // output while looking consistent.
-    if !declaration.agrees_with(
-        &authored.inputs.iter().cloned().collect::<Vec<_>>(),
-        &authored.outputs.iter().cloned().collect::<Vec<_>>(),
-    ) {
-        return Err(DelightQLError::database_error(
-            "corrupt catalog: the stored mode and the stored definition are not the same              declaration",
-            name.to_string(),
-        ));
-    }
-    let authored = authored.clone();
-
     let call = fold.resolve_standard_application(application)?;
-    // THE DECLARED HEADING IS A RELATION'S. Minting all of it — inputs then
-    // outputs — gives the output cells the occurrences they read and the
-    // pick the occurrence it publishes, from one heading rather than two.
-    let (inputs, outputs) = mint_heading(fold, &name, &declaration);
-    let mode = resolve_mode(fold, authored, &inputs)?;
+    // THE DECLARED ROWS ARE RELATIONS. The input row is what an output
+    // cell stands over and reads — declared and stood over in one lexical
+    // act; the output row is what a pick selects from.
+    let (input_row, inputs, outputs) = declare_rows(fold, &name, &declaration)?;
+    let mode = mode_use.resolve_arms(fold, input_row)?;
 
     Ok(Some(ast_resolved::FunctionApplication::FieldSelect(
         FieldSelect {
             application: call,
-            field: ColumnOccurrence {
-                column: outputs[selected],
-                explicit_qualifier: false,
-            },
+            field: ColumnOccurrence::engine(outputs[selected]),
             dependency: Box::new(ModeWitness {
-                entity: QualifiedName {
-                    namespace_path: crate::pipeline::asts::core::NamespacePath::from_fq_string(
-                        &entity.namespace,
-                    )
-                    .unwrap_or_else(|_| crate::pipeline::asts::core::NamespacePath::empty()),
-                    name: entity.name.clone(),
-                },
+                entity: entity_identity,
                 mode,
                 inputs,
                 selected,
@@ -179,92 +139,59 @@ pub(in crate::pipeline::resolver) fn resolve_mode_call(
     )))
 }
 
-/// The mode's output rows, resolved AGAINST THE DECLARED INPUTS AND NOTHING
-/// ELSE.
+/// THE DECLARED ROWS, DECLARED ONCE EACH: the input row and the output
+/// row, in declared order and under the declared spellings.
 ///
-/// An output cell's only binders are the inputs the head declared — there is
-/// no enclosing row in either face — so the caller's heading is taken away
-/// for the duration. Without that, a cell reading `a` would silently bind to
-/// a column of the row the call stands in, which is a different relation's
-/// value under the same name.
-fn resolve_mode(
-    fold: &mut ResolverFold,
-    mode: FactFunctionMode<Unresolved>,
-    inputs: &[crate::names::ColId],
-) -> Result<FactFunctionMode<Resolved>> {
-    use crate::pipeline::asts::core::FactFunctionArm;
-    use crate::pipeline::ast_transform::AstTransform;
-
-    let outer_available = std::mem::replace(&mut fold.available, inputs.to_vec());
-    let outer_local = std::mem::replace(&mut fold.local_available, inputs.to_vec());
-    let outer_qualifiers = std::mem::take(&mut fold.qualifier_scope);
-    fold.push_declared_scope();
-
-    let resolved = (|| {
-        let arms = mode.arms.try_map(|arm| -> Result<FactFunctionArm<Resolved>> {
-            Ok(FactFunctionArm {
-                inputs: arm.inputs,
-                outputs: arm.outputs.try_map(|value| fold.transform_domain(value))?,
-            })
-        })?;
-        let default = match mode.default {
-            Some(row) => Some(row.try_map(|value| fold.transform_domain(value))?),
-            None => None,
-        };
-        Ok(FactFunctionMode {
-            inputs: mode.inputs,
-            outputs: mode.outputs,
-            arms,
-            default,
-        })
-    })();
-
-    fold.pop_declared_scope();
-    fold.qualifier_scope = outer_qualifiers;
-    fold.local_available = outer_local;
-    fold.available = outer_available;
-    resolved
-}
-
-/// THE DECLARED RELATION, MINTED ONCE: inputs then outputs, in declared
-/// order and under the declared spellings.
-///
-/// The inputs are what an output cell reads; the outputs are what a pick
-/// selects from. Both are positions of ONE heading — the same heading the
-/// relational face publishes — so neither is a second answer to what this
-/// entity's columns are. Lowering reads the POSITION; nothing past here
-/// addresses a field by characters.
-fn mint_heading(
+/// The input row is the relation an output cell stands over and reads —
+/// born and stood over by the lexical authority's own act, from the
+/// declaration's spellings; the output row is what a pick selects from.
+/// Lowering reads the POSITION; nothing past here addresses a field by
+/// characters.
+fn declare_rows(
     fold: &mut ResolverFold,
     name: &str,
     declaration: &DeclaredMode,
-) -> (Vec<crate::names::ColId>, Vec<crate::names::ColId>) {
-    let identities = &fold.registry.identities;
+) -> Result<(
+    crate::pipeline::resolver::ResolvedRelation,
+    Vec<crate::relation::PortId>,
+    Vec<crate::relation::PortId>,
+)> {
+    let identities = &fold.core.identities;
     let hint = identities.intern(name, false);
-    let scope = identities.mint_scope(ScopeOrigin::AnonRelation, Hint::User(hint), None);
-    let mint = |position: usize, declared: &delightql_types::SqlIdentifier| {
-        let published = identities.intern(declared.as_str(), declared.is_stropped());
-        identities.mint_column(
-            scope,
-            ColumnOrigin::Bound {
-                position: position as u32,
-            },
-            Some(published),
-            Addressing::Published,
-            ValueFacts::default(),
-        )
+    let slots = |declared: &[delightql_types::SqlIdentifier]| -> Vec<_> {
+        declared
+            .iter()
+            .enumerate()
+            .map(
+                |(position, declared)| crate::relation::form::AnonymousSlot::Binder {
+                    position: position as u32,
+                    named: identities.intern(declared.as_str(), declared.is_stropped()),
+                    declared_type: None,
+                    shape: crate::names::ValueShape::Unknown,
+                },
+            )
+            .collect()
     };
-    let inputs: Vec<_> = declaration
-        .inputs
-        .iter()
-        .enumerate()
-        .map(|(position, declared)| mint(position, declared))
-        .collect();
-    let outputs: Vec<_> = declaration
-        .outputs
-        .iter()
-        .enumerate()
-        .map(|(position, declared)| mint(inputs.len() + position, declared))
-        .collect();
-    (inputs, outputs)
+    let input_slots = slots(&declaration.inputs);
+    let input_row = crate::pipeline::resolver::ResolvedRelation::declared_row(
+        crate::relation::form::AnonymousSpec {
+            shape: crate::relation::form::AnonymousShape::ArgumentRow,
+            slots: &input_slots,
+            answers_to: Some(hint),
+        },
+        identities,
+    )?;
+    let inputs = crate::relation::published_ports(identities, &input_row.semantic_relation())?;
+    let output_slots = slots(&declaration.outputs);
+    let output_row = identities
+        .authority()
+        .derive(crate::relation::RelForm::Anonymous(
+            crate::relation::form::AnonymousSpec {
+                shape: crate::relation::form::AnonymousShape::ArgumentRow,
+                slots: &output_slots,
+                answers_to: Some(hint),
+            },
+        ))?;
+    let outputs = crate::relation::published_ports(identities, &output_row)?;
+    Ok((input_row, inputs, outputs))
 }

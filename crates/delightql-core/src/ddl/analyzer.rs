@@ -31,7 +31,7 @@
 use crate::enums::EntityType;
 use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
 use crate::pipeline::asts::core::{
-    Comparison, Existence, FunctionApplication, MemberCorrelation, Membership,
+    Comparison, Existence, FunctionApplication, GroundForm, MemberCorrelation, Membership,
     RelationalMembership, SigmaApplication, ValueTemplatePart,
 };
 use crate::pipeline::asts::core::{NamedReference, Reference};
@@ -51,16 +51,11 @@ pub struct ExtractedReference {
 /// Extract all entity references from a full query (view body, may include CTEs)
 pub fn extract_references_from_query(query: &Query) -> Vec<ExtractedReference> {
     let mut refs = Vec::new();
-    for cfe in &query.cfes {
-        match &cfe.body {
-            crate::pipeline::asts::core::OutValue::Domain(value) => walk_domain(value, &mut refs),
-            crate::pipeline::asts::core::OutValue::Truth(crossing) => {
-                walk_boolean(crossing.truth(), &mut refs)
-            }
-        }
+    for cfe in query.cfes() {
+        walk_domain(&cfe.body, &mut refs);
     }
-    for cte in &query.ctes {
-        walk_relational(&cte.expression, &mut refs);
+    for cte in query.ctes() {
+        walk_relational(cte.body(), &mut refs);
     }
     walk_relational(&query.body, &mut refs);
     refs
@@ -85,11 +80,11 @@ pub fn extract_references_from_domain(expr: &DomainExpression) -> Vec<ExtractedR
 
 #[stacksafe::stacksafe]
 fn walk_relational(expr: &Chain, refs: &mut Vec<ExtractedReference>) {
-    match &expr.head {
-        Grelex::Reference(rel) => walk_relation(rel, refs),
-        Grelex::Literal(anon) => walk_anon_table(&anon.table, refs),
+    match expr.head().form() {
+        GroundForm::Reference(rel) => walk_relation(rel, refs),
+        GroundForm::Literal(anon) => walk_anon_table(&anon.table, refs),
     }
-    for continuation in &expr.continuations {
+    for continuation in expr.forms() {
         match continuation {
             Continuation::Access { access, .. } => walk_access(access, refs),
             Continuation::Restrict { condition, .. } => walk_boolean(condition, refs),
@@ -114,7 +109,7 @@ fn walk_relational(expr: &Chain, refs: &mut Vec<ExtractedReference>) {
             Continuation::BagOp { arm, .. } => walk_relational(arm, refs),
             Continuation::Pipe { operator, .. } => walk_unary_operator(operator, refs),
             Continuation::Structural(step) => match &step.form {
-                crate::pipeline::asts::core::StructuralForm::Ordering { specs } => {
+                crate::pipeline::asts::core::StructuralForm::Ordering { specs, .. } => {
                     for spec in specs {
                         walk_domain(&spec.column, refs);
                     }
@@ -169,7 +164,10 @@ fn walk_relation(rel: &Relation, refs: &mut Vec<ExtractedReference>) {
         // spelling participates, so it contributes no reference a DDL body
         // could depend on.
         Relation::Ground {
-            mention: GroundMention::Plan { .. },
+            mention:
+                GroundMention::Scratch { .. }
+                | GroundMention::Receipt { .. }
+                | GroundMention::Structural { .. },
             ..
         } => {}
         Relation::FunctorCall { call, .. } => {
@@ -180,8 +178,8 @@ fn walk_relation(rel: &Relation, refs: &mut Vec<ExtractedReference>) {
         }
         Relation::ConsultedView { body, .. } => {
             // Recursively extract references from the consulted view body
-            for cte in &body.ctes {
-                walk_relational(&cte.expression, refs);
+            for cte in body.ctes() {
+                walk_relational(cte.body(), refs);
             }
             walk_relational(&body.body, refs);
         }
@@ -253,24 +251,12 @@ fn walk_inner_relation_pattern(pattern: &InnerRelationPattern, refs: &mut Vec<Ex
     }
 }
 
-/// What an arm COMPUTES: a value, or the licensed crossing.
-fn walk_out_value(
-    value: &crate::pipeline::asts::core::OutValue,
-    refs: &mut Vec<ExtractedReference>,
-) {
-    match value {
-        crate::pipeline::asts::core::OutValue::Domain(domain) => walk_domain(domain, refs),
-        crate::pipeline::asts::core::OutValue::Truth(crossing) => {
-            walk_boolean(crossing.truth(), refs)
-        }
-    }
-}
-
 fn walk_domain(expr: &DomainExpression, refs: &mut Vec<ExtractedReference>) {
     match expr {
         DomainExpression::Application(func) => walk_function(func, refs),
         DomainExpression::Reference(Reference::Named(NamedReference(_)))
-        | DomainExpression::Reference(Reference::Ordinal(_)) => {}
+        | DomainExpression::Reference(Reference::Ordinal(_))
+        | DomainExpression::Reference(Reference::Physical(_)) => {}
     }
 }
 
@@ -286,7 +272,7 @@ fn walk_scalar_relation(
             apparent_type: EntityType::DbPermanentTable.as_i32(),
         });
     }
-    walk_relational(&relation.body().body, refs);
+    walk_relational(relation.body().body(), refs);
 }
 
 fn walk_function(func: &FunctionApplication, refs: &mut Vec<ExtractedReference>) {
@@ -318,7 +304,7 @@ fn walk_function(func: &FunctionApplication, refs: &mut Vec<ExtractedReference>)
                 if let Some(guard) = &arm.guard {
                     walk_boolean(guard, refs);
                 }
-                walk_out_value(&arm.result, refs);
+                walk_domain(&arm.result, refs);
             }
         }
         crate::pipeline::asts::core::FunctionApplication::Case(case) => walk_case(case, refs),
@@ -328,6 +314,9 @@ fn walk_function(func: &FunctionApplication, refs: &mut Vec<ExtractedReference>)
         // The path is a spec — it names no relation and no column.
         crate::pipeline::asts::core::FunctionApplication::JsonAccess(access) => {
             walk_domain(&access.source, refs)
+        }
+        crate::pipeline::asts::core::FunctionApplication::Crossed(crossing) => {
+            walk_boolean(crossing.truth(), refs)
         }
     }
 }
@@ -510,15 +499,23 @@ fn walk_enclyph(
                     RecordMember::Keyed { value, .. } => walk_domain(value, refs),
                     RecordMember::Induced { value, .. } => walk_enclyph(value, refs),
                     // A self-keyed member and a spread both address columns
-                    // of the operand, not a declared entity.
-                    RecordMember::SelfKeyed(_) | RecordMember::Spread(_) => {}
+                    // of the operand, not a declared entity; a metadata
+                    // member's keys and targets do too.
+                    RecordMember::SelfKeyed(_)
+                    | RecordMember::Spread(_)
+                    | RecordMember::Metadata { .. } => {}
                 }
             }
         }
         Enclyph::EmptyRecord(empty) => match *empty {},
         Enclyph::Tuple(tuple) => {
             for element in tuple.elements.iter() {
-                walk_domain(element, refs);
+                match element {
+                    crate::pipeline::asts::core::TupleElement::Value(element) => {
+                        walk_domain(element, refs)
+                    }
+                    crate::pipeline::asts::core::TupleElement::Spread(_) => {}
+                }
             }
         }
     }
@@ -538,7 +535,7 @@ fn walk_metadata_group(
 /// A publication item references what its value references. A spread names
 /// columns of the operand rather than referring to a declared entity.
 fn walk_out_item(item: &crate::pipeline::asts::core::OutItem, refs: &mut Vec<ExtractedReference>) {
-    if let Some(expr) = item.domain_value() {
+    if let Some(expr) = item.value() {
         walk_domain(expr, refs);
     }
 }
@@ -627,9 +624,7 @@ fn walk_unary_operator(op: &PipeOp, refs: &mut Vec<ExtractedReference>) {
             ..
         } => {
             for item in transformations {
-                if let Some(value) = item.expr.domain() {
-                    walk_domain(value, refs);
-                }
+                walk_domain(&item.expr, refs);
             }
         }
         PipeOp::EmbedMapCover(EmbedMapCover {
@@ -657,7 +652,7 @@ mod tests {
     /// The clause a stored definition reconstructs to, by body position.
     fn scalar(source: &str) -> crate::pipeline::asts::unresolved::DomainExpression {
         match reconstruct::clauses(source).unwrap().remove(0).body {
-            DdlBody::Scalar(expr) => expr.into_domain().expect("a value body"),
+            DdlBody::Scalar(expr) => expr,
             other => panic!("expected a value body, got {other:?}"),
         }
     }

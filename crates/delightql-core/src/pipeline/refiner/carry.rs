@@ -23,14 +23,11 @@ pub(crate) struct CarryToRefined;
 impl AstTransform<resolved::Resolved, refined::Refined> for CarryToRefined {
     fn fold_correlation_arm(
         &mut self,
-        arm: crate::names::ScopeId,
-    ) -> crate::error::Result<crate::names::ScopeId> {
+        arm: crate::relation::SemanticRelation,
+    ) -> crate::error::Result<crate::relation::SemanticRelation> {
         Ok(arm)
     }
 
-    fn fold_ho_landing(&mut self, landing: ()) -> crate::error::Result<()> {
-        Ok(landing)
-    }
 
     crate::pipeline::ast_transform::uninhabited_payload_folds!(
         fold_column_ordinal,
@@ -40,9 +37,13 @@ impl AstTransform<resolved::Resolved, refined::Refined> for CarryToRefined {
     );
     fn fold_open_leaf(
         &mut self,
-        leaf: crate::pipeline::asts::vocabulary::Never,
+        _: crate::pipeline::asts::core::FormalHole,
     ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-        match leaf {}
+        Err(crate::error::DelightQLError::validation_error_categorized(
+            "value/open/unapplied",
+            "a composition input stands outside any callable applying it",
+            "the position that applies an open body spends its slot",
+        ))
     }
 
     fn fold_cover_callable(&mut self, callable: ()) -> crate::error::Result<()> {
@@ -56,18 +57,14 @@ impl AstTransform<resolved::Resolved, refined::Refined> for CarryToRefined {
         Ok(target)
     }
     crate::pipeline::ast_transform::decided_payload_travels_forward!(
-        fold_scope(crate::names::ScopeId),
-        fold_consulted(crate::names::ScopeId),
-        fold_recursion(crate::pipeline::asts::vocabulary::RecursionState),
-        fold_cte_subject(crate::names::ScopeId),
-        fold_cte_authority(()),
-        fold_output(Option<crate::names::ColId>),
-        fold_scalar_output(crate::names::ColId),
+        fold_scope(crate::relation::SemanticRelation),
+        fold_output(crate::relation::PortId),
+        fold_scalar_output(crate::relation::PortId),
         fold_destructure(Vec<crate::pipeline::asts::core::DestructureMapping>),
         fold_drill(crate::pipeline::asts::core::operators::BoundDrill),
         fold_entity(crate::names::CallableId),
         fold_col(crate::pipeline::asts::core::ColumnOccurrence),
-        fold_binder(crate::names::ColId),
+        fold_binder(crate::relation::PortId),
     );
 
     /// A comma with no decided orientation is an inner join, and the refined
@@ -82,12 +79,10 @@ impl AstTransform<resolved::Resolved, refined::Refined> for CarryToRefined {
                 rhs,
                 correlation,
                 join_type,
-                cpr_schema,
             } => resolved::Continuation::Member {
                 rhs,
                 correlation,
                 join_type: Some(join_type.unwrap_or(JoinType::Inner)),
-                cpr_schema,
             },
             other => other,
         };

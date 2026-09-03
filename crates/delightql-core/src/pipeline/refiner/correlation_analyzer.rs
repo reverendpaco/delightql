@@ -31,11 +31,11 @@ use crate::pipeline::asts::resolved;
 #[stacksafe::stacksafe]
 pub fn detect_correlation_filters_in_scope(
     expr: &resolved::Chain,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<Vec<resolved::TruthExpression>> {
     let mut filters = Vec::new();
 
-    for continuation in &expr.continuations {
+    for continuation in expr.forms() {
         match continuation {
             resolved::Continuation::Restrict { condition, .. } => {
                 // Clone for metadata, but the filter stays in the chain.
@@ -75,7 +75,7 @@ pub fn detect_correlation_filters_in_scope(
 /// `user_id = u.id` has one qualifier (`u`) + an unqualified lvar → correlation.
 pub fn is_correlation_predicate(
     pred: &resolved::TruthExpression,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> bool {
     let mut scopes = HashSet::new();
     let mut has_unqualified_lvar = false;
@@ -96,9 +96,9 @@ pub fn is_correlation_predicate(
 /// mispartitioned row_number()).
 pub fn prove_partition_key(
     filter: &resolved::TruthExpression,
-    inner_scope: crate::names::ScopeId,
-    identities: &crate::names::Registry,
-) -> Result<crate::names::ColId> {
+    inner: crate::relation::SemanticRelation,
+    identities: &crate::relation::Planning,
+) -> Result<crate::relation::PortId> {
     use crate::error::DelightQLError;
 
     let resolved::TruthExpression::Comparison(Comparison { left, right, .. }) = filter else {
@@ -108,8 +108,8 @@ pub fn prove_partition_key(
     let topn_hint = "join normally and rank explicitly: ... |> (..., row_number:(<~ %(outer identity), #(ordering)) as rnk), rnk <= N";
 
     let (key, flank) = match (
-        interior_key_column(left, inner_scope, identities),
-        interior_key_column(right, inner_scope, identities),
+        interior_key_column(left, inner, identities),
+        interior_key_column(right, inner, identities),
     ) {
         (Some(key), None) => (key, right),
         (None, Some(key)) => (key, left),
@@ -129,7 +129,7 @@ pub fn prove_partition_key(
         }
     };
 
-    if !provably_outer_only(flank, inner_scope, identities) {
+    if !provably_outer_only(flank, inner, identities) {
         return Err(DelightQLError::validation_error_categorized(
             "interior/topn/unprovable_partition",
             "interior top-N requires the non-key side of each correlation equality to reference only the outer scope: an interior reference there narrows the candidate set within a partition group, and the pre-ranked lowering would rank rows the join predicate then discards".to_string(),
@@ -147,13 +147,16 @@ pub fn prove_partition_key(
 /// (functions, parentheses) is not directly representable: None.
 fn interior_key_column(
     expr: &resolved::DomainExpression,
-    inner_scope: crate::names::ScopeId,
-    identities: &crate::names::Registry,
-) -> Option<crate::names::ColId> {
+    inner: crate::relation::SemanticRelation,
+    identities: &crate::relation::Planning,
+) -> Option<crate::relation::PortId> {
     match expr {
         resolved::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { column, .. },
-        ))) if identities.contains_scope(inner_scope, identities.scope_of(*column)) => {
+        ))) if crate::relation::owner(identities, *column).is_ok_and(|owner| {
+            crate::relation::contains_scope(identities, &inner, owner).unwrap_or(false)
+        }) =>
+        {
             Some(*column)
         }
         _ => None,
@@ -168,21 +171,27 @@ fn interior_key_column(
 /// windows, subqueries, ...) is unproven and answers false.
 fn provably_outer_only(
     expr: &resolved::DomainExpression,
-    inner_scope: crate::names::ScopeId,
-    identities: &crate::names::Registry,
+    inner: crate::relation::SemanticRelation,
+    identities: &crate::relation::Planning,
 ) -> bool {
+    // A relation beneath the value is its own scope, whose references this
+    // walk cannot enumerate: unproven, so false.
+    if expr.nests_relation() {
+        return false;
+    }
     match expr {
         resolved::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { column, .. },
-        ))) => !identities.contains_scope(inner_scope, identities.scope_of(*column)),
+        ))) => crate::relation::owner(identities, *column).is_ok_and(|owner| {
+            !crate::relation::contains_scope(identities, &inner, owner).unwrap_or(true)
+        }),
         resolved::DomainExpression::Application(resolved::FunctionApplication::Ground(_)) => true,
         resolved::DomainExpression::Application(func) => match func {
             resolved::FunctionApplication::Standard(application) => {
                 let arguments = &application.call().arguments;
-                arguments.relations().next().is_none()
-                    && arguments
-                        .value_domains()
-                        .all(|expr| provably_outer_only(expr, inner_scope, identities))
+                arguments
+                    .value_domains()
+                    .all(|expr| provably_outer_only(expr, inner, identities))
                     && arguments
                         .scalar_members()
                         .iter()
@@ -196,11 +205,17 @@ fn provably_outer_only(
             ) => tuple
                 .elements
                 .iter()
-                .all(|element| provably_outer_only(element, inner_scope, identities)),
+                .all(|element| provably_outer_only(element.value(), inner, identities)),
             resolved::FunctionApplication::Infix(infix) => {
-                provably_outer_only(&infix.left, inner_scope, identities)
-                    && provably_outer_only(&infix.right, inner_scope, identities)
+                provably_outer_only(&infix.left, inner, identities)
+                    && provably_outer_only(&infix.right, inner, identities)
             }
+            // A crossed truth is outer-only when every value it reads is.
+            resolved::FunctionApplication::Crossed(crossing) => crossing
+                .truth()
+                .scalar_operands()
+                .into_iter()
+                .all(|operand| provably_outer_only(operand, inner, identities)),
             _ => false,
         },
         _ => false,
@@ -210,16 +225,16 @@ fn provably_outer_only(
 /// Extract correlation column names from correlation filters
 pub fn extract_correlation_columns(
     filters: &[resolved::TruthExpression],
-    inner_scope: crate::names::ScopeId,
-    identities: &crate::names::Registry,
-) -> Vec<crate::names::ColId> {
+    inner: crate::relation::SemanticRelation,
+    identities: &crate::relation::Planning,
+) -> Vec<crate::relation::PortId> {
     let mut columns = vec![];
 
     for filter in filters {
         if let resolved::TruthExpression::Comparison(Comparison { left, right, .. }) = filter {
-            if let Some(col) = interior_key_column(left, inner_scope, identities) {
+            if let Some(col) = interior_key_column(left, inner, identities) {
                 columns.push(col);
-            } else if let Some(col) = interior_key_column(right, inner_scope, identities) {
+            } else if let Some(col) = interior_key_column(right, inner, identities) {
                 columns.push(col);
             }
         }
@@ -236,7 +251,7 @@ pub fn extract_correlation_columns(
 fn collect_qualifiers(
     expr: &resolved::TruthExpression,
     out: &mut HashSet<crate::names::ScopeId>,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) {
     let mut _unused = false;
     collect_qualifiers_and_unqualified(expr, out, &mut _unused, identities);
@@ -247,7 +262,7 @@ fn collect_qualifiers_and_unqualified(
     expr: &resolved::TruthExpression,
     out: &mut HashSet<crate::names::ScopeId>,
     has_unqualified: &mut bool,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) {
     match expr {
         resolved::TruthExpression::Comparison(Comparison { left, right, .. }) => {
@@ -295,7 +310,7 @@ fn collect_qualifiers_and_unqualified(
 fn collect_domain_qualifiers(
     expr: &resolved::DomainExpression,
     out: &mut HashSet<crate::names::ScopeId>,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) {
     let mut _unused = false;
     collect_domain_qualifiers_and_unqualified(expr, out, &mut _unused, identities);
@@ -306,7 +321,7 @@ fn collect_domain_qualifiers_and_unqualified(
     expr: &resolved::DomainExpression,
     out: &mut HashSet<crate::names::ScopeId>,
     has_unqualified: &mut bool,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) {
     match expr {
         resolved::DomainExpression::Reference(Reference::Named(NamedReference(
@@ -316,11 +331,14 @@ fn collect_domain_qualifiers_and_unqualified(
                 ..
             },
         ))) => {
-            out.insert(identities.scope_of(*column));
+            if let Ok(owner) = crate::relation::owner(identities, *column) {
+                out.insert(owner);
+            }
             if !explicit_qualifier {
                 *has_unqualified = true;
             }
         }
+        resolved::DomainExpression::Reference(Reference::Physical(_)) => {}
         resolved::DomainExpression::Application(func) => match func {
             resolved::FunctionApplication::Ground(_) | resolved::FunctionApplication::Open(_) => {}
             resolved::FunctionApplication::Standard(application) => {
@@ -354,7 +372,7 @@ fn collect_domain_qualifiers_and_unqualified(
             ) => {
                 for arg in tuple.elements.iter() {
                     collect_domain_qualifiers_and_unqualified(
-                        arg,
+                        arg.value(),
                         out,
                         has_unqualified,
                         identities,
@@ -380,11 +398,22 @@ fn collect_domain_qualifiers_and_unqualified(
                     if let Some(guard) = &arm.guard {
                         collect_qualifiers(guard, out, identities);
                     }
-                    collect_result_qualifiers(&arm.result, out, identities);
+                    collect_domain_qualifiers(&arm.result, out, identities);
                 }
             }
             resolved::FunctionApplication::Case(case) => {
                 collect_case_qualifiers(case, out, identities)
+            }
+            // THE CROSSING IS DESCENDED ONCE, as a truth: a correlated
+            // existence or membership read as a value carries the same
+            // qualifiers it carries in truth position.
+            resolved::FunctionApplication::Crossed(crossing) => {
+                collect_qualifiers_and_unqualified(
+                    crossing.truth(),
+                    out,
+                    has_unqualified,
+                    identities,
+                );
             }
             // A drill reads its source at THIS level: `u.meta:{.k}` carries
             // the correlation qualifier `u`, and skipping it fails OPEN — a
@@ -429,25 +458,10 @@ fn collect_domain_qualifiers_and_unqualified(
     }
 }
 
-/// Collect qualifier names from a CASE arm
-/// What an arm computes: a value, or the licensed crossing.
-fn collect_result_qualifiers(
-    result: &resolved::OutValue,
-    out: &mut HashSet<crate::names::ScopeId>,
-    identities: &crate::names::Registry,
-) {
-    match result {
-        resolved::OutValue::Domain(domain) => collect_domain_qualifiers(domain, out, identities),
-        resolved::OutValue::Truth(crossing) => {
-            collect_qualifiers(crossing.truth(), out, identities)
-        }
-    }
-}
-
 fn collect_case_qualifiers(
     case: &resolved::CaseExpression,
     out: &mut HashSet<crate::names::ScopeId>,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) {
     let default = match case {
         resolved::CaseExpression::Anchored {

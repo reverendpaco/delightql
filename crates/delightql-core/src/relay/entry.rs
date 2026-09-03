@@ -38,7 +38,6 @@ use crate::pipeline::asts::core::literals::LiteralValue;
 use crate::pipeline::asts::core::DomainExpression;
 use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::effects::DirectiveDescriptor;
-use crate::pipeline::asts::effects::{directive_category, DirectiveCategory};
 use crate::pipeline::compiled_query::CompiledPlan;
 use crate::pipeline::effect_transformer;
 
@@ -63,8 +62,8 @@ pub(super) enum EffectEntry {
     /// effect body; the run's value is the directive's receipt.
     AdhocBody {
         query: Box<Query>,
-        /// Statement annotations ride the typed program.
-        assertions: Vec<crate::pipeline::asts::core::queries::AssertionSpec>,
+        danger_specs: Vec<crate::pipeline::asts::unresolved::DangerSpec>,
+        ddl_blocks: Vec<crate::pipeline::asts::unresolved::InlineDdlSpec>,
     },
 }
 
@@ -82,31 +81,33 @@ pub(super) fn classify_effect_entry(
     goal: crate::pipeline::normalize::Goal,
     allow_adhoc: bool,
 ) -> std::result::Result<EffectEntry, crate::pipeline::normalize::Goal> {
-    // Semantic routing: assertions and emits ride the typed program as head
-    // steps — an annotated statement chooses the SAME execution generation as
-    // its unannotated twin. Danger/option overrides and inline DDL blocks are
-    // compile-mode configuration and conservatively keep today's path.
-    if !goal.declared.dangers.is_empty()
-        || !goal.declared.options.is_empty()
-        || !goal.declared.ddl_blocks.is_empty()
-    {
+    // Danger annotations are query-local refinement policy and travel into the
+    // typed plan. Option overrides and inline DDL blocks still require the
+    // ordinary compiler's broader configuration surface.
+    if !goal.declared.options.is_empty() {
         return Err(goal);
     }
-    let crate::pipeline::normalize::Goal { query, declared } = goal;
-    let assertions = declared.assertions.clone();
+    let crate::pipeline::normalize::Goal {
+        query,
+        declared,
+        category,
+        spelling,
+    } = goal;
     match classify_query(query.clone()) {
         Some(EffectEntry::AdhocBody { query: body, .. }) if allow_adhoc => {
             Ok(EffectEntry::AdhocBody {
                 query: body,
-                assertions,
+                danger_specs: declared.dangers,
+                ddl_blocks: declared.ddl_blocks,
             })
         }
-        // The run/entry forms take no statement annotations today; an
-        // annotated run! keeps today's path rather than dropping them.
-        Some(other) if assertions.is_empty() && !matches!(other, EffectEntry::AdhocBody { .. }) => {
-            Ok(other)
-        }
-        _ => Err(crate::pipeline::normalize::Goal { query, declared }),
+        Some(other) if !matches!(other, EffectEntry::AdhocBody { .. }) => Ok(other),
+        _ => Err(crate::pipeline::normalize::Goal {
+            query,
+            declared,
+            category,
+            spelling,
+        }),
     }
 }
 
@@ -125,19 +126,24 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
     // execute (laziness). The body is still this road's, because the
     // binding is.
     //
-    // A CTE list with no effect mark in it stays on today's path: those
-    // bindings name pure expressions, nothing about them is a demand, and
-    // the ordinary pipeline is where they already compile.
-    if query.ctes.iter().any(|cte| cte.subject.declares_effect()) {
+    // A CTE list with no effect mark in it does not decide the road: those
+    // bindings are pure, but a directive terminal in the body still makes
+    // the complete statement an ad-hoc effect body.
+    if query
+        .ctes()
+        .iter()
+        .any(|cte| cte.subject().declares_effect())
+    {
         return Some(EffectEntry::AdhocBody {
             query: Box::new(query),
-            assertions: Vec::new(),
+            danger_specs: Vec::new(),
+            ddl_blocks: Vec::new(),
         });
     }
-    if !query.is_bare() {
-        // Binding-carrying shapes with no effect mark stay on today's path.
-        return None;
-    }
+    // Pure bindings do not themselves demand effects, but they do not erase
+    // a directive demanded by the statement body either. Tail classification
+    // below wraps the complete query, including those bindings, when the body
+    // is a descriptor-declared ad-hoc terminal.
     let expr = &query.body;
     // Descend through PURE postfix operators (drills, narrows,
     // projections — e.g. the `!>` normalization or an explicit
@@ -152,19 +158,22 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
         .unwrap_or(crate::pipeline::asts::core::Access::Unasked);
     let mut probe = expr.steps();
     loop {
-        match probe.split_last() {
+        match probe.split_last().map(|(step, rest)| (step.form(), rest)) {
             // The structural forms — ordering, reposition, meta, the
             // witnesses, drill, narrowing — and the pure pipe operators are
             // the postfix steps this descent reads through: the
             // classification is by the expression's directive TAIL, not its
             // outermost step. Named by their exact variants — the pipe
             // stage, and the structural step that is one BY TYPE — never by
-            // a run-membership protocol. An access is a boundary here as it
-            // always was — a receipt access stands between the descent and
-            // the call that owns it.
+            // a run-membership protocol. An access step past the head's own
+            // read — `… as u(a, b)` patterning the completed receipt — is a
+            // consumer of that receipt exactly as a pipe is, and the descent
+            // reads through it; the receipt access itself is the head's and
+            // never stands among these steps.
             Some((
                 crate::pipeline::asts::core::Continuation::Pipe { .. }
-                | crate::pipeline::asts::core::Continuation::Structural(_),
+                | crate::pipeline::asts::core::Continuation::Structural(_)
+                | crate::pipeline::asts::core::Continuation::Access { .. },
                 prefix,
             )) => probe = prefix,
             _ => break,
@@ -178,9 +187,10 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
         // run!/run_namespace! entities refuse with their whole-statement
         // policy until receipt access lands more generally.
         None => {
-            let crate::pipeline::asts::core::Grelex::Reference(Relation::FunctorCall {
-                call, ..
-            }) = &expr.head
+            let crate::pipeline::asts::core::GroundForm::Reference(Relation::FunctorCall {
+                call,
+                ..
+            }) = expr.head().form()
             else {
                 return None;
             };
@@ -190,11 +200,11 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
             // exact-arity receipt binding; any other
             // spec falls through to the executor's refusal.
             let reference = Some(&call.call().callee)?;
-            let name = reference.name_text();
             if adhoc_statement_call(call.call()) {
                 return Some(EffectEntry::AdhocBody {
                     query: Box::new(query),
-                    assertions: Vec::new(),
+                    danger_specs: Vec::new(),
+                    ddl_blocks: Vec::new(),
                 });
             }
             let access = &head_access;
@@ -217,22 +227,25 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
                 })
             };
             let access = run_access?;
-            match name.as_str() {
-                "run_namespace!" => {
+            match crate::pipeline::asts::effects::kind_for_reference(reference) {
+                Some(crate::pipeline::asts::effects::DirectiveKind::RunNamespace) => {
                     single_argument(&arguments).map(|namespace| EffectEntry::RunNamespace {
                         namespace,
                         access: access.clone(),
                     })
                 }
-                "run!" => single_argument(&arguments).map(|path| EffectEntry::RunFile {
-                    path,
-                    access: access.clone(),
-                }),
+                Some(crate::pipeline::asts::effects::DirectiveKind::Run) => {
+                    single_argument(&arguments).map(|path| EffectEntry::RunFile {
+                        path,
+                        access: access.clone(),
+                    })
+                }
                 // `cli::repl.set_prompt!("✅")(*)` arrives here. See the
                 // matching arm above for why it is a run.
-                name if user_directive(name) => Some(EffectEntry::AdhocBody {
+                None if user_directive(reference) => Some(EffectEntry::AdhocBody {
                     query: Box::new(query),
-                    assertions: Vec::new(),
+                    danger_specs: Vec::new(),
+                    ddl_blocks: Vec::new(),
                 }),
                 _ => None,
             }
@@ -254,28 +267,18 @@ fn classify_query(query: Query) -> Option<EffectEntry> {
 /// authority described it completely, and changing a realization would leave
 /// the old routing live.
 fn adhoc_statement_call(call: &crate::pipeline::asts::core::FunctorCall) -> bool {
-    crate::pipeline::asts::effects::descriptor(&call.callee.name_text())
+    crate::pipeline::asts::effects::descriptor_for_reference(&call.callee)
         .is_some_and(DirectiveDescriptor::is_adhoc_statement_terminal)
 }
 
 /// Is this a user directive — an effect rule rather than a prelude entity?
 ///
-/// Asked of the descriptor table rather than matched against a list of names.
-/// Thirty of the thirty-two descriptors are `std::prelude`, so "absent from the
-/// table" and "not a registered prelude entity" are the same statement, and
-/// `directive_category` already returns `User` for the miss. A hand-kept list
-/// here would be a second copy of that table, checked by nothing — the arms
-/// above grew to six names before anyone noticed the seventh could not be
-/// added.
-///
-/// Naming a rule that resolves to nothing still refuses; it refuses in the
-/// executor, where the registry can say so, instead of here where it cannot.
-fn user_directive(name: &str) -> bool {
-    // THE `!` IS PART OF THE NAME. Without it the reference names a PURE
-    // entity — a view, a bin relation — and "absent from the descriptor
-    // table" says nothing about it. A pure call is not a run, and routing one
-    // here takes it off the road where its own executor lives.
-    name.ends_with('!') && directive_category(name) == DirectiveCategory::User
+/// Asked of the complete-reference authority. A wrong qualifier selects no
+/// built-in; entity-backed names stay on the entity road solely so its
+/// visibility teaching can name the true identity, while other misses are
+/// ordinary qualified effect-rule references.
+fn user_directive(reference: &crate::pipeline::asts::vocabulary::Ref) -> bool {
+    crate::pipeline::asts::effects::is_user_effect_reference(reference)
 }
 
 /// The single argument of a run form: a bare/`::`-qualified name (an Lvar
@@ -374,12 +377,21 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     Some(names) => self.bind_run_receipt(term, "run!", "path", &path, &names),
                 }
             }
-            EffectEntry::AdhocBody { query, assertions } => {
-                match effect_transformer::compile_query_plan_annotated(
+            EffectEntry::AdhocBody {
+                query,
+                danger_specs,
+                ddl_blocks,
+            } => {
+                if let Err(error) =
+                    crate::pipeline::inline_ddl::register_prompt_blocks(ddl_blocks, self.system)
+                {
+                    return error_term(&error);
+                }
+                match effect_transformer::compile_query_plan(
                     self.system,
                     &query,
                     None,
-                    &assertions,
+                    &danger_specs,
                 ) {
                     Ok(plan) => self.play_plan(&plan),
                     Err(e) => error_term(&e),
@@ -689,9 +701,13 @@ mod tests {
         );
 
         for name in terminals {
-            // Every one of them names WHERE the effect lands as an ordinary
-            // relation designator, so one authored shape reaches them all.
-            let dql = format!("orders(*) |> {name}!(target(*))(*)");
+            let dql = match name {
+                "abort" => "orders(*) |> abort!(\"runtime/assertion\", \"test\")(*)".to_string(),
+                "assert" => "has_rows(T(*))(*) : T(*)\n\
+                             orders(*) |> assert!(has_rows(*), \"test\")(*)"
+                    .to_string(),
+                _ => format!("orders(*) |> {name}!(target(*))(*)"),
+            };
             assert!(
                 matches!(
                     classify_effect_entry(read_goal(&dql), true),
@@ -700,6 +716,15 @@ mod tests {
                 "expected AdhocBody for {dql:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_pure_cte_does_not_hide_the_bodys_adhoc_terminal() {
+        let dql = "adults(*) : users(*), age > 30\nadults(*) |> table!(a2)(*)";
+        assert!(matches!(
+            classify_effect_entry(read_goal(dql), true),
+            Ok(EffectEntry::AdhocBody { .. })
+        ));
     }
 
     /// The policy's two near misses, which a name list got right only by
@@ -731,7 +756,7 @@ mod tests {
             "mount!(\"db.sqlite\", \"main\")(*)",
             "users(*), region = \"EU\"",
             // imprint! keeps its own existing execution path
-            "users(*) |> imprint!(t)(*)",
+            "users(*) |> imprint!(\"lib::t\", \"main\")(*)",
         ] {
             assert!(
                 classify_effect_entry(read_goal(dql), true).is_err(),
@@ -742,24 +767,14 @@ mod tests {
     }
 
     #[test]
-    fn annotated_statements_ride_the_typed_program() {
-        // Semantic routing: an assertion-carrying DML
-        // classifies — the annotation rides the typed program as a head
-        // step, so wrapped and unwrapped demands choose the SAME
-        // execution generation (the acceptance clause). The old
-        // conservative bailout is gone.
-        let dql =
-            "orders(*) |> insert!(t(*))(*) (~~assert ~> count:(*) as c, c = 1 |> exists(*) ~~)";
-        match classify_effect_entry(read_goal(dql), true) {
-            Ok(EffectEntry::AdhocBody { assertions, .. }) => {
-                assert_eq!(assertions.len(), 1, "the assertion spec is threaded");
-            }
-            other => panic!("expected AdhocBody with the assertion, got {other:?}"),
-        }
-        // Danger/option overrides are compile-mode configuration and
-        // conservatively keep today's path.
+    fn query_local_danger_annotations_ride_the_typed_path() {
         let dql = "orders(*) |> insert!(t(*))(*) (~~danger://cardinality/cartesian ~~)";
-        assert!(classify_effect_entry(read_goal(dql), true).is_err());
+        match classify_effect_entry(read_goal(dql), true) {
+            Ok(EffectEntry::AdhocBody { danger_specs, .. }) => {
+                assert_eq!(danger_specs.len(), 1);
+            }
+            _ => panic!("expected annotated AdhocBody"),
+        }
     }
 
     #[test]
@@ -785,8 +800,8 @@ mod tests {
     /// One statement, read the way the relay reads it.
     fn read_goal(dql: &str) -> crate::pipeline::normalize::Goal {
         let tree = crate::pipeline::parse::prompt(dql).expect("the statement parses");
-        let registry = std::rc::Rc::new(crate::names::Registry::new(&[]));
-        let normalized = crate::pipeline::normalize::definition_file(&tree, registry)
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+        let normalized = crate::pipeline::normalize::definition_file(&tree, registry.names())
             .expect("the statement normalizes");
         crate::pipeline::one_goal(normalized).expect("one statement, one goal")
     }

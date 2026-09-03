@@ -82,7 +82,6 @@ module.exports = grammar({
     $.pipe_operation,
     $.pipe_structural,
     $.postfix_operator,
-    $.stage_boundary,
     $.reduction_item,
     $.selector_item,
     $.domain_expression,
@@ -121,10 +120,10 @@ module.exports = grammar({
     $.rename_source,
     $.group_key,
     $.heading_reference,
-    $.hole_choice,
     $.cfe_param,
     $.function_param,
     $.ho_param,
+    $.rule_mode_param,
     $.datum,
     $.out_item,
     $.out_value,
@@ -193,7 +192,8 @@ module.exports = grammar({
 
     query_sequence: $ => repeat1(choice($.relex, $.effrelex)),
 
-    // ≡ `_ :- body`; a let block is admitted — the REPL wrap depends on it.
+    // The sole top-level-goal spelling; a let block is admitted — the REPL
+    // wrap depends on it.
     top_level_goal: $ => seq(
       $.goal_marker,
       field('goal', choice($.relex, $.effrelex)),
@@ -358,7 +358,8 @@ module.exports = grammar({
     operator_continuation: $ => choice(
       $.pipe_continuation,
       $.postfix_operator,
-      $.stage_boundary,
+      $.stage_name,
+      $.argumentative_stage,
       $.singleton_reduction,
     ),
 
@@ -404,10 +405,12 @@ module.exports = grammar({
 
     // '&' holds only declared edges and selects by the term's exact canonical
     // spelling; '&&' composes edge relations. The context is a light mention.
+    // The peer takes the outer mark: `users_t(*) &(::normal) orders_t?(*)`
+    // keeps every left row.
     edge_continuation: $ => seq(
       field('operator', choice($.transitive_edge_sigil, $.edge_sigil)),
       optional(field('context', $.edge_context)),
-      field('term', $.named_grelex),
+      field('term', choice($.named_grelex, $.outer_grelex)),
     ),
 
     edge_context: $ => seq('(', $.symbol, ')'),
@@ -468,9 +471,17 @@ module.exports = grammar({
     ho_part: $ => seq(
       '(',
       choice(
+        // `;`-rows left of `&` are one lifted relation, rows right of it
+        // another: `f(1, 100; 2, 200 & 1, "x"; 2, "y")(*)` supplies two.
+        // Disambiguating exactly that is why `&` was adopted (FN.9).
         seq(
           field('lifted', $.data_row),
           repeat1(seq(';', field('lifted', $.data_row))),
+          optional(seq(
+            $.lift_sigil,
+            field('second', $.data_row),
+            repeat(seq(';', field('second', $.data_row))),
+          )),
         ),
         seq(
           commaSep1($, $.ho_argument),
@@ -494,10 +505,20 @@ module.exports = grammar({
     // is supplied as a relation — `f(users(*))(*)` — or through the relation
     // hole at a landing site.
     ho_argument: $ => choice(
+      $.residual_designator,
       $.grelex,
       $.ho_argument_reference,
       $.ground,
       $.relation_hole,
+    ),
+
+    // In a rule-value position, one argument group is a configured prefix,
+    // not a relational access. Keeping this production inside `ho_argument`
+    // makes the enclosing formal the authority that decides the role. The
+    // same bytes in a relation formal remain a whole relation actual.
+    residual_designator: $ => seq(
+      field('relation', $.relation_name),
+      field('ho_part', $.ho_part),
     ),
 
     // AN ARGUMENT THAT ADDRESSES A COLUMN REACHES AS FAR AS ANY REFERENCE:
@@ -509,8 +530,9 @@ module.exports = grammar({
 
     argumentative_form: $ => commaSep1($, $.slot),
 
-    // A slot never holds a PREDICATE: a truth expression standing here is the
-    // CROSSING's value. The predicate reading takes the comma road.
+    // A slot never holds a PREDICATE: a truth standing here is a crossed
+    // VALUE the column unifies with, reached through the ordinary value
+    // grammar. The predicate reading takes the comma road.
     slot: $ => choice(
       $.named_reference,
       $.disregarded,
@@ -529,10 +551,7 @@ module.exports = grammar({
       field('alias', $.identifier),
     ),
 
-    constraint_term: $ => choice(
-      $.function_application,
-      $.truth_as_value,
-    ),
+    constraint_term: $ => $.function_application,
 
     // =====================================================================
     // Anonymous tables
@@ -559,7 +578,7 @@ module.exports = grammar({
     sparse_fill: $ => seq(
       '_(',
       commaSep1Field($, 'column', $.identifier),
-      '@',
+      $.separator,
       commaSep1Field($, 'value', $.ground),
       ')',
     ),
@@ -576,7 +595,7 @@ module.exports = grammar({
     // CTE may stand in a pure query is a judgment over the built block.
     let_block: $ => repeat1(choice($.cte, $.cfe, $.effect_cte, $.ddl_annotation)),
 
-    cte: $ => choice($.standard_cte, $.label_cte),
+    cte: $ => choice($.standard_cte, $.label_cte, $.ho_cte),
 
     // A query-scoped label is a BARE name — no namespace. It outranks the
     // head-first reading: `users(*) : adults` is the labelling shorthand, not
@@ -596,6 +615,25 @@ module.exports = grammar({
     standard_cte: $ => seq(
       field('name', $.predicate_identifier),
       field('head', choice($.argumentative_heading, $.glob_heading)),
+      ':',
+      field('body', $.let_free_relex),
+    ),
+
+    // The COMMON HIGHER-ORDER EXPRESSION: the consulted `ho_rule`'s head with
+    // the SHADOW-NECK — a parameterized rule that lives for the query. The
+    // parameter group and the head group are the rule's own (`ho_param`,
+    // `head_term`), so a formal admitted in a file is admitted here; the
+    // body is the query's own text and stays a `let_free_relex` like every
+    // other binding's. No badge position: a query-scoped parameterized
+    // fixpoint has no ruling to stand on.
+    ho_cte: $ => seq(
+      field('name', $.predicate_identifier),
+      '(',
+      commaSep1($, $.ho_param),
+      ')',
+      '(',
+      field('head', choice(commaSep1($, $.head_term), $.glob)),
+      ')',
       ':',
       field('body', $.let_free_relex),
     ),
@@ -691,7 +729,10 @@ module.exports = grammar({
     // "k": {…} nests; "k": ~> {…} iterates.
     nested_pattern: $ => seq($.key, choice($.tree_pattern, $.iteration)),
 
-    iteration: $ => seq($.reduction_sigil, $.tree_pattern),
+    // FN.22 (amended): a metadata group may stand as an induced member's
+    // body — `"by_country": ~> country:~> {sales}` iterates into the keyed
+    // group.
+    iteration: $ => seq($.reduction_sigil, choice($.tree_pattern, $.metadata_binding)),
 
     // Reach without matching. A path binding publishes the underscore-
     // flattened spelling; `as` renames.
@@ -735,27 +776,17 @@ module.exports = grammar({
     // =====================================================================
 
     annotation: $ => choice(
-      $.assert_annotation,
       $.definition_annotation,
       $.reserved_annotation,
     ),
 
-    // The annotations that need no relation. An ASSERTION is the one that
-    // does — its body is a continuation, evaluated against the relation it
-    // stands on — which is why it is not one of these and why a definition's
-    // doc slot, standing before the body, has no derivation for it.
+    // The closed annotation family carries declarations, not executable
+    // relation checks. Runtime assertions are ordinary `assert!` effects.
     definition_annotation: $ => choice(
       $.error_annotation,
       $.danger_annotation,
       $.config_annotation,
       $.ddl_annotation,
-    ),
-
-    assert_annotation: $ => seq(
-      '(~~assert',
-      optional(seq(':', field('name', $.string))),
-      field('body', repeat1($.continuation)),
-      '~~)',
     ),
 
     error_annotation: $ => seq(
@@ -876,11 +907,13 @@ module.exports = grammar({
         field('terminal', $.post_pipe_effrelex),
       ),
       // THE UNWRAP PIPE: Q !> S ≡ Q |> S |> .returned(*) — a pipe form, never
-      // a boundary.
+      // a boundary. Any right side whose result carries a `returned` payload
+      // works, effectful or not; a right side without one gets the error the
+      // equivalence itself produces.
       seq(
-        field('source', choice($.let_free_relex, $.effect_chain)),
+        field('source', choice($.let_free_relex, $.mutation_source, $.effect_chain)),
         $.unwrap_pipe_operator,
-        field('terminal', $.post_pipe_effrelex),
+        field('terminal', choice($.post_pipe_effrelex, $.pure_invocation)),
       ),
       // Genuine peer joins: two relations meet and a combined relation
       // results.
@@ -971,7 +1004,7 @@ module.exports = grammar({
       ')',
     ),
 
-    effect_cte: $ => choice($.effect_standard_cte, $.effect_label_cte),
+    effect_cte: $ => choice($.effect_standard_cte, $.effect_label_cte, $.effect_ho_cte),
 
     effect_label_cte: $ => prec.dynamic(1, seq(
       field('body', choice($.let_free_relex, $.effect_chain)),
@@ -982,6 +1015,20 @@ module.exports = grammar({
 
     effect_standard_cte: $ => seq(
       field('head', choice($.effect_argumentative_head, $.effect_glob_head)),
+      ':',
+      field('body', choice($.let_free_relex, $.effect_chain)),
+    ),
+
+    // The effect mirror of `ho_cte`: the consulted `effect_rule`'s head with
+    // the SHADOW-NECK. Its head is a glob, as every effect rule's is.
+    effect_ho_cte: $ => seq(
+      field('name', $.effect_identifier),
+      '(',
+      commaSep1($, $.ho_param),
+      ')',
+      '(',
+      $.glob,
+      ')',
       ':',
       field('body', choice($.let_free_relex, $.effect_chain)),
     ),
@@ -1094,10 +1141,35 @@ module.exports = grammar({
     // PURE-GROUND position is one where every clause supplies a constant, and
     // those constants are the domain a free call-site argument ranges over.
     ho_param: $ => choice(
+      $.rule_param,
       $.open_relation_param,
       $.declared_relation_param,
       $.scalar_param,
       $.ground,
+    ),
+
+    // A CLOSED RESIDUAL CONTRACT. `...` existentially hides the complete
+    // left prefix already sealed into the value; the rest of this row is the
+    // exact ordered mode still required. The final group is the heading the
+    // residual publishes. These are signature members, not binders of the
+    // enclosing rule, so they have their own productions instead of reusing
+    // `ho_param` recursively.
+    rule_param: $ => seq(
+      field('name', $.identifier),
+      '(',
+      '...',
+      optional($.comma_sigil),
+      commaSep1($, $.rule_mode_param),
+      ')',
+      '(',
+      field('head', choice(commaSep1($, $.identifier), $.glob)),
+      ')',
+    ),
+
+    rule_mode_param: $ => choice(
+      $.open_relation_param,
+      $.declared_relation_param,
+      $.scalar_param,
     ),
 
     open_relation_param: $ => seq(field('name', $.identifier), '(', $.glob, ')'),
@@ -1165,9 +1237,9 @@ module.exports = grammar({
       ')',
     ),
 
-    // The FACT-FUNCTION: a two-column fact whose '->' declares the functional
-    // mode (input -> output). Both a table AND a callable; the arms are the
-    // case law's match arms.
+    // The FACT-FUNCTION: a fact whose '->' declares the functional mode
+    // (inputs -> outputs). It is always callable. Without a default its arms
+    // also form a finite relation; a default makes the family callable-only.
     fact_function: $ => seq(
       field('name', $.predicate_identifier),
       '(',
@@ -1306,8 +1378,6 @@ module.exports = grammar({
       $.drill,
     ),
 
-    stage_boundary: $ => choice($.materialize, $.stage_name),
-
     // THE SINGLETON PIPE — sugar: `R ~> f:(*)` normalizes to the zero-key
     // group `R |> %( ~> f:(*))`.
     singleton_reduction: $ => seq(
@@ -1345,8 +1415,14 @@ module.exports = grammar({
 
     // No guard: a guarded application needs a fallback value, and an embedded
     // column has none.
+    // NAMING IS ONE ACT: the embedded column is named with the same `as` the
+    // rename cover spells before its name template. A template standing bare
+    // after the callable (`+$(f:() :"…")`) has no derivation.
     embed_map_cover: $ => seq(
-      '+$(', field('cover', $.callable), optional($.as_name_template), ')',
+      '+$(',
+      field('cover', $.callable),
+      optional(seq($.as_keyword, field('naming', $.as_name_template))),
+      ')',
       '(', field('selector', $.selector), ')',
     ),
 
@@ -1421,7 +1497,7 @@ module.exports = grammar({
     // rename cover's job.
     named_out_item: $ => seq($.out_value, optional($.naming)),
 
-    out_value: $ => choice($.domain_expression, $.truth_as_value),
+    out_value: $ => $.domain_expression,
 
     // ONE spelling; rename versus baptism is a classification by operand kind,
     // not two syntaxes.
@@ -1500,6 +1576,18 @@ module.exports = grammar({
     // `as f` on a stage names its output and removes it from `_`'s deictic
     // domain.
     stage_name: $ => seq($.as_keyword, field('name', $.identifier)),
+
+    // `as f(slots)` — THE ARGUMENTATIVE STAGE: names the occurrence standing
+    // here and applies a total slot row to it in one act. The row is the
+    // same argumentative form a caller pattern writes, and it attaches to
+    // exactly the occurrence plain `as f` would name.
+    argumentative_stage: $ => seq(
+      $.as_keyword,
+      field('name', $.identifier),
+      '(',
+      field('slots', $.argumentative_form),
+      ')',
+    ),
 
     // =====================================================================
     // Value position
@@ -1604,13 +1692,27 @@ module.exports = grammar({
       $.star_sigil,
     ),
 
-    function_application: $ => choice($.infix_operator, $.non_infix_application),
+    function_application: $ => choice(
+      $.infix_operator,
+      // THE CROSSING, whole-value stratum: an infix truth is a value the way
+      // `a + b` is one — open on a side, so never an operand. An admission
+      // stratum, not a second carrier: the node kind is crossed_truth.
+      alias($._infix_crossing, $.crossed_truth),
+      $.non_infix_application,
+    ),
+
+    _infix_crossing: $ => $._infix_truth,
 
     // An admission stratum, not a second carrier — the AST kind is
     // function_application. Parens are admission, not meaning: ONE carrier
     // for them, reachable both as an operand and as a complete expression
     // (`f:(x) :- (x * 2)`).
     non_infix_application: $ => choice(
+      // THE CROSSING, operand stratum: a truth read as a value is an
+      // ordinary value, so it stands where one stands — an operand included.
+      // Only truth's NON-INFIX forms stand here, for the reason `a + b` is
+      // not an operand: an operand derives no infix form.
+      $.crossed_truth,
       $.parenthesized_operand,
       // The flowing value stands wherever a value does, at any depth: the CST
       // admits zero or many holes and the BUILDER judges the count once
@@ -1631,18 +1733,25 @@ module.exports = grammar({
     // carrier, not a syntactic guarantee: this admits zero or many holes and
     // the builder judges the count once. NO CASE IS A CALLABLE.
     // A COVER APPLIES A FUNCTION PER COLUMN, and a window function is a
-    // function: the spec stands after the open functor exactly as it stands
-    // after a standard application, and the cover's own name template follows
-    // it.
+    // function: its spec stands INSIDE the open functor's parens exactly as it
+    // stands inside a window application, and the cover's own naming follows
+    // the closed callable.
     callable: $ => choice($.open_functor, $.open_window_functor, $.template, $.lambda),
 
+    // THE SPEC IS ENCLOSED BY THE CALL IT WINDOWS. `f:(x <~ %(a))` is one
+    // closed value; a spec after the closing paren (`f:(x) <~ %(a)`) has no
+    // derivation, so composing windowed calls never needs added parentheses.
     open_window_functor: $ => seq(
-      field('call', $.open_functor),
-      $.window_spec,
+      field('callee', $.callee),
+      ':(',
+      optional(commaSep1($, $.open_expression)),
+      optional($.guard),
+      field('window', $.window_spec),
+      ')',
     ),
 
-    // Zero holes: implicit landing per hole_choice, which is why
-    // `x /-> upper:(y)` means `upper(x, y)`.
+    // Zero holes: the flowing value lands at the row's final place, which
+    // is why `x /-> upper:(y)` means `upper(y, x)`.
     open_functor: $ => seq(
       field('callee', $.callee),
       ':(',
@@ -1677,16 +1786,39 @@ module.exports = grammar({
 
     // `<~` is one glyph, two carriers: the group delegate and this window
     // context. Related by lowering, never merged in meaning.
+    //
+    // THE SPEC IS ENCLOSED BY THE CALL IT WINDOWS: it follows the argument row
+    // inside the call's own parens, so a windowed call is a closed value and
+    // `(f:(x <~ %(a)) + 2) / 3` reads with no added parentheses. A spec after
+    // the closing paren (`f:(x) <~ %(a)`) has no derivation. The delegate's
+    // sigil is bare because a column is a function of itself — there is no
+    // call for it to sit inside.
     window_application: $ => seq(
-      field('call', $.standard_application),
-      $.window_spec,
+      field('callee', $.callee),
+      ':(',
+      optional(commaSep1($, $.argument)),
+      optional($.guard),
+      field('window', $.window_spec),
+      ')',
     ),
 
+    // Partition, ordering, frame — each optional, in that order, and a comma
+    // stands only BETWEEN two written items. The closing paren ends the spec,
+    // so no item list to the right can be confused for a spec item.
     window_spec: $ => seq(
       $.window_sigil,
-      optional(seq(field('partition', $.partition), optional($.comma_sigil))),
-      optional(seq(field('order', $.ordering), optional($.comma_sigil))),
-      optional(field('frame', $.frame)),
+      optional(choice(
+        seq(
+          field('partition', $.partition),
+          optional(seq(optional($.comma_sigil), field('order', $.ordering))),
+          optional(seq(optional($.comma_sigil), field('frame', $.frame))),
+        ),
+        seq(
+          field('order', $.ordering),
+          optional(seq(optional($.comma_sigil), field('frame', $.frame))),
+        ),
+        field('frame', $.frame),
+      )),
     ),
 
     partition: $ => seq(
@@ -1729,7 +1861,6 @@ module.exports = grammar({
     // judgment at build, never this layer's.
     argument: $ => choice(
       $.value_argument,
-      $.truth_as_value,
       $.spread,
       $.context_marker,
       $.lambda,
@@ -1757,22 +1888,23 @@ module.exports = grammar({
 
     // `++` concatenates; `||` is SQL's spelling and is not DelightQL's.
     binary_op: $ => choice('+', '-', '*', '/', '%', '++'),
-    // `=` and `!=` are the NULL-SAFE pair; `==` and `!==` their traditional
-    // twins. Null-safety is semantic, not syntactic — the token says which
-    // pair, and the lowering says what that means on the target. `<>` is a
-    // target's OUTPUT spelling of `!==`, never an input one.
-    cmp_op: $ => choice('=', '==', '!=', '!==', '<', '<=', '>', '>='),
+    // `=` and `!=` are DelightQL's null-safe equality pair; the target's own
+    // three-valued comparison is a prelude sigma predicate (`+sql_eq(l, r)`,
+    // `+sql_ne(l, r)`), never an infix glyph. Null-safety is semantic, not
+    // syntactic — the lowering says what `=` means on the target. `==` and
+    // `!==` are not tokens: a retired spelling is diagnosed after the parse
+    // fails, never derived as an operator.
+    cmp_op: $ => choice('=', '!=', '<', '<=', '>', '>='),
 
-    // THE SUBSTITUTION LAW at value level: the flowing value lands
-    // first/last, or at a written composition_input. TWO CARRIERS, ONE LAW.
+    // THE SUBSTITUTION LAW at value level: the flowing value lands at the
+    // row's FINAL place, or at a written composition_input. TWO CARRIERS,
+    // ONE LAW — one glyph per composition family, no landing to choose.
     function_pipe: $ => prec.left(seq(
       $.domain_expression,
       repeat1($.function_pipe_step),
     )),
 
-    function_pipe_step: $ => seq($.hole_choice, $.callable),
-
-    hole_choice: $ => choice($.function_pipe_first, $.function_pipe_last),
+    function_pipe_step: $ => seq($.function_pipe_operator, $.callable),
 
     // THE HEADER CLASSIFIES: an '@' header present means anchored — every arm
     // a ground match term; absent means searched — every arm a condition.
@@ -1826,7 +1958,6 @@ module.exports = grammar({
     relation_like: $ => choice(
       $.scalar_subquery,
       $.anon_scalar_subquery,
-      $.exists_as_column,
       $.field_select,
     ),
 
@@ -1840,11 +1971,26 @@ module.exports = grammar({
 
     // CARDINALITY IS AUTHORED, DEGREE IS JUDGED: a relation enters value
     // position only through an inner form ending in a declared compression.
+    // COLON-FIRST (FN.41, reversed by ruling): `foo:(, continuation)` when
+    // the callee takes no arguments, `foo:(args)(, continuation)` when it
+    // does. A continuation begins with its connective and an argument row
+    // never does, so the two groups cannot be confused.
     scalar_subquery: $ => seq(
       field('callee', $.relation_name),
-      optional(field('ho_part', $.ho_part)),
-      ':(', field('interior', $.compressed_interior), ')',
+      ':(',
+      choice(
+        seq(field('interior', $.compressed_interior), ')'),
+        seq(
+          field('arguments', $.inner_argument_row),
+          ')',
+          '(',
+          field('interior', $.compressed_interior),
+          ')',
+        ),
+      ),
     ),
+
+    inner_argument_row: $ => commaSep1($, $.ho_argument),
 
     // THE SOURCELESS INNER FORM: no base relation; the body resolves against
     // the ENCLOSING row only, and the leading comma is the no-op base made
@@ -1877,18 +2023,6 @@ module.exports = grammar({
     bound_to_one: $ => seq($.comma_sigil, alias($._at_most, $.bound_op), $.one),
 
     _at_most: $ => seq('#', '<'),
-
-    // Existence entering value position IS the truth-compression: one surface,
-    // one carrier — AN OCCURRENCE NEVER HAS TWO. The crossing's adapter admits
-    // a truth expression at the same out item, so both readings derive and the
-    // grammar has to say which is the carrier rather than leaving it to
-    // whichever GLR stack survives.
-    exists_as_column: $ => prec.dynamic(1, seq(
-      $.polarity,
-      field('callee', $.relation_name),
-      optional(field('ho_part', $.ho_part)),
-      field('interior', $.interior_continuation),
-    )),
 
     interior_continuation: $ => seq('(', $.interior, ')'),
 
@@ -1927,9 +2061,11 @@ module.exports = grammar({
     path_key: $ => choice($.path_name, $.string, $.number),
     path_name: $ => $.identifier,
 
-    // Truth reified as a value — the crossing's adapter, admitted ONLY at its
-    // enumerated positions: out_value, argument, slot constraint.
-    truth_as_value: $ => $.truth_expression,
+    // THE CROSSING — truth read as a value. It stands wherever a value
+    // stands; the stratum that admits it says which truth forms may stand
+    // there, exactly as the value grammar says for its own infix form. This
+    // is the operand stratum; function_application admits the infix one.
+    crossed_truth: $ => $._non_infix_truth,
 
     // THE BINDER NAMES THE FLOW: the name IS the flowing value, usable any
     // number of times. `|x|` is position-discriminated, never an ordinal.
@@ -1947,13 +2083,24 @@ module.exports = grammar({
     // =====================================================================
 
     record: $ => seq('{', commaSep1($, $.record_member), '}'),
-    tuple: $ => seq('[', commaSep1($, $.domain_expression), ']'),
+    // A tuple position takes the record's spread spellings (FN.28),
+    // expanding as FN.35 states.
+    tuple: $ => seq('[', commaSep1($, choice($.domain_expression, $.spread)), ']'),
 
     record_member: $ => choice(
       $.keyed_value,
       $.induced_member,
+      $.keyed_metadata,
       $.spread,
       $.self_keyed_reference,
+    ),
+
+    // FN.22 (amended): a metadata group may stand as an induced member's
+    // body, under a fixed key: `"by_order_status": o.status:~> {…}`. The
+    // key is the name, so the group's own naming has no place here.
+    keyed_metadata: $ => seq(
+      $.key,
+      alias($._nested_metadata_group, $.metadata_group),
     ),
 
     keyed_value: $ => seq($.key, $.domain_expression),
@@ -2016,24 +2163,35 @@ module.exports = grammar({
     // Truth position
     // =====================================================================
 
-    truth_expression: $ => choice(
+    // TWO STRATA, ONE SUPERTYPE. The strata are hidden so the supertype keeps
+    // all its members; the crossing admits them at different value tiers.
+    truth_expression: $ => choice($._infix_truth, $._non_infix_truth),
+
+    // The forms open on at least one side. Not operands: they cross into
+    // value position only as a whole value, and re-enter operand position
+    // through parentheses — NO PEMDAS holds for truth as for arithmetic.
+    _infix_truth: $ => choice(
       $.comparison,
       $.heading_correlation,
       $.conjunction_expression,
       $.disjunction_expression,
-      $.negation,
       $.membership,
       $.relational_membership,
+    ),
+
+    // The forms a closing token ends. These are operands.
+    _non_infix_truth: $ => choice(
+      $.negation,
       $.existence,
       $.sigma_application,
       $.parenthesized_truth,
     ),
 
-    // CST-only, like parenthesized_operand: CROSSING LAW's own spelling is
-    // `(age > 18) as adult`.
+    // CST-only, like parenthesized_operand: `(age > 18) as adult` and
+    // `(x > 0) = true` are the same parens — grouping, never meaning.
     parenthesized_truth: $ => seq('(', $.truth_expression, ')'),
 
-    // `=`/`==` null-safety is semantic, not syntactic.
+    // `=` null-safety is semantic, not syntactic.
     comparison: $ => seq($.operand, $.cmp_op, $.operand),
 
     // THE WHOLE HEADING CORRELATES. A spread is never an operand — it is not
@@ -2099,12 +2257,15 @@ module.exports = grammar({
       field('interior', $.interior_continuation),
     ),
 
-    existence: $ => seq(
+    // The interior continuation is decisive. The same bytes can also begin a
+    // sigma application, but later syntax must not reinterpret the completed
+    // atom.
+    existence: $ => prec.dynamic(1, seq(
       $.polarity,
       field('callee', $.relation_name),
       optional(field('ho_part', $.ho_part)),
       field('interior', $.interior_continuation),
-    ),
+    )),
 
     // Colon-less: polarity is truth position's reinterpretation mark, as ':'
     // is value position's. ONE application carrier after build.

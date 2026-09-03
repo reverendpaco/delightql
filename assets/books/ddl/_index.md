@@ -1,10 +1,10 @@
 # Data Definition Language (DDL) {.dqlh}
 
 
-DDL is the set of features that create, modify, or
-delete schema entities.  This is the SQL definition.
+The definition of SQL DDL is the set of features that create, modify, or
+delete schema entities.
 
-Delightql's DDL encompasses SQL's DDL and features with no
+Delightql's DDL encompasses SQL's DDL and extra features with no
 direct SQL mapping (higher-order predicates, ER-context rules). The thematic
 concern is **reusability**: definitions, tables, and data that can be authored,
 loaded, and referenced.

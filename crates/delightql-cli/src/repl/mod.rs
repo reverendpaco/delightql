@@ -3,9 +3,14 @@
 /// REPL module for interactive DelightQL sessions
 pub mod commands;
 pub mod completions;
+pub mod config;
+
 pub mod info_panel;
+
 pub mod multi_pane_tui;
 pub mod name_generator;
+pub mod parser_worker;
+pub mod worker;
 
 #[cfg(feature = "prettify")]
 pub mod syntax_highlighter;
@@ -21,12 +26,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::output_format::OutputFormat;
 use std::sync::atomic::{AtomicBool, Ordering};
-use delightql_cst::cst::{self, TypedNode};
-use delightql_cst::{Parser, SyntaxTree};
 
 use self::commands::{handle_dot_command, is_dot_command, process_query, CommandResult, ReplState};
 use self::completions::DotCommandCompleter;
+use self::config::ReplParserOperation;
 use self::multi_pane_tui::run_multi_pane_tui;
+use self::parser_worker::{ParserWorkerController, ProbeOutcome};
+use self::worker::WorkerResult;
 
 /// The DelightQL language, for the highlighting substrate.
 ///
@@ -41,40 +47,23 @@ pub(crate) fn dql_language() -> tree_sitter::Language {
     delightql_cst::language()
 }
 
-/// Read one prompt line.
-///
-/// The REPL's line is an interactive submission, so it takes the same entrance
-/// the compiler gives one: the prompt wrap. Reading it any other way would let
-/// the prompt disagree with the road that will actually run the line.
-fn parse_line(line: &str) -> SyntaxTree {
-    Parser::new().parse_prompt(line)
-}
-
 /// Every CONTINUATION ANCHOR in the line, as char positions.
 ///
 /// A continuation anchor is where the text to the left is already a relational
 /// expression and a continuation may replace what follows — which is exactly
 /// what a reader jumping through a chain wants to land on. The chain's own
 /// start is one, and so is every continuation within it.
-fn find_stop_points(line: &str) -> Vec<usize> {
-    let tree = parse_line(line);
-    let mut byte_positions: Vec<usize> = delightql_cst::walk(&tree)
-        .filter(|node| {
-            // `Continuation` is a supertype, so the cast is how its whole
-            // family is named at once — a member added to the grammar becomes
-            // an anchor here without this line changing.
-            cst::Continuation::cast(node.node()).is_some()
-                || cst::Relex::cast(node.node()).is_some()
-                || cst::Effrelex::cast(node.node()).is_some()
-        })
-        .filter_map(|node| tree.byte_range(node).map(|range| range.start))
-        .collect();
-    byte_positions.sort_unstable();
-    byte_positions.dedup();
-    byte_positions
-        .iter()
-        .map(|&bp| byte_to_char_pos(line, bp))
-        .collect()
+///
+/// The parse crosses the containment worker; a probe that does not answer
+/// yields no stops, so the shortcut no-ops instead of freezing the editor.
+fn find_stop_points(worker: &ParserWorkerController, line: &str) -> Vec<usize> {
+    match worker.probe(ReplParserOperation::ContinuationNavigation, line, None) {
+        ProbeOutcome::Answer(WorkerResult::Continuations { byte_offsets }) => byte_offsets
+            .iter()
+            .map(|&bp| byte_to_char_pos(line, bp))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Convert byte position to character position
@@ -116,6 +105,33 @@ fn supports_unicode() -> bool {
     }
 
     false
+}
+
+/// The prompt's readiness, told to whoever holds the other end of the
+/// pipe named by `DQL_REPL_READY_FD`: one byte before every read. A
+/// replay driver synchronizes on it instead of scraping the prompt.
+/// Unset, it is nothing; a failed write is nothing too — the human at
+/// a real terminal never needs it.
+struct ReadySignal(Option<std::os::fd::RawFd>);
+
+impl ReadySignal {
+    fn from_environment() -> Self {
+        ReadySignal(
+            std::env::var("DQL_REPL_READY_FD")
+                .ok()
+                .and_then(|v| v.trim().parse::<std::os::fd::RawFd>().ok())
+                .filter(|fd| *fd >= 0),
+        )
+    }
+
+    fn signal(&self) {
+        #[cfg(unix)]
+        if let Some(fd) = self.0 {
+            // SAFETY: one byte from a live buffer to a descriptor the
+            // parent handed us; a bad descriptor fails, nothing else.
+            let _ = unsafe { libc::write(fd, b"\n".as_ptr().cast(), 1) };
+        }
+    }
 }
 
 /// Get the appropriate prompt based on mode and Unicode support
@@ -170,7 +186,9 @@ impl ConditionalEventHandler for MultiPaneTuiToggleHandler {
 }
 
 /// Custom event handler for Ctrl+X, d to delete to next continuation
-struct DeleteToNextContinuationHandler;
+struct DeleteToNextContinuationHandler {
+    worker: Arc<ParserWorkerController>,
+}
 
 impl ConditionalEventHandler for DeleteToNextContinuationHandler {
     fn handle(
@@ -188,7 +206,7 @@ impl ConditionalEventHandler for DeleteToNextContinuationHandler {
                 let current_pos = ctx.pos();
                 let line = ctx.line();
 
-                let stops = find_stop_points(line);
+                let stops = find_stop_points(&self.worker, line);
                 let target = stops
                     .iter()
                     .find(|&&p| p > current_pos)
@@ -208,7 +226,9 @@ impl ConditionalEventHandler for DeleteToNextContinuationHandler {
 }
 
 /// Custom event handler for Ctrl+X, D to delete to previous continuation
-struct DeleteToPrevContinuationHandler;
+struct DeleteToPrevContinuationHandler {
+    worker: Arc<ParserWorkerController>,
+}
 
 impl ConditionalEventHandler for DeleteToPrevContinuationHandler {
     fn handle(
@@ -226,7 +246,7 @@ impl ConditionalEventHandler for DeleteToPrevContinuationHandler {
                 let current_pos = ctx.pos();
                 let line = ctx.line();
 
-                let stops = find_stop_points(line);
+                let stops = find_stop_points(&self.worker, line);
                 let target = stops
                     .iter()
                     .rev()
@@ -278,6 +298,7 @@ impl ConditionalEventHandler for MultiLineHandler {
 /// says what it publishes. Tab on a prefix the prompt marks `?>` falls through
 /// rather than interrupting the line to print a parse error.
 struct SchemaDisplayHandler {
+    worker: Arc<ParserWorkerController>,
     trigger_schema_display: Arc<Mutex<bool>>,
     current_line: Arc<Mutex<String>>,
     /// Cursor byte offset at the moment Tab was pressed, so the span meta-ized
@@ -307,8 +328,9 @@ impl ConditionalEventHandler for SchemaDisplayHandler {
                 // Meta-izing a prefix that does not parse builds `<junk> ^` and
                 // prints a parse error, having already torn down the line to do
                 // it. Fall through instead: no interrupt, no error, and Tab
-                // stays available to the completer.
-                if !self::completions::is_well_formed(left) {
+                // stays available to the completer. A probe that does not
+                // answer falls through too.
+                if self::completions::is_well_formed(&self.worker, left) != Some(true) {
                     return None;
                 }
 
@@ -331,7 +353,9 @@ impl ConditionalEventHandler for SchemaDisplayHandler {
 }
 
 /// Custom event handler for Ctrl-B to jump to previous relational continuation
-struct PrevContinuationHandler;
+struct PrevContinuationHandler {
+    worker: Arc<ParserWorkerController>,
+}
 
 impl ConditionalEventHandler for PrevContinuationHandler {
     fn handle(
@@ -345,7 +369,7 @@ impl ConditionalEventHandler for PrevContinuationHandler {
             if *k == KeyEvent::ctrl('b') || *k == KeyEvent::ctrl('B') {
                 let current_pos = ctx.pos();
                 let line = ctx.line();
-                let stops = find_stop_points(line);
+                let stops = find_stop_points(&self.worker, line);
                 if stops.is_empty() {
                     return Some(Cmd::Noop);
                 }
@@ -374,7 +398,9 @@ impl ConditionalEventHandler for PrevContinuationHandler {
 }
 
 /// Custom event handler for Ctrl-F to jump to next relational continuation
-struct NextContinuationHandler;
+struct NextContinuationHandler {
+    worker: Arc<ParserWorkerController>,
+}
 
 impl ConditionalEventHandler for NextContinuationHandler {
     fn handle(
@@ -388,7 +414,7 @@ impl ConditionalEventHandler for NextContinuationHandler {
             if *k == KeyEvent::ctrl('f') || *k == KeyEvent::ctrl('F') {
                 let current_pos = ctx.pos();
                 let line = ctx.line();
-                let stops = find_stop_points(line);
+                let stops = find_stop_points(&self.worker, line);
                 if stops.is_empty() {
                     return Some(Cmd::Noop);
                 }
@@ -431,13 +457,13 @@ fn get_history_path() -> Option<PathBuf> {
 
         // Try to create config directory if it doesn't exist
         if let Err(e) = fs::create_dir_all(config_dir) {
-            eprintln!("Warning: Failed to create config directory: {}", e);
+            crate::client::incident::warning("config", crate::client::incident::hierarchy::CONFIG, format!("failed to create the config directory: {e}"));
             return None;
         }
 
         Some(config_dir.join("history"))
     } else {
-        eprintln!("Warning: Could not determine config directory for history");
+        crate::client::incident::warning("config", crate::client::incident::hierarchy::CONFIG, "could not determine the config directory for history".to_string());
         None
     }
 }
@@ -467,7 +493,7 @@ pub fn run_interactive_with_connection(
     ctrlc::set_handler(|| {
         QUERY_INTERRUPTED.store(true, Ordering::Relaxed);
     })
-    .unwrap_or_else(|e| eprintln!("Warning: Could not set Ctrl-C handler: {}", e));
+    .unwrap_or_else(|e| crate::client::incident::warning("terminal", crate::client::incident::hierarchy::TERMINAL, format!("could not set the Ctrl-C handler: {e}")));
 
     // Initialize syntax highlighter with config (if prettify feature enabled)
     #[cfg(feature = "prettify")]
@@ -494,7 +520,18 @@ pub fn run_interactive_with_connection(
     // Create REPL state (with optional connection)
     let mut repl_state =
         ReplState::new_with_connection(db_path.clone(), output_format, connection)?;
-    repl_state.show_meta_output = show_meta;
+    repl_state.set_show_meta_output(show_meta, "startup");
+
+    // The parser containment boundary: budgets from the typed config, the
+    // raw incident writer, and the highlight configuration the worker must
+    // mirror. Replaces the default controller before anything probes.
+    let parser_worker = Arc::new(ParserWorkerController::new(
+        *repl_state.config().parser_budgets(),
+        Arc::clone(repl_state.config().editor_helper_policy()),
+        repl_state.repl_db.clone(),
+        highlights_path.map(|p| p.to_path_buf()),
+    ));
+    repl_state.parser_worker = Arc::clone(&parser_worker);
 
     // Show database type if in verbose mode
     if show_meta {
@@ -507,12 +544,24 @@ pub fn run_interactive_with_connection(
     }
 
     // Set up readline editor with completion
-    let completer = DotCommandCompleter::new();
+    let completer = DotCommandCompleter::new(Arc::clone(&parser_worker));
     let config = rustyline::Config::builder()
         .color_mode(rustyline::ColorMode::Enabled)
         .build();
     let mut rl = Editor::with_config(config).context("Failed to create readline editor")?;
     rl.set_helper(Some(completer));
+    // The session record certifies which road the prompt ran: a transcript
+    // from a plain road (no tty, TERM unsupported) exercised none of the
+    // per-keystroke hooks, and must not pass for one that did.
+    if let Some(db) = &repl_state.repl_db {
+        use crate::client::context::EditorRoad;
+        let road = if rl.is_rich_road() {
+            EditorRoad::Rich
+        } else {
+            EditorRoad::Plain
+        };
+        db.record_editor_road(road);
+    }
 
     // Use Ctrl+X as leader key (avoids conflicts with Ctrl+T transpose)
     // Add custom event handler for Ctrl+X, t (toggle TUI)
@@ -539,6 +588,7 @@ pub fn run_interactive_with_connection(
     let trigger_schema_display = Arc::new(Mutex::new(false));
     let schema_cursor = Arc::new(Mutex::new(0usize));
     let schema_handler = SchemaDisplayHandler {
+        worker: Arc::clone(&parser_worker),
         trigger_schema_display: trigger_schema_display.clone(),
         current_line: current_line_storage.clone(),
         schema_cursor: schema_cursor.clone(),
@@ -550,7 +600,9 @@ pub fn run_interactive_with_connection(
 
     // Add custom event handler for Ctrl+X, d (delete to next continuation)
     for ctrl_x_key in [KeyEvent::ctrl('x'), KeyEvent::ctrl('X')] {
-        let delete_next_handler = DeleteToNextContinuationHandler;
+        let delete_next_handler = DeleteToNextContinuationHandler {
+            worker: Arc::clone(&parser_worker),
+        };
         rl.bind_sequence(
             Event::KeySeq(vec![
                 ctrl_x_key,
@@ -562,7 +614,9 @@ pub fn run_interactive_with_connection(
 
     // Add custom event handler for Ctrl+X, D (delete to previous continuation)
     for ctrl_x_key in [KeyEvent::ctrl('x'), KeyEvent::ctrl('X')] {
-        let delete_prev_handler = DeleteToPrevContinuationHandler;
+        let delete_prev_handler = DeleteToPrevContinuationHandler {
+            worker: Arc::clone(&parser_worker),
+        };
         rl.bind_sequence(
             Event::KeySeq(vec![
                 ctrl_x_key,
@@ -581,23 +635,31 @@ pub fn run_interactive_with_connection(
 
     // Add custom event handlers for Ctrl-B / Ctrl-F to navigate continuations
     // Note: Ctrl keys can come through as either uppercase or lowercase
-    let prev_cont_handler_lower = PrevContinuationHandler;
+    let prev_cont_handler_lower = PrevContinuationHandler {
+        worker: Arc::clone(&parser_worker),
+    };
     rl.bind_sequence(
         KeyEvent::ctrl('b'),
         EventHandler::Conditional(Box::new(prev_cont_handler_lower)),
     );
-    let prev_cont_handler_upper = PrevContinuationHandler;
+    let prev_cont_handler_upper = PrevContinuationHandler {
+        worker: Arc::clone(&parser_worker),
+    };
     rl.bind_sequence(
         KeyEvent::ctrl('B'),
         EventHandler::Conditional(Box::new(prev_cont_handler_upper)),
     );
 
-    let next_cont_handler_lower = NextContinuationHandler;
+    let next_cont_handler_lower = NextContinuationHandler {
+        worker: Arc::clone(&parser_worker),
+    };
     rl.bind_sequence(
         KeyEvent::ctrl('f'),
         EventHandler::Conditional(Box::new(next_cont_handler_lower)),
     );
-    let next_cont_handler_upper = NextContinuationHandler;
+    let next_cont_handler_upper = NextContinuationHandler {
+        worker: Arc::clone(&parser_worker),
+    };
     rl.bind_sequence(
         KeyEvent::ctrl('F'),
         EventHandler::Conditional(Box::new(next_cont_handler_upper)),
@@ -607,7 +669,7 @@ pub fn run_interactive_with_connection(
     if let Some(history_path) = get_history_path() {
         if history_path.exists() {
             if let Err(e) = rl.load_history(&history_path) {
-                eprintln!("Warning: Failed to load history: {}", e);
+                crate::client::incident::warning("config", crate::client::incident::hierarchy::CONFIG, format!("failed to load history: {e}"));
             }
         }
     }
@@ -620,6 +682,7 @@ pub fn run_interactive_with_connection(
     // it. Storing only the text forces it to end-of-line.
     let mut preserved_line: Option<(String, String)> = None;
     let mut multiline_buffer: Vec<String> = vec![];
+    let ready = ReadySignal::from_environment();
 
     loop {
         // A REPL prompt is a recovery boundary: never present an ordinary
@@ -635,7 +698,12 @@ pub fn run_interactive_with_connection(
             || preserved_line
                 .as_ref()
                 .map_or(false, |(l, r)| l.contains('\n') || r.contains('\n'));
-        let prompt = get_prompt(repl_state.sql_mode, is_continuation);
+        let prompt = get_prompt(repl_state.config().sql_mode(), is_continuation);
+
+        // The ready byte: a replay driver holding the other end of the
+        // pipe waits for it before typing the next line. Written right
+        // before the read, on every road, and nothing else changes.
+        ready.signal();
 
         // Use readline_with_initial if we have a preserved line
         let result = if let Some((before, after)) = preserved_line.take() {
@@ -646,7 +714,7 @@ pub fn run_interactive_with_connection(
 
         match result {
             Ok(line) => {
-                if repl_state.multiline {
+                if repl_state.config().multiline() {
                     let trimmed = line.trim();
 
                     if trimmed.is_empty() {
@@ -671,7 +739,7 @@ pub fn run_interactive_with_connection(
                         }
                     } else if multiline_buffer.is_empty() && trimmed == "." {
                         // Single dot toggles multi-pane TUI — only when buffer empty
-                        repl_state.sync_shared_config();
+                        repl_state.prepare_tui_snapshot();
                         let handle = repl_state.dql_handle.clone();
                         let connection = repl_state.db_connection.clone();
                         let final_window_position =
@@ -703,7 +771,7 @@ pub fn run_interactive_with_connection(
 
                     // Special case: single dot toggles multi-pane TUI
                     if line_to_process == "." {
-                        repl_state.sync_shared_config();
+                        repl_state.prepare_tui_snapshot();
                         let handle = repl_state.dql_handle.clone();
                         let connection = repl_state.db_connection.clone();
                         let final_window_position =
@@ -744,7 +812,7 @@ pub fn run_interactive_with_connection(
                         repl_state.shared_info.last_input = saved_line.clone();
 
                         // Open multi-pane TUI
-                        repl_state.sync_shared_config();
+                        repl_state.prepare_tui_snapshot();
                         let handle = repl_state.dql_handle.clone();
                         let connection = repl_state.db_connection.clone();
                         let final_window_position =
@@ -804,7 +872,7 @@ pub fn run_interactive_with_connection(
                 break;
             }
             Err(err) => {
-                eprintln!("Error reading line: {}", err);
+                crate::client::incident::error("terminal", crate::client::incident::hierarchy::TERMINAL, format!("error reading line: {err}"));
                 break;
             }
         }
@@ -813,8 +881,18 @@ pub fn run_interactive_with_connection(
     // Save history
     if let Some(history_path) = get_history_path() {
         if let Err(e) = rl.save_history(&history_path) {
-            eprintln!("Warning: Failed to save history: {}", e);
+            crate::client::incident::warning("config", crate::client::incident::hierarchy::CONFIG, format!("failed to save history: {e}"));
         }
+    }
+
+    // Close the session while the handle — and core's findings in it —
+    // is alive: the interactive road always writes its three files.
+    {
+        let mut handle = repl_state
+            .dql_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::client::exit::finish(Some(&mut **handle), 0);
     }
 
     println!("Goodbye!");
@@ -835,123 +913,3 @@ fn process_input(
     }
 }
 
-/// Process input with interactive commands (handles dot commands in piped/file input)
-fn process_interactive_input(
-    input: &str,
-    db_path: Option<String>,
-    output_format: OutputFormat,
-    target_stage: Option<crate::args::Stage>,
-    show_meta: bool,
-    no_headers: bool,
-) -> Result<()> {
-    let mut repl_state = commands::ReplState::new(db_path.clone(), output_format)?;
-    repl_state.target_stage = target_stage;
-    repl_state.show_meta_output = show_meta;
-    repl_state.no_headers = no_headers;
-
-    let mut query_buffer = String::new();
-
-    // Process each line
-    for line in input.lines() {
-        let trimmed = line.trim();
-
-        // Skip empty lines between queries
-        if trimmed.is_empty() && query_buffer.is_empty() {
-            continue;
-        }
-
-        // Check if it's a dot command
-        if commands::is_dot_command(trimmed) {
-            // Execute any buffered query first
-            if !query_buffer.is_empty() {
-                // Create a dummy flag for non-interactive mode
-                let dummy_flag = std::sync::atomic::AtomicBool::new(false);
-                commands::process_query(&query_buffer, &mut repl_state, &dummy_flag)?;
-                query_buffer.clear();
-            }
-
-            // Handle the dot command
-            match commands::handle_dot_command(trimmed, &mut repl_state)? {
-                commands::CommandResult::Exit => {
-                    // Exit command encountered, stop processing
-                    break;
-                }
-                commands::CommandResult::Continue => {
-                    // Continue to next line
-                    continue;
-                }
-            }
-        } else if !trimmed.is_empty() {
-            // Add to query buffer (queries continue until a dot command or empty line)
-            if !query_buffer.is_empty() {
-                query_buffer.push(' ');
-            }
-            query_buffer.push_str(trimmed);
-        } else if !query_buffer.is_empty() {
-            // Empty line with buffered query - execute it
-            let dummy_flag = std::sync::atomic::AtomicBool::new(false);
-            commands::process_query(&query_buffer, &mut repl_state, &dummy_flag)?;
-            query_buffer.clear();
-        }
-    }
-
-    // Execute any remaining buffered query
-    if !query_buffer.is_empty() {
-        let dummy_flag = std::sync::atomic::AtomicBool::new(false);
-        commands::process_query(&query_buffer, &mut repl_state, &dummy_flag)?;
-    }
-
-    Ok(())
-}
-
-/// Process piped input (non-interactive)
-pub fn process_piped_input(
-    input: &str,
-    db_path: Option<String>,
-    output_format: OutputFormat,
-    target_stage: Option<crate::args::Stage>,
-    interactive: bool,
-    quiet: bool,
-    verbose: bool,
-    no_headers: bool,
-    no_sanitize: bool,
-    connection: Option<crate::connection::ConnectionManager>,
-) -> Result<()> {
-    if interactive {
-        let show_meta = verbose && !quiet;
-        process_interactive_input(
-            input,
-            db_path,
-            output_format,
-            target_stage,
-            show_meta,
-            no_headers,
-        )
-    } else {
-        let _conn = connection
-            .ok_or_else(|| anyhow::anyhow!("No database connection available for piped input"))?;
-
-        let mut handle = crate::connection::open_handle()?;
-
-        let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
-
-        // mount! the user database as "main" if specified
-        if let Some(ref path) = db_path {
-            crate::exec_ng::run_dql_query(
-                &format!("mount!(\"{}\", \"main\")(*)", path),
-                &mut *session,
-            )?;
-        }
-
-        crate::exec_ng::execute_query(
-            input,
-            &mut *session,
-            target_stage,
-            output_format,
-            no_headers,
-            no_sanitize,
-            false,
-        )?;
-        Ok(())
-    }
-}

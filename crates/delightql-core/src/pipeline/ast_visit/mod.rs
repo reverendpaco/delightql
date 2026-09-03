@@ -58,7 +58,7 @@ use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
 use crate::pipeline::asts::core::operators::{FrameBound, HoArgument, WindowFrame};
 use crate::pipeline::asts::core::{
     Access, AnonTable, Chain, Continuation, CteBinding, Datum, DomainExpression, Enclyph,
-    FunctionApplication, Grelex, GroupSpec, MemberCorrelation, MetadataGroup, MetadataTarget,
+    FunctionApplication, GroundForm, GroupSpec, MemberCorrelation, MetadataGroup, MetadataTarget,
     OrderingSpec, Phase, PipeOp, Query, RecordMember, ReductionItem, Relation, TabularRow,
     TruthExpression,
 };
@@ -242,7 +242,7 @@ pub fn walk_visit_query<P: Phase, F: AstVisit<P> + ?Sized>(
     // (which carries `cfes` through the phase door) and descend the bindings
     // and the body. A caller wanting a CFE body roots a fresh visit at it
     // (the W12 pattern).
-    for c in &query.ctes {
+    for c in query.ctes() {
         child!(walk_visit_cte_binding(v, c));
     }
     child!(walk_visit_relational(v, &query.body));
@@ -253,7 +253,10 @@ pub fn walk_visit_cte_binding<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     cte: &CteBinding<P>,
 ) -> Result<Descent> {
-    walk_visit_relational(v, &cte.expression)
+    for part in cte.parts() {
+        child!(walk_visit_relational(v, part));
+    }
+    Ok(Descent::Continue)
 }
 
 // =============================================================================
@@ -266,11 +269,11 @@ pub fn walk_visit_relational<P: Phase, F: AstVisit<P> + ?Sized>(
     expr: &Chain<P>,
 ) -> Result<Descent> {
     enter!(v.enter_relational(expr));
-    match &expr.head {
-        Grelex::Reference(rel) => child!(walk_visit_relation(v, rel)),
-        Grelex::Literal(anon) => child!(walk_visit_anon_table(v, &anon.table)),
+    match expr.head().form() {
+        GroundForm::Reference(rel) => child!(walk_visit_relation(v, rel)),
+        GroundForm::Literal(anon) => child!(walk_visit_anon_table(v, &anon.table)),
     }
-    for continuation in &expr.continuations {
+    for continuation in expr.forms() {
         child!(walk_visit_continuation(v, continuation));
     }
     exit!(v.exit_relational(expr));
@@ -318,9 +321,11 @@ pub fn walk_visit_continuation<P: Phase, F: AstVisit<P> + ?Sized>(
             rhs, correlation, ..
         } => {
             child!(walk_visit_relational(v, rhs));
-            // A correspondence holds names, not expressions: there is no
-            // child to descend into.
-            if let Some(c) = correlation.as_ref().and_then(MemberCorrelation::condition) {
+            // A correspondence holds names, not expressions, and a decided
+            // Cartesian holds nothing: there is no child to descend into.
+            if let Some(c) =
+                P::member_correlation(correlation).and_then(MemberCorrelation::condition)
+            {
                 child!(walk_visit_boolean(v, c));
             }
         }
@@ -343,7 +348,9 @@ pub fn walk_visit_continuation<P: Phase, F: AstVisit<P> + ?Sized>(
             child!(walk_visit_relational(v, &P::er_join(carried).rhs));
         }
         Continuation::Structural(step) => match &step.form {
-            crate::pipeline::asts::core::StructuralForm::Ordering { specs } => {
+            // The bound an ordering consumed is a clause of integers; only
+            // the specs hold expressions to reach.
+            crate::pipeline::asts::core::StructuralForm::Ordering { specs, .. } => {
                 for s in specs {
                     child!(walk_visit_ordering_spec(v, s));
                 }
@@ -461,7 +468,7 @@ pub fn walk_visit_operator<P: Phase, F: AstVisit<P> + ?Sized>(
             guard: conditioned_on,
         } => {
             for item in transformations {
-                child!(walk_visit_out_value(v, &item.expr));
+                child!(walk_visit_domain(v, &item.expr));
             }
             if let Some(c) = conditioned_on {
                 child!(walk_visit_boolean(v, c));
@@ -542,37 +549,6 @@ pub fn walk_visit_boolean<P: Phase, F: AstVisit<P> + ?Sized>(
     exit!(v.exit_boolean(expr));
 }
 
-/// An argument's value: the domain road, or the crossing's truth. Both are
-/// reached, so a subquery beneath a crossed argument is not lost.
-pub fn walk_visit_argument_value<P: Phase, F: AstVisit<P> + ?Sized>(
-    v: &mut F,
-    value: &crate::pipeline::asts::core::ArgumentValue<P>,
-) -> Result<Descent> {
-    match value {
-        crate::pipeline::asts::core::ArgumentValue::Domain { value, .. } => {
-            walk_visit_domain(v, value)
-        }
-        crate::pipeline::asts::core::ArgumentValue::Truth(crossing) => {
-            walk_visit_boolean(v, crossing.truth())
-        }
-    }
-}
-
-/// A published value: the domain road, or the crossing's truth. The walk
-/// reaches BOTH, so a subquery beneath a published existence is not lost to
-/// the recursion-closure matrix.
-pub fn walk_visit_out_value<P: Phase, F: AstVisit<P> + ?Sized>(
-    v: &mut F,
-    value: &crate::pipeline::asts::core::OutValue<P>,
-) -> Result<Descent> {
-    match value {
-        crate::pipeline::asts::core::OutValue::Domain(domain) => walk_visit_domain(v, domain),
-        crate::pipeline::asts::core::OutValue::Truth(crossing) => {
-            walk_visit_boolean(v, crossing.truth())
-        }
-    }
-}
-
 pub fn walk_visit_domain<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     expr: &DomainExpression<P>,
@@ -606,7 +582,7 @@ pub fn walk_visit_function<P: Phase, F: AstVisit<P> + ?Sized>(
                 if let Some(guard) = &arm.guard {
                     child!(walk_visit_boolean(v, guard));
                 }
-                child!(walk_visit_out_value(v, &arm.result));
+                child!(walk_visit_domain(v, &arm.result));
             }
         }
         crate::pipeline::asts::core::FunctionApplication::Infix(infix) => {
@@ -637,6 +613,12 @@ pub fn walk_visit_function<P: Phase, F: AstVisit<P> + ?Sized>(
         // it for a walk to reach.
         crate::pipeline::asts::core::FunctionApplication::JsonAccess(access) => {
             child!(walk_visit_domain(v, &access.source));
+        }
+        // THE ONE DESCENT through the crossing: the truth beneath it is
+        // reached as a truth, so a subquery under a crossed existence is
+        // never lost to a walk that only reads values.
+        crate::pipeline::asts::core::FunctionApplication::Crossed(crossing) => {
+            child!(walk_visit_boolean(v, crossing.truth()));
         }
     }
     exit!(v.exit_function(func));
@@ -676,8 +658,8 @@ pub fn walk_visit_scalarized<P: Phase, F: AstVisit<P> + ?Sized>(
     body: &crate::pipeline::asts::core::ScalarizedRelation<P>,
 ) -> Result<Descent> {
     use crate::pipeline::asts::core::Scalarization;
-    child!(walk_visit_relational(v, &body.body));
-    match &body.scalarization {
+    child!(walk_visit_relational(v, body.body()));
+    match &body.scalarization() {
         Scalarization::ZeroKeyReduction(items) => {
             for item in items.iter() {
                 child!(walk_visit_reduction_item(v, item));
@@ -746,10 +728,14 @@ pub fn walk_visit_functor_call<P: Phase, F: AstVisit<P> + ?Sized>(
     match &call.call().arguments {
         CallArguments::None => {}
         CallArguments::HigherOrder(part) => {
-            for argument in part.members.iter() {
+            for argument in part.members().iter() {
                 match argument {
-                    HoArgument::Relation(relation) => child!(walk_visit_relational(v, relation)),
-                    HoArgument::Value(value) => child!(walk_visit_argument_value(v, value)),
+                    HoArgument::Relation(relation)
+                    | HoArgument::Rule(relation)
+                    | HoArgument::Landed(relation) => {
+                        child!(walk_visit_relational(v, relation))
+                    }
+                    HoArgument::Value(value) => child!(walk_visit_domain(v, &value.value)),
                     // Structural row marks: nothing beneath to reach.
                     HoArgument::Landing(_) | HoArgument::Skip => {}
                 }
@@ -758,7 +744,7 @@ pub fn walk_visit_functor_call<P: Phase, F: AstVisit<P> + ?Sized>(
         CallArguments::Scalar(members) => {
             for member in members {
                 match member {
-                    ScalarArgument::Value(value) => child!(walk_visit_argument_value(v, value)),
+                    ScalarArgument::Value(value) => child!(walk_visit_domain(v, &value.value)),
                     // A spread enumerates, a star names the whole, and a
                     // context marker selects a calling mode: none evaluates,
                     // so none has a child to reach.
@@ -797,15 +783,8 @@ pub fn walk_visit_slot<P: Phase, F: AstVisit<P> + ?Sized>(
     v: &mut F,
     slot: &crate::pipeline::asts::core::Slot<P>,
 ) -> Result<Descent> {
-    match slot {
-        crate::pipeline::asts::core::Slot::Constraint(
-            crate::pipeline::asts::core::SlotConstraint::Truth { value, .. },
-        ) => child!(walk_visit_boolean(v, value.truth())),
-        other => {
-            if let Some(term) = other.term() {
-                child!(walk_visit_domain(v, &term));
-            }
-        }
+    if let Some(term) = slot.term() {
+        child!(walk_visit_domain(v, &term));
     }
     Ok(Descent::Continue)
 }
@@ -825,7 +804,7 @@ pub fn walk_visit_out_item<P: Phase, F: AstVisit<P> + ?Sized>(
 ) -> Result<Descent> {
     enter!(v.enter_out_item(item));
     match item {
-        crate::pipeline::asts::core::OutItem::One(one) => walk_visit_out_value(v, &one.expr),
+        crate::pipeline::asts::core::OutItem::One(one) => walk_visit_domain(v, &one.expr),
         // Neither of the other two computes a value, so neither has a
         // child to reach.
         crate::pipeline::asts::core::OutItem::Many(_)
@@ -920,7 +899,12 @@ pub fn walk_visit_enclyph<P: Phase, F: AstVisit<P> + ?Sized>(
         Enclyph::EmptyRecord(_) => {}
         Enclyph::Tuple(tuple) => {
             for e in tuple.elements.iter() {
-                child!(walk_visit_domain(v, e));
+                match e {
+                    crate::pipeline::asts::core::TupleElement::Value(e) => {
+                        child!(walk_visit_domain(v, e))
+                    }
+                    crate::pipeline::asts::core::TupleElement::Spread(_) => {}
+                }
             }
         }
     }
@@ -935,6 +919,7 @@ pub fn walk_visit_record_member<P: Phase, F: AstVisit<P> + ?Sized>(
         RecordMember::Keyed { value, .. } => child!(walk_visit_domain(v, value)),
         RecordMember::Induced { value, .. } => child!(walk_visit_enclyph(v, value)),
         RecordMember::Spread(_) | RecordMember::SelfKeyed(_) => {}
+        RecordMember::Metadata { group, .. } => child!(walk_visit_metadata_group(v, group)),
     }
     Ok(Descent::Continue)
 }
@@ -1024,3 +1009,49 @@ fn walk_visit_cte_requirements<P: Phase, F: AstVisit<P> + ?Sized>(
 
 #[cfg(test)]
 mod tests;
+
+/// ENCLOSES A RELATIONAL SCOPE — one judgment for the closed value and
+/// truth families together.
+///
+/// A relation standing inside an expression — a scalarized interior, an
+/// existence or relational-membership interior, a relational argument to a
+/// call, a fetched sigma body's own interiors — is its own scope: the
+/// names inside it address that relation first, and which of them
+/// correlate outward is resolution's answer, never a reader's. A walker
+/// that must see every reference an expression makes cannot make that
+/// judgment through such a scope from the outside, so it asks this ONE
+/// question and treats the answer as "may read anything".
+///
+/// The judgment is the walk's, not a hand enumeration in either family: it
+/// reaches a relation wherever the exhaustive walk reaches one, beneath a
+/// crossed truth's operands, a comparison's operands, a case result, a
+/// template, a record member, a window specification, exactly alike.
+struct NestsRelation(bool);
+
+impl<P: Phase> AstVisit<P> for NestsRelation {
+    fn enter_relational(&mut self, _: &Chain<P>) -> Result<Descent> {
+        self.0 = true;
+        Ok(Descent::Break)
+    }
+}
+
+impl<P: Phase> DomainExpression<P> {
+    /// Whether a relation of its own scope stands anywhere beneath this
+    /// value. See [`NestsRelation`].
+    pub fn nests_relation(&self) -> bool {
+        let mut judge = NestsRelation(false);
+        walk_visit_domain(&mut judge, self).expect("the scope judgment raises no error");
+        judge.0
+    }
+}
+
+impl<P: Phase> TruthExpression<P> {
+    /// Whether a relation of its own scope stands anywhere beneath this
+    /// truth — its interiors included, and the interiors beneath the values
+    /// it reads. See [`NestsRelation`].
+    pub fn nests_relation(&self) -> bool {
+        let mut judge = NestsRelation(false);
+        walk_visit_boolean(&mut judge, self).expect("the scope judgment raises no error");
+        judge.0
+    }
+}

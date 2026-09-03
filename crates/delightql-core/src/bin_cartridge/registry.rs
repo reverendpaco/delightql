@@ -140,7 +140,6 @@ mod tests {
     use super::*;
     use crate::bin_cartridge::{
         BinCartridgeMetadata, EffectExecutable, EntityResult, EntitySignature, OutputSchema,
-        Parameter,
     };
     use crate::enums::{EntityType, Language};
     use crate::error::Result;

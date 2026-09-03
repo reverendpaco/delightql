@@ -4,9 +4,10 @@
 //
 // Whether a CTE is recursive is NOT decided here. The resolver decides it
 // where the self-reference binds and stores the decision on the binding;
-// this pass reads the flag the `Cte` was constructed with. A second
-// structural detector over the SQL AST is a second opinion, and two
-// opinions about one fact are free to differ.
+// this pass reads the BODY it was built into — a fixpoint body is a
+// fixpoint, not a query with a flag beside it. A second structural
+// detector over the SQL AST is a second opinion, and two opinions about
+// one fact are free to differ.
 //
 // `legalize_recursive_limits` — `#<N` inside a recursive rule.
 //    DQL semantics (ratified): a TOTAL-ROW CAP on the fixpoint unfold —
@@ -78,8 +79,8 @@ fn allows_recursive_limit(dialect: SqlDialect) -> bool {
     }
 }
 
-/// Legalize `#<N` bounds inside recursive members. Must run AFTER
-/// the resolver's stored decision (it only inspects CTEs already marked).
+/// Legalize `#<N` bounds inside recursive members. It reaches only the
+/// bindings the resolver's decision built as fixpoints.
 pub fn legalize_recursive_limits(stmt: &mut SqlStatement, dialect: SqlDialect) -> Result<()> {
     if let Some(ctes) = statement_with_clause_mut(stmt) {
         for cte in ctes.iter_mut() {
@@ -118,7 +119,13 @@ fn legalize_cte(cte: &mut Cte, dialect: SqlDialect) -> Result<()> {
         return Ok(());
     }
     let scope = cte.scope();
-    legalize_branches(cte.query_mut(), scope, dialect)
+    // A FIXPOINT'S PARTS ARE ITS BRANCHES. The anchor and each member come
+    // out of the body as themselves; the descent inside one is for an arm's
+    // OWN union, not for rediscovering the accumulation.
+    for part in cte.parts_mut() {
+        legalize_branches(part, scope, dialect)?;
+    }
+    Ok(())
 }
 
 /// Walk the set-op tree of a recursive CTE body; legalize each SELECT
@@ -235,9 +242,10 @@ fn inline_limit_wrapper(
     // Map: wrapper column name -> inner expression.
     let mut map = std::collections::HashMap::new();
     for item in inner.select_list() {
-        let SelectItem::Expression {
+        let SelectItem::Publishing {
             expr,
-            alias: Some(alias),
+            slot: alias,
+            printed: true,
         } = item
         else {
             return Err(shape_error("limit wrapper has unaliased or star items"));
@@ -248,9 +256,15 @@ fn inline_limit_wrapper(
     // Rebuild the outer select list with wrapper references substituted.
     let mut items = Vec::with_capacity(outer.select_list().len());
     for item in outer.select_list() {
-        let SelectItem::Expression { expr, alias } = item else {
+        let SelectItem::Publishing {
+            expr,
+            slot,
+            printed,
+        } = item
+        else {
             return Err(shape_error("recursive member selects a star"));
         };
+        let (alias, printed) = (slot, *printed);
         let new_expr = match expr {
             DomainExpression::Column(column) if map.contains_key(column) => map
                 .get(column)
@@ -259,9 +273,14 @@ fn inline_limit_wrapper(
             DomainExpression::Literal(_) | DomainExpression::Column(_) => expr.clone(),
             _ => return Err(shape_error("recursive member computes over the wrapper")),
         };
-        items.push(match alias {
-            Some(a) => SelectItem::expression_with_alias(new_expr, *a),
-            None => SelectItem::expression(new_expr),
+        items.push(if printed {
+            SelectItem::expression_with_alias(new_expr, *alias)
+        } else {
+            SelectItem::Publishing {
+                expr: new_expr,
+                slot: *alias,
+                printed: false,
+            }
         });
     }
 
@@ -322,8 +341,12 @@ fn query_references(query: &QueryExpression, scope: crate::names::ScopeId) -> bo
         QueryExpression::WithCte { ctes, query } => {
             // A nested CTE of the same name shadows; conservatively still
             // count it (over-detection only strengthens the keyword).
-            ctes.iter().any(|c| query_references(c.query(), scope))
-                || query_references(query, scope)
+            ctes.iter().any(|c| {
+                c.body()
+                    .parts()
+                    .into_iter()
+                    .any(|p| query_references(p, scope))
+            }) || query_references(query, scope)
         }
     }
 }
@@ -418,9 +441,12 @@ fn validate_cte(cte: &mut Cte) -> Result<()> {
         return Ok(());
     }
     let scope = cte.scope();
-    unwrap_transparent_members(cte.query_mut(), scope);
-    inline_aliased_self_references(cte.query_mut(), scope);
-    validate_branches(cte.query_mut(), scope)
+    for part in cte.parts_mut() {
+        unwrap_transparent_members(part, scope);
+        inline_aliased_self_references(part, scope);
+        validate_branches(part, scope)?;
+    }
+    Ok(())
 }
 
 /// A self-reference wearing a relation alias — `FROM (SELECT c.a AS a, c.b AS b
@@ -471,6 +497,29 @@ fn inline_aliased_self_references(q: &mut QueryExpression, cte_scope: crate::nam
                             self.pairs.iter().find(|(output, _)| output == column)
                         {
                             *column = *source;
+                        }
+                    }
+                }
+
+                fn table(&mut self, t: &mut TableExpression) {
+                    // A merged pair names two exact slots; dissolving the
+                    // wrapper re-anchors its side onto the CTE's own
+                    // occurrence, and the pair keeps naming it. The
+                    // spelling is the generator's and needs no converting.
+                    let TableExpression::Join { join_condition, .. } = t else {
+                        return;
+                    };
+                    let crate::pipeline::sql_ast::JoinCondition::Merge(pairs) = join_condition
+                    else {
+                        return;
+                    };
+                    for pair in pairs.iter_mut() {
+                        for slot in [&mut pair.left, &mut pair.right] {
+                            if let Some((_, source)) =
+                                self.pairs.iter().find(|(output, _)| output == slot)
+                            {
+                                *slot = *source;
+                            }
                         }
                     }
                 }
@@ -527,9 +576,10 @@ fn aliased_self_reference(
         .select_list()
         .iter()
         .map(|item| match item {
-            SelectItem::Expression {
+            SelectItem::Publishing {
                 expr: DomainExpression::Column(source),
-                alias: Some(output),
+                slot: output,
+                printed: true,
             } => Some((*output, *source)),
             _ => None,
         })
@@ -594,7 +644,11 @@ fn unwrap_transparent_members(q: &mut QueryExpression, cte_scope: crate::names::
                 .select_list()
                 .iter()
                 .filter_map(|item| match item {
-                    SelectItem::Expression { alias: Some(a), .. } => Some(*a),
+                    SelectItem::Publishing {
+                        slot: a,
+                        printed: true,
+                        ..
+                    } => Some(*a),
                     _ => None,
                 })
                 .collect();
@@ -606,10 +660,11 @@ fn unwrap_transparent_members(q: &mut QueryExpression, cte_scope: crate::names::
                     .iter()
                     .zip(inner_columns.iter())
                     .map(|(item, want)| match item {
-                        SelectItem::Expression {
+                        SelectItem::Publishing {
                             expr: DomainExpression::Column(column),
-                            alias,
-                        } if column == want => Some((alias.unwrap_or(*want), alias.is_some())),
+                            slot,
+                            printed,
+                        } if column == want => Some((*slot, *printed)),
                         _ => None,
                     })
                     .collect::<Option<Vec<_>>>()
@@ -635,7 +690,7 @@ fn unwrap_transparent_members(q: &mut QueryExpression, cte_scope: crate::names::
                     .iter()
                     .zip(outer_aliases)
                     .map(|(item, output)| {
-                        let SelectItem::Expression { expr, .. } = item else {
+                        let Some(expr) = item.expr() else {
                             unreachable!("inner_columns covers the complete select list")
                         };
                         SelectItem::expression_with_alias(expr.clone(), output)
@@ -773,13 +828,10 @@ fn member_has_aggregation(select: &SelectStatement) -> bool {
     if select.group_by().is_some() || select.having().is_some() {
         return true;
     }
-    select.select_list().iter().any(|item| {
-        if let SelectItem::Expression { expr, .. } = item {
-            expr_has_aggregate(expr)
-        } else {
-            false
-        }
-    })
+    select
+        .select_list()
+        .iter()
+        .any(|item| item.expr().is_some_and(expr_has_aggregate))
 }
 
 fn expr_has_aggregate(expr: &DomainExpression) -> bool {
@@ -830,6 +882,7 @@ fn recursion_error(leaf: &str, message: String) -> DelightQLError {
         "nonlinear" => "recursion/nonlinear",
         "aggregate" => "recursion/aggregate",
         "self_subquery" => "recursion/self_subquery",
+        "set_operator" => crate::uri_registry::subcat::RECURSION_SET_OPERATOR,
         other => unreachable!("unknown recursion refusal leaf: {other}"),
     };
     DelightQLError::ValidationError {
@@ -842,19 +895,17 @@ fn recursion_error(leaf: &str, message: String) -> DelightQLError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::names::{Addressing, ColumnOrigin, Hint, Registry, ScopeOrigin, ValueFacts};
+    use crate::names::{Addressing, Registry};
     use crate::pipeline::ast_refined::LiteralValue;
-    use crate::pipeline::sql_ast::{SelectItem, SetOperator};
+    use crate::pipeline::bindings::SqlFixpoint;
+    use crate::pipeline::sql_ast::{CteBody, SelectItem};
 
     struct Fixture {
-        identities: Registry,
         x: crate::names::ScopeId,
-        inner_x: crate::names::ScopeId,
         t: crate::names::ScopeId,
         a: crate::names::ScopeId,
         w: crate::names::ScopeId,
         xn: crate::names::ColId,
-        inner_xn: crate::names::ColId,
         tn: crate::names::ColId,
         an: crate::names::ColId,
         wn: crate::names::ColId,
@@ -866,41 +917,26 @@ mod tests {
             let make_scope = |name: &str| {
                 let spelling = identities.intern(name, false);
                 let entity = identities.mint_entity(spelling);
-                identities.mint_scope(
-                    ScopeOrigin::Resolution { of: entity },
-                    Hint::User(spelling),
-                    None,
-                )
+                identities.resolved_access_scope(entity, spelling)
             };
             let x = make_scope("x");
-            let inner_x = make_scope("x");
             let t = make_scope("t");
             let a = make_scope("a");
             let w = make_scope("w");
             let make_column = |scope| {
                 let spelling = identities.intern("n", false);
-                identities.mint_column(
-                    scope,
-                    ColumnOrigin::Bound { position: 0 },
-                    Some(spelling),
-                    Addressing::Published,
-                    ValueFacts::default(),
-                )
+                identities.sql_column(scope, Some(spelling), Addressing::Published)
             };
             let xn = make_column(x);
-            let inner_xn = make_column(inner_x);
             let tn = make_column(t);
             let an = make_column(a);
             let wn = make_column(w);
             Self {
-                identities,
                 x,
-                inner_x,
                 t,
                 a,
                 w,
                 xn,
-                inner_xn,
                 tn,
                 an,
                 wn,
@@ -911,16 +947,12 @@ mod tests {
         fn publish(
             &self,
             at: crate::names::ScopeId,
-            outputs: impl IntoIterator<Item = crate::names::ColId>,
             select: crate::pipeline::sql_ast::SelectBuilder,
         ) -> SelectStatement {
-            crate::pipeline::transformer::builder::publish_at(
-                at,
-                outputs,
-                select,
-                &self.identities,
-            )
-            .expect("a fixture publishes exactly what it names")
+            (select)
+                .standing_at(at)
+                .map_err(crate::error::DelightQLError::parse_error)
+                .expect("a fixture publishes exactly what it names")
         }
 
         fn table(scope: crate::names::ScopeId) -> TableExpression {
@@ -934,7 +966,6 @@ mod tests {
         fn base_member(&self) -> SelectStatement {
             self.publish(
                 self.x,
-                [self.xn],
                 SelectStatement::builder().select(SelectItem::expression_with_alias(
                     DomainExpression::Literal(LiteralValue::Number("1".to_string())),
                     self.xn,
@@ -942,18 +973,24 @@ mod tests {
             )
         }
 
-        fn recursive_stmt(&self, member: SelectStatement) -> SqlStatement {
-            let body = QueryExpression::SetOperation {
-                op: SetOperator::UnionAll,
-                left: Box::new(QueryExpression::Select(Box::new(self.base_member()))),
-                right: Box::new(QueryExpression::Select(Box::new(member))),
-            };
+        /// The statement as the transformer builds it for a binding the
+        /// resolver decided is a fixpoint: an anchor and one member, kept
+        /// apart, joined by the accumulation the decision named.
+        fn fixpoint_stmt(&self, member: SelectStatement) -> SqlStatement {
+            self.fixpoint_query_stmt(QueryExpression::Select(Box::new(member)))
+        }
+
+        fn fixpoint_query_stmt(&self, member: QueryExpression) -> SqlStatement {
+            let cte = Cte::fixpoint(SqlFixpoint::bag_fixture(
+                self.x,
+                QueryExpression::Select(Box::new(self.base_member())),
+                vec![member],
+            ));
             SqlStatement::Query {
-                with_clause: Some(vec![Cte::new(self.x, body)]),
+                with_clause: Some(vec![cte]),
                 query: QueryExpression::Select(Box::new(
                     self.publish(
                         self.x,
-                        [],
                         SelectStatement::builder()
                             .select(SelectItem::star_over_nothing())
                             .from_tables(vec![Self::table(self.x)]),
@@ -969,7 +1006,6 @@ mod tests {
         ) -> SelectStatement {
             self.publish(
                 self.x,
-                [self.xn],
                 SelectStatement::builder()
                     .select(SelectItem::expression_with_alias(
                         Self::column(column),
@@ -982,7 +1018,6 @@ mod tests {
         fn buried_limit_member(&self) -> SelectStatement {
             let inner = self.publish(
                 self.w,
-                [self.wn],
                 SelectStatement::builder()
                     .select(SelectItem::expression_with_alias(
                         Self::column(self.xn),
@@ -993,7 +1028,6 @@ mod tests {
             );
             self.publish(
                 self.x,
-                [self.xn],
                 SelectStatement::builder()
                     .select(SelectItem::expression_with_alias(
                         Self::column(self.wn),
@@ -1025,10 +1059,9 @@ mod tests {
             if inner_distinct {
                 inner = inner.distinct();
             }
-            let inner = self.publish(self.w, [self.wn], inner);
+            let inner = self.publish(self.w, inner);
             self.publish(
                 self.x,
-                [self.xn],
                 SelectStatement::builder()
                     .select(SelectItem::expression_with_alias(
                         Self::column(self.wn),
@@ -1052,7 +1085,6 @@ mod tests {
         ) -> TableExpression {
             let inner = self.publish(
                 alias,
-                [output],
                 SelectStatement::builder()
                     .select(SelectItem::expression_with_alias(
                         Self::column(self.xn),
@@ -1076,7 +1108,6 @@ mod tests {
             QueryExpression::Select(Box::new(
                 self.publish(
                     self.x,
-                    [self.xn],
                     SelectStatement::builder()
                         .select(SelectItem::expression_with_alias(
                             Self::column(read),
@@ -1086,21 +1117,17 @@ mod tests {
                 ),
             ))
         }
+    }
 
-        /// The statement as the transformer builds it for a binding the
-        /// resolver decided is recursive.
-        fn marked_stmt(&self, member: SelectStatement) -> SqlStatement {
-            let mut stmt = self.recursive_stmt(member);
-            let SqlStatement::Query {
-                with_clause: Some(ctes),
-                ..
-            } = &mut stmt
-            else {
-                unreachable!()
-            };
-            ctes[0] = Cte::new_recursive(ctes[0].scope(), ctes[0].query().clone());
-            stmt
-        }
+    /// The one recursive member of the fixture's fixpoint.
+    fn sole_member(stmt: &SqlStatement) -> &QueryExpression {
+        let CteBody::Fixpoint(fixpoint) = first_cte(stmt).body() else {
+            panic!("expected a fixpoint body");
+        };
+        let [member] = fixpoint.members() else {
+            panic!("the fixture has exactly one member");
+        };
+        member
     }
 
     fn first_cte(stmt: &SqlStatement) -> &Cte {
@@ -1168,7 +1195,7 @@ mod tests {
         let QueryExpression::Select(member) = f.member_over(from, f.an) else {
             unreachable!("member_over builds a SELECT")
         };
-        expect_badge(&mut f.marked_stmt(*member), "nonlinear");
+        expect_badge(&mut f.fixpoint_stmt(*member), "nonlinear");
     }
 
     #[test]
@@ -1176,7 +1203,6 @@ mod tests {
         let f = Fixture::new();
         let inner = f.publish(
             f.a,
-            [f.an],
             SelectStatement::builder()
                 .select(SelectItem::expression_with_alias(
                     Fixture::column(f.xn),
@@ -1202,23 +1228,21 @@ mod tests {
     #[test]
     fn buried_limit_unwraps_only_where_supported() {
         let f = Fixture::new();
-        // The flag arrives from the resolver; this pass reads it.
-        let mut sqlite = f.marked_stmt(f.buried_limit_member());
+        // The fixpoint body arrives from the resolver's decision; this
+        // pass reads it.
+        let mut sqlite = f.fixpoint_stmt(f.buried_limit_member());
         legalize_recursive_limits(&mut sqlite, SqlDialect::SQLite).unwrap();
-        let QueryExpression::SetOperation { right, .. } = first_cte(&sqlite).query() else {
-            panic!("expected set operation");
-        };
-        let QueryExpression::Select(member) = &**right else {
+        let QueryExpression::Select(member) = sole_member(&sqlite) else {
             panic!("expected recursive SELECT");
         };
         assert_eq!(member.from().unwrap()[0], Fixture::table(f.x));
         assert_eq!(member.limit().unwrap().count(), Some(2));
-        let SelectItem::Expression { expr, .. } = &member.select_list()[0] else {
+        let Some(expr) = member.select_list()[0].expr() else {
             panic!("expected expression");
         };
         assert_eq!(expr, &Fixture::column(f.xn));
 
-        let mut postgres = f.marked_stmt(f.buried_limit_member());
+        let mut postgres = f.fixpoint_stmt(f.buried_limit_member());
         let err = legalize_recursive_limits(&mut postgres, SqlDialect::PostgreSQL).unwrap_err();
         assert!(err.to_string().contains("total-row cap"));
     }
@@ -1227,24 +1251,22 @@ mod tests {
     fn plain_recursive_member_is_unchanged() {
         let f = Fixture::new();
         let member = f.recursive_member(f.x, f.xn);
-        let mut stmt = f.marked_stmt(member.clone());
+        let mut stmt = f.fixpoint_stmt(member.clone());
         legalize_recursive_limits(&mut stmt, SqlDialect::PostgreSQL).unwrap();
-        let QueryExpression::SetOperation { right, .. } = first_cte(&stmt).query() else {
-            panic!("expected set operation");
-        };
-        assert_eq!(**right, QueryExpression::Select(Box::new(member)));
+        assert_eq!(
+            *sole_member(&stmt),
+            QueryExpression::Select(Box::new(member))
+        );
     }
 
     #[test]
     fn transparent_member_rebuilds_at_the_outer_scope_before_validation() {
         let f = Fixture::new();
         let mut stmt =
-            f.marked_stmt(f.transparently_renamed_member(Some(Fixture::column(f.xn)), false));
+            f.fixpoint_stmt(f.transparently_renamed_member(Some(Fixture::column(f.xn)), false));
         validate_recursive_members(&mut stmt).unwrap();
-        let QueryExpression::SetOperation { right, .. } = first_cte(&stmt).query() else {
-            panic!("expected set operation");
-        };
-        let QueryExpression::Select(member) = &**right else {
+        let right = sole_member(&stmt);
+        let QueryExpression::Select(member) = right else {
             panic!("expected recursive SELECT");
         };
         assert_eq!(member.from().unwrap(), [Fixture::table(f.x)]);
@@ -1262,7 +1284,7 @@ mod tests {
     fn a_distinct_self_wrapper_remains_buried() {
         let f = Fixture::new();
         let member = f.transparently_renamed_member(None, true);
-        expect_badge(&mut f.marked_stmt(member), "self_subquery");
+        expect_badge(&mut f.fixpoint_stmt(member), "self_subquery");
     }
 
     #[test]
@@ -1277,23 +1299,19 @@ mod tests {
                 left: Box::new(Fixture::table(f.x)),
                 right: Box::new(Fixture::table(f.x)),
                 join_type: crate::pipeline::sql_ast::JoinType::Inner,
-                join_condition: crate::pipeline::sql_ast::JoinCondition::On(Fixture::column(
-                    f.xn,
-                )),
+                join_condition: crate::pipeline::sql_ast::JoinCondition::On(Fixture::column(f.xn)),
             }]);
-        let nonlinear = f.publish(f.x, [f.xn], nonlinear);
-        expect_badge(&mut f.marked_stmt(nonlinear), "nonlinear");
+        let nonlinear = f.publish(f.x, nonlinear);
+        expect_badge(&mut f.fixpoint_stmt(nonlinear), "nonlinear");
 
         let inner = f.publish(
             f.x,
-            [],
             SelectStatement::builder()
                 .select(SelectItem::star_over_nothing())
                 .from_tables(vec![Fixture::table(f.x)]),
         );
         let subquery = f.publish(
             f.x,
-            [f.xn],
             SelectStatement::builder()
                 .select(SelectItem::expression_with_alias(
                     Fixture::column(f.xn),
@@ -1305,7 +1323,7 @@ mod tests {
                     query: Box::new(QueryExpression::Select(Box::new(inner))),
                 }),
         );
-        expect_badge(&mut f.marked_stmt(subquery), "self_subquery");
+        expect_badge(&mut f.fixpoint_stmt(subquery), "self_subquery");
     }
 
     #[test]
@@ -1314,7 +1332,6 @@ mod tests {
         let aggregate = |scope, column| {
             f.publish(
                 f.x,
-                [f.xn],
                 SelectStatement::builder()
                     .select(SelectItem::expression_with_alias(
                         DomainExpression::Function {
@@ -1327,7 +1344,7 @@ mod tests {
                     .from_tables(vec![Fixture::table(scope)]),
             )
         };
-        expect_badge(&mut f.marked_stmt(aggregate(f.x, f.xn)), "aggregate");
-        validate_recursive_members(&mut f.marked_stmt(aggregate(f.t, f.tn))).unwrap();
+        expect_badge(&mut f.fixpoint_stmt(aggregate(f.x, f.xn)), "aggregate");
+        validate_recursive_members(&mut f.fixpoint_stmt(aggregate(f.t, f.tn))).unwrap();
     }
 }

@@ -9,6 +9,11 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 /// This module contains the rustyline helper implementations for tab completion
 /// of dot commands and column names in the REPL.
 use rustyline::{Context as RustylineContext, Helper};
+use std::sync::Arc;
+
+use super::config::ReplParserOperation;
+use super::parser_worker::{ParserWorkerController, ProbeOutcome};
+use super::worker::WorkerResult;
 
 /// Context for determining what type of completion to provide
 #[derive(Debug, Clone)]
@@ -19,13 +24,6 @@ enum CompletionContext {
     ColumnName { tables: Vec<String> },
     /// Unknown context, no completions
     Unknown,
-}
-
-thread_local! {
-    /// One parser per thread, reused. `Parser` is neither `Clone` nor `Sync`,
-    /// and the helper is both, so it cannot live in the struct.
-    static WF_PARSER: std::cell::RefCell<Option<delightql_cst::Parser>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 /// Largest char boundary at or below `i`. rustyline keeps its cursor on a
@@ -58,35 +56,31 @@ pub(crate) fn split_at_cursor(line: &str, pos: usize) -> (&str, &str) {
 /// discarded, would this run" — NOT "is the user finished". Well-formedness is
 /// not monotonic over prefixes: `users(*)` holds, `users(*) |>` does not,
 /// `users(*) |> (id)` holds again.
-pub(crate) fn is_well_formed(prefix: &str) -> bool {
+///
+/// The parse runs in the containment worker at the prompt entrance — the
+/// road the line will take if Enter is pressed. `None` means the probe did
+/// not answer (budget exceeded, the worker unavailable, or the optional
+/// helpers disabled); the caller keeps its previous verdict or falls
+/// through — a timed-out keystroke never freezes the prompt, and Tab's
+/// meta-ize never fires without a verdict.
+pub(crate) fn is_well_formed(worker: &ParserWorkerController, prefix: &str) -> Option<bool> {
     let prefix = prefix.trim();
     // Dot-commands are REPL directives, not queries.
     if prefix.is_empty() || prefix.starts_with('.') {
-        return false;
+        return Some(false);
     }
-    WF_PARSER.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(delightql_cst::Parser::new());
-        }
-        let parser = slot.as_mut().expect("initialised above");
-        // The prompt entrance, because that is the road the line will take if
-        // Enter is pressed. Parsing it any other way would answer about a
-        // submission the REPL is not about to make.
-        //
-        // A parse ALWAYS returns a tree: recovery wraps broken input into
-        // valid-LOOKING nodes. Asking for defects is the whole difference
-        // between this and accepting a corrupt parse; asking for a branch is
-        // what keeps a source that declares nothing from reading as complete.
-        let tree = parser.parse_prompt(prefix);
-        !tree.has_defects() && tree.root_branch().is_some()
-    })
+    match worker.probe(ReplParserOperation::PromptWellFormed, prefix, None) {
+        ProbeOutcome::Answer(WorkerResult::WellFormed { well_formed }) => Some(well_formed),
+        _ => None,
+    }
 }
 
 /// Completer for dot commands and column names in the REPL
 #[derive(Clone)]
 pub struct DotCommandCompleter {
     commands: Vec<String>,
+    /// The containment boundary every speculative parse crosses.
+    worker: Arc<ParserWorkerController>,
     /// Well-formedness of the prefix left of the cursor, for the buffer being
     /// drawn. Written by `highlight_char`, read by `highlight_prompt` — which
     /// receives no line buffer of its own. `Cell` because every `Highlighter`
@@ -96,7 +90,7 @@ pub struct DotCommandCompleter {
 }
 
 impl DotCommandCompleter {
-    pub fn new() -> Self {
+    pub fn new(worker: Arc<ParserWorkerController>) -> Self {
         Self {
             // Projection of the dot-command registry — a hand-list here
             // completed fossils (.debug-last had no dispatch arm) and
@@ -104,6 +98,7 @@ impl DotCommandCompleter {
             commands: super::commands::dot_command_spellings()
                 .map(String::from)
                 .collect(),
+            worker,
             well_formed: std::cell::Cell::new(false),
             // schema: None, // Temporarily disabled
         }
@@ -297,8 +292,18 @@ impl Highlighter for DotCommandCompleter {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
         #[cfg(feature = "prettify")]
         {
-            // Use our syntax highlighter for DelightQL syntax
-            crate::repl::syntax_highlighter::highlight_line(line)
+            // Spans come from the containment worker; only the ANSI
+            // rendering happens here. A probe that does not answer draws
+            // the line uncolored — never a frozen prompt.
+            match self
+                .worker
+                .probe(ReplParserOperation::SyntaxHighlight, line, None)
+            {
+                ProbeOutcome::Answer(WorkerResult::Highlights { spans }) => {
+                    crate::repl::syntax_highlighter::render_line(line, &spans)
+                }
+                _ => std::borrow::Cow::Borrowed(line),
+            }
         }
         #[cfg(not(feature = "prettify"))]
         {
@@ -308,6 +313,14 @@ impl Highlighter for DotCommandCompleter {
     }
 
     fn highlight_char(&self, line: &str, pos: usize) -> bool {
+        // With the optional helpers off, the prompt is the ORDINARY prompt:
+        // the neutral verdict clears any stale `?>` left from before the
+        // breaker opened, and nothing contacts or spawns the worker. A read
+        // of the shared policy, not a probe.
+        if !self.worker.helpers_enabled() {
+            self.well_formed.set(true);
+            return true;
+        }
         // The only Highlighter hook that receives BOTH the line and the cursor,
         // and rustyline calls it before drawing the prompt on every edit AND
         // every cursor move. So it is where the verdict is computed.
@@ -317,7 +330,11 @@ impl Highlighter for DotCommandCompleter {
         // the prompt flips at each boundary where the prefix stops standing
         // alone.
         let (left, _right) = split_at_cursor(line, pos);
-        self.well_formed.set(is_well_formed(left));
+        if let Some(verdict) = is_well_formed(&self.worker, left) {
+            self.well_formed.set(verdict);
+        }
+        // On no-answer the PREVIOUS verdict stands: a timed-out probe keeps
+        // the prompt's last honest state instead of flapping or freezing.
 
         // Returning `true` forces a full refresh, which is what redraws the
         // prompt. Returning `false` lets rustyline take its fast paths — write
@@ -349,31 +366,3 @@ impl Validator for DotCommandCompleter {
 impl Helper for DotCommandCompleter {}
 
 // End of temporarily disabled test module
-
-#[cfg(test)]
-mod wf_tests {
-    use super::is_well_formed;
-
-    /// Scrubbing the cursor left through a finished query passes through
-    /// well-formed states on the way to other well-formed states. This is the
-    /// property the dynamic prompt renders, and it is deliberately NOT
-    /// monotonic.
-    #[test]
-    fn prefix_wellformedness_is_not_monotonic() {
-        let line = "users(*) |> (id)";
-        let ladder: Vec<(usize, bool)> = (0..=line.len())
-            .filter(|i| line.is_char_boundary(*i))
-            .map(|i| (i, is_well_formed(&line[..i])))
-            .collect();
-
-        for (i, wf) in &ladder {
-            println!("{:>3} {:<20} {}", i, &line[..*i], if *wf { "WF" } else { "--" });
-        }
-
-        let flips = ladder.windows(2).filter(|w| w[0].1 != w[1].1).count();
-        assert!(flips >= 3, "expected several transitions, saw {flips}");
-        assert!(is_well_formed(line), "the whole line must be well formed");
-        assert!(!is_well_formed(""), "empty is not runnable");
-        assert!(!is_well_formed(".help"), "dot-commands are not queries");
-    }
-}

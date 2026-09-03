@@ -36,14 +36,15 @@ pub fn baptise_statements<'registry>(
     identities: &'registry crate::names::Registry,
     statements: &[&SqlStatement],
 ) -> Result<Baptised<'registry>, GeneratorError> {
-    let bundle = crate::names::Bundle {
-        statements: statements
+    let bundle = crate::names::Bundle::gather(
+        statements
             .iter()
             .map(|statement| {
                 crate::pipeline::sql_ast::names::statement_names(statement, identities)
             })
             .collect(),
-    };
+    )
+    .reserve_authored(identities);
     crate::names::baptise(identities, &bundle)
         .map_err(|error| GeneratorError::Error(format!("SQL naming failed: {error:?}")))
 }
@@ -82,6 +83,7 @@ fn reads_scope(table: &TableExpression, scope: ScopeId) -> bool {
 pub(crate) struct Emitting {
     pub scope: ScopeId,
     pub reflexive: bool,
+    unqualified: bool,
 }
 
 impl Emitting {
@@ -89,6 +91,15 @@ impl Emitting {
         Self {
             scope,
             reflexive: false,
+            unqualified: false,
+        }
+    }
+
+    fn ddl(scope: ScopeId) -> Self {
+        Self {
+            scope,
+            reflexive: false,
+            unqualified: true,
         }
     }
 }
@@ -142,6 +153,19 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
     ) -> Result<String, GeneratorError> {
         let mut sql = String::new();
         self.generate_domain_expression(&mut sql, expr, Some(Emitting::at(at)))?;
+        Ok(sql)
+    }
+
+    /// Render a DDL CHECK or DEFAULT expression. SQL column definitions do
+    /// not introduce a table alias, so their column references are always
+    /// unqualified even when resolution crossed an internal occurrence.
+    pub(crate) fn render_ddl_expression(
+        &self,
+        expr: &DomainExpression,
+        at: ScopeId,
+    ) -> Result<String, GeneratorError> {
+        let mut sql = String::new();
+        self.generate_domain_expression(&mut sql, expr, Some(Emitting::ddl(at)))?;
         Ok(sql)
     }
 
@@ -262,9 +286,13 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                 "column reference {column:?} was not included in the baptism bundle"
             )));
         }
-        self.write_name(sql, |names, output| {
-            names.write_ref(column, at.scope, at.reflexive, output)
-        })
+        if at.unqualified {
+            self.write_column(sql, column)
+        } else {
+            self.write_name(sql, |names, output| {
+                names.write_ref(column, at.scope, at.reflexive, output)
+            })
+        }
     }
 
     fn write_entity(&self, sql: &mut String, entity: EntityId) -> Result<(), GeneratorError> {
@@ -801,16 +829,39 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
 
             // CTE name
             self.write_scope(sql, cte.scope())?;
-            sql.push_str(" AS (");
+            if cte.materialized_once() {
+                // ONCE-ONLY IS A TARGET CAPABILITY, and this is where the
+                // target answers. A closed configured rule value is
+                // evaluated where it is constructed and read wherever it
+                // is spent; three families say so in the CTE itself.
+                // MySQL and SQL Server have no spelling that forbids
+                // re-evaluation, so a plain CTE there would silently
+                // re-run a volatile configuration once per spend. The
+                // refusal is the honest answer; emitting `AS (` would be
+                // a guarantee the target does not make.
+                match self.config.dialect {
+                    SqlDialect::SQLite | SqlDialect::PostgreSQL | SqlDialect::DuckDB => {
+                        sql.push_str(" AS MATERIALIZED (");
+                    }
+                    SqlDialect::MySQL | SqlDialect::SqlServer => {
+                        return Err(GeneratorError::Error(format!(
+                            "{:?} cannot guarantee the required once-only materialization of a closed configured rule value",
+                            self.config.dialect
+                        )));
+                    }
+                }
+            } else {
+                sql.push_str(" AS (");
+            }
 
-            // CTE query (indented if pretty printing)
+            // CTE body (indented if pretty printing)
             if self.config.pretty_print {
                 sql.push('\n');
-                self.generate_query_expression(sql, cte.query(), indent + 1)?;
+                self.generate_cte_body(sql, cte.body(), indent + 1)?;
                 sql.push('\n');
                 self.indent(sql, indent);
             } else {
-                self.generate_query_expression(sql, cte.query(), indent)?;
+                self.generate_cte_body(sql, cte.body(), indent)?;
             }
 
             sql.push(')');
@@ -819,7 +870,45 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         Ok(())
     }
 
-    /// Generate a query expression (SELECT, UNION, VALUES)
+    /// A CTE's body.
+    ///
+    /// A FIXPOINT EMITS ITS OWN PARTS. The anchor and the members are
+    /// structure, and the keyword between them is the accumulation the
+    /// recursion decision chose — read off the body, not matched against a
+    /// token some node happens to carry. There is nothing here to place
+    /// wrongly, so nothing to detect.
+    #[stacksafe::stacksafe]
+    fn generate_cte_body(
+        &self,
+        sql: &mut String,
+        body: &crate::pipeline::sql_ast::CteBody,
+        indent: usize,
+    ) -> Result<(), GeneratorError> {
+        use crate::pipeline::sql_ast::CteBody;
+        match body {
+            CteBody::Ordinary(query) => self.generate_query_expression(sql, query, indent),
+            CteBody::Fixpoint(fixpoint) => {
+                self.generate_query_expression(sql, fixpoint.anchor(), indent)?;
+                for member in fixpoint.members() {
+                    if self.config.pretty_print {
+                        sql.push('\n');
+                        self.indent(sql, indent);
+                    } else {
+                        sql.push(' ');
+                    }
+                    sql.push_str(fixpoint.keyword());
+                    if self.config.pretty_print {
+                        sql.push('\n');
+                    } else {
+                        sql.push(' ');
+                    }
+                    self.generate_query_expression(sql, member, indent)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     #[stacksafe::stacksafe]
     fn generate_query_expression(
         &self,
@@ -843,9 +932,7 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                     sql.push(' ');
                 }
 
-                sql.push_str(match op {
-                    SetOperator::UnionAll => "UNION ALL",
-                });
+                sql.push_str(op.keyword());
 
                 if self.config.pretty_print {
                     sql.push('\n');
@@ -873,52 +960,15 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                 }
             }
             QueryExpression::WithCte { ctes, query } => {
-                // Generate nested WITH clause
+                // A NESTED WITH IS THE SAME WITH. One road writes the
+                // clause — recursion keyword, once-only materialization,
+                // each body — so a target's materialization answer cannot
+                // be given twice and differ.
                 self.indent(sql, indent);
-
-                // Check if any CTE is recursive
-                let has_recursive = ctes.iter().any(|cte| cte.is_recursive());
-
-                if has_recursive {
-                    sql.push_str("WITH RECURSIVE ");
-                } else {
-                    sql.push_str("WITH ");
-                }
-
-                // Generate each CTE (inline the logic from generate_with_clause)
-                for (i, cte) in ctes.iter().enumerate() {
-                    if i > 0 {
-                        sql.push(',');
-                        if self.config.pretty_print {
-                            sql.push('\n');
-                            self.indent(sql, indent);
-                        } else {
-                            sql.push(' ');
-                        }
-                    }
-
-                    // CTE name
-                    self.write_scope(sql, cte.scope())?;
-                    sql.push_str(" AS (");
-
-                    // CTE query (indented if pretty printing)
-                    if self.config.pretty_print {
-                        sql.push('\n');
-                        self.generate_query_expression(sql, cte.query(), indent + 1)?;
-                        sql.push('\n');
-                        self.indent(sql, indent);
-                    } else {
-                        self.generate_query_expression(sql, cte.query(), indent)?;
-                    }
-
-                    sql.push(')');
-                }
-
+                self.generate_with_clause(sql, ctes, indent)?;
                 if self.config.pretty_print {
                     sql.push('\n');
                 }
-
-                // Generate the inner query
                 self.generate_query_expression(sql, query, indent)?;
             }
         }
@@ -939,10 +989,13 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                 !self.names.is_scratch_scope(select.at())
                     && from.iter().any(|table| reads_scope(table, select.at()))
             }),
+            unqualified: false,
         };
         for item in select.select_list() {
-            if let SelectItem::Expression {
-                alias: Some(alias), ..
+            if let SelectItem::Publishing {
+                slot: alias,
+                printed: true,
+                ..
             } = item
             {
                 if !self.names.column_belongs_to(*alias, at.scope) {
@@ -1126,11 +1179,15 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
             SelectItem::Star { .. } => {
                 sql.push('*');
             }
-            SelectItem::Expression { expr, alias } => {
+            SelectItem::Publishing { expr, .. } | SelectItem::Scaffolding { expr, .. } => {
                 self.generate_domain_expression(sql, expr, Some(at))?;
-                if let Some(alias) = alias {
+                // THE ALIAS IS A RENDERING DECISION. The position's
+                // identity is its slot, which every reader addresses it by;
+                // whether SQL writes an `AS` is a separate question the
+                // item already answered.
+                if let Some(alias) = item.printed_alias() {
                     sql.push_str(" AS ");
-                    self.write_column(sql, *alias)?;
+                    self.write_column(sql, alias)?;
                 }
             }
         }
@@ -1225,18 +1282,23 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                         sql.push_str(" ON ");
                         self.generate_domain_expression(sql, expr, Some(at))?;
                     }
-                    JoinCondition::Using(columns) => {
-                        sql.push_str(" USING (");
-                        for (i, col) in columns.iter().enumerate() {
+                    // Each pair is written as the equality of its two exact
+                    // slots, each under its own qualifier: nothing here
+                    // depends on the two sides sharing characters.
+                    JoinCondition::Merge(pairs) => {
+                        sql.push_str(" ON ");
+                        for (i, pair) in pairs.iter().enumerate() {
                             if i > 0 {
-                                sql.push_str(", ");
+                                sql.push_str(" AND ");
                             }
-                            self.write_column(sql, *col)?;
+                            self.write_ref(sql, pair.left, at)?;
+                            sql.push_str(" = ");
+                            self.write_ref(sql, pair.right, at)?;
                         }
-                        sql.push(')');
                     }
-                    JoinCondition::Natural => {
-                        // NATURAL is already in the join type
+                    JoinCondition::Cartesian => {
+                        // A deliberate cross spells no condition; dialects
+                        // that reject the bare form were legalized upstream.
                     }
                 }
             }
@@ -1609,10 +1671,11 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
             }
             DomainExpression::PredicateRewrite {
                 name,
+                namespace,
                 args,
                 negated,
             } => {
-                self.generate_predicate_rewrite(sql, name, args, *negated, at)?;
+                self.generate_predicate_rewrite(sql, name, namespace, args, *negated, at)?;
             }
             // THE POLARITY OBSERVATION, in the target's own spelling. The
             // canonical form is SQL's `IS [NOT] TRUE`; a target without it
@@ -1652,6 +1715,7 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         &self,
         sql: &mut String,
         name: &str,
+        namespace: &[String],
         args: &[DomainExpression],
         negated: bool,
         at: Option<Emitting>,
@@ -1717,9 +1781,13 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
             ))
         })?;
 
-        let entity = registry.lookup_entity(name).ok_or_else(|| {
-            GeneratorError::Error(format!("Unknown predicate rewrite: '{}'", name))
-        })?;
+        // The identity the resolver selected: a qualified citation names its
+        // namespace exactly, a bare one is the universally visible entity.
+        let entity = registry
+            .lookup_qualified_entity(namespace, name)
+            .ok_or_else(|| {
+                GeneratorError::Error(format!("Unknown predicate rewrite: '{}'", name))
+            })?;
 
         let sql_gen = entity.as_sql_generatable().ok_or_else(|| {
             GeneratorError::Error(format!(

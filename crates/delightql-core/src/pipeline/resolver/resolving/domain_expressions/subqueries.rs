@@ -11,7 +11,6 @@
 //! occurrence the value publishes.
 
 use crate::error::{DelightQLError, Result};
-use crate::names::{ColId, HeadingKnowledge};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
@@ -40,16 +39,11 @@ pub(in crate::pipeline::resolver) fn resolve_scalar_relation_via_fold(
             name: delightql_types::SqlIdentifier::new("_"),
         },
     };
-    let config = fold.config.clone();
-    let (resolved, _) = super::super::super::resolve_relational_expression_with_registry(
-        relation.body().clone().attached(),
-        fold.registry,
-        Some(&fold.available),
-        &config,
-        None,
-    )?;
+    let resolved = fold
+        .resolve_interior(relation.body().clone().attached())?
+        .into_body();
 
-    let sole = sole_column(&resolved, &fold.registry.identities, &identifier)?;
+    let sole = sole_column(&resolved, &fold.core.identities, &identifier)?;
     let body = Box::new(ast_resolved::ScalarizedRelation::detach(resolved, sole)?);
 
     Ok(match relation {
@@ -67,16 +61,16 @@ pub(in crate::pipeline::resolver) fn resolve_scalar_relation_via_fold(
 /// unknown never means one.
 fn sole_column(
     resolved: &ast_resolved::Chain,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
     identifier: &ast_unresolved::QualifiedName,
-) -> Result<ColId> {
-    let scope = published_scope(resolved);
-    let heading = match identities.heading(scope) {
-        HeadingKnowledge::Known(heading) => heading,
-        HeadingKnowledge::Opaque => return Err(opaque_heading(identifier)),
-    };
-    let columns: Vec<ColId> = heading.into_iter().collect();
-    match columns.as_slice() {
+) -> Result<crate::relation::PortId> {
+    let relation = published_relation(resolved);
+    let interface = identities.authority().interface(relation)?;
+    if interface.is_opaque() {
+        return Err(opaque_heading(identifier));
+    }
+    let columns = interface.ports();
+    match columns {
         [only] => Ok(*only),
         wider => Err(wider_heading(identifier, wider.len())),
     }
@@ -84,24 +78,10 @@ fn sole_column(
 
 /// The relation the outermost node of a resolved chain publishes.
 #[stacksafe::stacksafe]
-fn published_scope(expr: &ast_resolved::Chain) -> crate::names::ScopeId {
-    use crate::pipeline::asts::core::expressions::relational::Relation;
-    use crate::pipeline::asts::core::Grelex;
-    if let Some(continuation) = expr.continuations.last() {
-        return *continuation
-            .cpr_schema()
-            // Only an ER edge carries no publication, and an edge is
-            // expanded into ordinary members by the resolver.
-            .expect("an ER edge cannot survive resolution");
-    }
-    match &expr.head {
-        Grelex::Literal(anon) => anon.table.cpr_schema,
-        Grelex::Reference(rel) => match rel {
-            Relation::Ground { cpr_schema, .. }
-            | Relation::InnerRelation { cpr_schema, .. }
-            | Relation::FunctorCall { cpr_schema, .. } => *cpr_schema,
-            Relation::ConsultedView { scoped, .. } => *scoped,
-        },
+fn published_relation(expr: &ast_resolved::Chain) -> &crate::relation::SemanticRelation {
+    match expr.continuations().last() {
+        Some(step) => step.result(),
+        None => expr.head().result(),
     }
 }
 

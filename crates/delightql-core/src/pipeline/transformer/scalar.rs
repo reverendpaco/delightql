@@ -31,6 +31,7 @@ use crate::pipeline::asts::core::expressions::{Enclyph, Record, RecordMember};
 use crate::pipeline::asts::core::literals::LiteralValue;
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::asts::core::Polarity;
+use crate::pipeline::asts::core::TruthConsumer;
 use crate::pipeline::asts::core::{
     Comparison, Existence, Membership, RelationalMembership, SigmaApplication,
 };
@@ -61,36 +62,33 @@ pub(super) fn s_lower_expression(
         ast_refined::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { column, .. },
         ))) => {
-            let landed = qualify.rebind(column)?;
-            // A correlated outer reference passes through the local rebind
-            // untouched — nothing here publishes it. That is only correct
-            // while the enclosing FROM still exposes the scope the reference
-            // was addressed at; a boundary the transformer inserted out there
-            // (freezing a pipe into a subquery) republishes the heading, and
-            // the reference must re-anchor onto the occurrence the outer
-            // scope NOW publishes. The republication chain decides, bounded
-            // the same way the local chain tier is: one candidate or none.
-            let landed = if landed == column
-                && !ctx.outer_columns.is_empty()
-                && !qualify
-                    .scope_columns()
-                    .iter()
-                    .any(|local| local.identity() == column)
-            {
-                let identities = qualify.identities();
-                let mut candidates = ctx
-                    .outer_columns
-                    .iter()
-                    .map(crate::pipeline::asts::core::ColumnMetadata::identity)
-                    .filter(|candidate| identities.republishes(*candidate, column));
-                match (candidates.next(), candidates.next()) {
-                    (Some(candidate), None) => candidate,
-                    _ => landed,
+            let local = qualify.rebind_port(column);
+            let landed = match local {
+                Ok(column) => column,
+                Err(local_error) => {
+                    let matches: Vec<_> = ctx
+                        .outer_sites
+                        .iter()
+                        .filter_map(|site| ctx.identities.bindings().at(*site, column).ok())
+                        .collect();
+                    match matches.as_slice() {
+                        [column] => *column,
+                        [] => return Err(local_error),
+                        _ => return Err(DelightQLError::parse_error(
+                            "a correlated semantic port is bound by more than one outer SQL site",
+                        )),
+                    }
                 }
-            } else {
-                landed
             };
             Ok(SqlDomainExpr::Column(landed))
+        }
+        ast_refined::DomainExpression::Reference(Reference::Physical(column)) => {
+            // A PHYSICAL SLOT IS RE-ANCHORED THROUGH THE WRAPS ABOVE IT. The
+            // level that published this value may since have been wrapped as
+            // a subquery and republished; the site records what each wrap
+            // did, and a reference that named the pre-wrap occurrence would
+            // qualify by a FROM entry the statement no longer has.
+            Ok(SqlDomainExpr::Column(qualify.rebind_physical(column)?))
         }
         ast_refined::DomainExpression::Application(ast_refined::FunctionApplication::Ground(
             value,
@@ -128,7 +126,7 @@ pub(super) fn s_lower_expression(
 
 /// Lower a DQL `DomainExpression` to a `SelectItem` (for projection lists).
 ///
-/// Handles both regular expressions (column refs → SelectItem::Expression)
+/// Handles both regular expressions (column refs → a publishing position)
 /// and projection-only expressions (Glob → SelectItem::Star).
 #[stacksafe::stacksafe]
 /// Lower one PUBLICATION ITEM. The alias is the output occurrence the
@@ -152,35 +150,18 @@ pub(super) fn s_lower_out_item(
                 .collect(),
         )),
         ast_refined::OutItem::One(one) => {
-            let output = one.output;
-            let mut item = s_lower_out_select_item(one.expr, qualify, ctx)?;
+            let output = *one.output();
+            let mut item = s_lower_select_item(one.expr, qualify, ctx)?;
             // THE ITEM'S OUTPUT IS AUTHORITATIVE. A referenced value lowers to
             // the occurrence it READS, which is a different question from what
             // the position publishes it as — letting the read win published a
             // named delegate payload under the source column's name on every
             // road that does not later repair the projection from its heading.
-            if let (SelectItem::Expression { alias, .. }, Some(output)) = (&mut item, output) {
-                *alias = Some(output);
+            if let Some(expr) = item.expr() {
+                item = SelectItem::expression_with_alias(expr.clone(), output.column());
             }
             Ok(item)
         }
-    }
-}
-
-/// A PUBLISHED item: the domain road, or the licensed crossing lowered as a
-/// value. A crossing baptizes rather than renames, so it carries no alias of
-/// its own to extract.
-pub(super) fn s_lower_out_select_item(
-    value: ast_refined::OutValue,
-    qualify: &dyn Qualify,
-    ctx: &TransformCtx,
-) -> Result<SelectItem> {
-    match value {
-        ast_refined::OutValue::Domain(domain) => s_lower_select_item(domain, qualify, ctx),
-        ast_refined::OutValue::Truth(crossing) => Ok(SelectItem::Expression {
-            expr: s_lower_boolean(crossing.into_truth(), qualify, ctx)?.into_expr(),
-            alias: None,
-        }),
     }
 }
 
@@ -194,9 +175,19 @@ pub(super) fn s_lower_select_item(
         other => {
             let alias = extract_alias(&other);
             let sql_expr = s_lower_expression(other, qualify, ctx)?;
-            Ok(SelectItem::Expression {
-                expr: sql_expr,
-                alias,
+            // A VALUE THAT NAMES NO OCCURRENCE IS SCAFFOLDING until a
+            // publication position says which one it realizes; the caller
+            // above states that where it knows.
+            Ok(match alias {
+                Some(alias) => SelectItem::expression_with_alias(sql_expr, alias),
+                None => match sql_expr {
+                    crate::pipeline::sql_ast::DomainExpression::Column(column) => {
+                        SelectItem::bare_column(column)
+                    }
+                    other => {
+                        SelectItem::scaffolding_value(other, ctx.identities.scaffolding_slot())
+                    }
+                },
             })
         }
     }
@@ -206,54 +197,37 @@ fn extract_alias(expr: &ast_refined::DomainExpression) -> Option<crate::names::C
     match expr {
         ast_refined::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { column, .. },
-        ))) => Some(*column),
+        ))) => Some(column.column()),
+        ast_refined::DomainExpression::Reference(Reference::Physical(column)) => Some(*column),
         _ => None,
     }
 }
 
-/// Lower a DQL `TruthExpression` to a SQL `SqlPredicate`.
+/// Lower a DQL `TruthExpression` standing in TRUTH position to a SQL
+/// `SqlPredicate`.
 ///
 /// Used by `r_lower_filter` and `r_lower_join` to translate WHERE/ON
 /// conditions. Recurses through AND/OR/NOT, lowering each leaf
 /// comparison's operands via `s_lower_expression`.
-#[stacksafe::stacksafe]
-/// Lower an ARGUMENT's value. DISTINCT is the argument's own data and is
-/// applied by the call that reads it; the crossing lowers as a value.
-pub(super) fn s_lower_argument_value(
-    value: ast_refined::ArgumentValue,
-    qualify: &dyn Qualify,
-    ctx: &TransformCtx,
-) -> Result<SqlDomainExpr> {
-    match value {
-        ast_refined::ArgumentValue::Domain { value, .. } => s_lower_expression(value, qualify, ctx),
-        ast_refined::ArgumentValue::Truth(crossing) => {
-            Ok(s_lower_boolean(crossing.into_truth(), qualify, ctx)?.into_expr())
-        }
-    }
-}
-
-/// Lower a PUBLISHED value: a domain expression, or the licensed crossing.
-///
-/// The crossing is where three-valued logic changes behaviour — the truth is
-/// read as a value here, so its unknown is CARRIED into the column instead
-/// of rejecting the row.
-pub(super) fn s_lower_out_value(
-    value: ast_refined::OutValue,
-    qualify: &dyn Qualify,
-    ctx: &TransformCtx,
-) -> Result<SqlDomainExpr> {
-    match value {
-        ast_refined::OutValue::Domain(domain) => s_lower_expression(domain, qualify, ctx),
-        ast_refined::OutValue::Truth(crossing) => {
-            Ok(s_lower_boolean(crossing.into_truth(), qualify, ctx)?.into_expr())
-        }
-    }
-}
-
 pub(super) fn s_lower_boolean(
     expr: ast_refined::TruthExpression,
     qualify: &dyn Qualify,
     ctx: &TransformCtx,
+) -> Result<SqlPredicate> {
+    s_lower_truth(expr, qualify, ctx, TruthConsumer::Filter)
+}
+
+/// The one truth lowering, told WHO CONSUMES the truth. Every filtering
+/// position on this road enters through `s_lower_boolean`; only the crossing
+/// enters as a value, and the consumer follows the connectives down (a
+/// crossed conjunction's members are crossed) but never into a nested
+/// relation, whose own truth positions name their own consumer.
+#[stacksafe::stacksafe]
+fn s_lower_truth(
+    expr: ast_refined::TruthExpression,
+    qualify: &dyn Qualify,
+    ctx: &TransformCtx,
+    consumer: TruthConsumer,
 ) -> Result<SqlPredicate> {
     match expr {
         ast_refined::TruthExpression::Comparison(Comparison {
@@ -275,15 +249,15 @@ pub(super) fn s_lower_boolean(
         // SQL's operator is binary, so the chain is rebuilt HERE, left to
         // right, and nowhere earlier.
         ast_refined::TruthExpression::Conjunction(parts) => {
-            n_ary_predicate(*parts, SqlPredicate::and, qualify, ctx)
+            n_ary_predicate(*parts, SqlPredicate::and, qualify, ctx, consumer)
         }
 
         ast_refined::TruthExpression::Disjunction(parts) => {
-            n_ary_predicate(*parts, SqlPredicate::or, qualify, ctx)
+            n_ary_predicate(*parts, SqlPredicate::or, qualify, ctx, consumer)
         }
 
         ast_refined::TruthExpression::Not { expr } => {
-            let inner = s_lower_boolean(*expr, qualify, ctx)?;
+            let inner = s_lower_truth(*expr, qualify, ctx, consumer)?;
             Ok(inner.not())
         }
 
@@ -305,7 +279,7 @@ pub(super) fn s_lower_boolean(
                 .into_values()
                 .try_map(|p| s_lower_expression(p, qualify, ctx))?
                 .into_vec();
-            let inner_ctx = ctx.with_outer_scope(qualify.scope_columns());
+            let inner_ctx = ctx.with_outer_scope(qualify);
             let names = &inner_ctx.names;
             let inner_builder = super::descend::descend_as_query(*subquery, names, &inner_ctx)?;
             let output_columns = inner_builder.scope_columns();
@@ -328,16 +302,15 @@ pub(super) fn s_lower_boolean(
                     "the left side of `in` must match the relation's width",
                 ));
             }
-            let origin = crate::pipeline::asts::core::ColumnMetadata::common_identity_scope(
+            let wrap_scope = crate::pipeline::asts::core::ColumnMetadata::common_identity_scope(
                 &output_columns,
                 &inner_ctx.identities,
             )
-            .map(|input| crate::names::ScopeOrigin::Wrap {
-                input,
-                why: crate::names::WrapReason::Correlation,
-            })
-            .unwrap_or(crate::names::ScopeOrigin::AnonRelation);
-            let wrap_scope = names.fresh(origin).identity();
+            .map_or_else(
+                || names.anonymous(),
+                |input| names.wrap(input, crate::names::WrapReason::Correlation),
+            )
+            .identity();
             let sources: Vec<_> = cols
                 .iter()
                 .map(|col| crate::pipeline::asts::core::ColumnMetadata::new(*col))
@@ -347,7 +320,6 @@ pub(super) fn s_lower_boolean(
                 wrap_scope,
                 &sources,
                 &inner_ctx.identities,
-                crate::names::Republish::BoundaryExport,
             )?;
             let conds: Vec<SqlDomainExpr> = wrapped
                 .iter()
@@ -361,25 +333,19 @@ pub(super) fn s_lower_boolean(
             } else {
                 SqlDomainExpr::and(conds)
             };
-            let at = inner_ctx.identities.mint_scope(
-                crate::names::ScopeOrigin::AnonRelation,
-                crate::names::Hint::None,
-                None,
-            );
+            let at = inner_ctx.identities.anonymous_scope(None);
             // The wrapper is read for whether a row survives, never for a
             // column, so it publishes nothing — the literal names no
             // occurrence and the scope owns none.
-            let select = super::builder::publish_at(
-                at,
-                [],
-                sql_ast::SelectStatement::builder()
-                    .select(SelectItem::expression(SqlDomainExpr::literal(
-                        LiteralValue::Number("1".to_string()),
-                    )))
-                    .from_subquery(query, wrap_scope)
-                    .where_clause(where_expr),
-                &inner_ctx.identities,
-            )?;
+            let select = (sql_ast::SelectStatement::builder()
+                .select(SelectItem::scaffolding_value(
+                    SqlDomainExpr::literal(LiteralValue::Number("1".to_string())),
+                    ctx.identities.scaffolding_slot(),
+                ))
+                .from_subquery(query, wrap_scope)
+                .where_clause(where_expr))
+            .standing_at(at)
+            .map_err(crate::error::DelightQLError::parse_error)?;
             let exists_query = sql_ast::QueryExpression::Select(Box::new(select));
             Ok(SqlPredicate::new(if negated {
                 SqlDomainExpr::not_exists(exists_query)
@@ -440,20 +406,31 @@ pub(super) fn s_lower_boolean(
             Ok(if negated { pred.not() } else { pred })
         }
 
-        // THE OBSERVATION IS SPELLED HERE, and nowhere earlier. Positive
-        // polarity is `IS TRUE`, negative `IS NOT TRUE`; the two are
-        // complementary over every input row, the UNKNOWN-answering ones
-        // included, which is the equipartition the law states.
+        // THE OBSERVATION IS SPELLED HERE, and nowhere earlier. In truth
+        // position positive polarity is `IS TRUE`, negative `IS NOT TRUE`;
+        // the two are complementary over every input row, the
+        // UNKNOWN-answering ones included, which is the equipartition the
+        // law states. Read as a value, a positive application IS its proof:
+        // nothing collapses it, so `+sql_eq(null, null) as v` carries the
+        // engine's UNKNOWN as NULL exactly as `(x > 5) as v` does. The
+        // proof itself is lowered under the same consumer, so a rule body
+        // read as a value is a value all the way down.
         ast_refined::TruthExpression::Sigma(SigmaApplication { proof, polarity }) => {
-            let observed = match proof {
+            let proof = match proof {
                 crate::pipeline::asts::core::NamedProof::Call(call) => {
                     s_lower_sigma_application(call, qualify, ctx)?
                 }
                 crate::pipeline::asts::core::NamedProof::Body(body) => {
-                    s_lower_boolean(*body, qualify, ctx)?
+                    s_lower_truth(*body, qualify, ctx, consumer)?
                 }
             };
-            Ok(observed.observed(polarity.is_positive()))
+            Ok(
+                if polarity.is_positive() && !consumer.observes_positive_proof() {
+                    proof
+                } else {
+                    proof.observed(polarity.is_positive())
+                },
+            )
         }
     }
 }
@@ -464,11 +441,12 @@ fn n_ary_predicate(
     combine: fn(SqlPredicate, SqlPredicate) -> SqlPredicate,
     qualify: &dyn Qualify,
     ctx: &TransformCtx,
+    consumer: TruthConsumer,
 ) -> Result<SqlPredicate> {
     let (first, rest) = parts.into_head_tail();
-    let mut combined = s_lower_boolean(first, qualify, ctx)?;
+    let mut combined = s_lower_truth(first, qualify, ctx, consumer)?;
     for part in rest {
-        combined = combine(combined, s_lower_boolean(part, qualify, ctx)?);
+        combined = combine(combined, s_lower_truth(part, qualify, ctx, consumer)?);
     }
     Ok(combined)
 }
@@ -495,6 +473,20 @@ fn s_lower_sigma_application(
             })?;
         name
     };
+    // The identity the resolver selected travels whole: a qualified citation
+    // keeps the namespace it was selected in, so the generator looks the
+    // entity up by exactly that identity and never by a bare-name search.
+    let namespace = ctx
+        .identities
+        .function_namespace(call.callee)
+        .into_iter()
+        .map(|part| {
+            let mut text = String::new();
+            ctx.identities
+                .write(part, &mut crate::names::sink::Teaching(&mut text));
+            text
+        })
+        .collect::<Vec<_>>();
     let members = match call.arguments {
         crate::pipeline::asts::core::operators::CallArguments::Scalar(members) => members,
         crate::pipeline::asts::core::operators::CallArguments::None => Vec::new(),
@@ -510,7 +502,7 @@ fn s_lower_sigma_application(
         .into_iter()
         .map(|member| match member {
             ast_refined::ScalarArgument::Value(value) => {
-                s_lower_argument_value(value, qualify, ctx)
+                s_lower_expression(value.value, qualify, ctx)
             }
             // The whole operand, as the target spells it.
             ast_refined::ScalarArgument::Star => Ok(SqlDomainExpr::star()),
@@ -526,7 +518,7 @@ fn s_lower_sigma_application(
             }),
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(SqlPredicate::rewrite_call(name, args, false))
+    Ok(SqlPredicate::rewrite_call(name, namespace, args, false))
 }
 
 /// Lower an InnerExists (semi-join / anti-join) to EXISTS / NOT EXISTS.
@@ -543,7 +535,7 @@ fn s_lower_inner_exists(
 ) -> Result<SqlPredicate> {
     use super::descend;
 
-    let inner_ctx = ctx.with_outer_scope(qualify.scope_columns());
+    let inner_ctx = ctx.with_outer_scope(qualify);
     let names = &inner_ctx.names;
     let inner_builder = descend::descend_as_query(subquery, names, &inner_ctx)?;
     let query = inner_builder.to_sql()?;
@@ -559,20 +551,20 @@ fn s_lower_inner_exists(
 /// The output column names a membership EXISTS wrapper can address on
 /// a subquery. `None` when any column is anonymous (bare star or an
 /// unaliased non-column expression).
-fn membership_output_columns(
-    query: &sql_ast::QueryExpression,
-) -> Option<Vec<crate::names::ColId>> {
+fn membership_output_columns(query: &sql_ast::QueryExpression) -> Option<Vec<crate::names::ColId>> {
     match query {
         sql_ast::QueryExpression::Select(select) => select
             .select_list()
             .iter()
             .map(|item| match item {
-                SelectItem::Expression {
-                    alias: Some(alias), ..
+                SelectItem::Publishing {
+                    expr,
+                    slot: alias,
+                    printed: true,
                 } => Some(*alias),
-                SelectItem::Expression {
+                SelectItem::Scaffolding {
                     expr: SqlDomainExpr::Column(column),
-                    alias: None,
+                    ..
                 } => Some(*column),
                 _ => None,
             })
@@ -597,26 +589,32 @@ fn s_lower_arithmetic_op(op: crate::pipeline::asts::vocabulary::BinOp) -> Binary
     }
 }
 
-pub(super) fn s_lower_comparison_op(op: crate::pipeline::asts::vocabulary::CmpOp) -> BinaryOperator {
+pub(super) fn s_lower_comparison_op(
+    op: crate::pipeline::asts::vocabulary::CmpOp,
+) -> BinaryOperator {
     match op {
-        crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual => BinaryOperator::IsNotDistinctFrom,
-        crate::pipeline::asts::vocabulary::CmpOp::NullSafeNotEqual => BinaryOperator::IsDistinctFrom,
+        crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual => {
+            BinaryOperator::IsNotDistinctFrom
+        }
+        crate::pipeline::asts::vocabulary::CmpOp::NullSafeNotEqual => {
+            BinaryOperator::IsDistinctFrom
+        }
         crate::pipeline::asts::vocabulary::CmpOp::Equal => BinaryOperator::Equal,
         crate::pipeline::asts::vocabulary::CmpOp::NotEqual => BinaryOperator::NotEqual,
         crate::pipeline::asts::vocabulary::CmpOp::LessThan => BinaryOperator::LessThan,
         crate::pipeline::asts::vocabulary::CmpOp::GreaterThan => BinaryOperator::GreaterThan,
-        crate::pipeline::asts::vocabulary::CmpOp::LessThanOrEqual => BinaryOperator::LessThanOrEqual,
-        crate::pipeline::asts::vocabulary::CmpOp::GreaterThanOrEqual => BinaryOperator::GreaterThanOrEqual,
+        crate::pipeline::asts::vocabulary::CmpOp::LessThanOrEqual => {
+            BinaryOperator::LessThanOrEqual
+        }
+        crate::pipeline::asts::vocabulary::CmpOp::GreaterThanOrEqual => {
+            BinaryOperator::GreaterThanOrEqual
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // CFE expansion
 // ---------------------------------------------------------------------------
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // Internal handlers (called from s_lower_expression)
@@ -674,7 +672,7 @@ fn s_lower_function(
         // A RELATION MADE ONE VALUE: the compression goes back on the body
         // it closes, and the relation lowers as the subquery it is.
         ast_refined::FunctionApplication::Scalarized(relation) => {
-            let inner_ctx = ctx.with_outer_scope(qualify.scope_columns());
+            let inner_ctx = ctx.with_outer_scope(qualify);
             let names = &inner_ctx.names;
             let inner_builder = super::descend::descend_as_query(
                 relation.into_body().attached(),
@@ -698,7 +696,7 @@ fn s_lower_function(
                 .elements
                 .into_vec()
                 .into_iter()
-                .map(|element| s_lower_expression(element, qualify, ctx))
+                .map(|element| s_lower_expression(element.into_value(), qualify, ctx))
                 .collect::<Result<_>>()?;
             Ok(SqlDomainExpr::function("JSON_ARRAY", args))
         }
@@ -710,6 +708,19 @@ fn s_lower_function(
         // THE MODE IS THE COMPRESSION, spelled.
         ast_refined::FunctionApplication::FieldSelect(select) => {
             s_lower_field_select(select, qualify, ctx)
+        }
+
+        // THE CROSSING: the truth lowers through the one truth lowerer and
+        // its predicate is consumed as a scalar SQL expression. This is
+        // where three-valued logic changes behaviour — the truth's UNKNOWN
+        // is CARRIED as NULL instead of rejecting the row.
+        // THE CROSSING: a truth read as a value. No position observes it,
+        // so the consumer is the VALUE — UNKNOWN survives as NULL.
+        ast_refined::FunctionApplication::Crossed(crossing) => {
+            Ok(
+                s_lower_truth(crossing.into_truth(), qualify, ctx, TruthConsumer::Value)?
+                    .into_expr(),
+            )
         }
 
         other => Err(DelightQLError::ParseError {
@@ -778,9 +789,7 @@ pub(super) fn mode_arguments_mut(
         | crate::pipeline::asts::core::operators::CallArguments::HigherOrder(_) => [].iter_mut(),
     };
     members.filter_map(|member| match member {
-        ast_refined::ScalarArgument::Value(ast_refined::ArgumentValue::Domain {
-            value, ..
-        }) => Some(value),
+        ast_refined::ScalarArgument::Value(ast_refined::ArgumentValue { value, .. }) => Some(value),
         _ => None,
     })
 }
@@ -820,7 +829,7 @@ fn s_lower_field_select(
     for argument in arguments {
         match argument {
             ScalarArg::Value { value, .. } => supplied.push(value),
-            ScalarArg::Crossed(_) | ScalarArg::Star => {
+            ScalarArg::Star => {
                 return Err(DelightQLError::transformation_error(
                     "a mode-compressed call supplies values for its declared inputs",
                     "mode/argument",
@@ -846,7 +855,7 @@ fn s_lower_field_select(
 
     // THE CALLABLE FACE SPENDS THE BINDING: an output cell that reads a
     // declared input reads the value THIS call supplied for it.
-    let bindings: Vec<(crate::names::ColId, ast_refined::DomainExpression)> = witness
+    let bindings: Vec<(crate::relation::PortId, ast_refined::DomainExpression)> = witness
         .inputs
         .iter()
         .copied()
@@ -869,7 +878,7 @@ fn s_lower_field_select(
     for (position, value) in supplied.into_iter().enumerate() {
         let lowered = s_lower_expression(value, qualify, ctx)?;
         inputs.push(if named.get(position).copied().unwrap_or(0) > 1 {
-            bound_where_it_stands(lowered)?
+            lowered.bound_where_it_stands()?
         } else {
             lowered
         });
@@ -936,11 +945,11 @@ fn s_lower_field_select(
 }
 
 /// The declared-input occurrences a resolved output cell reads.
-fn reads_of(expr: &ast_refined::DomainExpression) -> Vec<crate::names::ColId> {
+fn reads_of(expr: &ast_refined::DomainExpression) -> Vec<crate::relation::PortId> {
     use crate::pipeline::ast_visit::{walk_visit_domain, AstVisit, Descent};
 
     #[derive(Default)]
-    struct Reads(Vec<crate::names::ColId>);
+    struct Reads(Vec<crate::relation::PortId>);
     impl AstVisit<crate::pipeline::asts::core::Refined> for Reads {
         fn enter_domain(&mut self, e: &ast_refined::DomainExpression) -> Result<Descent> {
             if let ast_refined::DomainExpression::Reference(Reference::Named(NamedReference(
@@ -964,12 +973,12 @@ fn reads_of(expr: &ast_refined::DomainExpression) -> Vec<crate::names::ColId> {
 /// an output cell reads.
 fn spend_bindings(
     expr: ast_refined::DomainExpression,
-    bindings: &[(crate::names::ColId, ast_refined::DomainExpression)],
+    bindings: &[(crate::relation::PortId, ast_refined::DomainExpression)],
 ) -> Result<ast_refined::DomainExpression> {
     use crate::pipeline::ast_transform::{self, AstTransform};
 
     struct Spend<'a> {
-        bindings: &'a [(crate::names::ColId, ast_refined::DomainExpression)],
+        bindings: &'a [(crate::relation::PortId, ast_refined::DomainExpression)],
     }
     impl AstTransform<crate::pipeline::asts::core::Refined, crate::pipeline::asts::core::Refined>
         for Spend<'_>
@@ -999,9 +1008,8 @@ fn spend_bindings(
 
 /// Lower a multi-clause value rule's SELECTION.
 ///
-/// A clause's result is its body, so it lowers through the crossing-aware
-/// road; a guardless clause is the group's default, which the head laws
-/// already limit to one.
+/// A clause's result is its body, an ordinary value; a guardless clause is
+/// the group's default, which the head laws already limit to one.
 fn s_lower_clause_selection(
     selection: crate::pipeline::asts::core::ClauseSelection<crate::pipeline::asts::core::Refined>,
     qualify: &dyn Qualify,
@@ -1010,7 +1018,7 @@ fn s_lower_clause_selection(
     let mut when_clauses = Vec::new();
     let mut else_clause = None;
     for arm in selection.arms {
-        let result = s_lower_out_value(arm.result, qualify, ctx)?;
+        let result = s_lower_expression(arm.result, qualify, ctx)?;
         match arm.guard {
             Some(guard) => {
                 let when = s_lower_boolean(guard, qualify, ctx)?.into_expr();
@@ -1103,10 +1111,6 @@ fn lower_function_arguments(
     for argument in arguments {
         match argument {
             ScalarArg::Star => lowered.push(SqlDomainExpr::star()),
-            // The crossing lowers as the truth it is, read as a value.
-            ScalarArg::Crossed(crossing) => {
-                lowered.push(s_lower_boolean(crossing.into_truth(), qualify, ctx)?.into_expr())
-            }
             ScalarArg::Value {
                 distinct: is_distinct,
                 value,
@@ -1125,7 +1129,10 @@ pub(super) fn functor_name(
 ) -> Result<delightql_types::SqlIdentifier> {
     let mut name = String::new();
     ctx.identities
-        .write_function_name(call.call().callee, &mut crate::names::sink::Teaching(&mut name))
+        .write_function_name(
+            call.call().callee,
+            &mut crate::names::sink::Teaching(&mut name),
+        )
         .map_err(|error| {
             DelightQLError::parse_error(format!("call has no renderable spelling: {error:?}"))
         })?;
@@ -1145,13 +1152,8 @@ pub(super) enum ScalarArg {
         distinct: bool,
         value: ast_refined::DomainExpression,
     },
-    /// THE CROSSING, at the one value position that admits it. It stays a
-    /// truth all the way to the SQL: converting it back into a value that
-    /// holds one is the road this carrier exists to close.
-    Crossed(crate::pipeline::asts::core::TruthAsValue<ast_refined::TruthExpression>),
     Star,
 }
-
 
 pub(super) fn scalar_call_arguments(call: ast_refined::FunctorCall) -> Result<Vec<ScalarArg>> {
     // A scalar call carries the SCALAR stratum by type: a relational
@@ -1170,16 +1172,10 @@ pub(super) fn scalar_call_arguments(call: ast_refined::FunctorCall) -> Result<Ve
     members
         .into_iter()
         .map(|member| match member {
-            // DISTINCT rides with the argument it modifies; a crossed
-            // argument is the licensed truth-to-value admission and lowers
-            // as the value it was read as.
-            ast_refined::ScalarArgument::Value(ast_refined::ArgumentValue::Truth(crossing)) => {
-                Ok(ScalarArg::Crossed(crossing))
+            // DISTINCT rides with the argument it modifies.
+            ast_refined::ScalarArgument::Value(ast_refined::ArgumentValue { distinct, value }) => {
+                Ok(ScalarArg::Value { distinct, value })
             }
-            ast_refined::ScalarArgument::Value(ast_refined::ArgumentValue::Domain {
-                distinct,
-                value,
-            }) => Ok(ScalarArg::Value { distinct, value }),
             // The whole operand, as the argument row resolved it.
             ast_refined::ScalarArgument::Star => Ok(ScalarArg::Star),
             // An authored enumeration cannot reach lowering: its container
@@ -1225,7 +1221,7 @@ fn s_lower_named_function(
             .into_iter()
             .map(|argument| match argument {
                 ScalarArg::Value { value, .. } => Some(value),
-                ScalarArg::Crossed(_) | ScalarArg::Star => None,
+                ScalarArg::Star => None,
             })
             .collect::<Vec<_>>()
             .into_iter();
@@ -1261,9 +1257,6 @@ fn s_lower_named_function(
     })
 }
 
-
-
-
 /// Binary operator from already-lowered SQL expressions.
 fn s_lower_binary_sql(
     operator: crate::pipeline::asts::vocabulary::BinOp,
@@ -1295,13 +1288,25 @@ fn s_lower_binary_sql(
 /// the wrong expression: `||` binds tighter than `*` on SQLite).
 ///
 /// The one grouping that may be dropped is the identity every target
-/// already agrees on: the same operator nested on the LEFT. Every operator
-/// in this vocabulary is left-associative on every target, so `(a - b) - c`
-/// and `a - b - c` are the same expression. That is an associativity
-/// identity, not an ordering between different operators.
+/// already agrees on: the same ARITHMETIC operator nested on the LEFT. Every
+/// arithmetic operator in this vocabulary is left-associative on every
+/// target, so `(a - b) - c` and `a - b - c` are the same expression. That is
+/// an associativity identity, not an ordering between different operators.
+/// A comparison nested in a comparison — a crossed truth compared again —
+/// keeps its parentheses: `(a = b) = c` is not `a = b = c`, which some
+/// targets refuse and others read as a chain.
 fn grouped(expr: SqlDomainExpr, parent: &BinaryOperator, is_left: bool) -> SqlDomainExpr {
+    let associative = matches!(
+        parent,
+        BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+            | BinaryOperator::Concatenate
+    );
     match &expr {
-        SqlDomainExpr::Binary { op, .. } if is_left && op == parent => expr,
+        SqlDomainExpr::Binary { op, .. } if is_left && associative && op == parent => expr,
         SqlDomainExpr::Binary { .. } => SqlDomainExpr::Parens(Box::new(expr)),
         _ => expr,
     }
@@ -1335,97 +1340,34 @@ fn s_lower_case(
 type AnchorLowering<'a> =
     &'a dyn Fn(ast_refined::DomainExpression, &dyn Qualify, &TransformCtx) -> Result<SqlDomainExpr>;
 
-/// THE ANCHOR WHERE IT STANDS, when no row published it.
-///
-/// A column reference IS one occurrence and so is a literal: naming either
-/// twice names the same value. Anything else must have been published by the
-/// row that owns the case, and a position with no row to publish it — a
-/// predicate, an ordering, a context that never reached a projection — has
-/// nowhere to put it. Repeating it there would ask a volatile value twice and
-/// answer for neither, so this refuses instead.
-fn bound_where_it_stands(anchor: SqlDomainExpr) -> Result<SqlDomainExpr> {
-    if matches!(anchor, SqlDomainExpr::Column(_) | SqlDomainExpr::Literal(_)) {
-        return Ok(anchor);
-    }
-    Err(crate::error::DelightQLError::transformation_error(
-        "case/anchor_needs_a_row",
-        "a match arm spelling `null` asks its question of the anchor itself, \
-         so a computed anchor must be published by the row that owns the \
-         case; this one stands where no row publishes it",
-    ))
-}
-
 fn s_lower_case_anchored_by(
     case: ast_refined::CaseExpression,
     qualify: &dyn Qualify,
     ctx: &TransformCtx,
     lower_anchor: AnchorLowering<'_>,
 ) -> Result<SqlDomainExpr> {
-    // THE ANCHOR IS ONE VALUE, so it is evaluated once.
-    //
-    // A match arm is a null-safe question — `WHEN anchor IS NOT DISTINCT
-    // FROM term` — and asking it per arm means writing the anchor per arm,
-    // which for a volatile anchor asks about a DIFFERENT value each time and
-    // can reach an arm no single value could.
-    //
-    // Where no term is null, THE EQUALITY LAW makes the target's own simple
-    // `CASE anchor WHEN term` equivalent: a null anchor answers UNKNOWN to
-    // `=` and FALSE to `IS NOT DISTINCT FROM`, and neither fires, so both
-    // fall to the same default. That form names the anchor once and is what
-    // this lowering emits.
-    //
-    // Where a term IS null the two disagree — SQL's simple CASE makes a null
-    // arm dead code and the language's does not — so the null-safe spelling
-    // stays, and with it the per-arm occurrence. That residue is recorded as
-    // a gap rather than traded for a wrong answer on a form the language
-    // rules must fire.
-    let mut case_expr: Option<SqlDomainExpr> = None;
     let mut when_clauses: Vec<WhenClause> = Vec::new();
     let mut else_clause: Option<SqlDomainExpr> = None;
 
     let default = match case {
+        // THE ANCHORED SHAPE IS THE SQL AST'S OWN: the arms decide whether
+        // the target's simple CASE is equivalent, and one lowering answers
+        // that for every road that spells a match.
         ast_refined::CaseExpression::Anchored {
             anchor,
             arms,
             default,
         } => {
-            let arms = arms.into_vec();
-            let any_null_term = arms
-                .iter()
-                .any(|arm| matches!(arm.term, crate::pipeline::asts::core::LiteralValue::Null));
             let subject = lower_anchor(*anchor, qualify, ctx)?;
-            if any_null_term {
-                // A null term needs the null-safe question, which names the
-                // anchor in every arm — so the anchor is bound to one
-                // occurrence and the arms ask about THAT.
-                let mut asked: Vec<(SqlDomainExpr, SqlDomainExpr)> = Vec::new();
-                for arm in arms {
-                    asked.push((
-                        s_lower_literal(&arm.term)?,
-                        s_lower_expression(*arm.result, qualify, ctx)?,
-                    ));
-                }
-                let default = default.map(|result| s_lower_expression(*result, qualify, ctx));
-                let else_expr = default.transpose()?;
-                let occurrence = bound_where_it_stands(subject)?;
-                return Ok(SqlDomainExpr::Case {
-                    expr: None,
-                    when_clauses: asked
-                        .into_iter()
-                        .map(|(term, then)| {
-                            WhenClause::new(occurrence.clone().is_not_distinct_from(term), then)
-                        })
-                        .collect(),
-                    else_clause: else_expr.map(Box::new),
-                });
-            } else {
-                case_expr = Some(subject);
-                for arm in arms {
-                    let then = s_lower_expression(*arm.result, qualify, ctx)?;
-                    when_clauses.push(WhenClause::new(s_lower_literal(&arm.term)?, then));
-                }
-            }
-            default
+            let asked = arms
+                .into_vec()
+                .into_iter()
+                .map(|arm| Ok((arm.term, s_lower_expression(*arm.result, qualify, ctx)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let else_expr = default
+                .map(|result| s_lower_expression(*result, qualify, ctx))
+                .transpose()?;
+            return SqlDomainExpr::anchored_case(subject, asked, else_expr);
         }
         ast_refined::CaseExpression::Searched { arms, default } => {
             for arm in arms.into_vec() {
@@ -1441,7 +1383,7 @@ fn s_lower_case_anchored_by(
     }
 
     Ok(SqlDomainExpr::Case {
-        expr: case_expr.map(Box::new),
+        expr: None,
         when_clauses,
         else_clause: else_clause.map(Box::new),
     })
@@ -1627,6 +1569,7 @@ pub(super) fn s_lower_record_scalar(
     for member in record.members.into_vec() {
         match member {
             RecordMember::SelfKeyed(NamedReference(ColumnOccurrence { column, .. })) => {
+                let column = column.column();
                 args.push(SqlDomainExpr::PublishedNameLiteral(column));
                 let lowered = SqlDomainExpr::Column(column);
                 args.push(if qualify.tree_valued(column) {
@@ -1640,7 +1583,7 @@ pub(super) fn s_lower_record_scalar(
                 let is_tree = match value.as_ref() {
                     ast_refined::DomainExpression::Reference(Reference::Named(NamedReference(
                         ColumnOccurrence { column, .. },
-                    ))) => qualify.tree_valued(*column),
+                    ))) => qualify.tree_valued(column.column()),
                     _ => false,
                 };
                 let lowered = s_lower_expression(*value, qualify, ctx)?;
@@ -1649,6 +1592,20 @@ pub(super) fn s_lower_record_scalar(
                 } else {
                     lowered
                 });
+            }
+            // OUTWARD-ACTING: a metadata group summarizes the group of
+            // rows its record stands for. A record lowered per row stands
+            // for one row, and a single row is not a group.
+            RecordMember::Metadata { key, .. } => {
+                return Err(DelightQLError::validation_error_categorized(
+                    "constraint/metadata_per_row",
+                    format!(
+                        "`~> {{` makes one record PER ROW, and the metadata group \
+                         '{key}' inside it has no group of rows to summarize"
+                    ),
+                    "write the grouping keys, so the record stands for a group: \
+                     `%(keys ~> {{ … }})`",
+                ));
             }
             RecordMember::Induced { key, .. } => {
                 // An induced level is lowered by the CTE road in
@@ -1752,6 +1709,26 @@ mod distinct_transport_tests {
         fn identities(&self) -> &Registry {
             &self.identities
         }
+
+        // A FIXTURE THAT EMITS NOTHING says so, exactly as an anonymous
+        // row does. There is no site under it to answer from.
+        fn rebind_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId> {
+            Err(crate::error::DelightQLError::parse_error(format!(
+                "the fixture scope emits no column for {port:?}"
+            )))
+        }
+
+        fn slot_of_port(&self, port: crate::relation::PortId) -> Result<usize> {
+            Err(crate::error::DelightQLError::parse_error(format!(
+                "the fixture scope lays out no position for {port:?}"
+            )))
+        }
+
+        fn slot_of_physical(&self, column: crate::names::ColId) -> Result<usize> {
+            Err(crate::error::DelightQLError::parse_error(format!(
+                "the fixture scope lays out no position for {column:?}"
+            )))
+        }
     }
 
     #[test]
@@ -1759,24 +1736,25 @@ mod distinct_transport_tests {
     fn distinct_argument_reaches_the_sql_ast_as_the_outer_function_flag() {
         let source = "_(x @ 1; 1) |> %(~> count:(%x))";
         let tree = crate::pipeline::parse::query_sequence(source).expect("source should parse");
-        let mut normalized =
+        let normalized =
             crate::pipeline::parse::normalize_sequence(&tree).expect("source should normalize");
-        let query = normalized.queries.remove(0).query;
+        let query = normalized.into_queries().remove(0).query;
         let built = query.to_lispy();
         // `%` is the ARGUMENT's own modifier, so it shows on the argument
         // value rather than as a domain wrapper any position could build —
         // and it is never a call to a function named DISTINCT.
-        assert!(built.contains("argument_value:domain"));
+        assert!(built.contains("(argument_value (distinct true)"));
         assert!(!built.contains("(name \"DISTINCT\")"));
 
-        let identities = Rc::new(Registry::new(&[]));
+        let (identities, relations) = crate::relation::sealed_empty();
         let qualify = NoColumns {
             identities: Rc::clone(&identities),
         };
         let ctx = TransformCtx {
+            relations,
             identities: Rc::clone(&identities),
+            outer_sites: Vec::new(),
             names: NameGenerator::new(identities),
-            outer_columns: vec![],
             danger_gates: crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
         };
         let distinct_argument = ast_refined::DomainExpression::Application(
@@ -1844,8 +1822,7 @@ mod distinct_transport_tests {
                                 Vec::new(),
                             ),
                             arguments:
-                                crate::pipeline::asts::core::operators::CallArguments::Scalar(
-                                    vec![
+                                crate::pipeline::asts::core::operators::CallArguments::Scalar(vec![
                                     crate::pipeline::asts::core::operators::ScalarArgument::plain(
                                         ast_refined::DomainExpression::Application(
                                             ast_refined::FunctionApplication::Ground(
@@ -1853,8 +1830,7 @@ mod distinct_transport_tests {
                                             ),
                                         ),
                                     ),
-                                ],
-                                ),
+                                ]),
                             marks: Default::default(),
                         },
                     ),

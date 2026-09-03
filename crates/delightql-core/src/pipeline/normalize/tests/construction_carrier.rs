@@ -24,9 +24,9 @@ fn chain(source: &str) -> Chain<Unresolved> {
 /// The one enclyph a lone publication item publishes.
 fn constructed(source: &str) -> Enclyph<Unresolved> {
     let operators: Vec<_> = chain(source)
-        .continuations
+        .continuations()
         .iter()
-        .filter_map(|continuation| match continuation {
+        .filter_map(|continuation| match continuation.form() {
             Continuation::Pipe { operator, .. } => Some(operator.clone()),
             _ => None,
         })
@@ -38,8 +38,8 @@ fn constructed(source: &str) -> Enclyph<Unresolved> {
         OutItem::One(one) if items.len() == 1 => one,
         _ => panic!("expected one published item in {source:?}, got {items:?}"),
     };
-    match one.expr.domain() {
-        Some(DomainExpression::Application(FunctionApplication::Enclyph(enclyph))) => enclyph.clone(),
+    match &one.expr {
+        DomainExpression::Application(FunctionApplication::Enclyph(enclyph)) => enclyph.clone(),
         other => panic!("expected a constructed value in {source:?}, got {other:?}"),
     }
 }
@@ -54,9 +54,9 @@ fn record_of(source: &str) -> Vec<RecordMember<Unresolved>> {
 /// The pattern a destructure declares.
 fn pattern(source: &str) -> TreePattern<Unresolved> {
     chain(source)
-        .continuations
+        .continuations()
         .iter()
-        .find_map(|continuation| match continuation {
+        .find_map(|continuation| match continuation.form() {
             Continuation::Destructure { pattern, .. } => Some(pattern.clone()),
             _ => None,
         })
@@ -77,6 +77,7 @@ fn member_kind(member: &RecordMember<Unresolved>) -> &'static str {
         RecordMember::Induced { .. } => "induced",
         RecordMember::Spread(_) => "spread",
         RecordMember::SelfKeyed(_) => "self-keyed",
+        RecordMember::Metadata { .. } => "metadata",
     }
 }
 
@@ -220,15 +221,14 @@ fn a_path_binding_publishes_its_flattened_reach() {
 #[test]
 fn a_metadata_group_stands_in_reduction_position() {
     let operators: Vec<_> = chain("t(*) |> %(a ~> g:~> {v})")
-        .continuations
+        .continuations()
         .iter()
-        .filter_map(|continuation| match continuation {
+        .filter_map(|continuation| match continuation.form() {
             Continuation::Pipe { operator, .. } => Some(operator.clone()),
             _ => None,
         })
         .collect();
-    let [PipeOp::Group(GroupSpec::Reduce { reductions, .. })] = operators.as_slice()
-    else {
+    let [PipeOp::Group(GroupSpec::Reduce { reductions, .. })] = operators.as_slice() else {
         panic!("expected one grouping, got {operators:?}");
     };
     // THE REDUCTION ITEM CARRIES IT. A metadata group is not a value, so it
@@ -246,15 +246,14 @@ fn a_metadata_group_stands_in_reduction_position() {
 #[test]
 fn metadata_levels_chain_to_a_constructor() {
     let operators: Vec<_> = chain("t(*) |> %(a ~> g:~> h:~> {v})")
-        .continuations
+        .continuations()
         .iter()
-        .filter_map(|continuation| match continuation {
+        .filter_map(|continuation| match continuation.form() {
             Continuation::Pipe { operator, .. } => Some(operator.clone()),
             _ => None,
         })
         .collect();
-    let [PipeOp::Group(GroupSpec::Reduce { reductions, .. })] = operators.as_slice()
-    else {
+    let [PipeOp::Group(GroupSpec::Reduce { reductions, .. })] = operators.as_slice() else {
         panic!("expected one grouping, got {operators:?}");
     };
     let metadata = match reductions.first() {

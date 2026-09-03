@@ -22,16 +22,18 @@
 //! downstream may pick a clause and read the group's identity off it.
 
 use super::core::{
-    AnonRelation, AnonTable, Chain, ContextMode, Datum, DomainExpression, FunctionApplication,
-    Grelex, LiteralValue, NamedReference, OutValue, Query, Reference, TabularBody, TabularRow,
+    AnonRelation, AnonTable, Chain, ContextMode, Datum, DomainExpression, FactFunctionDefinition,
+    FunctionApplication, LiteralValue, NamedReference, Query, Reference, TabularBody, TabularRow,
     TruthExpression, Unresolved,
 };
+use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
+use crate::pipeline::asts::core::GroundForm;
 use delightql_types::SqlIdentifier;
 
 pub use super::core::definitions::{
-    DefKind, GroundNaming, Head, HeadAssembly, HeadItem, HeadItems, HeadedClause, HoParam, Neck,
-    Supply,
+    DefKind, Fixpoint, GroundNaming, Head, HeadAssembly, HeadItem, HeadItems, HeadedClause,
+    HoParam, Supply,
 };
 
 /// One clause of a definition: everything the neck introduces.
@@ -47,13 +49,6 @@ pub use super::core::definitions::{
 #[derive(Debug, Clone)]
 pub struct Clause {
     pub head: Head,
-    /// The neck this clause was written with. A definition IS its neck; no
-    /// pass may search text for one. Carried and unread: `:-` and `:=`
-    /// select the same registration today, so the distinction has no
-    /// consumer yet — dropping the field would put that gap back where
-    /// only a text search could find it.
-    #[allow(dead_code)]
-    pub neck: Neck,
     pub body: DdlBody,
     /// The authored characters, PROVENANCE only: persistence stores them
     /// and re-parsing reconstructs the definition from them. No semantic
@@ -70,7 +65,6 @@ pub struct Clause {
 #[derive(Debug, Clone)]
 pub struct ClauseDecl {
     pub front: DefinitionFront,
-    pub neck: Neck,
     pub body: DdlBody,
     pub full_source: String,
     pub doc: Option<String>,
@@ -90,6 +84,11 @@ pub struct DefinitionFront {
     pub kind: DefKind,
     pub subject: DefSubject,
     pub head: Head,
+    /// The fixpoint flavor this clause's head badged (`c%(*) :- …`).
+    /// Carried UNJUDGED to the group, where CLAUSE AGREEMENT is decided,
+    /// and from there to the one recursion decision — a badge is a claim
+    /// about the target, and the target is the group.
+    pub fixpoint: Fixpoint,
 }
 
 impl DefinitionFront {
@@ -110,14 +109,12 @@ impl DefinitionFront {
 
     pub fn into_clause_decl(
         self,
-        neck: Neck,
         body: DdlBody,
         full_source: String,
         doc: Option<String>,
     ) -> ClauseDecl {
         ClauseDecl {
             front: self,
-            neck,
             body,
             full_source,
             doc,
@@ -128,7 +125,15 @@ impl DefinitionFront {
 
 /// §9 — a head baptizes ONE name; an edge names a PAIR and baptizes
 /// nothing. That is the one deliberate second subject shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq`/`Hash` are the SUBJECT'S IDENTITY, and they are what every grouping
+/// keys on — registration's and the liminal ledger's alike:
+/// `SqlIdentifier` folds an unstropped name and compares a stropped one
+/// verbatim, so two clauses named `Counter` and `counter` are ONE subject
+/// and a stropped `` `Counter` `` beside them is another. Grouping over
+/// `catalog_name()` instead throws that law away and splits one entity into
+/// two the catalog then reaches under one lookup identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DefSubject {
     Named(delightql_types::SqlIdentifier),
     Edge {
@@ -174,6 +179,25 @@ impl DefSubject {
     }
 }
 
+/// ONE SUBJECT'S CLAUSES, GATHERED — the one grouping authority.
+///
+/// Clauses are gathered by the SUBJECT'S OWN identity, never by its catalog
+/// spelling: the identifier law lives on `SqlIdentifier`, and a `String` key
+/// discards it. Groups come out in first-appearance order, and each keeps its
+/// clauses in authored order, so a caller that needs the position of a
+/// subject's first clause and a caller that needs its clauses read the same
+/// answer.
+pub fn group_by_subject(decls: Vec<ClauseDecl>) -> Vec<(DefSubject, Vec<ClauseDecl>)> {
+    let mut groups: indexmap::IndexMap<DefSubject, Vec<ClauseDecl>> = indexmap::IndexMap::new();
+    for decl in decls {
+        groups
+            .entry(decl.front.subject.clone())
+            .or_default()
+            .push(decl);
+    }
+    groups.into_iter().collect()
+}
+
 /// §9 — a definition: one subject and its clauses, assembled.
 ///
 /// `DefinitionGroup::assemble` is the ONLY constructor and it is fallible.
@@ -187,6 +211,8 @@ impl DefSubject {
 pub struct DefinitionGroup {
     subject: DefSubject,
     kind: DefKind,
+    entity_type: EntityType,
+    fixpoint: Fixpoint,
     clauses: Vec<Clause>,
     assembly: HeadAssembly,
 }
@@ -203,9 +229,10 @@ impl DefinitionGroup {
         let name = subject.catalog_name();
 
         // One subject, or it is not one definition. Callers group by the
-        // catalog spelling, so a disagreement here means two definitions
-        // were handed over as one — a caller bug, refused rather than
-        // silently registered under the first one's name.
+        // SUBJECT'S OWN identity (`group_by_subject`), so a disagreement
+        // here means two definitions were handed over as one — a caller
+        // bug, refused rather than silently registered under the first
+        // one's name.
         for decl in decls.iter().skip(1) {
             if decl.front.subject != subject {
                 return Err(DelightQLError::validation_error_categorized(
@@ -226,6 +253,30 @@ impl DefinitionGroup {
         // relational bodies. Every other mix still refuses.
         let kind = declared_group_kind(&name, &decls)?;
 
+        // EVERY CLAUSE OF ONE TARGET WEARS THE SAME BADGE. A fixpoint
+        // flavor is a claim about the TARGET, and the target is the group,
+        // so a mixed set is two claims about one thing. Decided here beside
+        // the other group-wide agreements — the last place the clauses are
+        // still distinguishable.
+        let fixpoint = first.front.fixpoint;
+        for (idx, decl) in decls.iter().enumerate().skip(1) {
+            if decl.front.fixpoint != fixpoint {
+                return Err(DelightQLError::validation_error_categorized(
+                    crate::uri_registry::subcat::RECURSION_MIXED_BADGE,
+                    format!(
+                        "definition '{}': clause {} is {} and clause 1 is {}. \
+                         A fixpoint flavor is one claim about the target — \
+                         every clause wears the same badge.",
+                        name,
+                        idx + 1,
+                        decl.front.fixpoint.spelling(),
+                        fixpoint.spelling()
+                    ),
+                    "mixed fixpoint badges in one definition",
+                ));
+            }
+        }
+
         // One signature arity, counting every position. Clauses may fix
         // DIFFERENT positions with ground constants; what they may not do
         // is disagree about how many positions there are.
@@ -245,6 +296,51 @@ impl DefinitionGroup {
                     ),
                     "mixed clause arity in one definition",
                 ));
+            }
+        }
+
+        // A rule-valued position is one family contract. Every clause must
+        // declare that role and the same ordered structural signature; a
+        // clause-order winner would publish code under a promise its siblings
+        // never made.
+        for position in 0..first_arity {
+            let clauses: Vec<_> = decls
+                .iter()
+                .enumerate()
+                .map(|(ordinal, decl)| {
+                    (
+                        ordinal,
+                        decl.front
+                            .head
+                            .ho_params
+                            .as_ref()
+                            .and_then(|params| params.get(position)),
+                    )
+                })
+                .collect();
+            let agreed = clauses.iter().find_map(|(_, param)| match param {
+                Some(HoParam::Rule { signature, .. }) => Some(signature),
+                _ => None,
+            });
+            let Some(agreed) = agreed else {
+                continue;
+            };
+            for (ordinal, param) in clauses {
+                let agrees = matches!(
+                    param,
+                    Some(HoParam::Rule { signature, .. }) if signature.same_shape(agreed)
+                );
+                if !agrees {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "ddl/head/rule_contract",
+                        format!(
+                            "Disjunctive definition '{name}': clause {} disagrees about the rule-valued contract at parameter position {}. Every clause must declare the same remaining roles and headings.",
+                            ordinal + 1,
+                            position + 1,
+                        ),
+                        "one rule-valued position has one family-wide structural contract",
+                    ));
+                }
             }
         }
 
@@ -276,12 +372,12 @@ impl DefinitionGroup {
         };
         let heads: Vec<&Head> = decls.iter().map(|d| &d.front.head).collect();
         let assembly = super::core::definitions::assemble(&name, &heads, ground_naming)?;
+        let entity_type = assembled_entity_type(kind, &decls)?;
 
         let clauses = decls
             .into_iter()
             .map(|decl| Clause {
                 head: decl.front.head,
-                neck: decl.neck,
                 body: decl.body,
                 full_source: decl.full_source,
                 doc: decl.doc,
@@ -291,6 +387,8 @@ impl DefinitionGroup {
         Ok(DefinitionGroup {
             subject,
             kind,
+            entity_type,
+            fixpoint,
             clauses,
             assembly,
         })
@@ -299,6 +397,13 @@ impl DefinitionGroup {
     /// The catalog spelling this group registers under.
     pub fn name(&self) -> String {
         self.subject.catalog_name()
+    }
+
+    /// The fixpoint flavor every clause of this target authored. Whether the
+    /// target IS a fixpoint is not decided here — it is not knowable until
+    /// the self-reference binds.
+    pub fn fixpoint(&self) -> Fixpoint {
+        self.fixpoint
     }
 
     /// The subject AS THE IDENTIFIER it is — strop bit intact — for the
@@ -327,6 +432,16 @@ impl DefinitionGroup {
     /// re-derives it from the Rust type of a body.
     pub fn kind(&self) -> DefKind {
         self.kind
+    }
+
+    /// The catalog capability this complete family owns.
+    ///
+    /// In particular, a fact function's default arm is judged while all of
+    /// its definition is present here. A default-bearing family receives a
+    /// callable-only entity type; a finite family receives the ordinary fact
+    /// type. Catalog selection consumes this fact and never re-reads arms.
+    pub fn entity_type(&self) -> EntityType {
+        self.entity_type
     }
 
     pub fn clauses(&self) -> &[Clause] {
@@ -369,7 +484,7 @@ impl DefinitionGroup {
     /// read and no cross-clause agreement to take.
     pub fn declared_mode(&self) -> Option<&super::core::FactFunctionMode<Unresolved>> {
         match &self.first().body {
-            DdlBody::FactFunction(mode) => Some(mode),
+            DdlBody::FactFunction(definition) => Some(definition.mode()),
             DdlBody::Scalar(_)
             | DdlBody::Truth(_)
             | DdlBody::Relational(_)
@@ -396,13 +511,29 @@ impl DefinitionGroup {
     }
 
     /// Apply S04's one desugar law: each clause body carries the projection
-    /// its own head declares, and the head is spent. Returns the clauses.
+    /// its own head declares, and the head is spent. A finite fact-function
+    /// family also spends its construction-owned face token here, turning
+    /// the mode into ordinary relational clauses. No clause can do that on
+    /// its own.
     pub fn spend_heads(self) -> Result<Vec<Clause>> {
-        if !self.output_head_is_ours() {
-            return Ok(self.clauses);
+        let entity_type = self.entity_type;
+        let mut clauses = if !self.output_head_is_ours() {
+            self.clauses
+        } else {
+            let subject = self.subject.catalog_name();
+            super::core::definitions::spend_heads(self.clauses, &self.assembly, &subject)?
+        };
+        if entity_type == EntityType::DqlFactExpression {
+            for clause in &mut clauses {
+                if let DdlBody::FactFunction(definition) = &clause.body {
+                    let query = definition
+                        .relational_body()
+                        .expect("the finite entity type carries a finite fact-function face");
+                    clause.body = DdlBody::Relational(query);
+                }
+            }
         }
-        let subject = self.subject.catalog_name();
-        super::core::definitions::spend_heads(self.clauses, &self.assembly, &subject)
+        Ok(clauses)
     }
 }
 
@@ -459,11 +590,11 @@ pub struct HoPositionInfo {
     pub position: usize,
     /// Unified column kind across all clauses
     pub column_kind: HoColumnKind,
-    /// How ground values distribute across clauses
-    pub ground_mode: HoGroundMode,
+    /// Ground-pattern evidence used only to discriminate supplied scalars.
+    pub ground_pattern: Option<HoGroundPattern>,
     /// Ground constant values (one per clause that has a ground param at this pos)
     pub ground_values: Vec<(usize, String)>, // (clause_ordinal, value)
-    /// Canonical column name (from free-variable clauses; None for PureGround)
+    /// Canonical column name from free-variable clauses, when any exist.
     pub column_name: Option<String>,
 }
 
@@ -474,44 +605,37 @@ pub enum HoColumnKind {
     TableGlob,
     /// T(x,y) in every clause
     TableArgumentative(Vec<String>),
+    /// A closed pure relational rule value. The signature is the complete
+    /// structural contract consumers admit; the hidden sealed-prefix count
+    /// is deliberately not part of it.
+    Rule(super::core::definitions::ResidualSignature),
     /// Scalar/ground across clauses
     Scalar,
 }
 
 /// How ground values distribute across clauses at a single position.
 #[derive(Debug, Clone, PartialEq)]
-pub enum HoGroundMode {
-    /// Every clause: ground — free+unbound at call site IS valid
-    PureGround,
-    /// Some ground, some free — call site MUST provide concrete value
-    MixedGround,
-    /// Every clause: free — standard parameter
-    PureUnbound,
-    /// Table parameter (Glob/Argumentative) — always input-moded
-    InputOnly,
+pub enum HoGroundPattern {
+    /// Every clause carries a ground match term at this scalar position.
+    AllClauses,
+    /// Ground match terms and scalar binders share this position.
+    SomeClauses,
 }
 
 /// Definition body — the DQL expression(s) after the neck.
 #[derive(Debug, Clone)]
 pub enum DdlBody {
-    /// VALUE body: a function definition computes one value per tuple —
-    /// a domain expression, or the licensed crossing at the same carrier a
-    /// publication position uses.
-    Scalar(OutValue<Unresolved>),
+    /// VALUE body: a function definition computes one value per tuple.
+    Scalar(DomainExpression<Unresolved>),
     /// TRUTH body: a sigma rule's body accepts or rejects a tuple, so it is
     /// carried as the truth it is. A value standing here has no derivation,
     /// and the parse-level category already refuses one.
     Truth(TruthExpression<Unresolved>),
     /// Relational body: view/ho-view definitions produce full queries (may include CTEs)
     Relational(Query<Unresolved>),
-    /// THE DECLARED MODE, from the one carrier that serves both of its
-    /// faces. Relationally it publishes the declared inputs followed by the
-    /// declared outputs, with the explicit arms as its finite rows; callably
-    /// it is the null-safe case law those arms spell. Storing the elaborated
-    /// relation beside the mode would put the arms in the tree twice and let
-    /// the two disagree, so the relation is BUILT from the mode where a
-    /// relational body is asked for.
-    FactFunction(super::core::FactFunctionMode<Unresolved>),
+    /// THE DECLARED MODE. Family assembly decides whether it also has a
+    /// finite relational face; the mode itself remains the callable case law.
+    FactFunction(FactFunctionDefinition),
     /// A higher-order TEMPLATE whose text cannot be parsed until its
     /// parameters are substituted — the authored characters, held as such.
     ///
@@ -534,8 +658,8 @@ impl Clause {
         self.head.ho_params.as_deref().unwrap_or_default()
     }
 
-    /// The value body, in the carrier that says whether it crossed.
-    pub fn as_out_value(&self) -> Option<&OutValue<Unresolved>> {
+    /// The value body.
+    pub fn as_scalar_body(&self) -> Option<&DomainExpression<Unresolved>> {
         match &self.body {
             DdlBody::Scalar(expr) => Some(expr),
             DdlBody::Truth(_)
@@ -558,8 +682,8 @@ impl Clause {
         }
     }
 
-    /// Consume the definition and return the value body, crossing included.
-    pub fn into_out_value(self) -> Option<OutValue<Unresolved>> {
+    /// Consume the definition and return the value body.
+    pub fn into_scalar_body(self) -> Option<DomainExpression<Unresolved>> {
         match self.body {
             DdlBody::Scalar(expr) => Some(expr),
             DdlBody::Truth(_)
@@ -573,9 +697,9 @@ impl Clause {
     pub fn into_query(self) -> Option<Query<Unresolved>> {
         match self.body {
             DdlBody::Relational(query) => Some(query),
-            // FACT ELABORATION, taken from the one carrier that holds the
-            // arms — never from a second copy stored beside it.
-            DdlBody::FactFunction(mode) => Some(mode.relational_body()),
+            // A fact-function clause becomes relational only when its whole
+            // group spends the finite face token.
+            DdlBody::FactFunction(_) => None,
             DdlBody::Scalar(_) | DdlBody::Truth(_) | DdlBody::Deferred { .. } => None,
         }
     }
@@ -615,9 +739,12 @@ fn declared_group_kind(name: &str, decls: &[ClauseDecl]) -> Result<DefKind> {
             DefKind::View
         });
     }
-    let first_type_id = entity_type_id(first.front.kind, &first.front.head.context);
     for (idx, decl) in decls.iter().enumerate().skip(1) {
-        if entity_type_id(decl.front.kind, &decl.front.head.context) != first_type_id {
+        let same_kind = decl.front.kind == first.front.kind;
+        let same_call_protocol = first.front.kind != DefKind::Function
+            || matches!(first.front.head.context, ContextMode::None)
+                == matches!(decl.front.head.context, ContextMode::None);
+        if !same_kind || !same_call_protocol {
             return Err(mixed_kind(idx, decl.front.kind, first.front.kind));
         }
     }
@@ -635,7 +762,6 @@ fn declared_group_kind(name: &str, decls: &[ClauseDecl]) -> Result<DefKind> {
 fn elaborate_fact_clause(subject: &str, decl: ClauseDecl) -> Result<Vec<ClauseDecl>> {
     let ClauseDecl {
         front,
-        neck,
         body,
         full_source,
         doc,
@@ -649,7 +775,10 @@ fn elaborate_fact_clause(subject: &str, decl: ClauseDecl) -> Result<Vec<ClauseDe
     let chain = query.into_bare_body().map_err(|_| {
         DelightQLError::parse_error(format!("fact '{subject}': a fact's body is its data table"))
     })?;
-    let (Grelex::Literal(anon), true) = (chain.head, chain.continuations.is_empty()) else {
+    let (GroundForm::Literal(anon), true) = (
+        chain.head().form().clone(),
+        chain.continuations().is_empty(),
+    ) else {
         return Err(DelightQLError::parse_error(format!(
             "fact '{subject}': a fact's body is its data table"
         )));
@@ -672,15 +801,16 @@ fn elaborate_fact_clause(subject: &str, decl: ClauseDecl) -> Result<Vec<ClauseDe
             };
             items.push(HeadItem::plumb(column.name.clone()));
         }
-        let table_body =
-            Query::relational(Chain::ground(Grelex::Literal(AnonRelation::plain(table))));
+        let table_body = Query::relational(Chain::authored(GroundForm::Literal(
+            AnonRelation::plain(table),
+        )));
         return Ok(vec![ClauseDecl {
             front: DefinitionFront {
                 kind: front.kind,
                 subject: front.subject,
                 head: Head::listed(items),
+                fixpoint: front.fixpoint,
             },
-            neck,
             body: DdlBody::Relational(table_body),
             full_source,
             doc,
@@ -714,8 +844,8 @@ fn elaborate_fact_clause(subject: &str, decl: ClauseDecl) -> Result<Vec<ClauseDe
                 kind: front.kind,
                 subject: front.subject.clone(),
                 head: Head::listed(items),
+                fixpoint: front.fixpoint,
             },
-            neck,
             body: DdlBody::Relational(unit_body()),
             full_source: full_source.clone(),
             doc: doc.clone(),
@@ -737,38 +867,52 @@ fn unit_body() -> Query<Unresolved> {
         .expect("one datum"),
     ));
     let rows = crate::pipeline::asts::vocabulary::Vec1::try_from_vec(vec![row]).expect("one row");
-    Query::relational(Chain::ground(Grelex::Literal(AnonRelation::plain(
+    Query::relational(Chain::authored(GroundForm::Literal(AnonRelation::plain(
         AnonTable {
             body: TabularBody { header: None, rows },
-            cpr_schema: (),
         },
     ))))
 }
 
-/// Entity type integer for storage in the bootstrap database.
-///
-/// Maps declared kind → entity_type_enum.id. A context-capturing function
-/// is a different entity type from a plain one because the call protocol
-/// differs, which is why the head's capture mode is read here.
-pub fn entity_type_id(kind: DefKind, context: &ContextMode) -> i32 {
+/// The catalog capability of one completely assembled definition family.
+fn assembled_entity_type(kind: DefKind, decls: &[ClauseDecl]) -> Result<EntityType> {
+    let context = &decls
+        .first()
+        .expect("an assembled group has a first clause")
+        .front
+        .head
+        .context;
     match kind {
         DefKind::Function => {
             if matches!(context, ContextMode::None) {
-                1
+                Ok(EntityType::DqlFunctionExpression)
             } else {
-                3
+                Ok(EntityType::DqlContextAwareFunctionExpression)
             }
         }
-        DefKind::View => 4,
-        DefKind::HoView => 8,
-        DefKind::Sigma => 9,
-        // A fact function IS a fact relationally; what makes it callable is
-        // the functional dependency stored beside it, not a second kind of
-        // entity with its own relational road.
-        DefKind::Fact | DefKind::FactFunction => 16,
-        DefKind::Edge => 17,
-        // 20 = DqlEffectRule (enums.rs) — effect rules are their own entity type.
-        DefKind::Effect => 20,
+        DefKind::View => Ok(EntityType::DqlTemporaryViewExpression),
+        DefKind::HoView => Ok(EntityType::DqlHoTemporaryViewExpression),
+        DefKind::Sigma => Ok(EntityType::DqlTemporarySigmaRule),
+        DefKind::Fact => Ok(EntityType::DqlFactExpression),
+        DefKind::FactFunction => {
+            let mut callable_only = false;
+            for decl in decls {
+                let DdlBody::FactFunction(definition) = &decl.body else {
+                    return Err(DelightQLError::parse_error(
+                        "a fact-function family carries only declared modes",
+                    ));
+                };
+                callable_only |=
+                    definition.entity_type() == EntityType::DqlDefaultFactFunctionExpression;
+            }
+            Ok(if callable_only {
+                EntityType::DqlDefaultFactFunctionExpression
+            } else {
+                EntityType::DqlFactExpression
+            })
+        }
+        DefKind::Edge => Ok(EntityType::DqlErContextRule),
+        DefKind::Effect => Ok(EntityType::DqlEffectRule),
     }
 }
 

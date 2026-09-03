@@ -19,9 +19,12 @@ tree-sitter.workspace = true
 [build-dependencies]
 cc = "1.0"
 serde_json.workspace = true
+sha2 = "0.10"
 
 [dev-dependencies]
 # The conformance tests assert on Point coordinates directly.
 tree-sitter.workspace = true
 # The slot-ambiguity test reads the same node-types.json the generator does.
 serde_json.workspace = true
+# The fingerprint test recomputes the build script's framed digest.
+sha2 = "0.10"

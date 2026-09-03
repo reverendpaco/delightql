@@ -1,34 +1,30 @@
-# Delegate Selection {.dqlh}
+# Group Delegates {.dqlh}
 
-A grouped query collapses each group to one row. Aggregate functions
-*synthesize* a value across the group (`sum`, `count`, `avg`). **Delegate
-selection** does the opposite: it *selects* a value that already exists in
-some row of the group, using the F-OVER sigil `<~`{.delightql .sigil} in
-reduction place to pull the reduction back to a representative row.
+A group delegate is a principled mechanism for choosing one value among many during
+group reduction. The group delegate generalizes the aggregate functions `max()`
+and `min()` by allowing the user to choose their own ordering criteria.
+The group delegate is a function in unfamiliar clothing.
 
-A delegate payload is parenthesized for a coherent multi-column row, or a
-bare column for a single value. With an empty ordering (bare `<~`) the
-delegate row is **arbitrary**:
 
-```delightql
-  employee(*)
-    |> %(Department ~> (LastName, FirstName) <~)
-```
-
-`LastName` and `FirstName` are read from the *same* arbitrary row of each
-Department group. This replaces the older `~?` "unsafe reduced column"
-sigil. [SQLite provides useful semantics when an aggregate such as `max()`
-or `min()` is also present -- the delegate leans toward the row containing
-the extremum.]{.sidenote}
+The group delegate may be found **in reduction place**.
+A column parenthesisized and then postfixed by the F-OVER sigil `<~`{.delightql .sigil}
+followed by an explicit ordering criteria.
 
 ```delightql
-  employee(*)
-    |> %(Department
-          ~>
-        max:(Salary),
-        (LastName, FirstName) <~)
+users(*)
+  |> %(country ~> count:(*) as n, (first_name) <~ #(balance desc))
 ```
 
-[An *ordered* delegate `<~ #(order)` selects the first row under an
-explicit ordering -- the general form that subsumes Postgres `DISTINCT
-ON`. That form is forthcoming.]{.sidenote}
+With an empty ordering (bare `<~`) the delegate row is **arbitrary**:
+
+```delightql
+users(*)
+  |> %(country
+        ~> count:(*) as n,
+        (first_name as highest_balance) <~ #(balance desc),
+        (first_name as arbitray)<~ )
+```
+
+Some Sql vendors implement this functionality directly with dedicated syntax -- the `DISTINCT ON` syntax.
+
+

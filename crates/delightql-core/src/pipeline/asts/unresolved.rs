@@ -20,6 +20,16 @@ pub type CfeDefinition = crate::pipeline::asts::core::CfeDefinition;
 pub type ErContextSpec = crate::pipeline::asts::core::ErContextSpec;
 pub type Chain = crate::pipeline::asts::core::Chain<crate::pipeline::asts::core::Unresolved>;
 pub type Grelex = crate::pipeline::asts::core::Grelex<crate::pipeline::asts::core::Unresolved>;
+pub type GroundForm =
+    crate::pipeline::asts::core::GroundForm<crate::pipeline::asts::core::Unresolved>;
+pub type Step = crate::pipeline::asts::core::Step<crate::pipeline::asts::core::Unresolved>;
+#[allow(dead_code)]
+pub type Peel = crate::pipeline::asts::core::Peel<crate::pipeline::asts::core::Unresolved>;
+#[allow(dead_code)]
+#[allow(dead_code)]
+pub type Transparent =
+    crate::pipeline::asts::core::Transparent<crate::pipeline::asts::core::Unresolved>;
+pub type RunForm = crate::pipeline::asts::core::RunForm<crate::pipeline::asts::core::Unresolved>;
 pub type WholeHeading =
     crate::pipeline::asts::core::WholeHeading<crate::pipeline::asts::core::Unresolved>;
 pub type MemberCorrelation =
@@ -73,9 +83,6 @@ pub type Probe = crate::pipeline::asts::core::Probe<crate::pipeline::asts::core:
 pub type ValueRow = crate::pipeline::asts::core::ValueRow<crate::pipeline::asts::core::Unresolved>;
 pub type ArgumentValue =
     crate::pipeline::asts::core::ArgumentValue<crate::pipeline::asts::core::Unresolved>;
-pub type OutValue = crate::pipeline::asts::core::OutValue<crate::pipeline::asts::core::Unresolved>;
-pub type SlotConstraint =
-    crate::pipeline::asts::core::SlotConstraint<crate::pipeline::asts::core::Unresolved>;
 pub type PipeOp = crate::pipeline::asts::core::PipeOp<crate::pipeline::asts::core::Unresolved>;
 pub type GroupSpec =
     crate::pipeline::asts::core::GroupSpec<crate::pipeline::asts::core::Unresolved>;
@@ -86,8 +93,6 @@ pub type OrderingSpec =
 pub type OutItem = crate::pipeline::asts::core::OutItem<crate::pipeline::asts::core::Unresolved>;
 pub type ReductionItem =
     crate::pipeline::asts::core::ReductionItem<crate::pipeline::asts::core::Unresolved>;
-pub type Reference =
-    crate::pipeline::asts::core::Reference<crate::pipeline::asts::core::Unresolved>;
 pub type OneOut = crate::pipeline::asts::core::OneOut<crate::pipeline::asts::core::Unresolved>;
 pub type NamedOutItem =
     crate::pipeline::asts::core::NamedOutItem<crate::pipeline::asts::core::Unresolved>;
@@ -121,19 +126,17 @@ pub type CaseExpression = crate::pipeline::asts::core::expressions::CaseExpressi
 pub type ValueTemplatePart = crate::pipeline::asts::core::expressions::ValueTemplatePart<
     crate::pipeline::asts::core::Unresolved,
 >;
-pub use crate::pipeline::asts::core::metadata::{GroundedPath, NamespacePath};
+pub use crate::pipeline::asts::core::metadata::NamespacePath;
 pub use crate::pipeline::asts::core::{
-    AssertionSpec, ColumnOrdinal, ColumnRange, DangerSpec, DestructureMode, GroundMention,
-    InlineDdlBody, InlineDdlSpec, LiteralValue, OptionSpec, OrderDirection, QualifiedName,
-    SetOperator,
+    ColumnOrdinal, ColumnRange, DangerSpec, DestructureMode, GroundMention, InlineDdlBody,
+    InlineDdlSpec, LiteralValue, OptionSpec, OrderDirection, QualifiedName, SetOperator,
 };
 
 impl Chain {
     pub fn pipe(self, operator: PipeOp) -> Self {
-        self.then(Continuation::Pipe {
+        self.then(Step::authored(Continuation::Pipe {
             operator,
             named: None,
-            cpr_schema: (),
-        })
+        }))
     }
 }

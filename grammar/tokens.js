@@ -38,18 +38,16 @@ module.exports = {
   asc_keyword: $ => choice('asc', 'ascending'),
   desc_keyword: $ => choice('desc', 'descending'),
 
-  // ---- pipes and stage boundaries ----------------------------------------
+  // ---- pipes ---------------------------------------------------------------
   pipe_operator: $ => '|>',
   unwrap_pipe_operator: $ => '!>',
-  materialize: $ => '|*>',
-  function_pipe_first: $ => '/->',
-  function_pipe_last: $ => '/->>',
+  function_pipe_operator: $ => '/->',
 
   // ---- reduction, iteration, arrows --------------------------------------
   reduction_sigil: $ => '~>',
   // ':~>' is ONE token; interior whitespace is allowed.
   metadata_sigil: $ => token(seq(':', /[ \t\r\n]*/, '~>')),
-  destructure_sigil: $ => '~=',
+  destructure_sigil: $ => choice('~=','has','@'),
   arrow: $ => '->',
   window_sigil: $ => '<~',
 
@@ -91,7 +89,7 @@ module.exports = {
   one: $ => '1',
 
   // ---- necks and goals ----------------------------------------------------
-  definition_neck: $ => choice(':-', ':='),
+  definition_neck: $ => ':-',
   goal_marker: $ => '?-',
 
   // ---- separators ---------------------------------------------------------

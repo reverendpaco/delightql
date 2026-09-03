@@ -36,6 +36,21 @@ enum TreeJsonKey {
     Literal(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeColumn {
+    Semantic(crate::relation::PortId),
+    Physical(crate::names::ColId),
+}
+
+impl TreeColumn {
+    fn column(self) -> crate::names::ColId {
+        match self {
+            TreeColumn::Semantic(port) => port.column(),
+            TreeColumn::Physical(column) => column,
+        }
+    }
+}
+
 /// One published cell of a level, as the LOWERING needs it: a key and the
 /// value under it. A record's member says both; a tuple's element publishes
 /// by position and says only the value.
@@ -45,7 +60,7 @@ enum TreeJsonKey {
 #[derive(Clone)]
 enum TreeLeaf {
     /// A self-keyed member: the key IS the column's published name.
-    Published(crate::names::ColId),
+    Published(crate::relation::PortId),
     /// A keyed member: an authored key and the value under it.
     Keyed {
         key: String,
@@ -58,11 +73,16 @@ enum TreeLeaf {
 #[derive(Clone)]
 struct TreeLevel {
     leaves: Vec<TreeLeaf>,
-    group_keys: Vec<crate::names::ColId>,
+    group_keys: Vec<TreeColumn>,
     output: crate::names::ColId,
     inner: Vec<(TreeJsonKey, crate::names::ColId)>,
-    metadata_key: Option<crate::names::ColId>,
+    metadata_key: Option<TreeColumn>,
     siblings: Vec<TreeSibling>,
+    /// An OUTWARD level stands for its whole group: one object per set of
+    /// group keys, its leaves reductions or keys of the grouping — never an
+    /// array of the group's rows. Stated where the level is collected, from
+    /// the members' own kinds.
+    per_group: bool,
 }
 
 #[derive(Clone)]
@@ -74,17 +94,23 @@ struct TreeSibling {
 }
 
 fn resolved_heading(
-    schema: crate::names::ScopeId,
+    relation: &crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Vec<crate::names::ColId>> {
-    Ok(ctx.identities.known_heading(schema)?.to_vec())
+    Ok(ctx
+        .relations
+        .interface(relation)?
+        .ports()
+        .iter()
+        .map(|port| port.column())
+        .collect())
 }
 
-fn source_column(expression: &ast_refined::DomainExpression) -> Result<crate::names::ColId> {
+fn source_column(expression: &ast_refined::DomainExpression) -> Result<TreeColumn> {
     match expression {
         ast_refined::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { column, .. },
-        ))) => Ok(*column),
+        ))) => Ok(TreeColumn::Semantic(*column)),
         _ => Err(DelightQLError::ParseError {
             message: "tree group key is not a resolved column".to_string(),
             source: None,
@@ -93,79 +119,31 @@ fn source_column(expression: &ast_refined::DomainExpression) -> Result<crate::na
     }
 }
 
-fn current_column(
-    source: crate::names::ColId,
-    qualify: &dyn Qualify,
-) -> Result<crate::names::ColId> {
-    let identities = qualify.identities();
-    let columns = qualify.scope_columns();
-    // The rebind tiers, in their order: identity, republication chain,
-    // then value. A value-only match is too loose to lead — a prepend
-    // stage leaves the original column and its rename both in scope, one
-    // value carried twice, while the chain names exactly the occurrence
-    // the tree's reference was resolved to.
-    if columns.iter().any(|column| column.identity() == source) {
-        return Ok(qualify.read_through_joins(source));
+fn current_column(source: TreeColumn, qualify: &dyn Qualify) -> Result<crate::names::ColId> {
+    match source {
+        TreeColumn::Semantic(port) => qualify.rebind_port(port),
+        TreeColumn::Physical(column) => qualify.rebind_physical(column),
     }
-    let mut chained = columns
-        .iter()
-        .map(|column| column.identity())
-        .filter(|candidate| identities.republishes(*candidate, source));
-    match (chained.next(), chained.next()) {
-        (Some(column), None) => return Ok(qualify.read_through_joins(column)),
-        (Some(_), Some(_)) => {
-            return Err(DelightQLError::ParseError {
-                message: "tree group column is ambiguous at this CTE level".to_string(),
-                source: None,
-                subcategory: None,
-            })
-        }
-        (None, _) => {}
-    }
-    let matches = columns
-        .into_iter()
-        .map(|column| column.identity())
-        .filter(|candidate| identities.same_value(*candidate, source))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        // What a leaf emits is read, not published — the key beside it carries
-        // the published name — so the occurrence wanted here is the one a FROM
-        // entry actually offers. A join publishes a heading under no alias, and
-        // stopping at its occurrence qualifies the leaf by a table the
-        // statement does not contain.
-        [column] => Ok(qualify.read_through_joins(*column)),
-        [] => Err(DelightQLError::ParseError {
-            message: "tree group column is not present at this CTE level".to_string(),
-            source: None,
-            subcategory: None,
-        }),
-        _ => Err(DelightQLError::ParseError {
-            message: "tree group column is ambiguous at this CTE level".to_string(),
-            source: None,
-            subcategory: None,
-        }),
+}
+
+fn current_slot(source: TreeColumn, qualify: &dyn Qualify) -> Result<usize> {
+    match source {
+        TreeColumn::Semantic(port) => qualify.slot_of_port(port),
+        TreeColumn::Physical(column) => qualify.slot_of_physical(column),
     }
 }
 
 fn internal_tree_column(key: Option<&str>, ctx: &TransformCtx) -> crate::names::ColId {
-    let scope = ctx.identities.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-        None,
-    );
+    let scope = ctx.identities.anonymous_scope(None);
     let published = key.map(|text| ctx.identities.intern(text, false));
-    ctx.identities.mint_column(
+    ctx.identities.sql_column(
         scope,
-        crate::names::ColumnOrigin::Computed {
-            via: crate::names::Computation::Aggregate,
-        },
         published,
         if published.is_some() {
             crate::names::Addressing::Bare
         } else {
             crate::names::Addressing::Hygienic
         },
-        crate::names::ValueFacts::default(),
     )
 }
 
@@ -179,7 +157,7 @@ fn rebind_tree_expression(mut expression: SqlExpr, input: &dyn Qualify) -> Resul
             let SqlExpr::Column(source) = expression else {
                 return;
             };
-            match current_column(*source, self.input) {
+            match current_column(TreeColumn::Physical(*source), self.input) {
                 Ok(column) => *expression = SqlExpr::Column(column),
                 Err(_) => self.error = Some("tree group expression cannot be rebound"),
             }
@@ -197,22 +175,13 @@ fn rebind_tree_expression(mut expression: SqlExpr, input: &dyn Qualify) -> Resul
     }
 }
 
-/// A reduction item's PUBLISHED value. A crossing is never a tree group, so
-/// it lowers as the ordinary published value.
+/// A reduction item's PUBLISHED value.
 pub(super) fn s_lower_out_reduction_item(
-    value: ast_refined::OutValue,
+    value: ast_refined::DomainExpression,
     qualify: &dyn Qualify,
     ctx: &TransformCtx,
 ) -> Result<SelectItem> {
-    match value {
-        ast_refined::OutValue::Domain(domain) => {
-            s_lower_reduction_item(ReductionPayload::Value(domain), qualify, ctx)
-        }
-        crossing @ ast_refined::OutValue::Truth(_) => Ok(SelectItem::Expression {
-            expr: super::scalar::s_lower_out_value(crossing, qualify, ctx)?,
-            alias: None,
-        }),
-    }
+    s_lower_reduction_item(ReductionPayload::Value(value), qualify, ctx)
 }
 
 /// One reduction, lowered where it publishes.
@@ -238,9 +207,9 @@ pub(super) fn s_lower_reduction_item(
     match expr {
         ast_refined::DomainExpression::Application(ast_refined::FunctionApplication::Enclyph(
             Enclyph::Record(record),
-        )) => Ok(SelectItem::Expression {
+        )) => Ok(SelectItem::Scaffolding {
+            slot: ctx.identities.scaffolding_slot(),
             expr: s_lower_record_aggregate(record_leaves(record.members.into_vec()), qualify, ctx)?,
-            alias: None,
         }),
         ast_refined::DomainExpression::Application(ast_refined::FunctionApplication::Enclyph(
             Enclyph::Tuple(tuple),
@@ -249,11 +218,11 @@ pub(super) fn s_lower_reduction_item(
                 .elements
                 .into_vec()
                 .into_iter()
-                .map(|element| scalar::s_lower_expression(element, qualify, ctx))
+                .map(|element| scalar::s_lower_expression(element.into_value(), qualify, ctx))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(SelectItem::Expression {
+            Ok(SelectItem::Scaffolding {
+                slot: ctx.identities.scaffolding_slot(),
                 expr: tree_aggregate(SqlExpr::function("JSON_ARRAY", lowered.clone()), lowered),
-                alias: None,
             })
         }
         other => scalar::s_lower_select_item(other, qualify, ctx),
@@ -270,7 +239,7 @@ fn record_leaves(members: Vec<RecordMember<Refined>>) -> Vec<TreeLeaf> {
                 Some(TreeLeaf::Published(column))
             }
             RecordMember::Keyed { key, value } => Some(TreeLeaf::Keyed { key, value }),
-            RecordMember::Induced { .. } => None,
+            RecordMember::Induced { .. } | RecordMember::Metadata { .. } => None,
             RecordMember::Spread(spread) => spread.expanded(),
         })
         .collect()
@@ -314,6 +283,19 @@ fn json_key_expression(key: TreeJsonKey) -> SqlExpr {
     }
 }
 
+/// The key a leaf publishes under. Settled by the leaf alone — a level, a
+/// qualifier and a lowering have no say in it. Reading the key back at a
+/// layer ABOVE the one that emitted the value has to go through here: the
+/// enclosing CTE emits its own outputs, and the source ports it grouped are
+/// not bound there.
+fn leaf_json_key(leaf: &TreeLeaf) -> Option<TreeJsonKey> {
+    match leaf {
+        TreeLeaf::Published(column) => Some(TreeJsonKey::Published(column.column())),
+        TreeLeaf::Keyed { key, .. } => Some(TreeJsonKey::Literal(key.clone())),
+        TreeLeaf::Positional(_) => None,
+    }
+}
+
 fn lower_tree_leaf(
     leaf: &TreeLeaf,
     qualify: &dyn Qualify,
@@ -321,9 +303,9 @@ fn lower_tree_leaf(
 ) -> Result<Option<(Option<TreeJsonKey>, SqlExpr, bool)>> {
     let value = match leaf {
         TreeLeaf::Published(column) => {
-            let current = current_column(*column, qualify)?;
+            let current = current_column(TreeColumn::Semantic(*column), qualify)?;
             return Ok(Some((
-                Some(TreeJsonKey::Published(*column)),
+                Some(TreeJsonKey::Published(column.column())),
                 SqlExpr::Column(current),
                 qualify.tree_valued(current),
             )));
@@ -335,15 +317,10 @@ fn lower_tree_leaf(
     let tree = match &**value {
         ast_refined::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { column, .. },
-        ))) => qualify.tree_valued(current_column(*column, qualify)?),
+        ))) => qualify.tree_valued(current_column(TreeColumn::Semantic(*column), qualify)?),
         _ => false,
     };
-    let key = match leaf {
-        TreeLeaf::Keyed { key, .. } => Some(TreeJsonKey::Literal(key.clone())),
-        TreeLeaf::Positional(_) => None,
-        TreeLeaf::Published(_) => unreachable!("answered above"),
-    };
-    Ok(Some((key, lowered, tree)))
+    Ok(Some((leaf_json_key(leaf), lowered, tree)))
 }
 
 fn tree_aggregate(value: SqlExpr, checks: Vec<SqlExpr>) -> SqlExpr {
@@ -400,6 +377,8 @@ fn tree_aggregate(value: SqlExpr, checks: Vec<SqlExpr>) -> SqlExpr {
 enum NestedLevel {
     Record(Vec<RecordMember<Refined>>),
     Tuple(Vec<TreeLeaf>),
+    /// A metadata group under the member's key: its own level chain.
+    Metadata(ast_refined::MetadataGroup),
 }
 
 impl NestedLevel {
@@ -408,16 +387,19 @@ impl NestedLevel {
         match self {
             Self::Record(members) => record_leaves(members.clone()),
             Self::Tuple(leaves) => leaves.clone(),
+            Self::Metadata(_) => Vec::new(),
         }
     }
 
-    /// A tuple never induces; a record does when a member says so.
+    /// A tuple never induces; a record does when a member says so, and a
+    /// metadata group always builds levels of its own.
     fn induces(&self) -> bool {
         match self {
             Self::Record(members) => members
                 .iter()
                 .any(|member| matches!(member, RecordMember::Induced { .. })),
             Self::Tuple(_) => false,
+            Self::Metadata(_) => true,
         }
     }
 
@@ -444,7 +426,7 @@ fn split_tree_members(
                         .elements
                         .into_vec()
                         .into_iter()
-                        .map(|element| match element {
+                        .map(|element| match element.into_value() {
                             ast_refined::DomainExpression::Reference(Reference::Named(
                                 NamedReference(ColumnOccurrence { column, .. }),
                             )) => TreeLeaf::Published(column),
@@ -454,6 +436,9 @@ fn split_tree_members(
                     nested.push((key, NestedLevel::Tuple(elements)));
                 }
             },
+            RecordMember::Metadata { key, group } => {
+                nested.push((key, NestedLevel::Metadata(*group)))
+            }
             RecordMember::SelfKeyed(NamedReference(ColumnOccurrence { column, .. })) => {
                 leaves.push(TreeLeaf::Published(column))
             }
@@ -466,21 +451,22 @@ fn split_tree_members(
 
 fn leaf_column(leaf: &TreeLeaf) -> Option<crate::names::ColId> {
     match leaf {
-        TreeLeaf::Published(column) => Some(*column),
+        TreeLeaf::Published(column) => Some(column.column()),
         TreeLeaf::Keyed { value, .. } | TreeLeaf::Positional(value) => {
-            source_column(value).ok()
+            source_column(value).ok().map(TreeColumn::column)
         }
     }
 }
 
-fn leaf_dependencies(leaf: &TreeLeaf, qualify: &dyn Qualify) -> Result<Vec<crate::names::ColId>> {
+fn leaf_dependencies(leaf: &TreeLeaf, qualify: &dyn Qualify) -> Result<Vec<TreeColumn>> {
     struct Columns<'a> {
         qualify: &'a dyn Qualify,
-        found: Vec<crate::names::ColId>,
+        found: Vec<TreeColumn>,
     }
 
     impl Columns<'_> {
-        fn record(&mut self, column: crate::names::ColId) {
+        fn record(&mut self, column: crate::relation::PortId) {
+            let column = TreeColumn::Semantic(column);
             if current_column(column, self.qualify).is_ok() && !self.found.contains(&column) {
                 self.found.push(column);
             }
@@ -530,7 +516,7 @@ fn leaf_dependencies(leaf: &TreeLeaf, qualify: &dyn Qualify) -> Result<Vec<crate
     }
 
     match leaf {
-        TreeLeaf::Published(column) => Ok(vec![*column]),
+        TreeLeaf::Published(column) => Ok(vec![TreeColumn::Semantic(*column)]),
         TreeLeaf::Keyed { value, .. } | TreeLeaf::Positional(value) => {
             let mut columns = Columns {
                 qualify,
@@ -544,7 +530,7 @@ fn leaf_dependencies(leaf: &TreeLeaf, qualify: &dyn Qualify) -> Result<Vec<crate
 
 fn collect_tree_levels(
     members: Vec<RecordMember<Refined>>,
-    group_keys: Vec<crate::names::ColId>,
+    group_keys: Vec<TreeColumn>,
     output: crate::names::ColId,
     qualify: &dyn Qualify,
     ctx: &TransformCtx,
@@ -559,6 +545,7 @@ fn collect_tree_levels(
             inner: Vec::new(),
             metadata_key: None,
             siblings: Vec::new(),
+            per_group: false,
         });
         return Ok(());
     }
@@ -570,6 +557,9 @@ fn collect_tree_levels(
             }
         }
     }
+    let has_metadata = nested
+        .iter()
+        .any(|(_, level)| matches!(level, NestedLevel::Metadata(_)));
     let all_flat = nested.len() > 1 && nested.iter().all(|(_, level)| !level.induces());
     let mut inner = Vec::new();
     if all_flat {
@@ -592,6 +582,7 @@ fn collect_tree_levels(
             inner: Vec::new(),
             metadata_key: None,
             siblings,
+            per_group: false,
         });
     } else {
         for (key, level) in nested {
@@ -600,6 +591,17 @@ fn collect_tree_levels(
                 NestedLevel::Record(members) => {
                     collect_tree_levels(members, inner_keys.clone(), alias, qualify, ctx, levels)?
                 }
+                // A metadata member builds its own chain: the target's
+                // levels grouped one level finer, then one JSON_GROUP_OBJECT
+                // per metadata key back up to this member's column.
+                NestedLevel::Metadata(group) => collect_metadata_member_levels(
+                    group,
+                    inner_keys.clone(),
+                    alias,
+                    qualify,
+                    ctx,
+                    levels,
+                )?,
                 // A tuple induced alone reaches this road with no geometry of
                 // its own to state: the level publishes its elements as an
                 // object whose keys are empty.
@@ -610,11 +612,15 @@ fn collect_tree_levels(
                     inner: Vec::new(),
                     metadata_key: None,
                     siblings: Vec::new(),
+                    per_group: false,
                 }),
             }
             inner.push((TreeJsonKey::Literal(key), alias));
         }
     }
+    // A level holding a metadata member is OUTWARD: it stands for its whole
+    // group, so its record is built once per set of group keys rather than
+    // aggregated over the group's rows.
     levels.push(TreeLevel {
         leaves,
         group_keys,
@@ -622,6 +628,7 @@ fn collect_tree_levels(
         inner,
         metadata_key: None,
         siblings: Vec::new(),
+        per_group: has_metadata,
     });
     Ok(())
 }
@@ -630,7 +637,7 @@ fn collect_tree_levels(
 /// keys it passed through on the way.
 fn unwrap_tree_item(
     item: ReductionPayload,
-) -> Result<(Vec<RecordMember<Refined>>, Vec<crate::names::ColId>)> {
+) -> Result<(Vec<RecordMember<Refined>>, Vec<TreeColumn>, bool)> {
     fn record_of(enclyph: Enclyph<Refined>) -> Result<Vec<RecordMember<Refined>>> {
         match enclyph {
             Enclyph::Record(record) => Ok(record.members.into_vec()),
@@ -644,17 +651,20 @@ fn unwrap_tree_item(
     }
     fn unwrap_group(
         group: ast_refined::MetadataGroup,
-        metadata: &mut Vec<crate::names::ColId>,
+        metadata: &mut Vec<TreeColumn>,
+        summary: &mut bool,
     ) -> Result<Vec<RecordMember<Refined>>> {
-        metadata.push(group.key.column);
+        metadata.push(TreeColumn::Semantic(group.key.column));
+        *summary = group.summary;
         match group.target {
             MetadataTarget::Enclyph(enclyph) => record_of(enclyph),
-            MetadataTarget::Group(nested) => unwrap_group(*nested, metadata),
+            MetadataTarget::Group(nested) => unwrap_group(*nested, metadata, summary),
         }
     }
     let mut metadata = Vec::new();
+    let mut summary = false;
     let members = match item {
-        ReductionPayload::Metadata(group) => unwrap_group(group, &mut metadata)?,
+        ReductionPayload::Metadata(group) => unwrap_group(group, &mut metadata, &mut summary)?,
         ReductionPayload::Value(ast_refined::DomainExpression::Application(
             ast_refined::FunctionApplication::Enclyph(enclyph),
         )) => record_of(enclyph)?,
@@ -666,7 +676,83 @@ fn unwrap_tree_item(
             })
         }
     };
-    Ok((members, metadata))
+    Ok((members, metadata, summary))
+}
+
+/// A metadata member's own level chain: the target's levels grouped by the
+/// parent's keys plus every metadata key, then one JSON_GROUP_OBJECT level
+/// per metadata key back up to the member's output. The same stacking the
+/// top-level metadata road performs, standing under a record member.
+fn collect_metadata_member_levels(
+    group: ast_refined::MetadataGroup,
+    parent_keys: Vec<TreeColumn>,
+    output: crate::names::ColId,
+    qualify: &dyn Qualify,
+    ctx: &TransformCtx,
+    levels: &mut Vec<TreeLevel>,
+) -> Result<()> {
+    fn unwrap(
+        group: ast_refined::MetadataGroup,
+        metadata: &mut Vec<TreeColumn>,
+        summary: &mut bool,
+    ) -> Result<Vec<RecordMember<Refined>>> {
+        metadata.push(TreeColumn::Semantic(group.key.column));
+        *summary = group.summary;
+        match group.target {
+            MetadataTarget::Enclyph(Enclyph::Record(record)) => Ok(record.members.into_vec()),
+            MetadataTarget::Enclyph(Enclyph::EmptyRecord(_)) => Ok(Vec::new()),
+            MetadataTarget::Enclyph(Enclyph::Tuple(_)) => Err(DelightQLError::ParseError {
+                message: "metadata tree group constructor must be a record".to_string(),
+                source: None,
+                subcategory: None,
+            }),
+            MetadataTarget::Group(nested) => unwrap(*nested, metadata, summary),
+        }
+    }
+    let mut metadata = Vec::new();
+    let mut summary = false;
+    let members = unwrap(group, &mut metadata, &mut summary)?;
+    let mut initial_keys = parent_keys.clone();
+    initial_keys.extend(metadata.iter().copied());
+    let innermost = internal_tree_column(None, ctx);
+    let before = levels.len();
+    collect_tree_levels(members, initial_keys, innermost, qualify, ctx, levels)?;
+    // A SUMMARY target reduces its subgroup: its own level stands for the
+    // whole subgroup, one object per key rather than an array of its rows.
+    // The target's record level is the last one collected.
+    if summary && levels.len() > before {
+        if let Some(level) = levels.last_mut() {
+            level.per_group = true;
+        }
+    }
+    for index in (0..metadata.len()).rev() {
+        let inner =
+            levels
+                .last()
+                .map(|level| level.output)
+                .ok_or_else(|| DelightQLError::ParseError {
+                    message: "metadata tree group has no inner level".to_string(),
+                    source: None,
+                    subcategory: None,
+                })?;
+        let level_output = if index == 0 {
+            output
+        } else {
+            internal_tree_column(None, ctx)
+        };
+        let mut keys = parent_keys.clone();
+        keys.extend(metadata[..index].iter().copied());
+        levels.push(TreeLevel {
+            leaves: Vec::new(),
+            group_keys: keys,
+            output: level_output,
+            inner: vec![(TreeJsonKey::Literal(String::new()), inner)],
+            metadata_key: Some(metadata[index]),
+            siblings: Vec::new(),
+            per_group: false,
+        });
+    }
+    Ok(())
 }
 
 /// Build one level's body, standing it at a scope of its own.
@@ -681,8 +767,9 @@ fn assemble_tree_cte(
     input: &super::builder::CteInput,
     mut items: Vec<SelectItem>,
     group_by: Vec<SqlExpr>,
+    input_slots: Vec<Option<usize>>,
 ) -> Result<CteBody> {
-    let (at, outputs) = super::builder::stand_cte_body_at(
+    let (at, outputs, physical_aliases) = super::builder::stand_cte_body_at(
         &mut items,
         input.scope(),
         crate::names::WrapReason::Aggregate,
@@ -694,11 +781,14 @@ fn assemble_tree_cte(
     if !group_by.is_empty() {
         select = select.group_by(group_by);
     }
-    let select =
-        super::builder::publish_at(at, outputs.iter().copied(), select, input.identities())?;
+    let select = (select)
+        .standing_at(at)
+        .map_err(crate::error::DelightQLError::parse_error)?;
     Ok(CteBody {
         query: crate::pipeline::sql_ast::QueryExpression::Select(Box::new(select)),
         output_columns: outputs,
+        input_slots,
+        physical_aliases,
     })
 }
 
@@ -709,11 +799,13 @@ fn build_tree_level(
 ) -> Result<CteBody> {
     let mut items = Vec::new();
     let mut group_by = Vec::new();
+    let mut input_slots = Vec::new();
     for key in &level.group_keys {
         let current = current_column(*key, input)?;
         let expression = SqlExpr::Column(current);
         group_by.push(expression.clone());
-        items.push(SelectItem::expression_with_alias(expression, *key));
+        items.push(SelectItem::expression_with_alias(expression, key.column()));
+        input_slots.push(Some(current_slot(*key, input)?));
     }
     if !level.siblings.is_empty() {
         for sibling in &level.siblings {
@@ -755,7 +847,7 @@ fn build_tree_level(
                 source: None,
                 subcategory: None,
             })?;
-        let value = SqlExpr::Column(current_column(inner.1, input)?);
+        let value = SqlExpr::Column(current_column(TreeColumn::Physical(inner.1), input)?);
         items.push(SelectItem::expression_with_alias(
             SqlExpr::function(
                 "JSON_GROUP_OBJECT",
@@ -778,24 +870,31 @@ fn build_tree_level(
             }
         }
         for (key, source) in &level.inner {
-            let value = SqlExpr::Column(current_column(*source, input)?);
+            let value = SqlExpr::Column(current_column(TreeColumn::Physical(*source), input)?);
             values.push(json_key_expression(key.clone()));
             values.push(SqlExpr::function("json", vec![value.clone()]));
             checks.push(value);
         }
         items.push(SelectItem::expression_with_alias(
-            tree_aggregate(SqlExpr::function("JSON_OBJECT", values), checks),
+            if level.per_group {
+                // OUTWARD: the record stands for its whole group — one
+                // object per set of group keys, never an array of rows.
+                SqlExpr::function("JSON_OBJECT", values)
+            } else {
+                tree_aggregate(SqlExpr::function("JSON_OBJECT", values), checks)
+            },
             level.output,
         ));
     }
-    assemble_tree_cte(input, items, group_by)
+    input_slots.resize(items.len(), None);
+    assemble_tree_cte(input, items, group_by, input_slots)
 }
 
 pub(super) fn r_lower_tree_group_cte(
     builder: Builder<Unprojected>,
     keys: Vec<ast_refined::DomainExpression>,
     reductions: Vec<ReductionPayload>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     let item = reductions
@@ -806,7 +905,7 @@ pub(super) fn r_lower_tree_group_cte(
             source: None,
             subcategory: None,
         })?;
-    let outputs = resolved_heading(cpr_schema, ctx)?;
+    let outputs = resolved_heading(&result, ctx)?;
     if outputs.len() != keys.len() + 1 {
         return Err(DelightQLError::ParseError {
             message: "tree group output heading does not match its keys".to_string(),
@@ -835,7 +934,7 @@ fn lower_tree_cte_chain(
         .iter()
         .map(|expression| source_column(expression))
         .collect::<Result<Vec<_>>>()?;
-    let (members, metadata) = unwrap_tree_item(item)?;
+    let (members, metadata, summary) = unwrap_tree_item(item)?;
     let mut initial_keys = group_keys.clone();
     initial_keys.extend(metadata.iter().copied());
     let mut levels = Vec::new();
@@ -847,6 +946,14 @@ fn lower_tree_cte_chain(
         ctx,
         &mut levels,
     )?;
+    // A SUMMARY target reduces its subgroup: one object per key, never an
+    // array of the subgroup's rows. The target's record level is the last
+    // one collected.
+    if summary && !levels.is_empty() {
+        if let Some(level) = levels.last_mut() {
+            level.per_group = true;
+        }
+    }
     for index in (0..metadata.len()).rev() {
         let inner =
             levels
@@ -871,6 +978,7 @@ fn lower_tree_cte_chain(
             inner: vec![(TreeJsonKey::Literal(String::new()), inner)],
             metadata_key: Some(metadata[index]),
             siblings: Vec::new(),
+            per_group: false,
         });
     }
     let mut projected = builder.project_all()?;
@@ -886,10 +994,12 @@ fn lower_tree_cte_chain(
         })
         .collect::<Result<Vec<_>>>()?;
     let aggregate = current_column(
-        levels
-            .last()
-            .expect("tree group always creates a level")
-            .output,
+        TreeColumn::Physical(
+            levels
+                .last()
+                .expect("tree group always creates a level")
+                .output,
+        ),
         &projected,
     )?;
     items.push(SelectItem::expression_with_alias(
@@ -939,12 +1049,12 @@ pub(super) fn r_lower_tree_group_mixed(
     reductions: Vec<ast_refined::ReductionItem>,
     plan: ast_refined::ReductionPlan,
     arbitrary: Vec<ast_refined::OutItem>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::sql_ast::{BinaryOperator, JoinCondition, JoinType};
 
-    let outputs = resolved_heading(cpr_schema, ctx)?;
+    let outputs = resolved_heading(&result, ctx)?;
     let key_count = keys.len();
     // An arbitrary payload that duplicates a group key is stamped `None` by
     // the resolver and publishes nothing — it is already emitted in group
@@ -962,16 +1072,19 @@ pub(super) fn r_lower_tree_group_mixed(
             subcategory: None,
         });
     }
-    let key_exprs: Vec<ast_refined::DomainExpression> =
-        super::relational::published_values(keys);
+    let key_exprs: Vec<ast_refined::DomainExpression> = super::relational::published_values(keys);
 
-    // Freeze the source once; every arm reads its own copy.
+    // Freeze the source once; every arm reads its own copy. EVERY ARM IS
+    // STILL THE SAME RELATION: the arms re-emit the operand's own
+    // occurrences, so each carries the operand's binding and a reduction
+    // item's references reach the positions they were addressed against.
     let cols = builder.columns().to_vec();
     let names = builder.names().clone();
     let identities = std::rc::Rc::clone(builder.identities());
+    let src_site = builder.publication().site();
     let src = builder.project_all()?.to_sql()?;
     let fresh_source = || -> Result<Builder<Unprojected>> {
-        Builder::from_frozen(
+        Builder::from_frozen_at_site(
             src.clone(),
             super::builder::ScopeName::Fresh(names.fresh(super::builder::wrap_origin(
                 &cols,
@@ -981,6 +1094,7 @@ pub(super) fn r_lower_tree_group_mixed(
             cols.clone(),
             names.clone(),
             std::rc::Rc::clone(&identities),
+            src_site,
         )
     };
 
@@ -1017,26 +1131,25 @@ pub(super) fn r_lower_tree_group_mixed(
                 continue;
             };
             let mut item = s_lower_out_reduction_item(expr.clone(), &arm, ctx)?;
-            if let Some(col) = *entry.output() {
-                super::relational::alias_unaliased(&mut item, col);
-            }
+            super::relational::alias_unaliased(&mut item, entry.output().column());
             slot[*index] = Some((0, offset));
             aggregates.push(item);
         }
         for (position, entry) in arbitrary.into_iter().enumerate() {
-            let output = entry.output();
+            let output = entry.output().map(crate::relation::PortId::column);
             let Some(expr) = super::relational::into_published_value(entry) else {
                 continue;
             };
             let Some(col) = output else {
                 continue; // resolver stamped None — no output column
             };
-            let mut item = match scalar::s_lower_select_item(expr, &arm, ctx)? {
-                SelectItem::Expression { expr, alias } => SelectItem::Expression {
-                    expr: SqlExpr::intrinsic(crate::names::Intrinsic::Arbitrary, vec![expr]),
-                    alias,
-                },
-                other => other,
+            let lowered = scalar::s_lower_select_item(expr, &arm, ctx)?;
+            let mut item = match lowered.expr() {
+                Some(expr) => lowered.with_expr(SqlExpr::intrinsic(
+                    crate::names::Intrinsic::Arbitrary,
+                    vec![expr.clone()],
+                )),
+                None => lowered,
             };
             super::relational::alias_unaliased(&mut item, col);
             slot[arbitrary_base + position] = Some((0, aggregates.len()));
@@ -1071,14 +1184,17 @@ pub(super) fn r_lower_tree_group_mixed(
         let key_aliases = key_exprs
             .iter()
             .map(|expression| source_column(expression))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(TreeColumn::column)
+            .collect::<Vec<_>>();
         let projected =
             lower_tree_cte_chain(arm, &key_exprs, payload, &key_aliases, tree_output, ctx)?;
         slot[index] = Some((operands.len(), 0));
         operands.push(projected.demote()?.into_join_operand()?);
     }
 
-    let key_anchor: Vec<crate::names::ColId> = operands[0].columns[..key_count]
+    let key_anchor: Vec<crate::names::ColId> = operands[0].columns()[..key_count]
         .iter()
         .map(|column| column.identity())
         .collect();
@@ -1093,7 +1209,7 @@ pub(super) fn r_lower_tree_group_mixed(
                         .map(|i| SqlExpr::Binary {
                             left: Box::new(SqlExpr::Column(key_anchor[i])),
                             op: BinaryOperator::IsNotDistinctFrom,
-                            right: Box::new(SqlExpr::Column(operand.columns[i].identity())),
+                            right: Box::new(SqlExpr::Column(operand.columns()[i].identity())),
                         })
                         .collect(),
                 )
@@ -1112,7 +1228,7 @@ pub(super) fn r_lower_tree_group_mixed(
     // Published slots only, in heading order — a `None` payload contributes
     // no output, so it must not consume one either.
     for ((arm, offset), output) in slot.iter().flatten().zip(&outputs[key_count..]) {
-        let column = operands[*arm].columns[key_count + offset].identity();
+        let column = operands[*arm].columns()[key_count + offset].identity();
         final_items.push(SelectItem::expression_with_alias(
             SqlExpr::Column(column),
             *output,
@@ -1121,8 +1237,8 @@ pub(super) fn r_lower_tree_group_mixed(
 
     Builder::from_joins(operands, conditions)?.add_projection_publishing(
         final_items,
-        cpr_schema,
-        super::relational::columns_from_cpr_schema(cpr_schema, &ctx.identities),
+        result.scope(),
+        super::relational::columns_from_relation(&result, ctx)?,
     )
 }
 
@@ -1130,7 +1246,7 @@ pub(super) fn r_lower_tree_group_in_keys(
     builder: Builder<Unprojected>,
     keys: Vec<ast_refined::DomainExpression>,
     reductions: Vec<ast_refined::DomainExpression>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     let mut tree = None;
@@ -1163,7 +1279,7 @@ pub(super) fn r_lower_tree_group_in_keys(
         });
     };
     let members = record.members.into_vec();
-    let outputs = resolved_heading(cpr_schema, ctx)?;
+    let outputs = resolved_heading(&result, ctx)?;
     let plain_columns = plain
         .iter()
         .map(|expression| source_column(expression))
@@ -1198,11 +1314,16 @@ pub(super) fn r_lower_tree_group_in_keys(
     let projected = builder.project_all()?.push_cte(|input| {
         let mut items = Vec::new();
         let mut group_by = Vec::new();
+        let mut input_slots = Vec::new();
         for source in &plain_columns {
             let current = current_column(*source, input)?;
             let expression = SqlExpr::Column(current);
             group_by.push(expression.clone());
-            items.push(SelectItem::expression_with_alias(expression, *source));
+            items.push(SelectItem::expression_with_alias(
+                expression,
+                source.column(),
+            ));
+            input_slots.push(Some(current_slot(*source, input)?));
         }
         for leaf in &leaves {
             if let Some((_, value, _)) = lower_tree_leaf(leaf, input, ctx)? {
@@ -1252,21 +1373,20 @@ pub(super) fn r_lower_tree_group_in_keys(
         for (expression, output) in reductions.iter().zip(extra_outputs.iter()) {
             let mut item =
                 s_lower_reduction_item(ReductionPayload::Value(expression.clone()), input, ctx)?;
-            if let SelectItem::Expression { alias, .. } = &mut item {
-                *alias = Some(*output);
+            if let Some(realized) = item.realizing(*output) {
+                item = realized;
             }
             items.push(item);
         }
-        assemble_tree_cte(input, items, group_by)
+        input_slots.resize(items.len(), None);
+        assemble_tree_cte(input, items, group_by, input_slots)
     })?;
     let columns = projected.columns();
     let value_start = plain_columns.len();
     let mut json = Vec::new();
     for (index, leaf) in leaves.iter().enumerate() {
-        if let Some((key, _, _)) = lower_tree_leaf(leaf, &projected, ctx)? {
-            json.push(json_key_expression(leaf_key(key)));
-            json.push(SqlExpr::Column(columns[value_start + index].identity()));
-        }
+        json.push(json_key_expression(leaf_key(leaf_json_key(leaf))));
+        json.push(SqlExpr::Column(columns[value_start + index].identity()));
     }
     for (index, (key, _)) in nested.iter().enumerate() {
         json.push(SqlExpr::literal(LiteralValue::String(key.clone())));

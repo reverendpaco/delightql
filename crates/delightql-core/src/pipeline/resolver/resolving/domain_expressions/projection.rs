@@ -5,64 +5,50 @@ use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::ast_unresolved;
 use crate::pipeline::asts::core::literals::{column_ordinal_text, column_range_text};
-use crate::pipeline::asts::core::OutValue;
 use crate::pipeline::asts::core::{AuthoredColumn, ColumnOccurrence};
 use crate::pipeline::asts::core::{Glob, RegexSelector, Spread};
 use crate::pipeline::asts::core::{NamedReference, Reference};
 
+pub(in crate::pipeline::resolver) type PendingOutItem = crate::relation::pending::Position;
+
 fn expand_glob(
     qualifier: Option<delightql_types::SqlIdentifier>,
-    available: &[crate::names::ColId],
-    registry: &crate::names::Registry,
+    position: &crate::pipeline::resolver::Position<'_>,
+    registry: &crate::relation::Planning,
 ) -> Result<Vec<ast_resolved::DomainExpression>> {
-    let explicit_qualifier = qualifier.is_some();
-    let columns = qualifier.map_or_else(
-        || available.to_vec(),
-        |qualifier| {
-            // As written: a stropped qualifier names a case-sensitive scope,
-            // and folding it here would look for a scope nobody named.
-            let spelling = registry.intern(qualifier.as_str(), qualifier.is_stropped());
-            registry
-                .qualified_glob(registry.canonical(spelling), available)
-                .to_vec()
-        },
-    );
+    // THE FRONTIER ANSWERS THE GLOB: its own heading bare, or what the
+    // qualifier reaches, each as the occurrence the glob addresses.
+    let columns = match qualifier {
+        None => position.heading(registry)?,
+        Some(qualifier) => position.qualified_glob(&qualifier, registry)?,
+    };
     Ok(columns
         .into_iter()
-        .map(|column| {
-            ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                ColumnOccurrence {
-                    column,
-                    explicit_qualifier,
-                },
-            )))
+        .map(|occurrence| {
+            ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(occurrence)))
         })
         .collect())
 }
 
 fn expand_pattern(
     pattern: &str,
-    available: &[crate::names::ColId],
+    position: &crate::pipeline::resolver::Position<'_>,
     allow_zero_matches: bool,
-    registry: &crate::names::Registry,
+    registry: &crate::relation::Planning,
 ) -> Result<Vec<ast_resolved::DomainExpression>> {
     use crate::pipeline::pattern::bre_to_rust_regex;
     let regex_pattern = bre_to_rust_regex(pattern)?;
 
-    // Create regex for matching
     let re = regex::Regex::new(&regex_pattern)
         .map_err(|e| DelightQLError::parse_error(format!("Invalid column pattern: {}", e)))?;
 
-    let columns: Vec<_> = registry
-        .pattern_columns(&re, available)
+    // THE FRONTIER ANSWERS THE SPREAD: the positions of the heading in
+    // view whose published names the pattern matches.
+    let columns: Vec<_> = position
+        .spread(|name| re.is_match(name), registry)?
         .into_iter()
-        .map(|column| {
-            ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                ColumnOccurrence {
-                    column,
-                    explicit_qualifier: false,
-                },
-            )))
+        .map(|occurrence| {
+            ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(occurrence)))
         })
         .collect();
 
@@ -199,12 +185,12 @@ fn format_range_string(range: &ast_unresolved::ColumnRange) -> String {
 pub(in crate::pipeline::resolver) fn expand_spread(
     fold: &mut crate::pipeline::resolver::resolver_fold::ResolverFold,
     spread: &Spread<crate::pipeline::asts::core::Unresolved>,
-    available: &[crate::names::ColId],
+    available: &[crate::relation::PortId],
     allow_zero_pattern_matches: bool,
 ) -> Result<Vec<ast_resolved::DomainExpression>> {
     match spread {
         Spread::Glob(Glob { qualifier, .. }) => {
-            let columns = expand_glob(qualifier.clone(), available, &fold.registry.identities)?;
+            let columns = expand_glob(qualifier.clone(), &fold.lexical, &fold.core.identities)?;
             if columns.is_empty() && qualifier.is_some() {
                 return Err(DelightQLError::validation_error(
                     format!(
@@ -219,9 +205,9 @@ pub(in crate::pipeline::resolver) fn expand_spread(
         }
         Spread::Regex(RegexSelector { pattern, .. }) => expand_pattern(
             pattern,
-            available,
+            &fold.lexical,
             allow_zero_pattern_matches,
-            &fold.registry.identities,
+            &fold.core.identities,
         ),
         Spread::PositionalSpan(range) => expand_range(fold, range, available),
     }
@@ -231,23 +217,15 @@ pub(in crate::pipeline::resolver) fn expand_spread(
 fn expand_range(
     fold: &mut crate::pipeline::resolver::resolver_fold::ResolverFold,
     range: &ast_unresolved::ColumnRange,
-    available: &[crate::names::ColId],
+    available: &[crate::relation::PortId],
 ) -> Result<Vec<ast_resolved::DomainExpression>> {
     // A qualified range is a qualified glob narrowed by position — the same
     // tiers, or `u|1..2|` and `u.*` reach different columns one character
     // apart.
-    let candidates = if let Some(qual) = &range.qualifier {
-        let spelling = fold
-            .registry
-            .identities
-            .intern(qual.as_str(), qual.is_stropped());
-        let qualifier = fold.registry.identities.canonical(spelling);
-        fold.registry
-            .identities
-            .qualified_glob(qualifier, available)
-    } else {
-        crate::names::Candidates::from_vec(available.to_vec())
-    };
+    let _ = available;
+    let candidates = fold
+        .lexical
+        .in_order(range.qualifier.as_ref(), &fold.core.identities)?;
 
     if candidates.is_empty() {
         return Err(DelightQLError::ColumnNotFoundError {
@@ -273,13 +251,7 @@ fn expand_range(
     Ok((start_idx..=end_idx)
         .map(|idx| {
             ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                ColumnOccurrence {
-                    column: *candidates
-                        .in_order()
-                        .nth(idx)
-                        .expect("validated range index is in candidate order"),
-                    explicit_qualifier: range.qualifier.is_some(),
-                },
+                candidates[idx].clone(),
             )))
         })
         .collect())
@@ -295,9 +267,12 @@ fn expand_range(
 pub(in crate::pipeline::resolver) fn resolve_selector_via_fold(
     fold: &mut crate::pipeline::resolver::resolver_fold::ResolverFold,
     selector: Vec<ast_unresolved::SelectorItem>,
-    available: &[crate::names::ColId],
+    available: &[crate::relation::PortId],
     allow_zero_pattern_matches: bool,
-) -> Result<(Vec<ast_resolved::SelectorItem>, Vec<crate::names::ColId>)> {
+) -> Result<(
+    Vec<ast_resolved::SelectorItem>,
+    Vec<crate::relation::PortId>,
+)> {
     let mut items = Vec::new();
     let mut columns = Vec::new();
     for item in selector {
@@ -324,11 +299,35 @@ pub(in crate::pipeline::resolver) fn resolve_selector_via_fold(
                     "selector",
                 ));
             };
+            // A SELECTOR ADDRESSES THE HEADING STANDING HERE. A qualified
+            // item reaches the lexical binding, whose position a step above
+            // it republished; the construction record says which position
+            // that became, and it is the one a removal removes.
+            let Some(column) =
+                crate::relation::landed_in(&fold.core.identities, available, column)?
+            else {
+                return Err(DelightQLError::transformation_error(
+                    "a selector item addresses a position this heading does not stand on",
+                    "selector",
+                ));
+            };
             if columns.contains(&column) {
                 continue;
             }
             columns.push(column);
-            items.push(ast_resolved::SelectorItem::Reference(reference));
+            items.push(ast_resolved::SelectorItem::Reference(
+                crate::pipeline::asts::core::Reference::Named(
+                    // THE SAME REFERENCE, standing on the heading's own
+                    // position: an occurrence the item addressed follows
+                    // its position; a spread's match is the engine's own.
+                    crate::pipeline::asts::core::NamedReference(match &reference {
+                        crate::pipeline::asts::core::Reference::Named(
+                            crate::pipeline::asts::core::NamedReference(occurrence),
+                        ) => occurrence.rebound(column),
+                        _ => ColumnOccurrence::engine(column),
+                    }),
+                ),
+            ));
         }
     }
     Ok((items, columns))
@@ -337,12 +336,13 @@ pub(in crate::pipeline::resolver) fn resolve_selector_via_fold(
 /// The occurrence a resolved reference names.
 pub(in crate::pipeline::resolver) fn reference_column(
     reference: &crate::pipeline::asts::core::Reference<crate::pipeline::asts::core::Resolved>,
-) -> Option<crate::names::ColId> {
+) -> Option<crate::relation::PortId> {
     match reference {
         crate::pipeline::asts::core::Reference::Named(
             crate::pipeline::asts::core::NamedReference(ColumnOccurrence { column, .. }),
         ) => Some(*column),
         crate::pipeline::asts::core::Reference::Ordinal(ordinal) => match *ordinal {},
+        crate::pipeline::asts::core::Reference::Physical(_) => None,
     }
 }
 
@@ -356,61 +356,40 @@ pub(in crate::pipeline::resolver) fn reference_column(
 pub(in crate::pipeline::resolver) fn resolve_reduction_items_via_fold(
     fold: &mut crate::pipeline::resolver::resolver_fold::ResolverFold,
     items: Vec<ast_unresolved::ReductionItem>,
-    available: &[crate::names::ColId],
-) -> Result<Vec<ast_resolved::ReductionItem>> {
+    available: &[crate::relation::PortId],
+) -> Result<Vec<crate::relation::pending::Reduction>> {
     let mut resolved = Vec::new();
     for item in items {
         match item {
             ast_unresolved::ReductionItem::Out(item) => {
                 for out in resolve_out_items_via_fold(fold, vec![item], available, false)? {
-                    resolved.push(ast_resolved::ReductionItem::Out(out));
+                    resolved.push(crate::relation::pending::Reduction::Out(out));
                 }
             }
-            ast_unresolved::ReductionItem::Metadata(metadata) => resolved.push(
-                ast_resolved::ReductionItem::Metadata(ast_resolved::MetadataOut {
+            ast_unresolved::ReductionItem::Metadata(metadata) => {
+                resolved.push(crate::relation::pending::Reduction::Metadata {
                     group: fold.resolve_metadata_group(metadata.group)?,
                     naming: metadata.naming,
-                    output: None,
-                }),
-            ),
+                })
+            }
             // THE IN IS THE HEADING WITNESS, and it is read after this: the
             // pivot's two expressions resolve here, its values where the
             // group's membership predicates are in scope.
-            ast_unresolved::ReductionItem::Pivot(pivot) => resolved.push(
-                ast_resolved::ReductionItem::Pivot(crate::pipeline::asts::core::PivotSpec {
-                    value_column: Box::new(fold.transform_domain(*pivot.value_column)?),
-                    pivot_key: Box::new(fold.transform_domain(*pivot.pivot_key)?),
-                    values: pivot.values,
-                }),
-            ),
+            ast_unresolved::ReductionItem::Pivot(pivot) => {
+                resolved.push(crate::relation::pending::Reduction::Pivot(
+                    crate::pipeline::asts::core::PivotSpec {
+                        value_column: Box::new(fold.transform_domain(*pivot.value_column)?),
+                        pivot_key: Box::new(fold.transform_domain(*pivot.pivot_key)?),
+                        values: pivot.values,
+                    },
+                ))
+            }
             // A delegate resolves at the group boundary that owns it, where
             // its payload's outputs publish AFTER every other reduction;
             // this general road resolves the members it carries.
-            ast_unresolved::ReductionItem::Delegate(delegate) => resolved.push(
-                ast_resolved::ReductionItem::Delegate(ast_resolved::DelegateSpec {
-                    payload: resolve_out_items_via_fold(
-                        fold,
-                        delegate.payload,
-                        available,
-                        false,
-                    )?,
-                    order: delegate
-                        .order
-                        .into_iter()
-                        .map(|ordering| {
-                            resolve_expressions_via_fold(fold, vec![ordering.column], available)
-                                .map(|mut expressions| ast_resolved::OrderingSpec {
-                                    column: expressions.pop().expect(
-                                        "one ordering expression resolves to one expression",
-                                    ),
-                                    direction: crate::pipeline::resolver::helpers::converters::convert_order_direction(
-                                        ordering.direction,
-                                    ),
-                                })
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                }),
-            ),
+            ast_unresolved::ReductionItem::Delegate(_) => {
+                unreachable!("group resolution partitions delegates before reduction events")
+            }
         }
     }
     Ok(resolved)
@@ -419,39 +398,30 @@ pub(in crate::pipeline::resolver) fn resolve_reduction_items_via_fold(
 pub(in crate::pipeline::resolver) fn resolve_out_items_via_fold(
     fold: &mut crate::pipeline::resolver::resolver_fold::ResolverFold,
     items: Vec<ast_unresolved::OutItem>,
-    available: &[crate::names::ColId],
+    available: &[crate::relation::PortId],
     allow_zero_pattern_matches: bool,
-) -> Result<Vec<ast_resolved::OutItem>> {
+) -> Result<Vec<PendingOutItem>> {
     let mut resolved = Vec::new();
     for item in items {
         match item {
             ast_unresolved::OutItem::Many(spread) => {
                 for expr in expand_spread(fold, &spread, available, allow_zero_pattern_matches)? {
-                    resolved.push(ast_resolved::OutItem::One(ast_resolved::OneOut {
-                        expr: OutValue::Domain(expr),
-                        naming: None,
-                        output: None,
-                    }));
+                    resolved.push(PendingOutItem::Expanded { expr, naming: None });
                 }
             }
             // The compiler's own whole-operand item passes through: there
             // is no heading question in it for resolution to answer.
-            ast_unresolved::OutItem::Whole => resolved.push(ast_resolved::OutItem::Whole),
+            ast_unresolved::OutItem::Whole => resolved.push(PendingOutItem::Whole),
             ast_unresolved::OutItem::One(one) => {
-                let ast_unresolved::OneOut {
-                    expr,
-                    naming,
-                    output: (),
-                } = one;
+                let (expr, naming) = (one.expr, one.naming);
                 // ONE ITEM, ONE VALUE — by type. Neither a domain value nor
                 // a crossing admits an enumerating form, so this road cannot
                 // fan out and no name is published across more than one
                 // column.
-                resolved.push(ast_resolved::OutItem::One(ast_resolved::OneOut {
+                resolved.push(PendingOutItem::Authored {
                     expr: resolve_out_value_via_fold(fold, expr, available)?,
                     naming,
-                    output: None,
-                }));
+                });
             }
         }
     }
@@ -460,36 +430,22 @@ pub(in crate::pipeline::resolver) fn resolve_out_items_via_fold(
 
 /// Resolve a list of domain expressions via the fold walker, expanding globs/patterns/ranges/ordinals
 /// structurally but using `fold.transform_domain()` for actual expression resolution.
-/// Resolve one PUBLISHED value. A domain value takes the ordinary road; a
-/// crossing resolves its truth through the same fold, so both sides of the
-/// adapter see the same scope.
+/// Resolve one PUBLISHED value.
 pub(in crate::pipeline::resolver) fn resolve_out_value_via_fold(
     fold: &mut crate::pipeline::resolver::resolver_fold::ResolverFold,
-    value: ast_unresolved::OutValue,
-    available: &[crate::names::ColId],
-) -> Result<ast_resolved::OutValue> {
-    use crate::pipeline::ast_transform::AstTransform;
-    Ok(match value {
-        ast_unresolved::OutValue::Domain(domain) => {
-            let mut values = resolve_expressions_via_fold(fold, vec![domain], available)?;
-            ast_resolved::OutValue::Domain(
-                values
-                    .pop()
-                    .expect("one value resolves to exactly one value"),
-            )
-        }
-        ast_unresolved::OutValue::Truth(crossing) => {
-            ast_resolved::OutValue::Truth(crate::pipeline::asts::core::TruthAsValue(
-                fold.transform_boolean(crossing.into_truth())?,
-            ))
-        }
-    })
+    value: ast_unresolved::DomainExpression,
+    available: &[crate::relation::PortId],
+) -> Result<ast_resolved::DomainExpression> {
+    let mut values = resolve_expressions_via_fold(fold, vec![value], available)?;
+    Ok(values
+        .pop()
+        .expect("one value resolves to exactly one value"))
 }
 
 pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
     fold: &mut crate::pipeline::resolver::resolver_fold::ResolverFold,
     expressions: Vec<ast_unresolved::DomainExpression>,
-    available: &[crate::names::ColId],
+    available: &[crate::relation::PortId],
 ) -> Result<Vec<ast_resolved::DomainExpression>> {
     let mut resolved = Vec::new();
 
@@ -499,18 +455,9 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                 // A qualified ordinal is a qualified glob narrowed by
                 // position — the same tiers, or `u|1|` and `u.*` reach
                 // different columns one character apart.
-                let candidates = if let Some(qual) = &ordinal.qualifier {
-                    let spelling = fold
-                        .registry
-                        .identities
-                        .intern(qual.as_str(), qual.is_stropped());
-                    let qualifier = fold.registry.identities.canonical(spelling);
-                    fold.registry
-                        .identities
-                        .qualified_glob(qualifier, available)
-                } else {
-                    crate::names::Candidates::from_vec(available.to_vec())
-                };
+                let candidates = fold
+                    .lexical
+                    .in_order(ordinal.qualifier.as_ref(), &fold.core.identities)?;
 
                 if candidates.is_empty() {
                     return Err(DelightQLError::ColumnNotFoundError {
@@ -521,16 +468,7 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
 
                 let idx = calculate_ordinal_index(&ordinal, candidates.len())?;
                 resolved.push(ast_resolved::DomainExpression::Reference(Reference::Named(
-                    NamedReference(ColumnOccurrence {
-                        column: *candidates
-                            .in_order()
-                            .nth(idx)
-                            .expect("validated ordinal index is in candidate order"),
-                        explicit_qualifier: ordinal.qualifier.is_some(),
-                        // As written, exactly as the other ordinal road: one
-                        // publication cannot be case-sensitive on one and folded
-                        // on the other.
-                    }),
+                    NamedReference(candidates[idx].clone()),
                 )));
             }
             ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(
@@ -540,8 +478,21 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                     namespace_path,
                 },
             ))) => {
+                // THE ACTIVE FORMAL FRAME ANSWERS FIRST, exactly as it does
+                // on the fold's own domain road: an unqualified name a
+                // definition body declares as a parameter is the
+                // caller-resolved actual, never a column of the source.
+                if qualifier.is_none() && namespace_path.is_empty() {
+                    if let Some(bound) = fold.env.formal_value(&name) {
+                        resolved.push(crate::pipeline::resolver::resolver_fold::anchor_formal(
+                            &fold.core.identities,
+                            available,
+                            bound,
+                        )?);
+                        continue;
+                    }
+                }
                 // Simple lvar resolution — no registry needed, same as existing
-                let available_clone = available.to_vec();
                 let lvar_expr = ast_unresolved::DomainExpression::Reference(Reference::Named(
                     NamedReference(AuthoredColumn {
                         name,
@@ -549,18 +500,17 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                         namespace_path,
                     }),
                 ));
-                let local = fold.local_available.clone();
-                let qualifiers = fold.qualifier_scope.clone();
                 let in_correlation = fold.in_correlation;
                 resolved.push(super::simple::resolve_simple_expr(
                     lvar_expr,
-                    &available_clone,
-                    &local,
-                    &qualifiers,
+                    &fold.lexical,
                     in_correlation,
                     &mut fold.correlation_witness,
-                    &fold.registry.identities,
+                    &fold.core.identities,
                 )?);
+            }
+            ast_unresolved::DomainExpression::Reference(Reference::Physical(_)) => {
+                unreachable!("physical references cannot enter resolution")
             }
             // An open body's leaf travels to instantiation: the position
             // The applying position spends an open leaf during resolution;

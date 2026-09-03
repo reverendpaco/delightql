@@ -18,34 +18,36 @@ In delightql these rules may be used for any of the following:
 All of these use the `:-`{.delightql .sigil} neck. The first five define
 relations; functions define the special subset of relations that are functions.
 
-
 ## Arity and Naming {.dqlh}
-
-
 
 A rule's **arity** is the number of arguments in its head.
 
-Definitions invoked with explicit arguments -- functions, sigma predicates,
-higher-order rules -- may share a name with different arities. The call site
-disambiguates:
-
 ```delightql
-add:(x) :- x + 1
-add:(x, y) :- x + y
+add:(x) :- x + 1        // arity 1
+add:(x, y) :- x + y     // arity 2
 
-// Invocation is unambiguous
-add:(5)      // add/1
-add:(5, 3)   // add/2
+
+employee(id, name) :- ... // arity 2
+employee(*)  // arity determined by body
 ```
 
-Definitions queried with the glob -- views, tables, facts -- must have fixed arity. The glob presumes a single schema:
+All definitions -- functions, sigma predicates, higher-order rulesviews, tables, facts -- must have the same fixed arity.
+
+The following are forbidden:
 
 ```delightql
+add:(x) :- x + 1        // arity 1
+add:(x, y) :- x + y     // arity 2
+
 employee(id, name) :- ...
-employee(*)  // expects one schema
+employee(id,name,age)  :- ...
 ```
 
 If you can write `foo(*)`, all `foo` definitions must agree on
 arity. With argumentative heads, agreement is stricter: same arity AND same
-names at each position. See [Head Semantics](#head-semantics) for the full
-rules.
+names at each position.
+
+This rule is stricter than most languages where a name can be overloaded by arity.
+Delightql insists that there can only be one named entity per namespace and that
+that entity always have the same arity.  The only place where this rule is relaxed
+is common expressions which can shadow tables, views, and functions.

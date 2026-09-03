@@ -30,14 +30,13 @@ use crate::pipeline::ast_transform::{
     same_phase_payload_folds, walk_transform_boolean, walk_transform_domain,
     walk_transform_operator, walk_transform_tabular_row, AstTransform,
 };
-use crate::pipeline::asts::core::columns::ColumnOccurrence;
 use crate::pipeline::asts::core::expressions::references::Reference;
 use crate::pipeline::asts::core::{FunctionApplication, LiteralValue, Refined};
 use crate::pipeline::sql_ast::{
     DomainExpression as SqlDomainExpr, QueryExpression, SelectBuilder, SelectItem, SqlFrameBound,
     SqlFrameMode, SqlWindowFrame, TableExpression,
 };
-use crate::pipeline::transformer::builder::{Builder, Publication, Unprojected};
+use crate::pipeline::transformer::builder::{Builder, SqlLayout, Unprojected};
 use crate::pipeline::transformer::{scalar, TransformCtx};
 
 /// Publish every anchor in `operator` that the row must hold, then hand back
@@ -89,10 +88,7 @@ pub(super) fn publishing_in_row(
     row: ast_refined::TabularRow<ast_refined::Datum>,
     ctx: &TransformCtx,
 ) -> Result<(RowAnchors, ast_refined::TabularRow<ast_refined::Datum>)> {
-    let at = ctx.identities.mint_derived_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-    );
+    let at = ctx.identities.anonymous_scope(None);
     let mut fold = Publish {
         identities: &ctx.identities,
         at,
@@ -140,10 +136,7 @@ pub(super) fn standing_on(
         let scope = if depth == last {
             at
         } else {
-            ctx.identities.mint_derived_scope(
-                crate::names::ScopeOrigin::AnonRelation,
-                crate::names::Hint::None,
-            )
+            ctx.identities.anonymous_scope(None)
         };
         let here = |minted: ColId| -> ColId {
             if depth == last {
@@ -182,7 +175,7 @@ pub(super) fn standing_on(
         if let Some((under, alias)) = body {
             sb = sb.from_tables(vec![TableExpression::subquery(under, alias)]);
         }
-        let holding = Publication::at(scope, columns, &ctx.identities)?.publish(sb)?;
+        let holding = SqlLayout::new(scope, columns, &ctx.identities).publish(sb)?;
         body = Some((QueryExpression::Select(Box::new(holding)), scope));
         carried = next;
     }
@@ -193,17 +186,8 @@ pub(super) fn standing_on(
 /// A fresh occurrence of `minted` at `scope`, for a layer that only carries it
 /// upward. The chain is what lets a reader addressed at the original find it.
 fn republication(minted: ColId, scope: ScopeId, identities: &Rc<Registry>) -> ColId {
-    let carried = identities.mint_column(
-        scope,
-        crate::names::ColumnOrigin::Republished {
-            from: minted,
-            how: crate::names::Republish::Passthrough,
-        },
-        None,
-        crate::names::Addressing::Hygienic,
-        crate::names::ValueFacts::default(),
-    );
-    carried
+    let _ = minted;
+    identities.sql_column(scope, None, crate::names::Addressing::Hygienic)
 }
 
 fn publishing<T>(
@@ -350,22 +334,13 @@ impl Publish<'_> {
             if named.get(position).copied().unwrap_or(0) < 2 || repeats_harmlessly(argument) {
                 continue;
             }
-            let column = self.identities.mint_column(
-                self.at,
-                crate::names::ColumnOrigin::Minted {
-                    by: crate::names::MintReason::AnchoredCase,
-                },
-                None,
-                crate::names::Addressing::Hygienic,
-                crate::names::ValueFacts::default(),
-            );
+            let column =
+                self.identities
+                    .sql_column(self.at, None, crate::names::Addressing::Hygienic);
             let depth = self.depth_of(argument);
             let published = std::mem::replace(
                 argument,
-                ast_refined::DomainExpression::Reference(Reference::named(ColumnOccurrence {
-                    column,
-                    explicit_qualifier: false,
-                })),
+                ast_refined::DomainExpression::Reference(Reference::physical(column)),
             );
             self.published.push(Published {
                 anchor: published,
@@ -382,13 +357,29 @@ impl Publish<'_> {
         use crate::pipeline::ast_visit::{walk_visit_domain, AstVisit, Descent};
 
         struct Reads<'a>(&'a [Published], usize);
+        impl Reads<'_> {
+            fn names(&mut self, column: crate::names::ColId) {
+                if let Some(entry) = self.0.iter().find(|entry| entry.column == column) {
+                    self.1 = self.1.max(entry.depth + 1);
+                }
+            }
+        }
         impl AstVisit<Refined> for Reads<'_> {
             fn enter_domain(&mut self, e: &ast_refined::DomainExpression) -> Result<Descent> {
-                if let ast_refined::DomainExpression::Reference(Reference::Named(named)) = e {
-                    let column = named.column().column;
-                    if let Some(entry) = self.0.iter().find(|entry| entry.column == column) {
-                        self.1 = self.1.max(entry.depth + 1);
+                // A PUBLISHED ANCHOR IS READ AS A PHYSICAL SLOT. What the
+                // fold wrote where the anchor stood is the column it minted,
+                // so a dependent anchor names it that way and not as a
+                // semantic occurrence — reading only the semantic form put
+                // both anchors on one level, where the second could not see
+                // the first.
+                match e {
+                    ast_refined::DomainExpression::Reference(Reference::Named(named)) => {
+                        self.names(named.column().column.column())
                     }
+                    ast_refined::DomainExpression::Reference(Reference::Physical(column)) => {
+                        self.names(*column)
+                    }
+                    _ => {}
                 }
                 Ok(Descent::Continue)
             }
@@ -455,27 +446,18 @@ impl AstTransform<Refined, Refined> for Publish<'_> {
             .iter()
             .any(|arm| matches!(arm.term, LiteralValue::Null));
         let anchor = if asks_about_null && !repeats_harmlessly(&anchor) {
-            let column = self.identities.mint_column(
-                self.at,
-                crate::names::ColumnOrigin::Minted {
-                    by: crate::names::MintReason::AnchoredCase,
-                },
-                None,
-                crate::names::Addressing::Hygienic,
-                crate::names::ValueFacts::default(),
-            );
+            let column =
+                self.identities
+                    .sql_column(self.at, None, crate::names::Addressing::Hygienic);
             let depth = self.depth_of(&anchor);
             self.published.push(Published {
                 anchor: *anchor,
                 column,
                 depth,
             });
-            Box::new(ast_refined::DomainExpression::Reference(Reference::named(
-                ColumnOccurrence {
-                    column,
-                    explicit_qualifier: false,
-                },
-            )))
+            Box::new(ast_refined::DomainExpression::Reference(
+                Reference::physical(column),
+            ))
         } else {
             anchor
         };

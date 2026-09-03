@@ -27,7 +27,7 @@ use std::rc::Rc;
 /// The source holds the clauses of ONE subject in authored order — that is
 /// what `entity_clause` keeps and what a group's reconstruction asks for.
 pub fn clauses(source: &str) -> Result<Vec<ClauseDecl>> {
-    normalized(source, None).map(|normalized| normalized.definitions)
+    normalized(source, None).map(Normalized::into_definitions)
 }
 
 /// The same, assembled. Every clause law runs in `DefinitionGroup::assemble`,
@@ -138,7 +138,7 @@ impl Drop for Compilation {
 /// inside a string literal, a comment, or a nested definition, and the "body"
 /// that follows is bytes that were never a body.
 pub fn bound_body(source: &str, bindings: HoParamBindings) -> Result<Query> {
-    let decls = normalized(source, Some(bindings))?.definitions;
+    let decls = normalized(source, Some(bindings))?.into_definitions();
     let Some(decl) = decls.into_iter().next() else {
         return Err(DelightQLError::parse_error(format!(
             "No definition found in source: '{}'",
@@ -147,7 +147,9 @@ pub fn bound_body(source: &str, bindings: HoParamBindings) -> Result<Query> {
     };
     match decl.body {
         DdlBody::Relational(query) => Ok(query),
-        DdlBody::FactFunction(mode) => Ok(mode.relational_body()),
+        DdlBody::FactFunction(_) => Err(DelightQLError::parse_error(
+            "a fact-function mode is not a higher-order relational body",
+        )),
         DdlBody::Scalar(_) => Err(DelightQLError::parse_error(format!(
             "'{}' is a value rule; its body is not relational",
             crate::pipeline::parse::truncate_for_display(source, 60)
@@ -174,15 +176,15 @@ pub fn bound_body(source: &str, bindings: HoParamBindings) -> Result<Query> {
 pub fn bound_relex(body_source: &str, bindings: HoParamBindings) -> Result<Query> {
     let tree = crate::pipeline::parse::query_sequence(body_source)?;
     let registry = Rc::new(crate::names::Registry::new(&[]));
-    let mut normalized =
-        crate::pipeline::normalize::bound_query_sequence(&tree, registry, bindings)?;
-    if normalized.queries.len() != 1 {
+    let normalized = crate::pipeline::normalize::bound_query_sequence(&tree, registry, bindings)?;
+    let mut queries = normalized.into_queries();
+    if queries.len() != 1 {
         return Err(DelightQLError::parse_error(format!(
             "a body is one relational expression: '{}'",
             crate::pipeline::parse::truncate_for_display(body_source, 60)
         )));
     }
-    Ok(normalized.queries.remove(0).query)
+    Ok(queries.remove(0).query)
 }
 
 fn normalized(source: &str, bindings: Option<HoParamBindings>) -> Result<Normalized> {
@@ -190,9 +192,9 @@ fn normalized(source: &str, bindings: Option<HoParamBindings>) -> Result<Normali
     let registry = Rc::new(crate::names::Registry::new(&[]));
     match bindings {
         Some(bindings) => {
-            crate::pipeline::normalize::bound_definition_file(&tree, registry, bindings)
+            crate::pipeline::normalize::stored_bound_definition_file(&tree, registry, bindings)
         }
-        None => crate::pipeline::normalize::definition_file(&tree, registry),
+        None => crate::pipeline::normalize::stored_definition_file(&tree, registry),
     }
 }
 
@@ -263,10 +265,10 @@ fn strip_docs_block(text: &str) -> &str {
 mod tests {
     use super::*;
     use crate::ddl::reconstruct;
-    use crate::pipeline::asts::core::definitions::{HoParam, Neck};
+    use crate::pipeline::asts::core::definitions::HoParam;
     use crate::pipeline::asts::core::{DomainExpression, FunctionApplication};
     use crate::pipeline::asts::ddl::DdlBody;
-    use crate::pipeline::asts::ddl::{entity_type_id, DefKind};
+    use crate::pipeline::asts::ddl::DefKind;
 
     /// A scalar parameter's name and whether it carries a guard.
     fn scalar_param(param: &HoParam) -> (String, bool) {
@@ -320,20 +322,18 @@ mod tests {
         assert_eq!(defs.len(), 1);
 
         let def = &defs[0];
-        assert_eq!(def.neck, Neck::Bind);
-
         let params = def.params();
         assert_eq!(params.len(), 1);
         assert_eq!(scalar_param(&params[0]), ("x".to_string(), false));
 
         // Body should be a scalar (DomainExpression)
-        let expr = def
-            .as_out_value()
-            .and_then(crate::pipeline::asts::core::OutValue::domain)
-            .expect("expected scalar body");
+        let expr = def.as_scalar_body().expect("expected scalar body");
         match expr {
             DomainExpression::Application(FunctionApplication::Infix(infix)) => {
-                assert_eq!(infix.operator, crate::pipeline::asts::vocabulary::BinOp::Mul);
+                assert_eq!(
+                    infix.operator,
+                    crate::pipeline::asts::vocabulary::BinOp::Mul
+                );
             }
             other => panic!("Expected infix multiply, got: {:?}", other),
         }
@@ -346,7 +346,6 @@ mod tests {
         assert_eq!(defs.len(), 1);
 
         let def = &defs[0];
-        assert_eq!(def.neck, Neck::Bind);
         assert!(def.head.is_glob());
 
         // Body should be relational
@@ -366,14 +365,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_persistent_neck() {
-        let source = "cached:(x) := x + 1";
-        let defs = reconstruct::group(source).unwrap().into_clauses();
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].neck, Neck::Assign);
-    }
-
-    #[test]
     fn test_full_source_preserved() {
         let source = "double:(x) :- x * 2";
         let defs = reconstruct::group(source).unwrap().into_clauses();
@@ -385,13 +376,13 @@ mod tests {
         let source = "double:(x) :- x * 2";
         let defs = reconstruct::group(source).unwrap().into_clauses();
         let def = defs.into_iter().next().unwrap();
-        let expr = def
-            .into_out_value()
-            .and_then(crate::pipeline::asts::core::OutValue::into_domain)
-            .expect("expected scalar body");
+        let expr = def.into_scalar_body().expect("expected scalar body");
         match &expr {
             DomainExpression::Application(FunctionApplication::Infix(infix)) => {
-                assert_eq!(infix.operator, crate::pipeline::asts::vocabulary::BinOp::Mul);
+                assert_eq!(
+                    infix.operator,
+                    crate::pipeline::asts::vocabulary::BinOp::Mul
+                );
             }
             other => panic!("Expected infix multiply, got: {:?}", other),
         }
@@ -566,8 +557,6 @@ mod tests {
         assert_eq!(group.kind(), DefKind::Sigma);
 
         let def = group.first();
-        assert_eq!(def.neck, Neck::Bind);
-
         {
             let params = def.params();
             assert_eq!(params.len(), 1);
@@ -576,7 +565,7 @@ mod tests {
 
         // A sigma rule's body is a TRUTH, and the carrier says so.
         assert!(def.as_truth_expr().is_some());
-        assert!(def.as_out_value().is_none());
+        assert!(def.as_scalar_body().is_none());
     }
 
     #[test]
@@ -600,8 +589,8 @@ mod tests {
     fn test_sigma_predicate_entity_type() {
         let group = reconstruct::group("empty(column) :- null = column").unwrap();
         assert_eq!(
-            crate::pipeline::asts::ddl::entity_type_id(group.kind(), group.context()),
-            9
+            group.entity_type(),
+            crate::enums::EntityType::DqlTemporarySigmaRule
         );
     }
 
@@ -616,19 +605,15 @@ mod tests {
             "delightql-error://semantic/ddl/head/mixed_kind"
         );
         assert_eq!(
-            crate::pipeline::asts::ddl::entity_type_id(
-                reconstruct::group("foo:(x) :- x + 1").unwrap().kind(),
-                reconstruct::group("foo:(x) :- x + 1").unwrap().context()
-            ),
-            1,
+            reconstruct::group("foo:(x) :- x + 1")
+                .unwrap()
+                .entity_type(),
+            crate::enums::EntityType::DqlFunctionExpression,
             "foo:(x) should be Function"
         );
         assert_eq!(
-            crate::pipeline::asts::ddl::entity_type_id(
-                reconstruct::group("foo(x) :- x > 0").unwrap().kind(),
-                reconstruct::group("foo(x) :- x > 0").unwrap().context()
-            ),
-            9,
+            reconstruct::group("foo(x) :- x > 0").unwrap().entity_type(),
+            crate::enums::EntityType::DqlTemporarySigmaRule,
             "foo(x) should be SigmaPredicate"
         );
     }
@@ -640,10 +625,27 @@ mod tests {
         assert_eq!(defs.len(), 1);
 
         let def = &defs[0];
-        // A fact writes NO neck; what it does is ASSIGN materialized data.
-        assert_eq!(def.neck, Neck::Assign);
         // Body should be relational (anonymous table)
         assert!(matches!(def.body, DdlBody::Relational(_)));
+    }
+
+    #[test]
+    fn fact_function_entity_type_owns_relational_capability() {
+        use crate::enums::EntityType;
+
+        let total =
+            reconstruct::group(r#"grade(score -> letter ---- 90 -> "A"; _ -> "F")"#).unwrap();
+        assert_eq!(
+            total.entity_type(),
+            EntityType::DqlDefaultFactFunctionExpression
+        );
+        assert!(!total.entity_type().realizes_relation());
+
+        let finite =
+            reconstruct::group(r#"grade(score -> letter ---- 90 -> "A"; null -> "unknown")"#)
+                .unwrap();
+        assert_eq!(finite.entity_type(), EntityType::DqlFactExpression);
+        assert!(finite.entity_type().realizes_relation());
     }
 
     #[test]

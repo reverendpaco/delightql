@@ -637,6 +637,14 @@ impl<H: Helper> Editor<H> {
         self.readline_with(prompt, Some(initial))
     }
 
+    /// Whether `readline` will take the rich road — raw mode, the editing
+    /// keymap, the helper's per-keystroke hooks — rather than a plain line
+    /// read. The same predicate `readline_with` branches on, so a host can
+    /// record which road a session ran without a second opinion.
+    pub fn is_rich_road(&self) -> bool {
+        !self.term.is_unsupported() && self.term.is_input_tty()
+    }
+
     fn readline_with(&mut self, prompt: &str, initial: Option<(&str, &str)>) -> Result<String> {
         if self.term.is_unsupported() {
             debug!(target: "rustyline", "unsupported terminal");

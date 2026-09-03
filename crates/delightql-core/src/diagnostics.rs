@@ -26,7 +26,7 @@ impl Severity {
         match self {
             Severity::Ok => "ok",
             Severity::Info => "info",
-            Severity::Warn => "warn",
+            Severity::Warn => "warning",
             Severity::Error => "error",
         }
     }
@@ -169,5 +169,22 @@ pub(crate) fn run_selftest(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
     let mut findings = Vec::new();
     findings.extend(run_autoloads(system));
     findings.extend(run_catalog(system));
+    // Every non-Ok finding is a row of sys::diagnostics.finding: the
+    // remediation is the identity when the provider minted one.
+    #[cfg(not(target_arch = "wasm32"))]
+    for f in &findings {
+        if f.severity == Severity::Ok {
+            continue;
+        }
+        let uri = f
+            .remediation
+            .clone()
+            .unwrap_or_else(|| format!("delightql-diagnostic://{}", f.provider));
+        let message = match &f.detail {
+            Some(detail) => format!("{}\n{detail}", f.summary),
+            None => f.summary.clone(),
+        };
+        system.record_finding(f.severity, &uri, &message, None, &f.provider);
+    }
     findings
 }

@@ -20,19 +20,19 @@ pub struct ExistsDependencies {
 
 pub(super) fn detect_interdependent_exists(
     predicates: &[FlatPredicate],
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<ExistsDependencies> {
     let mut deps = ExistsDependencies::default();
+    let mut relations = HashMap::new();
 
     for pred in predicates {
         if let resolved::TruthExpression::Existence(Existence {
             relation: subquery, ..
         }) = &pred.expr
         {
-            deps.exists_scopes
-                .insert(super::super::pattern_classifier::relational_scope(
-                    subquery,
-                )?);
+            let relation = subquery.semantic_relation();
+            deps.exists_scopes.insert(relation.scope());
+            relations.insert(relation.scope(), relation);
         }
     }
 
@@ -43,15 +43,16 @@ pub(super) fn detect_interdependent_exists(
         else {
             continue;
         };
-        let exists_scope = super::super::pattern_classifier::relational_scope(subquery)?;
+        let exists_relation = subquery.semantic_relation();
+        let exists_scope = exists_relation.scope();
         let mut collector = ReferencedScopes {
             identities,
             scopes: HashSet::new(),
         };
         walk_visit_relational(&mut collector, subquery)?;
-        collector
-            .scopes
-            .retain(|scope| !identities.contains_scope(exists_scope, *scope));
+        collector.scopes.retain(|scope| {
+            !crate::relation::contains_scope(identities, &exists_relation, *scope).unwrap_or(false)
+        });
 
         let references = deps
             .exists_scopes
@@ -59,7 +60,11 @@ pub(super) fn detect_interdependent_exists(
             .copied()
             .filter(|candidate| {
                 collector.scopes.iter().any(|referenced| {
-                    candidate == referenced || identities.contains_scope(*candidate, *referenced)
+                    candidate == referenced
+                        || relations.get(candidate).is_some_and(|relation| {
+                            crate::relation::contains_scope(identities, relation, *referenced)
+                                .unwrap_or(false)
+                        })
                 })
             })
             .collect::<HashSet<_>>();
@@ -85,7 +90,8 @@ impl AstVisit<Resolved> for ReferencedScopes<'_> {
             resolved::DomainExpression::Reference(Reference::Named(NamedReference(
                 ColumnOccurrence { column, .. },
             ))) => {
-                self.scopes.insert(self.identities.scope_of(*column));
+                self.scopes
+                    .insert(crate::relation::owner(self.identities, *column)?);
             }
             _ => {}
         }
@@ -98,7 +104,7 @@ impl AstVisit<Resolved> for ReferencedScopes<'_> {
     fn enter_continuation(&mut self, continuation: &resolved::Continuation) -> Result<Descent> {
         if let resolved::Continuation::Correlate { whole, .. } = continuation {
             let (left, right) = whole.arms();
-            self.scopes.extend([*left, *right]);
+            self.scopes.extend([left.scope(), right.scope()]);
         }
         Ok(Descent::Continue)
     }

@@ -1,41 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 use crate::error::Result;
-use crate::names::ScopeId;
 use crate::pipeline::ast_resolved;
+use crate::relation::SemanticRelation;
 use delightql_types::SqlIdentifier;
-
-/// The scope a chain publishes: the last continuation's, or the head's
-/// when nothing has consumed it.
-pub(in crate::pipeline) fn extract_cpr_schema(expr: &ast_resolved::Chain) -> ScopeId {
-    if let Some(continuation) = expr.continuations.last() {
-        return *continuation
-            .cpr_schema()
-            .expect("ER-join consumed by resolver");
-    }
-    extract_head_cpr_schema(&expr.head)
-}
-
-/// The scope a chain HEAD publishes.
-pub(in super::super) fn extract_head_cpr_schema(head: &ast_resolved::Grelex) -> ScopeId {
-    match head {
-        ast_resolved::Grelex::Literal(anon) => anon.table.cpr_schema,
-        ast_resolved::Grelex::Reference(rel) => match rel {
-            ast_resolved::Relation::Ground { cpr_schema, .. }
-            | ast_resolved::Relation::FunctorCall { cpr_schema, .. }
-            | ast_resolved::Relation::InnerRelation { cpr_schema, .. } => *cpr_schema,
-            ast_resolved::Relation::ConsultedView { scoped, .. } => *scoped,
-        },
-    }
-}
-
-/// The scope a resolved Query publishes.
-/// Dispatches to `extract_cpr_schema` on the main relational expression.
-pub(in super::super) fn extract_cpr_schema_from_query(
-    query: &ast_resolved::Query,
-) -> Result<ScopeId> {
-    Ok(extract_cpr_schema(&query.body))
-}
 
 pub(in super::super) fn extract_inline_using_columns(
     expr: &ast_resolved::Chain,
@@ -65,19 +33,30 @@ pub(in super::super) fn extract_inline_using_columns(
 /// Also pushes CteRegistration identity onto each column's identity stack.
 /// `origin` is the binding's TYPED construction provenance — never inferred
 /// from the name (a user may legally write `_ho_*` identifiers).
-pub(in super::super) fn transform_schema_table_names(
-    input: ScopeId,
+pub(in crate::pipeline) fn transform_schema_table_names(
+    input: &SemanticRelation,
     new_table_name: &SqlIdentifier,
     origin: ast_resolved::CteOrigin,
     role: crate::names::CteRole,
-    identities: &crate::names::Registry,
-) -> ScopeId {
+    identities: &crate::relation::Planning,
+) -> Result<SemanticRelation> {
+    use crate::relation::form::{CteLabelWhy, CteWhy, ExportSpec, ExportWhy};
     let spelling = identities.intern(new_table_name.as_str(), new_table_name.is_stropped());
-    let hint = match origin {
-        ast_resolved::CteOrigin::UserDefined => crate::names::Hint::User(spelling),
-        ast_resolved::CteOrigin::CompilerGenerated => crate::names::Hint::Prefix("cte"),
+    let label = match origin {
+        ast_resolved::CteOrigin::UserDefined => CteLabelWhy::Answering(spelling),
+        ast_resolved::CteOrigin::CompilerGenerated => CteLabelWhy::Prefixed("cte"),
     };
-    let scope = identities.mint_derived_scope(crate::names::ScopeOrigin::Cte { input, role }, hint);
-    identities.republish_heading(input, scope, crate::names::Republish::BoundaryExport);
-    scope
+    let role = match role {
+        crate::names::CteRole::TreeGroup => CteWhy::TreeGroup,
+        crate::names::CteRole::GroupCarrier => CteWhy::GroupCarrier,
+        crate::names::CteRole::Recursive => CteWhy::Recursive,
+        crate::names::CteRole::Reachability => CteWhy::Reachability,
+        crate::names::CteRole::Materialize => CteWhy::Materialize,
+    };
+    identities
+        .authority()
+        .derive(crate::relation::RelForm::Export(ExportSpec {
+            input: input.clone(),
+            why: ExportWhy::Cte { role, label },
+        }))
 }

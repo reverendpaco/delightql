@@ -39,37 +39,14 @@ impl AstTransform<Unresolved, Resolved> for PhaseConverter<'_> {
     crate::pipeline::ast_transform::a_context_marker_is_consumed_where_the_call_instantiates!();
     crate::pipeline::ast_transform::scope_is_minted_where_it_is_resolved!();
     crate::pipeline::ast_transform::minted_where_it_is_decided!(
-        fold_recursion -> crate::pipeline::asts::vocabulary::RecursionState: "a binding's recursion",
-    );
-    fn fold_cte_subject(
-        &mut self,
-        _: crate::pipeline::asts::core::CteSubject,
-    ) -> crate::error::Result<crate::names::ScopeId> {
-        Err(crate::error::DelightQLError::transformation_error(
-            "a binding's subject is spent where the resolver's CTE road mints its scope, \
-             and this fold is not that place",
-            "phase_payload",
-        ))
-    }
-    fn fold_cte_authority(
-        &mut self,
-        _: crate::pipeline::asts::core::CteAuthority,
-    ) -> crate::error::Result<()> {
-        Err(crate::error::DelightQLError::transformation_error(
-            "a binding's head and provenance are spent where the resolver's CTE road \
-             mints its scope, and this fold is not that place",
-            "phase_payload",
-        ))
-    }
-    crate::pipeline::ast_transform::minted_where_it_is_decided!(
-        fold_output -> Option<crate::names::ColId>: "an expression's output occurrence",
-        fold_scalar_output -> crate::names::ColId: "a scalarized relation's column",
+        fold_output -> crate::relation::PortId: "an expression's output port",
+        fold_scalar_output -> crate::relation::PortId: "a scalarized relation's column",
         fold_destructure -> Vec<crate::pipeline::asts::core::DestructureMapping>: "a destructuring pattern's columns",
     );
     fn fold_open_leaf(
         &mut self,
         _: crate::pipeline::asts::core::DomainHole,
-    ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
+    ) -> crate::error::Result<crate::pipeline::asts::core::FormalHole> {
         Err(crate::error::DelightQLError::validation_error_categorized(
             "value/open/unapplied",
             "a composition input stands outside any callable applying it",
@@ -144,7 +121,7 @@ impl AstTransform<Unresolved, Resolved> for PhaseConverter<'_> {
 /// Helper function to convert unresolved DomainExpression to resolved
 pub(super) fn convert_domain_expression(
     expr: &ast_unresolved::DomainExpression,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<ast_resolved::DomainExpression> {
     PhaseConverter { identities }.transform_domain(expr.clone())
 }

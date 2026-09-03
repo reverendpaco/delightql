@@ -20,9 +20,16 @@
 
 (standard_cte name:(predicate_identifier) @module.common)
 (label_cte name:(identifier) @module.common)
+;; The query-scoped parameterized rule — a CHOE. Its subject is a definition
+;; subject with a query's lifetime, so it takes the ho_rule's colour under the
+;; common-expression module.
+(ho_cte name:(predicate_identifier name:(identifier) @type.definition.ho))
+(effect_ho_cte name:(effect_identifier) @keyword.directive.defin)
 
 (label_cte (":") @label)
 (standard_cte (":") @label)
+(ho_cte (":") @label)
+(effect_ho_cte (":") @label)
 (definition_neck) @label
 (cfe (":") @label)
 
@@ -30,6 +37,7 @@
 (head_term (identifier)@variable.parameter)
 (plain_param (identifier)@variable.parameter)
 (ho_rule (scalar_param)@variable.parameter.input)
+(ho_cte (scalar_param)@variable.parameter.input)
 (fact_function inputs:(identifier) @variable.parameter)
 (fact_function outputs:(identifier) @variable.parameter)
 (record "{" @function.call "}" @function.call)
@@ -55,7 +63,6 @@
 
 ;;;;;;;;;;;;;;;;;;;;;;;
 
-(exists_as_column (relation_name (predicate_identifier) @function.call @markup.quote))
 (existence (relation_name (predicate_identifier) @markup.quote))
 
 (open_relation_param (identifier) @markup.quote @module.table)
@@ -76,7 +83,7 @@
 (relation_name (predicate_identifier (identifier)@module))
 (drill (named_reference (identifier)@module))
 (narrowing_access (named_reference (identifier)@module))
-(narrowing_destructure  column:(identifier)@module)
+(narrowing_destructure  column:(named_reference)@module)
 (record_pattern  "{" @module "}" @module)
 ;(outer_grelex (predicate_identifier (identifier)@module))
 

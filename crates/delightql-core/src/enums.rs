@@ -56,7 +56,6 @@ impl SourceType {
         self as i32
     }
 
-
     /// Get variant name for database
     pub fn variant_name(self) -> &'static str {
         match self {
@@ -119,7 +118,6 @@ impl Language {
     pub fn as_i32(self) -> i32 {
         self as i32
     }
-
 
     /// Get base language name
     pub fn language(self) -> &'static str {
@@ -242,6 +240,13 @@ pub enum EntityType {
     /// ordinary bin entity; its contextual policy refuses where the
     /// realization does. The stored name carries the `!` suffix.
     SyntaxDirective = 21,
+
+    /// A fact function with an authored `_ -> outputs` default arm.
+    ///
+    /// The default makes the function total over an unbounded input domain,
+    /// so this family is callable but cannot realize a relation. Its explicit
+    /// arms remain match clauses, not a finite table approximation.
+    DqlDefaultFactFunctionExpression = 22,
 }
 
 impl EntityType {
@@ -267,6 +272,7 @@ impl EntityType {
         Self::BinRelation,
         Self::DqlEffectRule,
         Self::SyntaxDirective,
+        Self::DqlDefaultFactFunctionExpression,
     ];
 
     /// Convert to integer for database storage
@@ -297,6 +303,7 @@ impl EntityType {
             Self::BinRelation => "BinRelation",
             Self::DqlEffectRule => "DQLEffectRule",
             Self::SyntaxDirective => "SyntaxDirective",
+            Self::DqlDefaultFactFunctionExpression => "DQLDefaultFactFunctionExpression",
         }
     }
 
@@ -308,13 +315,65 @@ impl EntityType {
         )
     }
 
-    /// Whether this is a function entity
+    /// The kinds that can REALIZE A RELATION — the one positive,
+    /// wildcard-free capability judgment shared by relation and sigma
+    /// positions. A kind absent from the first arm can never make a
+    /// relation face, however many same-named members crowd a name.
+    pub fn realizes_relation(self) -> bool {
+        match self {
+            Self::DqlTemporaryViewExpression
+            | Self::DqlPermanentViewExpression
+            | Self::DqlTemporaryTableExpression
+            | Self::DqlPermanentTableExpression
+            | Self::DqlHoTemporaryViewExpression
+            | Self::DbPermanentTable
+            | Self::DbPermanentView
+            | Self::DbTemporaryTable
+            | Self::DbTemporaryView
+            | Self::DqlFactExpression
+            | Self::BinRelation => true,
+            Self::DqlFunctionExpression
+            | Self::DqlHoFunctionExpression
+            | Self::DqlContextAwareFunctionExpression
+            | Self::DqlTemporarySigmaRule
+            | Self::BinPseudoPredicate
+            | Self::BinSigmaPredicate
+            | Self::DqlErContextRule
+            | Self::DqlEffectRule
+            | Self::SyntaxDirective
+            | Self::DqlDefaultFactFunctionExpression => false,
+        }
+    }
+
     pub fn is_fn(self) -> bool {
         matches!(
             self,
             Self::DqlFunctionExpression
                 | Self::DqlHoFunctionExpression
                 | Self::DqlContextAwareFunctionExpression
+                | Self::DqlDefaultFactFunctionExpression
+        )
+    }
+
+    /// The AUTHORED definition-family kinds: catalog rows whose clause text
+    /// is a consulted DQL definition and whose row therefore belongs to
+    /// exactly one namespace's current load. Everything else — engine
+    /// bins, introspected database objects, materialization products, and
+    /// reflected syntax directives — is SERVED: its row is registered by an
+    /// engine road and has no source-authored body to open.
+    pub fn is_authored_definition(self) -> bool {
+        matches!(
+            self,
+            Self::DqlFunctionExpression
+                | Self::DqlHoFunctionExpression
+                | Self::DqlContextAwareFunctionExpression
+                | Self::DqlTemporaryViewExpression
+                | Self::DqlHoTemporaryViewExpression
+                | Self::DqlTemporarySigmaRule
+                | Self::DqlFactExpression
+                | Self::DqlErContextRule
+                | Self::DqlEffectRule
+                | Self::DqlDefaultFactFunctionExpression
         )
     }
 
@@ -341,6 +400,7 @@ impl EntityType {
             19 => Ok(Self::BinRelation),
             20 => Ok(Self::DqlEffectRule),
             21 => Ok(Self::SyntaxDirective),
+            22 => Ok(Self::DqlDefaultFactFunctionExpression),
             _ => Err(anyhow!("Invalid entity_type_enum value: {}", value)),
         }
     }
@@ -392,7 +452,6 @@ impl ConnectionType {
     pub fn as_i32(self) -> i32 {
         self as i32
     }
-
 
     /// Get variant name for database
     pub fn variant_name(self) -> &'static str {
@@ -464,6 +523,8 @@ mod tests {
         assert!(EntityType::DqlFunctionExpression.is_fn());
         assert!(EntityType::DqlHoFunctionExpression.is_fn());
         assert!(EntityType::DqlContextAwareFunctionExpression.is_fn());
+        assert!(EntityType::DqlDefaultFactFunctionExpression.is_fn());
+        assert!(!EntityType::DqlDefaultFactFunctionExpression.realizes_relation());
         assert!(!EntityType::DbPermanentTable.is_fn());
     }
 

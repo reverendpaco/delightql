@@ -161,6 +161,16 @@ fn measure() -> Measurement {
 /// must not have to edit this table to land. A bucket that is on NEITHER list
 /// fails here rather than being absorbed into a percentage.
 const REFUSED_BY_LAW: &[(&str, usize)] = &[
+    // Exact `_` is reserved deixis: never an authored name, bare or
+    // stropped. The two cells are the pinned refusal witnesses.
+    ("delightql-error://semantic/identifier/deixis", 2),
+    // A reserved word is an identifier only when stropped; the inventory is
+    // the declared union in `names::identifier`. The two cells are the
+    // pinned refusal witnesses; every other corpus source spells its
+    // reserved names stropped.
+    // The third is the anon-header witness; the fourth is the dedicated
+    // relation-position witness, now refused at this boundary before lookup.
+    ("delightql-error://semantic/identifier/keyword", 4),
     // THE SET IS CLOSED: `(~~emit …~~)` is reserved room.
     ("delightql-error://semantic/annotation/reserved", 4),
     // `equals` is assertion SYNTAX: binary, and only inside an assertion.
@@ -175,6 +185,10 @@ const REFUSED_BY_LAW: &[(&str, usize)] = &[
     // binding to either lands on one frame slot. Judged by the identifier
     // law at the definition.
     ("delightql-error://semantic/cfe/parameter/duplicate", 3),
+    // Every query-local manifestation claims one spelling. Construction
+    // refuses a cross-kind duplicate before any lookup convention can pick
+    // one of the competing declarations.
+    ("delightql-error://semantic/scope/duplicate", 2),
     // THE WRITTEN NAME IS THE NAMING: a slot binds by position and publishes
     // no name for `as` to change. The grammar admits the form only so this
     // refusal can name the alias and point at the projection that renames.
@@ -220,6 +234,10 @@ const REFUSED_BY_LAW: &[(&str, usize)] = &[
     // NO PRECEDENCE: an infix composition standing as a function pipe's
     // source has two readings and the language picks neither.
     ("delightql-error://parse/pony", 4),
+    // THE RETIRED GLYPHS: `==` and `!==` are not tokens; the two cells are
+    // the pinned refusal witnesses, each teaching `=`/`!=` beside the
+    // explicit `+sql_eq`/`+sql_ne` prelude predicate.
+    ("delightql-error://parse/retired_operator", 2),
     // A template's escapes are a closed set; an unknown one is a typo, not a
     // literal backslash.
     ("delightql-error://parse/template/escape", 4),
@@ -227,6 +245,9 @@ const REFUSED_BY_LAW: &[(&str, usize)] = &[
     // has two values and no rule for choosing between them, and a fill naming
     // a column the header never marked addresses nothing.
     ("delightql-error://semantic/anon/sparse_duplicate", 2),
+    // SPARSE COLUMNS FORM A SUFFIX: positional omission is unambiguous only
+    // when the omittable columns come last (RULINGS 2026-08-19).
+    ("delightql-error://semantic/anon/sparse_suffix", 2),
     ("delightql-error://semantic/anon/sparse_fill_position", 2),
     ("delightql-error://semantic/anon/sparse_arity", 3),
     ("delightql-error://semantic/anon/sparse_header", 2),
@@ -273,6 +294,20 @@ const REFUSED_BY_LAW: &[(&str, usize)] = &[
     // the pipe fills it, so an argument written there leaves the piped
     // relation nowhere to land.
     ("delightql-error://semantic/effect/landing/nowhere", 2),
+    // The descriptor owns both ordinary argument arity and the receipt's
+    // exact access shape, so malformed directive calls reach one judgment.
+    ("delightql-error://semantic/directive/binding/arity", 4),
+    ("delightql-error://semantic/directive/invocation/access", 9),
+    // CLAUSE AGREEMENT reaches the query-scoped parameterized rule too: the
+    // repeated heads of one common higher-order expression are clauses of ONE
+    // definition, and they meet at the same assembler every consulted
+    // definition crosses. The inventory includes the ordinary heading
+    // disagreement and both clause orders of a rule-valued contract
+    // disagreement; changing clause order must not turn either one green.
+    (
+        "delightql-error://semantic/resolution/choe/head_agreement",
+        3,
+    ),
 ];
 
 /// The DEFERRALS: lawful forms the surviving AST has no carrier for. The
@@ -329,7 +364,17 @@ fn the_admitted_surface_normalizes_or_names_its_gap() {
             .sum();
         assert!(
             count <= *ceiling,
-            "'{named}' grew to {count}, above its ceiling of {ceiling}"
+            "'{named}' grew to {count}, above its ceiling of {ceiling}; examples:\n{}",
+            measurement
+                .examples
+                .iter()
+                .filter(|(bucket, _)| {
+                    bucket.as_str() == *named || bucket.starts_with(&format!("{named} ["))
+                })
+                .flat_map(|(_, examples)| examples)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 

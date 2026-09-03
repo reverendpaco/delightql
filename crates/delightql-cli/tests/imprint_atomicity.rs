@@ -102,12 +102,12 @@ fn replace_partial_failure_preserves_survivor() {
         "broken(*) :- employees(*) |> (1 as k)\n\
          kept(*)   :- employees(*), age >= 30\n\
          (~~ddl:\"_internal\"\n\
-         schema(\"broken\")(name, type) :-\n\
+         schema(\"broken\" as entity, name, type) :-\n\
            _(name, type\n\
              -----------\n\
              \"k\",  \"INTEGER\")\n\
-         constraints(\"broken\")(column, constraint, constraint_name) :-\n\
-           _(column, constraint, constraint_name\n\
+         constraints(\"broken\" as entity, column, constraint, constraint_name) :-\n\
+           _(`column`, `constraint`, constraint_name\n\
              ------------------------------------\n\
              \"k\",    \"%%\",       \"pk_broken\")\n\
          imprinting(entity, materialization, extent) :-\n\
@@ -193,7 +193,10 @@ fn strict_multi_entity_clash_leaves_target_untouched() {
         "consult!(\"ddl/lib.dql\", \"lib::a\")(*)\nimprint!(\"lib::a\", \"main\")(*)\n",
         true,
     );
-    assert!(!ok, "strict imprint! over a clash should fail; stderr:\n{err}");
+    assert!(
+        !ok,
+        "strict imprint! over a clash should fail; stderr:\n{err}"
+    );
     assert!(
         err.contains("already exist"),
         "failure should report the clash; stderr:\n{err}"

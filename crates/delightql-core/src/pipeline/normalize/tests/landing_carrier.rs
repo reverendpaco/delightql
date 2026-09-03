@@ -53,17 +53,36 @@ fn shape(source: &str) -> String {
 }
 
 #[test]
-fn the_argument_row_takes_the_implicit_landing() {
-    // ZERO HOLES: `/->` lands first, `/->>` lands last. This is why
-    // `x /-> upper:(y)` means `upper(x, y)`.
+fn the_argument_row_takes_the_default_landing_at_its_final_place() {
+    // ZERO HOLES: the flowing value lands at the row's FINAL place. This is
+    // why `x /-> max:(0)` means `max(0, x)`.
     no_hole_survives("_(x@1;2) |> (x /-> max:(0) as m)");
-    no_hole_survives("_(x@1;2) |> (x /->> max:(0) as m)");
 
-    let first = shape("_(x@1;2) |> (x /-> max:(0) as m)");
-    let last = shape("_(x@1;2) |> (x /->> max:(0) as m)");
+    // THE PIPED SPELLING IS THE DIRECT ONE. The landing is spent at build,
+    // so a step and the call it denotes normalize to the same shape and
+    // nothing downstream can tell which was written.
+    assert_eq!(
+        shape("_(x@1;2) |> (x /-> max:(0) as m)"),
+        shape("_(x@1;2) |> (max:(0, x) as m)"),
+        "a function-pipe step IS the application with the flowing value last"
+    );
+
+    // ...and it is NOT the application with the flowing value first: the two
+    // orders are different applications, so the equality above is a fact
+    // about the landing, not about `max` being symmetric here.
     assert_ne!(
-        first, last,
-        "the two directions land in different places and cannot normalize alike"
+        shape("_(x@1;2) |> (x /-> max:(0) as m)"),
+        shape("_(x@1;2) |> (max:(x, 0) as m)"),
+    );
+}
+
+/// THE ROW'S FINAL PLACE, with more than one written argument: everything
+/// authored binds a complete left prefix and the flowing value follows it.
+#[test]
+fn several_written_arguments_keep_their_order_before_the_landing() {
+    assert_eq!(
+        shape("_(x@1;2) |> (x /-> coalesce:(0, 50) as m)"),
+        shape("_(x@1;2) |> (coalesce:(0, 50, x) as m)"),
     );
 }
 
@@ -81,8 +100,8 @@ fn a_window_position_is_a_landing_site() {
     // the landing the author wrote is in the PARTITION, and reading only
     // the argument row would insert the value there and leave this one
     // standing.
-    no_hole_survives("_(x@1;2) |> (x /-> row_number:() <~ %(@) as rn)");
-    no_hole_survives("_(x@1;2) |> (x /-> row_number:() <~ #(@) as rn)");
+    no_hole_survives("_(x@1;2) |> (x /-> row_number:(<~ %(@)) as rn)");
+    no_hole_survives("_(x@1;2) |> (x /-> row_number:(<~ #(@)) as rn)");
 }
 
 #[test]

@@ -52,6 +52,10 @@ pub mod cst {
 
 pub use cst::{AnyNode, Kind, TypedNode, EXTRA_KINDS};
 
+// `GRAMMAR_FINGERPRINT` and `PARSER_RUNTIME`: the build identity the parser
+// evidence records, minted by the build script beside the generated CST.
+include!(concat!(env!("OUT_DIR"), "/minted_facts.rs"));
+
 extern "C" {
     fn tree_sitter_delightql() -> Language;
 }
@@ -569,6 +573,34 @@ fn collect_defects(node: Node<'_>, out: &mut Vec<RawDefect>) {
     }
 }
 
+/// What a cancellable parse answered: a finished tree, or the cancellation
+/// with the last progress the runtime reported before it. The elapsed time is
+/// the caller's to measure — the clock that armed the predicate owns it.
+pub enum CancellableParse {
+    Completed(SyntaxTree),
+    Cancelled {
+        /// The parse's last reported progress in AUTHORED bytes, `None` when
+        /// cancellation fired before the first checkpoint.
+        last_progress_byte: Option<usize>,
+        /// The road the cancelled parse was on — the same framing decision
+        /// a completed tree records as its entrance. Evidence about a
+        /// cancellation must not lose the entrance the request selected.
+        entrance: Root,
+    },
+}
+
+/// The road [`Parser::parse_submission`] will take for this source, from
+/// the same framing law, without parsing: marked text (an authored header,
+/// misplaced included — a submission that says which world it is in has
+/// said so) is the utility entrance; unmarked text is one interactive
+/// submission at the prompt wrap.
+pub fn submission_road(source: &str) -> Root {
+    match framing(source) {
+        Framing::Synthetic => Root::DefinitionFile,
+        Framing::Authored | Framing::Misframed(_) => Root::QuerySequence,
+    }
+}
+
 /// A parser bound to the consolidated language.
 pub struct Parser {
     inner: tree_sitter::Parser,
@@ -671,6 +703,107 @@ impl Parser {
             CompanionColumn::Default => DEFAULT_CELL_SELECTOR,
         };
         self.parse_with(selector, cell, Root::CompanionCell)
+    }
+
+    /// [`Parser::parse_prompt`], under a caller-owned cancellation predicate.
+    ///
+    /// The predicate is polled at the runtime's cooperative checkpoints with
+    /// the parse's progress in AUTHORED bytes; answering `true` cancels. The
+    /// checkpoints are reached between parse operations, not inside them — a
+    /// runtime defect that loops below them (the diagnosed `stack__iter`
+    /// recovery loop does) never polls, so this bounds only the parses that
+    /// keep making progress. Hard containment needs a process boundary.
+    pub fn parse_prompt_cancellable(
+        &mut self,
+        submission: &str,
+        should_cancel: &mut dyn FnMut(usize) -> bool,
+    ) -> CancellableParse {
+        self.parse_with_cancellation(PROMPT_SELECTOR, submission, Root::DefinitionFile, should_cancel)
+    }
+
+    /// [`Parser::parse_submission`], under a caller-owned cancellation
+    /// predicate. Framing follows the exact same law as the uncancellable
+    /// entrance: the submission's own bytes name the road.
+    pub fn parse_submission_cancellable(
+        &mut self,
+        source: &str,
+        should_cancel: &mut dyn FnMut(usize) -> bool,
+    ) -> CancellableParse {
+        match framing(source) {
+            Framing::Synthetic => self.parse_prompt_cancellable(source, should_cancel),
+            Framing::Authored => {
+                self.parse_with_cancellation("", source, Root::QuerySequence, should_cancel)
+            }
+            Framing::Misframed(at) => {
+                let mut parse = self.parse_with_cancellation(
+                    QUERY_SEQUENCE_FRAME,
+                    source,
+                    Root::QuerySequence,
+                    should_cancel,
+                );
+                if let CancellableParse::Completed(tree) = &mut parse {
+                    tree.misframed = Some(at);
+                }
+                parse
+            }
+        }
+    }
+
+    /// The cancellable core: [`Parser::parse_with`] through the runtime's
+    /// progress-callback option. Coordinates handed to the predicate and
+    /// reported on cancellation are AUTHORED bytes — the one prefix
+    /// convention holds here too.
+    fn parse_with_cancellation(
+        &mut self,
+        selector: &str,
+        source: &str,
+        entrance: Root,
+        should_cancel: &mut dyn FnMut(usize) -> bool,
+    ) -> CancellableParse {
+        debug_assert!(
+            !selector.contains('\n') || selector.ends_with('\n'),
+            "framing must end its line or the author's first byte lands mid-row"
+        );
+        let parsed = format!("{selector}{source}");
+        let selector_len = selector.len();
+        let mut last_progress_byte: Option<usize> = None;
+        let mut progress = |state: &tree_sitter::ParseState| -> bool {
+            let authored = state.current_byte_offset().saturating_sub(selector_len);
+            last_progress_byte = Some(authored);
+            should_cancel(authored)
+        };
+        let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
+        let bytes = parsed.as_bytes();
+        let mut read = |offset: usize, _pos: Point| -> &[u8] {
+            if offset < bytes.len() {
+                &bytes[offset..]
+            } else {
+                &[]
+            }
+        };
+        let tree = self
+            .inner
+            .parse_with_options(&mut read, None, Some(options));
+        match tree {
+            Some(tree) => CancellableParse::Completed(SyntaxTree {
+                tree,
+                parsed,
+                selector_len,
+                selector_rows: selector.matches('\n').count(),
+                misframed: None,
+                entrance,
+            }),
+            None => {
+                // A cancelled parse leaves the runtime mid-flight; without a
+                // reset the NEXT parse on this parser resumes that state and
+                // answers about the wrong text.
+                self.inner.reset();
+                CancellableParse::Cancelled {
+                    last_progress_byte,
+                    entrance,
+                }
+            }
+        }
     }
 
     /// ONE prefix convention for every entrance. A second offset rule is how

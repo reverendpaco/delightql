@@ -216,6 +216,33 @@ Set a config for this session. Same STATE grammar as
 .BI \-\-error\-prefix " PREFIX"
 See
 .BR dql (1).
+.SS Replay
+.TP
+.BI \-\-replay\-repl " SCRIPT|TARBALL"
+Re-run a recorded interactive session through the real prompt.
+.I SCRIPT
+is a
+.B replay\-script.<MS>
+file the REPL writes at exit (one block per input, headed
+.BR "# <id> <kind>" );
+.I TARBALL
+is a
+.B bug\-<MS>.tgz
+from the REPL's
+.B .bug
+command, which also carries the session's
+.B context.<MS>
+(the original arguments and environment, honored, with database and DDL
+paths redirected to the extracted copies).
+The driver spawns
+.B dql
+on a pseudo\-terminal, types each dot command and pastes each block,
+and waits for the prompt between keystrokes. The child's terminal output
+is shown verbatim, the child writes its own session files, and the exit
+status is the child's. Conflicts with
+.I QUERY
+and
+.BR \-\-file .
 .SH EXIT STATUS
 .TP
 .B 0

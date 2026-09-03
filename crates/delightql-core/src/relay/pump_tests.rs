@@ -522,14 +522,14 @@ fn routes_entries_per_connection() {
 // ---------------------------------------------------------------------
 
 use crate::pipeline::compiled_query::{
-    EffectAction, EffectStep, GuardDefinition, GuardPolarity, Requirement, TypedEffectPlan,
+    AbortProvenance, EffectAction, EffectStep, GuardDefinition, GuardPolarity, Requirement,
+    TerminalAction, TypedEffectPlan,
 };
 
 fn step(action: EffectAction, occurrence: &str, requirements: Vec<Requirement>) -> EffectStep {
     EffectStep {
         occurrence: occurrence.to_string(),
         operation: occurrence.to_string(),
-        span: None,
         route: None,
         requirements,
         action,
@@ -622,7 +622,9 @@ fn exit_absent_edges_skip_later_steps_and_the_tail() {
     let p = bracketed_typed_plan(
         vec![
             step(
-                EffectAction::Exit(stmts(&["INSERT INTO __exit VALUES (1)"])),
+                EffectAction::Terminal(TerminalAction::Exit {
+                    statements: stmts(&["INSERT INTO __exit VALUES (1)"]),
+                }),
                 "exit!#0",
                 vec![],
             ),
@@ -972,7 +974,7 @@ fn bracket_rolls_back_on_mid_bracket_statement_error() {
 /// aborts with today's identity and message shape, an open bracket rolls
 /// back, and later entries never execute.
 #[test]
-fn assertion_failure_mid_plan_aborts_and_rolls_back() {
+fn compiler_check_failure_mid_plan_refuses_and_rolls_back() {
     let conn = shared_sqlite();
     conn.lock()
         .unwrap()
@@ -999,12 +1001,15 @@ fn assertion_failure_mid_plan_aborts_and_rolls_back() {
             comment: None,
         },
         bare("INSERT INTO t VALUES ('rolled back')"),
-        PlanEntry::Assertion {
-            name: None,
+        PlanEntry::Check {
+            refusal: None,
             statement: PlanStatement::bare("SELECT 1"),
         },
-        PlanEntry::Assertion {
-            name: None,
+        PlanEntry::Check {
+            refusal: Some(crate::pipeline::compiled_query::Refusal {
+                identity: "runtime/precondition".to_string(),
+                message: "precondition failed".to_string(),
+            }),
             statement: PlanStatement::bare("SELECT 0"),
         },
         bare("INSERT INTO t VALUES ('never reached')"),
@@ -1016,17 +1021,11 @@ fn assertion_failure_mid_plan_aborts_and_rolls_back() {
     ]);
     let resp = relay.handle_plan(&p);
     let (identity, message) = error_message(resp);
-    assert_eq!(identity, b"delightql-error://runtime/assertion".to_vec());
-    assert!(
-        message.contains("Assertion 2 failed"),
-        "message must carry today's shape and the assertion's number, got: {}",
-        message
-    );
+    assert_eq!(identity, b"delightql-error://runtime/precondition".to_vec());
+    assert_eq!(message, "precondition failed");
 
     let seen = verdicts.lock().unwrap();
-    assert_eq!(seen.len(), 2, "both assertions reach the verdict hook");
-    assert!(seen[0].0, "first assertion passes");
-    assert!(!seen[1].0, "second assertion fails");
+    assert!(seen.is_empty(), "compiler checks are not assertion events");
 
     assert!(conn.lock().unwrap().is_autocommit());
     assert_eq!(
@@ -1039,7 +1038,7 @@ fn assertion_failure_mid_plan_aborts_and_rolls_back() {
 /// Assertion abort outside any bracket: earlier effects stand (nothing to
 /// roll back), later entries are never executed.
 #[test]
-fn assertion_abort_skips_later_entries_without_bracket() {
+fn compiler_check_refusal_skips_later_entries_without_bracket() {
     let conn = shared_sqlite();
     conn.lock()
         .unwrap()
@@ -1050,8 +1049,11 @@ fn assertion_abort_skips_later_entries_without_bracket() {
 
     let p = plan(vec![
         bare("INSERT INTO t VALUES ('a')"),
-        PlanEntry::Assertion {
-            name: None,
+        PlanEntry::Check {
+            refusal: Some(crate::pipeline::compiled_query::Refusal {
+                identity: "runtime/precondition".to_string(),
+                message: "precondition failed".to_string(),
+            }),
             statement: PlanStatement::bare("SELECT 0"),
         },
         bare("INSERT INTO t VALUES ('b')"),
@@ -1059,8 +1061,8 @@ fn assertion_abort_skips_later_entries_without_bracket() {
     ]);
     let resp = relay.handle_plan(&p);
     let (identity, message) = error_message(resp);
-    assert_eq!(identity, b"delightql-error://runtime/assertion".to_vec());
-    assert!(message.contains("Assertion 1 failed"), "got: {}", message);
+    assert_eq!(identity, b"delightql-error://runtime/precondition".to_vec());
+    assert_eq!(message, "precondition failed");
 
     let vals: Vec<String> = {
         let guard = conn.lock().unwrap();
@@ -1077,6 +1079,441 @@ fn assertion_abort_skips_later_entries_without_bracket() {
         vec!["a".to_string()],
         "unbracketed pre-abort effects stand; post-abort entries never run"
     );
+}
+
+#[test]
+fn assertion_abort_rolls_back_skips_the_tail_and_persists_its_verdict() {
+    let conn = shared_sqlite();
+    conn.lock()
+        .unwrap()
+        .execute_batch("CREATE TABLE t (v TEXT);")
+        .unwrap();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, Arc::clone(&conn));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_by_hook = Arc::clone(&seen);
+    relay.set_hooks(RelayHooks {
+        on_verdict: Some(Box::new(move |v| {
+            seen_by_hook
+                .lock()
+                .unwrap()
+                .push((v.outcome.clone(), v.identity.name.clone()));
+        })),
+        ..RelayHooks::default()
+    });
+
+    let abort = EffectAction::Terminal(TerminalAction::Abort {
+        provenance: AbortProvenance::Assertion {
+            label: "authored label".to_string(),
+        },
+        statements: Vec::new(),
+        probe: PlanStatement::bare("SELECT 1"),
+    });
+    let p = bracketed_typed_plan(
+        vec![
+            step(
+                EffectAction::Stage(stmts(&["INSERT INTO t VALUES ('rolled back')"])),
+                "before",
+                vec![],
+            ),
+            step(abort, "assert", vec![]),
+            step(
+                EffectAction::Stage(stmts(&["INSERT INTO t VALUES ('never')"])),
+                "after",
+                vec![],
+            ),
+        ],
+        vec![],
+        None,
+        vec![],
+    );
+    let (identity, message) = error_message(relay.handle_plan(&p));
+    assert_eq!(identity, b"delightql-error://runtime/assertion".to_vec());
+    assert!(message.contains("authored label"));
+    assert!(conn.lock().unwrap().is_autocommit());
+    assert_eq!(count_rows(&conn, "t"), 0);
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[(
+            crate::pipeline::verdict::VerdictOutcome::Fail,
+            Some("authored label".to_string())
+        )]
+    );
+    let recorded = relay
+        .system
+        .bootstrap_connection()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT name, outcome FROM assertions ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(recorded, ("authored label".to_string(), "fail".to_string()));
+}
+
+#[test]
+fn assertion_observation_failure_is_typed_health_and_cannot_report_pass() {
+    let conn = shared_sqlite();
+    conn.lock()
+        .unwrap()
+        .execute_batch("CREATE TABLE t (v TEXT);")
+        .unwrap();
+    let mut system = fresh_system();
+    system
+        .bootstrap_connection()
+        .lock()
+        .unwrap()
+        .execute_batch("PRAGMA query_only = ON")
+        .unwrap();
+    let mut relay = relay_over(&mut system, Arc::clone(&conn));
+    let plan = bracketed_typed_plan(
+        vec![
+            step(
+                EffectAction::Stage(stmts(&["INSERT INTO t VALUES ('rolled back')"])),
+                "before",
+                vec![],
+            ),
+            step(
+                EffectAction::Terminal(TerminalAction::Abort {
+                    statements: vec![],
+                    probe: PlanStatement::bare("SELECT 1 WHERE 0"),
+                    provenance: AbortProvenance::Assertion {
+                        label: "must observe pass".to_string(),
+                    },
+                }),
+                "assert",
+                vec![],
+            ),
+        ],
+        vec![],
+        None,
+        vec![],
+    );
+
+    let (identity, message) = error_message(relay.handle_plan(&plan));
+    assert_eq!(
+        identity,
+        b"delightql-error://runtime/session_health/external_effect".to_vec()
+    );
+    assert!(
+        message.contains("assertion verdict observation"),
+        "{message}"
+    );
+    assert_eq!(count_rows(&conn, "t"), 0);
+    assert!(relay.system.health_incident().is_some());
+}
+
+#[test]
+fn failed_assertion_keeps_primary_identity_when_observation_quarantines() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    system
+        .bootstrap_connection()
+        .lock()
+        .unwrap()
+        .execute_batch("PRAGMA query_only = ON")
+        .unwrap();
+    let mut relay = relay_over(&mut system, conn);
+    let plan = bracketed_typed_plan(
+        vec![step(
+            EffectAction::Terminal(TerminalAction::Abort {
+                statements: vec![],
+                probe: PlanStatement::bare("SELECT 1"),
+                provenance: AbortProvenance::Assertion {
+                    label: "primary assertion".to_string(),
+                },
+            }),
+            "assert",
+            vec![],
+        )],
+        vec![],
+        None,
+        vec![],
+    );
+
+    let (identity, message) = error_message(relay.handle_plan(&plan));
+    assert_eq!(identity, b"delightql-error://runtime/assertion".to_vec());
+    assert!(message.contains("primary assertion"), "{message}");
+    assert!(message.contains("session quarantined"), "{message}");
+    assert!(relay.system.health_incident().is_some());
+}
+
+#[test]
+fn committed_run_survives_abort_and_the_session_remains_usable() {
+    let conn = shared_sqlite();
+    conn.lock()
+        .unwrap()
+        .execute_batch("CREATE TABLE t (v TEXT);")
+        .unwrap();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, Arc::clone(&conn));
+
+    let committed = bracketed_typed_plan(
+        vec![step(
+            EffectAction::Stage(stmts(&["INSERT INTO t VALUES ('committed')"])),
+            "write",
+            vec![],
+        )],
+        vec![],
+        None,
+        vec![],
+    );
+    assert!(!matches!(
+        relay.handle_plan(&committed),
+        ServerTerm::Error { .. }
+    ));
+
+    let aborted = bracketed_typed_plan(
+        vec![
+            step(
+                EffectAction::Stage(stmts(&["INSERT INTO t VALUES ('gone')"])),
+                "write",
+                vec![],
+            ),
+            step(
+                EffectAction::Terminal(TerminalAction::Abort {
+                    provenance: AbortProvenance::Authored {
+                        identity: "runtime/abort-test".to_string(),
+                        label: "stop".to_string(),
+                    },
+                    statements: Vec::new(),
+                    probe: PlanStatement::bare("SELECT 1"),
+                }),
+                "abort",
+                vec![],
+            ),
+        ],
+        vec![],
+        None,
+        vec![],
+    );
+    let (identity, _) = error_message(relay.handle_plan(&aborted));
+    assert_eq!(identity, b"delightql-error://runtime/abort-test".to_vec());
+
+    let response = relay.handle_plan(&plan(vec![ship("SELECT v FROM t ORDER BY v")]));
+    let (_, rows) = fetch_all(&mut relay, response);
+    assert_eq!(rows, vec![vec!["committed".to_string()]]);
+}
+
+#[test]
+fn abort_probe_execution_error_keeps_the_runtime_execution_identity() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, conn);
+    let p = bracketed_typed_plan(
+        vec![step(
+            EffectAction::Terminal(TerminalAction::Abort {
+                provenance: AbortProvenance::Authored {
+                    identity: "runtime/should-not-replace".to_string(),
+                    label: "unreached".to_string(),
+                },
+                statements: Vec::new(),
+                probe: PlanStatement::bare("SELECT * FROM no_such_table"),
+            }),
+            "abort",
+            vec![],
+        )],
+        vec![],
+        None,
+        vec![],
+    );
+    let (identity, message) = error_message(relay.handle_plan(&p));
+    assert_eq!(identity, b"delightql-error://runtime/execution".to_vec());
+    assert!(message.contains("no_such_table"));
+}
+
+#[test]
+fn authored_abort_reaches_only_on_nonempty_input_and_keeps_the_session_usable() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, conn);
+
+    let empty = relay.handle(ClientTerm::Query {
+        text: b"_(x @ 1), x = 99 |> abort!(\"runtime/abort-test\", \"empty\")(*)".to_vec(),
+    });
+    let _ = fetch_all(&mut relay, empty);
+
+    let reached = relay.handle(ClientTerm::Query {
+        text: b"_(x @ 1) |> abort!(\"runtime/abort-test\", \"reached\")(*)".to_vec(),
+    });
+    let (identity, message) = error_message(reached);
+    assert_eq!(identity, b"delightql-error://runtime/abort-test".to_vec());
+    assert!(message.contains("reached"));
+
+    let usable = relay.handle(ClientTerm::Query {
+        text: b"_(x @ 2)".to_vec(),
+    });
+    let (_, rows) = fetch_all(&mut relay, usable);
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+#[test]
+fn qualified_builtin_identity_is_preserved_at_the_runtime_entry() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, conn);
+
+    let standard = relay.handle(ClientTerm::Query {
+        text: b"#!dql query-sequence\n\
+                nonempty(T(*))(*) : T(*)\n\
+                _(x @ 1) !> std::prelude.assert!(nonempty(*), \"standard\")(*) |> #(x)"
+            .to_vec(),
+    });
+    let (_, rows) = fetch_all(&mut relay, standard);
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let standard_abort = relay.handle(ClientTerm::Query {
+        text: b"_(x @ 1), x = 2 |> std::prelude.abort!(\"runtime/unreached\")(*)".to_vec(),
+    });
+    let _ = fetch_all(&mut relay, standard_abort);
+
+    for source in [
+        "#!dql query-sequence\nnonempty(T(*))(*) : T(*)\n_(x @ 1) !> bogus.assert!(nonempty(*))(*)",
+        "_(x @ 1) |> bogus.abort!(\"runtime/must-not-run\")(*)",
+        "_(x @ 1) |> bogus.insert!(sink(*))(*)",
+    ] {
+        let (identity, message) = error_message(relay.handle(ClientTerm::Query {
+            text: source.as_bytes().to_vec(),
+        }));
+        assert_ne!(identity, b"delightql-error://runtime/assertion".to_vec());
+        assert_ne!(identity, b"delightql-error://runtime/must-not-run".to_vec());
+        assert!(
+            message.contains("no effect rule")
+                || message.contains("not a built-in")
+                || message.contains("no DQL callable")
+                || message.contains("Unknown directive"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn configured_assert_releases_the_exact_rows_and_reports_one_pass() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, conn);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_by_hook = Arc::clone(&seen);
+    relay.set_hooks(RelayHooks {
+        on_verdict: Some(Box::new(move |v| {
+            seen_by_hook
+                .lock()
+                .unwrap()
+                .push((v.outcome.clone(), v.identity.name.clone()));
+        })),
+        ..RelayHooks::default()
+    });
+    let dql = "#!dql query-sequence\n\
+               at_least(n, T(*))(*) : T(*) ~> count:(*) as c, c >= n\n\
+               _(x @ 1; 2; 3) !> assert!(at_least(2), \"three rows\")(*) |> #(x)";
+    let response = relay.handle(ClientTerm::Query {
+        text: dql.as_bytes().to_vec(),
+    });
+    let (columns, rows) = fetch_all(&mut relay, response);
+    assert_eq!(columns, vec!["x"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["3".to_string()]
+        ]
+    );
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[(
+            crate::pipeline::verdict::VerdictOutcome::Pass,
+            Some("three rows".to_string())
+        )]
+    );
+}
+
+#[test]
+fn direct_assert_receipt_exposes_the_witness_and_returned_occurrences() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, conn);
+    let dql = "#!dql query-sequence\n\
+               one(T(*))(*) : T(*), x = 1\n\
+               assert!(one(*), \"direct\", _(x @ 1; 2))(*)";
+    let response = relay.handle(ClientTerm::Query {
+        text: dql.as_bytes().to_vec(),
+    });
+    let (columns, rows) = fetch_all(&mut relay, response);
+    assert_eq!(
+        columns,
+        vec!["success", "operation", "label", "witnesses", "returned"]
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][..3], &["1", "assert!", "direct"]);
+    assert!(rows[0][3].contains("\"x\":1"), "{}", rows[0][3]);
+    assert!(rows[0][4].contains("\"x\":1"), "{}", rows[0][4]);
+    assert!(rows[0][4].contains("\"x\":2"), "{}", rows[0][4]);
+}
+
+#[test]
+fn volatile_assert_input_is_one_occurrence_in_witness_and_returned_payloads() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, conn);
+    let dql = "#!dql query-sequence\n\
+               echo_property(T(*))(*) : T(*)\n\
+               volatile(*) : _(seed @ 1) |> (random:() as token)\n\
+               assert!(echo_property(*), \"volatile\", volatile(*))(*)";
+    let response = relay.handle(ClientTerm::Query {
+        text: dql.as_bytes().to_vec(),
+    });
+    let (_, rows) = fetch_all(&mut relay, response);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][3], rows[0][4],
+        "the property witness and returned relation must expose the one staged random() occurrence"
+    );
+}
+
+#[test]
+fn empty_assertion_witness_uses_runtime_assertion_and_explicit_label() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, conn);
+    let dql = "#!dql query-sequence\n\
+               none(T(*))(*) : T(*), x = 99\n\
+               _(x @ 1) !> assert!(none(*), \"no 99\")(*)";
+    let response = relay.handle(ClientTerm::Query {
+        text: dql.as_bytes().to_vec(),
+    });
+    let (identity, message) = error_message(response);
+    assert_eq!(identity, b"delightql-error://runtime/assertion".to_vec());
+    assert!(message.contains("no 99"));
+}
+
+#[test]
+fn omitted_assert_label_uses_the_synthetic_effect_identity() {
+    let conn = shared_sqlite();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, conn);
+    let label = Arc::new(Mutex::new(None));
+    let label_by_hook = Arc::clone(&label);
+    relay.set_hooks(RelayHooks {
+        on_verdict: Some(Box::new(move |v| {
+            *label_by_hook.lock().unwrap() = v.identity.name.clone();
+        })),
+        ..RelayHooks::default()
+    });
+    let dql = "#!dql query-sequence\n\
+               one(T(*))(*) : T(*), x = 1\n\
+               _(x @ 1) !> assert!(one(*))(*)";
+    let response = relay.handle(ClientTerm::Query {
+        text: dql.as_bytes().to_vec(),
+    });
+    let _ = fetch_all(&mut relay, response);
+    assert!(label
+        .lock()
+        .unwrap()
+        .as_deref()
+        .is_some_and(|name| name.starts_with("assert!#")));
 }
 
 /// Non-final shipped sets deliver through on_ship in execution order with

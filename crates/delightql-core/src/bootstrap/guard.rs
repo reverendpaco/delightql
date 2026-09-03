@@ -46,7 +46,33 @@ struct GuardState {
     /// Open installation/migration windows. While any is open the guard
     /// stands aside; sealing snapshots and closes them all.
     open_windows: u32,
+    /// Open definition-catalog write windows. Row DML against the
+    /// definition-family tables is denied unless one is open: the
+    /// publication capability and the sanctioned lifecycle writers open
+    /// one for the duration of their act, and compilation never does —
+    /// which is what makes "compilation cannot write the catalog" a store
+    /// fact rather than a discipline.
+    catalog_windows: u32,
 }
+
+/// The definition-family store: every table whose rows publish, link, or
+/// activate a definition family. Writes to these are denied outside a
+/// catalog window; the namespace row itself stays under its own writers'
+/// policies.
+const DEFINITION_TABLES: &[&str] = &[
+    "entity",
+    "entity_clause",
+    "entity_attribute",
+    "referenced_entity",
+    "entity_resolution",
+    "ho_param",
+    "ho_param_column",
+    "join_edge",
+    "functional_dependency",
+    "interior_entity",
+    "interior_entity_attribute",
+    "activated_entity",
+];
 
 /// SQLite compares object names ASCII-case-insensitively; the guard must
 /// compare under the same law or `CREATE TEMP TABLE ENTITY` shadows a
@@ -85,6 +111,9 @@ impl BootstrapGuard {
             };
             if state.open_windows > 0 {
                 return Authorization::Allow;
+            }
+            if state.catalog_windows == 0 && fenced_catalog_write(&context.action) {
+                return Authorization::Deny;
             }
             match classify(&context.action) {
                 Some(Structural::Target(name)) if state.protected.contains(&canonical(name)) => {
@@ -128,6 +157,20 @@ impl BootstrapGuard {
         }
     }
 
+    /// Open the definition-catalog write capability: row DML against the
+    /// definition-family tables (and the namespace active pointer) is
+    /// admitted exactly while the returned window lives. The publication
+    /// capability and the sanctioned lifecycle writers hold one for the
+    /// duration of their act; compilation never opens one.
+    pub(crate) fn catalog_window(&self) -> CatalogWindow {
+        if let Ok(mut state) = self.state.lock() {
+            state.catalog_windows += 1;
+        }
+        CatalogWindow {
+            state: Arc::clone(&self.state),
+        }
+    }
+
     fn snapshot(&self, conn: &Connection) -> Result<()> {
         let mut protected = HashSet::new();
         let mut statement = conn
@@ -153,7 +196,22 @@ impl BootstrapGuard {
         })?;
         state.protected = protected;
         state.open_windows = 0;
+        state.catalog_windows = 0;
         Ok(())
+    }
+}
+
+/// An open definition-catalog write window. Dropping it closes the
+/// capability; every exit path (errors included) re-fences the store.
+pub(crate) struct CatalogWindow {
+    state: Arc<Mutex<GuardState>>,
+}
+
+impl Drop for CatalogWindow {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.catalog_windows = state.catalog_windows.saturating_sub(1);
+        }
     }
 }
 
@@ -165,9 +223,9 @@ pub(crate) struct MigrationWindow {
     closed: bool,
 }
 
-#[allow(dead_code)]
 impl MigrationWindow {
     /// Re-seal: snapshot the migrated inventory and close the window.
+    #[allow(dead_code)]
     pub(crate) fn close(mut self, conn: &Connection) -> Result<()> {
         let guard = BootstrapGuard {
             state: Arc::clone(&self.state),
@@ -198,6 +256,18 @@ enum Structural<'c> {
     /// enough to judge the result, or the action would defeat the seal
     /// itself. The migration window is the one crossing.
     Sealed,
+}
+
+/// Whether one action is a row write the catalog fence denies outside a
+/// window: INSERT/UPDATE/DELETE on a definition-family table.
+fn fenced_catalog_write(action: &AuthAction<'_>) -> bool {
+    use AuthAction::*;
+    match action {
+        Insert { table_name } | Delete { table_name } | Update { table_name, .. } => {
+            DEFINITION_TABLES.contains(&canonical(table_name).as_str())
+        }
+        _ => false,
+    }
 }
 
 /// Classify one authorizer action.
@@ -287,11 +357,37 @@ mod tests {
                 "{teaching} must be denied: {sql}"
             );
         }
-        // The catalog's own row DML is untouched.
-        conn.execute("INSERT INTO entity (id) VALUES (1)", [])
-            .expect("row DML is ordinary");
-        conn.execute("DELETE FROM entity", [])
-            .expect("row DML is ordinary");
+    }
+
+    /// DEFINITION-TABLE row DML is the catalog fence's: denied outside a
+    /// catalog window, admitted inside one, and closed again when the
+    /// window drops — compilation, which never opens one, cannot write the
+    /// definition catalog.
+    #[test]
+    fn definition_writes_need_the_catalog_window() {
+        let (conn, guard) = sealed();
+        assert!(
+            conn.execute("INSERT INTO entity (id) VALUES (1)", [])
+                .is_err(),
+            "a definition-table write outside the window must be denied"
+        );
+        {
+            let _window = guard.catalog_window();
+            conn.execute("INSERT INTO entity (id) VALUES (1)", [])
+                .expect("the publication window admits the write");
+            conn.execute("DELETE FROM entity", [])
+                .expect("and the delete");
+        }
+        assert!(
+            conn.execute("INSERT INTO entity (id) VALUES (2)", [])
+                .is_err(),
+            "dropping the window re-fences the store"
+        );
+        // Non-definition tables stay under ordinary row policy.
+        conn.execute_batch("CREATE TABLE ordinary (x INTEGER)")
+            .expect("scratch stays ordinary");
+        conn.execute("INSERT INTO ordinary (x) VALUES (1)", [])
+            .expect("ordinary row DML is untouched");
     }
 
     /// Objects the installation did not create stay under ordinary policy:

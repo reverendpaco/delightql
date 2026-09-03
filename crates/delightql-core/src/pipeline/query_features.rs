@@ -13,21 +13,27 @@ use std::collections::HashMap;
 /// param names at construction time instead of using text-level regex replacement.
 #[derive(Debug, Clone, Default)]
 pub struct HoParamBindings {
-    /// Glob: param_name → actual table name
-    pub table_params: HashMap<String, String>,
     /// Glob: param_name → compiler-owned carrier occurrence.
     ///
-    /// Unlike `table_params`, this binding has no character spelling. The
-    /// builder places the scope directly in the unresolved relation and the
-    /// resolver connects it to the matching CTE binding.
-    pub table_scope_params: HashMap<String, crate::names::ScopeId>,
+    /// This binding has no character spelling. The builder places the scope
+    /// directly in the unresolved relation and the resolver connects it to
+    /// the matching CTE binding.
+    pub table_scope_params: HashMap<String, crate::relation::StructuralRelation>,
     /// The one table parameter receiving a piped source, when present.
     /// The formal spelling is diagnostic; the scope is the binding.
-    pub pipe_carrier: Option<(String, crate::names::ScopeId)>,
+    pub pipe_carrier: Option<(String, crate::relation::StructuralRelation)>,
     /// Argumentative: param_name → anonymous table Chain
     pub table_expr_params: HashMap<String, crate::pipeline::asts::unresolved::Chain>,
-    /// Scalar: param_name → DomainExpression value
-    pub scalar_params: HashMap<String, crate::pipeline::asts::unresolved::DomainExpression>,
+    /// THE SCALAR FORMALS. A bare name in this set is a PARAMETER of the
+    /// definition: the normalizer leaves it standing as a reference (a slot
+    /// written with it CONSTRAINS the position rather than binding a fresh
+    /// column), and the body's formal frame — the caller-resolved actuals —
+    /// answers it at resolution. No caller syntax is substituted.
+    pub scalar_formals: std::collections::HashSet<String>,
+    /// The scalar formals whose actual is a LITERAL, by value: the one
+    /// position that needs a value before resolution — a row bound
+    /// (`#< n`) — reads it here, because a literal's encoding is its value.
+    pub scalar_literals: HashMap<String, crate::pipeline::asts::core::LiteralValue>,
     /// Pending arity checks for argumentative params that received table references.
     /// (param_name, table_name, expected_column_count, column_names)
     pub argumentative_table_refs: Vec<(String, delightql_types::SqlIdentifier, usize, Vec<String>)>,
@@ -39,13 +45,14 @@ pub struct HoParamBindings {
     /// body. A by-name binding needs no map: the body writes the
     /// caller pattern itself, and that pattern IS the binding.
     pub argumentative_patterns: HashMap<String, Vec<String>>,
-    /// Interior CTEs: table arguments with interior conditions (filters, pipes, etc.)
-    /// that need to be materialized as CTEs before the view body is expanded.
-    /// The formal parameter is diagnostic vocabulary; `scope` is the binding.
+    /// The relation actuals, each ADMITTED as a closed relation value, to be
+    /// bound as carriers before the view body is expanded, with the part of
+    /// the call each is bound as. The landing a formal is addressed by is
+    /// written into `table_scope_params` by the bind, never ahead of it.
     pub interior_ctes: Vec<(
         String,
-        crate::names::ScopeId,
-        crate::pipeline::asts::unresolved::Chain,
+        crate::relation::form::HoPart,
+        crate::defuse::ClosedRelationActual,
     )>,
 }
 
@@ -84,25 +91,22 @@ impl HoParamBindings {
             };
             crate::pipeline::asts::unresolved::Chain::read(
                 crate::pipeline::asts::unresolved::Relation::Ground {
-                    mention: crate::pipeline::asts::unresolved::GroundMention::Plan {
-                        scope: *scope,
+                    mention: crate::pipeline::asts::unresolved::GroundMention::Structural {
+                        pending: *scope,
                         authored_name: Some(formal.into()),
                         alias,
                     },
                     outer,
-                    cpr_schema: (),
                 },
                 access,
-                (),
             )
         })
     }
 }
 
-/// Context for collecting assertions, dangers, options, and DDL blocks
+/// Context for collecting dangers, options, and DDL blocks
 /// during building.
 pub struct FeatureCollector {
-    assertions: Vec<crate::pipeline::asts::core::AssertionSpec>,
     dangers: Vec<crate::pipeline::asts::core::DangerSpec>,
     options: Vec<crate::pipeline::asts::core::OptionSpec>,
     ddl_blocks: Vec<crate::pipeline::asts::core::InlineDdlSpec>,
@@ -116,7 +120,6 @@ pub struct FeatureCollector {
 impl std::fmt::Debug for FeatureCollector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FeatureCollector")
-            .field("assertions", &self.assertions)
             .field("dangers", &self.dangers)
             .field("options", &self.options)
             .field("ddl_blocks", &self.ddl_blocks)
@@ -138,7 +141,6 @@ impl Default for FeatureCollector {
 impl FeatureCollector {
     pub fn new() -> Self {
         Self {
-            assertions: Vec::new(),
             dangers: Vec::new(),
             options: Vec::new(),
             ddl_blocks: Vec::new(),
@@ -153,16 +155,6 @@ impl FeatureCollector {
         fc.ho_bindings = parent.ho_bindings.clone();
         fc.allow_unbound_limit_identifiers = parent.allow_unbound_limit_identifiers;
         fc
-    }
-
-    /// Add a data assertion collected during continuation processing
-    pub fn add_assertion(&mut self, spec: crate::pipeline::asts::core::AssertionSpec) {
-        self.assertions.push(spec);
-    }
-
-    /// Take collected assertions (leaves the internal vec empty)
-    pub fn take_assertions(&mut self) -> Vec<crate::pipeline::asts::core::AssertionSpec> {
-        std::mem::take(&mut self.assertions)
     }
 
     /// Add a danger spec collected during continuation processing

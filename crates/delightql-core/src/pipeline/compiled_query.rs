@@ -3,12 +3,12 @@
 //! Compiled query output types.
 //!
 //! A `CompiledQuery` bundles everything the core pipeline produces after
-//! compilation: the primary SQL, assertion SQL, and emit streams. The host
+//! compilation: the primary SQL and compiler obligations. The host
 //! (CLI, TUI, library) receives this and decides how to execute each piece.
 //!
 //! `CompiledPlan` is the generalization (effect algebra): an ORDERED list
 //! of entries the pump plays start to finish — plain statements,
-//! statements whose result sets ship to the client, assertion checks,
+//! statements whose result sets ship to the client, compiler checks,
 //! emit streams, and the transaction bracket. A plain query is the
 //! degenerate plan (see `From<CompiledQuery> for CompiledPlan`); the
 //! effect transformer produces multi-entry plans.
@@ -26,19 +26,6 @@ pub enum SqlKind {
 ///
 /// The host receives this and decides how to execute each piece:
 /// - Primary SQL goes to the main result display (stdout, table pane, etc.)
-/// - Assertion SQL is evaluated for boolean verdicts
-/// One compiled assertion.
-///
-/// A struct rather than a tuple: the author's NAME is the third thing an
-/// assertion carries, and a positional pair is what let it be dropped
-/// silently for as long as the spelling has existed.
-#[derive(Debug, Clone)]
-pub struct CompiledAssertion {
-    /// The boolean SQL evaluated for the verdict.
-    pub sql: String,
-    /// The author's name from `(~~assert:"…" ~~)`, when given.
-    pub name: Option<String>,
-}
 
 /// A read the primary statement may not run without, and what its failure
 /// means.
@@ -57,14 +44,14 @@ pub struct CompiledObligation {
 pub struct CompiledQuery {
     /// The primary SQL query.
     pub primary_sql: String,
-    /// Whether this is a query or DML statement.
-    pub _kind: SqlKind,
-    /// The compiled assertions, in written order.
-    pub assertion_sqls: Vec<CompiledAssertion>,
+    /// Whether this is a query or a DML statement. Read where a caller must
+    /// know that what it is about to run cannot write — a consulted file's
+    /// read-only goal is the one such caller today.
+    pub kind: SqlKind,
     /// What the primary statement may not run without.
     pub obligations: Vec<CompiledObligation>,
-    /// Statements that run, in order, before the assertions, the
-    /// obligations and the primary statement. A mutation stages the
+    /// Statements that run, in order, before the obligations and the
+    /// primary statement. A mutation stages the
     /// relation it reads here, so its check and its write see the same
     /// rows.
     ///
@@ -92,8 +79,7 @@ pub struct CompiledQuery {
 /// comment used only by `CompiledPlan::render_sql` — the planner writes
 /// the arm/step annotations there, in the TORTURE-TEST-NORMAL.sql
 /// banner style.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by the pump/effect transformer; exercised by this file's tests
+#[derive(Debug, Clone)] // consumed by the pump/effect transformer; exercised by this file's tests
 pub struct PlanStatement {
     /// The SQL text, exactly as the generator spelled it.
     pub sql: String,
@@ -103,12 +89,13 @@ pub struct PlanStatement {
     pub connection_id: Option<i64>,
     /// Optional annotation printed as a `-- ` banner above the statement
     /// by `render_sql`. Never affects execution.
+    #[allow(dead_code)]
     pub comment: Option<String>,
 }
-
-#[allow(dead_code)] // see dead_code note on PlanStatement
+// see dead_code note on PlanStatement
 impl PlanStatement {
     /// A bare statement: SQL only, default connection, no banner.
+    #[allow(dead_code)]
     pub fn bare(sql: impl Into<String>) -> Self {
         PlanStatement {
             sql: sql.into(),
@@ -128,8 +115,7 @@ impl PlanStatement {
 /// - `ShippedStatement` — execute AND forward the result set to the client
 ///   (`stdout!`, the final value). The marker is what lets the pump know a
 ///   result must ship without inspecting SQL text.
-/// - `Assertion` — execute, read the first value as a boolean verdict,
-///   abort the run on failure.
+/// - `Check` — execute a compiler obligation and refuse on a false verdict.
 /// - `BeginTransaction` / `CommitTransaction` — the bracket, as ordinary
 ///   list positions so the planner can EXPRESS placement invariants:
 ///   scratch shells go BEFORE `BeginTransaction`, and "no transaction
@@ -138,27 +124,27 @@ impl PlanStatement {
 ///
 /// Rendering of every variant is pinned by the `render_*` tests in this
 /// file's test module.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // see dead_code note on PlanStatement
+#[derive(Debug, Clone)] // see dead_code note on PlanStatement
 pub enum PlanEntry {
     /// Execute; result discarded.
     Statement(PlanStatement),
     /// Execute; result set ships to the client.
     ShippedStatement(PlanStatement),
     /// Execute; first value is a pass/fail verdict; failure aborts the run.
-    Assertion {
+    Check {
         statement: PlanStatement,
-        /// The author's name for the check, when given.
-        name: Option<String>,
+        refusal: Option<Refusal>,
     },
     /// Open the transaction bracket on the routed connection.
     BeginTransaction {
         connection_id: Option<i64>,
+        #[allow(dead_code)]
         comment: Option<String>,
     },
     /// Close the transaction bracket on the routed connection.
     CommitTransaction {
         connection_id: Option<i64>,
+        #[allow(dead_code)]
         comment: Option<String>,
     },
 }
@@ -213,20 +199,37 @@ pub struct Refusal {
     pub message: String,
 }
 
+/// Why a reached abort exists. The provenance is typed so an authored abort
+/// cannot accidentally report an assertion verdict, and an assertion cannot
+/// acquire an arbitrary authored error identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortProvenance {
+    Authored { identity: String, label: String },
+    Assertion { label: String },
+}
+
+/// A reached terminal is one exhaustive value. Exit has no probe by type;
+/// abort owns its mandatory probe and provenance by type.
+#[derive(Debug, Clone)]
+pub enum TerminalAction {
+    /// Graceful early completion: later effects do not run and the bracket
+    /// commits.
+    Exit { statements: Vec<PlanStatement> },
+    /// Erroneous termination: later effects do not run and the bracket rolls
+    /// back after the mandatory probe establishes a nonempty input.
+    Abort {
+        statements: Vec<PlanStatement>,
+        probe: PlanStatement,
+        provenance: AbortProvenance,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum EffectAction {
-    /// A statement-level ASSERTION (annotated
-    /// statements ride the typed program — the same semantic policy as
-    /// unannotated ones). Runs FIRST, read-only, aborts the run on a
-    /// false verdict; never inside the bracket.
-    Assertion {
+    /// A compiler-written obligation. It is not an authored effect and does
+    /// not report an assertion verdict.
+    Check {
         statement: PlanStatement,
-        name: Option<String>,
-        /// What a false verdict MEANS, when the compiler wrote the check
-        /// rather than the program. A user's `~~assert~~` failing is an
-        /// assertion failure and says so; a check the compiler attached to
-        /// a statement failing is that statement being refused, and it has
-        /// to be able to say which refusal it is.
         refusal: Option<Refusal>,
     },
     /// Materialize what a later step reads. Runs before the checks and the
@@ -236,8 +239,9 @@ pub enum EffectAction {
     Dml(Vec<PlanStatement>),
     /// DDL occurrence: replace/holder drops + CREATE + receipt.
     Ddl(Vec<PlanStatement>),
-    /// exit!: the latch insert (plus any machinery lowered en route).
-    Exit(Vec<PlanStatement>),
+    /// A typed terminal. `exit!` owns its ordinary latch statements; an
+    /// `abort!` owns any staging statements plus the final nonempty probe.
+    Terminal(TerminalAction),
     /// Rule-boundary machinery (clause receipt sinks).
     RuleBoundary(Vec<PlanStatement>),
     /// Host-visible output (stdout!): machinery, then the SHIP.
@@ -268,7 +272,7 @@ pub enum EffectAction {
 /// enum travelling beside the stream would be free to disagree with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectStepKind {
-    Assertion,
+    Check,
     /// Materialize what a later step reads, so that step and the ones
     /// checking it consume one relation rather than two evaluations of one
     /// definition.
@@ -276,6 +280,7 @@ pub enum EffectStepKind {
     Dml,
     Ddl,
     Exit,
+    Abort,
     Host,
     Return,
     RuleBoundary,
@@ -288,11 +293,14 @@ pub enum EffectStepKind {
 impl EffectAction {
     pub fn kind(&self) -> EffectStepKind {
         match self {
-            EffectAction::Assertion { .. } => EffectStepKind::Assertion,
+            EffectAction::Check { .. } => EffectStepKind::Check,
             EffectAction::Stage(_) => EffectStepKind::Stage,
             EffectAction::Dml(_) => EffectStepKind::Dml,
             EffectAction::Ddl(_) => EffectStepKind::Ddl,
-            EffectAction::Exit(_) => EffectStepKind::Exit,
+            EffectAction::Terminal(terminal) => match terminal {
+                TerminalAction::Exit { .. } => EffectStepKind::Exit,
+                TerminalAction::Abort { .. } => EffectStepKind::Abort,
+            },
             EffectAction::RuleBoundary(_) => EffectStepKind::RuleBoundary,
             EffectAction::Host { .. } => EffectStepKind::Host,
             EffectAction::Return { .. } => EffectStepKind::Return,
@@ -309,15 +317,16 @@ impl EffectAction {
             EffectAction::Stage(s)
             | EffectAction::Dml(s)
             | EffectAction::Ddl(s)
-            | EffectAction::Exit(s)
             | EffectAction::RuleBoundary(s)
             | EffectAction::Setup(s)
             | EffectAction::Cleanup(s) => s,
+            EffectAction::Terminal(TerminalAction::Exit { statements })
+            | EffectAction::Terminal(TerminalAction::Abort { statements, .. }) => statements,
             EffectAction::Host { statements, .. } | EffectAction::Return { statements, .. } => {
                 statements
             }
             EffectAction::Begin { .. } | EffectAction::Commit { .. } => &[],
-            EffectAction::Assertion { statement, .. } => std::slice::from_ref(statement),
+            EffectAction::Check { statement, .. } => std::slice::from_ref(statement),
         }
     }
 
@@ -342,11 +351,6 @@ pub struct EffectStep {
     /// The directive's name as written (`insert!`) — STORED, never parsed
     /// out of the occurrence string.
     pub operation: String,
-    /// Source span provenance (byte start, end). OWED: ratified with
-    /// occurrence identity; populated once directive AST nodes
-    /// carry spans through the builder — the field keeps the debt
-    /// visible instead of silently dropped.
-    pub span: Option<(usize, usize)>,
     /// The step's connection route (`None` = the session default).
     pub route: Option<i64>,
     /// The guard edges this step samples when reached. Empty = always.
@@ -361,11 +365,12 @@ impl EffectStepKind {
     /// step_kind ∈ effect|return|control, action_kind ∈ dml|ddl|sql|host.
     pub fn projection_kinds(self) -> (&'static str, &'static str) {
         match self {
-            EffectStepKind::Assertion => ("control", "sql"),
+            EffectStepKind::Check => ("control", "sql"),
             EffectStepKind::Stage => ("control", "sql"),
             EffectStepKind::Dml => ("effect", "dml"),
             EffectStepKind::Ddl => ("effect", "ddl"),
             EffectStepKind::Exit => ("effect", "sql"),
+            EffectStepKind::Abort => ("effect", "sql"),
             EffectStepKind::Host => ("effect", "host"),
             EffectStepKind::Return => ("return", "sql"),
             EffectStepKind::RuleBoundary
@@ -434,14 +439,27 @@ impl TypedEffectPlan {
                         comment: None,
                     });
                 }
-                EffectAction::Assertion {
-                    statement, name, ..
-                } => {
-                    out.push(PlanEntry::Assertion {
+                EffectAction::Check { statement, refusal } => {
+                    out.push(PlanEntry::Check {
                         statement: statement.clone(),
-                        name: name.clone(),
+                        refusal: refusal.clone(),
                     });
                 }
+                EffectAction::Terminal(terminal) => match terminal {
+                    TerminalAction::Exit { statements } => {
+                        for st in statements {
+                            out.push(PlanEntry::Statement(st.clone()));
+                        }
+                    }
+                    TerminalAction::Abort {
+                        statements, probe, ..
+                    } => {
+                        for st in statements {
+                            out.push(PlanEntry::Statement(st.clone()));
+                        }
+                        out.push(PlanEntry::Statement(probe.clone()));
+                    }
+                },
                 action => {
                     for st in action.statements() {
                         out.push(PlanEntry::Statement(st.clone()));
@@ -462,8 +480,7 @@ impl TypedEffectPlan {
 ///
 /// A plain query is the degenerate plan — see `From<CompiledQuery>`
 /// (order pinned by `degenerate_entry_order_mirrors_relay`).
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // see dead_code note on PlanStatement
+#[derive(Debug, Clone)] // see dead_code note on PlanStatement
 pub struct CompiledPlan {
     /// The ordered entries. The pump executes them first to last.
     pub entries: Vec<PlanEntry>,
@@ -498,53 +515,36 @@ pub struct PlanCreatedObject {
     /// The connection the object was created on (`None` = session default).
     pub connection_id: Option<i64>,
 }
-
-#[allow(dead_code)] // see dead_code note on PlanStatement
+// see dead_code note on PlanStatement
 impl From<CompiledQuery> for CompiledPlan {
     /// The degenerate plan of a plain query.
     ///
     /// Entry order mirrors the relay's hardcoded sequence in
-    /// `handle_query` (relay/mod.rs): assertions first (abort on failure),
-    /// then emit streams, then the primary statement, whose results ship.
+    /// `handle_query` (relay/mod.rs): source staging, compiler obligations,
+    /// then the primary statement, whose results ship.
     /// Every entry inherits the query's `connection_id` — per-statement
     /// routing generalizes what the relay already consumes. Pinned by
     /// `degenerate_entry_order_mirrors_relay` and
     /// `degenerate_plain_query_is_one_shipped_entry`.
     fn from(q: CompiledQuery) -> Self {
-        let mut entries = Vec::with_capacity(q.assertion_sqls.len() + q.obligations.len() + 1);
-        for assertion in q.assertion_sqls {
-            entries.push(PlanEntry::Assertion {
-                statement: PlanStatement {
-                    sql: assertion.sql,
-                    connection_id: q.connection_id,
-                    comment: None,
-                },
-                name: assertion.name,
-            });
-        }
-        // What the statement may not run without, in the same abort-on-false
-        // position the relay evaluates it in. The flat entry list has no room
-        // for the refusal's own identifier, so it arrives as an assertion
-        // failure here — a coarser answer, never a quieter one.
-        for obligation in q.obligations {
-            entries.push(PlanEntry::Assertion {
-                statement: PlanStatement {
-                    sql: obligation.sql,
-                    connection_id: q.connection_id,
-                    comment: Some(obligation.refusal.identity),
-                },
-                name: None,
-            });
-        }
-        // The authored preconditions come first; only then is the source
-        // evaluated. A false one must not have run a volatile source or left
-        // compiler state behind.
+        let mut entries = Vec::with_capacity(q.obligations.len() + 1);
+        // Stage once before evaluating compiler obligations over that stage.
         for sql in q.prepare_sqls {
             entries.push(PlanEntry::Statement(PlanStatement {
                 sql,
                 connection_id: q.connection_id,
                 comment: Some("stage the source".to_string()),
             }));
+        }
+        for obligation in q.obligations {
+            entries.push(PlanEntry::Check {
+                statement: PlanStatement {
+                    sql: obligation.sql,
+                    connection_id: q.connection_id,
+                    comment: Some(obligation.refusal.identity.clone()),
+                },
+                refusal: Some(obligation.refusal),
+            });
         }
         entries.push(PlanEntry::ShippedStatement(PlanStatement {
             sql: q.primary_sql,
@@ -568,8 +568,7 @@ impl From<CompiledQuery> for CompiledPlan {
         }
     }
 }
-
-#[allow(dead_code)] // see dead_code note on PlanStatement
+// see dead_code note on PlanStatement
 impl CompiledPlan {
     /// Render the plan as a readable, commented, `;`-terminated statement
     /// list — the TORTURE-TEST-NORMAL.sql format (that file IS the target
@@ -591,21 +590,20 @@ impl CompiledPlan {
     /// renderer — its output stays byte-identical to the generator's
     /// (no `;`, no banners). This renderer takes over only when a compiler
     /// path produces multi-entry plans.
+    #[allow(dead_code)]
     pub fn render_sql(&self) -> String {
         let blocks: Vec<String> = self.entries.iter().map(render_entry).collect();
         blocks.join("\n\n")
     }
 }
 
-/// Render one entry as its banner (if any) plus its `;`-terminated SQL.
-#[allow(dead_code)] // see dead_code note on PlanStatement
+/// Render one entry as its banner (if any) plus its `;`-terminated SQL. // see dead_code note on PlanStatement
+#[allow(dead_code)]
 fn render_entry(entry: &PlanEntry) -> String {
     match entry {
         PlanEntry::Statement(st) => render_statement(&[], st),
         PlanEntry::ShippedStatement(st) => render_statement(&["[ship]".to_string()], st),
-        PlanEntry::Assertion { statement, .. } => {
-            render_statement(&["[assert]".to_string()], statement)
-        }
+        PlanEntry::Check { statement, .. } => render_statement(&["[check]".to_string()], statement),
         PlanEntry::BeginTransaction {
             connection_id,
             comment,
@@ -616,8 +614,8 @@ fn render_entry(entry: &PlanEntry) -> String {
         } => render_bracket("COMMIT", *connection_id, comment.as_deref()),
     }
 }
-
-#[allow(dead_code)] // see dead_code note on PlanStatement
+// see dead_code note on PlanStatement
+#[allow(dead_code)]
 fn render_bracket(keyword: &str, connection_id: Option<i64>, comment: Option<&str>) -> String {
     let st = PlanStatement {
         sql: keyword.to_string(),
@@ -626,8 +624,8 @@ fn render_bracket(keyword: &str, connection_id: Option<i64>, comment: Option<&st
     };
     render_statement(&[], &st)
 }
-
-#[allow(dead_code)] // see dead_code note on PlanStatement
+// see dead_code note on PlanStatement
+#[allow(dead_code)]
 fn render_statement(tags: &[String], st: &PlanStatement) -> String {
     let mut all_tags: Vec<String> = tags.to_vec();
     if let Some(cid) = st.connection_id {
@@ -671,8 +669,7 @@ mod tests {
     fn plain_query(primary: &str, connection_id: Option<i64>) -> CompiledQuery {
         CompiledQuery {
             primary_sql: primary.to_string(),
-            _kind: SqlKind::Query,
-            assertion_sqls: vec![],
+            kind: SqlKind::Query,
             obligations: vec![],
             prepare_sqls: vec![],
             cleanup_sqls: vec![],
@@ -701,44 +698,40 @@ mod tests {
 
     #[test]
     fn degenerate_entry_order_mirrors_relay() {
-        // Relay handle_query order: assertions, then primary.
+        // Relay handle_query order: compiler obligations, then primary.
         let q = CompiledQuery {
             primary_sql: "SELECT * FROM t".to_string(),
-            _kind: SqlKind::Query,
-            obligations: vec![],
+            kind: SqlKind::Query,
+            obligations: vec![CompiledObligation {
+                sql: "SELECT count(*) > 0 FROM t".to_string(),
+                refusal: Refusal {
+                    identity: "runtime/precondition".to_string(),
+                    message: "rows required".to_string(),
+                },
+            }],
             prepare_sqls: vec![],
             cleanup_sqls: vec![],
-            assertion_sqls: vec![
-                CompiledAssertion {
-                    sql: "SELECT count(*) > 0 FROM t".to_string(),
-                    name: Some("rows exist".to_string()),
-                },
-                CompiledAssertion {
-                    sql: "SELECT 1".to_string(),
-                    name: None,
-                },
-            ],
             connection_id: Some(7),
         };
         let plan: CompiledPlan = q.into();
-        assert_eq!(plan.entries.len(), 3);
+        assert_eq!(plan.entries.len(), 2);
         match &plan.entries[0] {
-            PlanEntry::Assertion { statement, name } => {
-                // The author's name rides all the way to the plan; it is
-                // what a failure will name instead of an ordinal.
-                assert_eq!(name.as_deref(), Some("rows exist"));
+            PlanEntry::Check { statement, refusal } => {
                 assert_eq!(statement.sql, "SELECT count(*) > 0 FROM t");
                 assert_eq!(statement.connection_id, Some(7));
+                assert_eq!(
+                    refusal.as_ref().map(|refusal| refusal.identity.as_str()),
+                    Some("runtime/precondition")
+                );
             }
-            other => panic!("entry 0: expected Assertion, got {:?}", other),
+            other => panic!("entry 0: expected Check, got {:?}", other),
         }
-        assert!(matches!(&plan.entries[1], PlanEntry::Assertion { .. }));
-        match &plan.entries[2] {
+        match &plan.entries[1] {
             PlanEntry::ShippedStatement(st) => {
                 assert_eq!(st.sql, "SELECT * FROM t");
                 assert_eq!(st.connection_id, Some(7));
             }
-            other => panic!("entry 2: expected ShippedStatement, got {:?}", other),
+            other => panic!("entry 1: expected ShippedStatement, got {:?}", other),
         }
     }
 
@@ -860,12 +853,12 @@ COMMIT;";
     }
 
     #[test]
-    fn render_tags_assert_and_connection() {
+    fn render_tags_check_and_connection() {
         let plan = CompiledPlan {
             entries: vec![
-                PlanEntry::Assertion {
+                PlanEntry::Check {
                     statement: PlanStatement::bare("SELECT count(*) = 3 FROM t"),
-                    name: None,
+                    refusal: None,
                 },
                 PlanEntry::ShippedStatement(PlanStatement {
                     sql: "SELECT * FROM t".to_string(),
@@ -878,7 +871,7 @@ COMMIT;";
             typed: None,
         };
         let expected = "\
--- [assert]
+-- [check]
 SELECT count(*) = 3 FROM t;
 
 -- [ship] [conn 4]

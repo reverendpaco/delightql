@@ -317,6 +317,18 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             source_path: None,
             writable: false,
         },
+        // The session's own diagnostics: every refusal the compiler raised
+        // and every selftest finding, as rows (sys::diagnostics.finding).
+        NamespaceSpec {
+            id: 19,
+            name: "diagnostics".into(),
+            pid: Some(2),
+            fq_name: "sys::diagnostics".into(),
+            kind: "system".into(),
+            provenance: Some("bootstrap".into()),
+            source_path: None,
+            writable: false,
+        },
     ];
 
     create_namespace_hierarchy(conn, &specs)

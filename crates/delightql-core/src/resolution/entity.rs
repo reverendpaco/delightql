@@ -5,14 +5,13 @@
 //! These types represent what things exist in DelightQL's world.
 //! They are NOT AST nodes, but domain concepts that the AST references.
 
-use crate::names::ScopeId;
 use crate::pipeline::ast_resolved::NamespacePath;
 use delightql_types::SqlIdentifier;
 
 /// Information about an entity discovered by the resolver
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct EntityInfo {
+    #[allow(dead_code)]
     pub name: SqlIdentifier,
     /// Canonical entity name from bootstrap (what the DB stores).
     /// None for CTEs, built-ins, and entities where bootstrap doesn't provide a canonical name.
@@ -20,12 +19,16 @@ pub struct EntityInfo {
     /// The namespace where this entity was found during resolution.
     /// For enlisted tables resolved as unqualified names, this carries the
     /// discovered namespace so the transformer can emit schema-qualified SQL.
+    #[allow(dead_code)]
     pub resolved_namespace: Option<NamespacePath>,
     /// Physical backend schema name for SQL generation (e.g., "_c" for logical namespace "c").
     /// Populated by the registry from namespace resolution.
     pub backend_schema: Option<String>,
+    #[allow(dead_code)]
     pub entity_type: ResolvedEntityKind,
+    #[allow(dead_code)]
     pub registry_source: RegistrySource,
+    #[allow(dead_code)]
     pub schema_source: SchemaSource,
     pub definition: EntityDefinition,
 }
@@ -61,5 +64,5 @@ pub enum SchemaSource {
 #[derive(Debug, Clone)]
 pub enum EntityDefinition {
     /// For relations (tables, CTEs, etc.)
-    RelationSchema(ScopeId),
+    RelationSchema(crate::relation::SemanticRelation),
 }

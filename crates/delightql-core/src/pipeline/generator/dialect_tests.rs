@@ -5,10 +5,7 @@
 //! row falls back to the canonical (SQLite) code default.
 
 use super::{SqlDialect, SqlGenerator};
-use crate::names::{
-    baptise, Addressing, Baptised, Bundle, ColId, ColumnOrigin, Hint, Registry, ScopeId,
-    ScopeOrigin, Statement, ValueFacts,
-};
+use crate::names::{baptise, Addressing, Baptised, Bundle, ColId, Registry, ScopeId, Statement};
 use crate::pipeline::ast_refined::LiteralValue;
 use crate::pipeline::dialect_pack::DialectPack;
 use crate::pipeline::sql_ast::{BinaryOperator, DomainExpression};
@@ -37,33 +34,24 @@ impl TestGenerator {
         bin_registry: Option<Arc<crate::bin_cartridge::registry::BinCartridgeRegistry>>,
     ) -> Self {
         let registry = Box::leak(Box::new(Registry::new(&[])));
-        let at = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::Prefix("expr"), None);
+        let at = registry.carrier_scope("expr");
         let mut columns = HashMap::new();
         let mut heading = Vec::new();
-        for (position, name) in TEST_COLUMNS.iter().copied().enumerate() {
+        for (_position, name) in TEST_COLUMNS.iter().copied().enumerate() {
             let spelling = registry.intern(name, false);
-            let column = registry.mint_column(
-                at,
-                ColumnOrigin::Bound {
-                    position: position as u32,
-                },
-                Some(spelling),
-                Addressing::Published,
-                ValueFacts::default(),
-            );
+            let column = registry.sql_column(at, Some(spelling), Addressing::Published);
             columns.insert(name, column);
             heading.push(column);
         }
         let names = Box::leak(Box::new(
             baptise(
                 registry,
-                &Bundle {
-                    statements: vec![Statement {
-                        scopes: vec![at],
-                        headings: vec![heading.clone()],
-                        refs: heading,
-                    }],
-                },
+                &Bundle::gather(vec![Statement {
+                    scopes: vec![at],
+                    headings: vec![heading.clone()],
+                    refs: heading,
+                }])
+                .reserve_authored(registry),
             )
             .unwrap(),
         ));
@@ -441,15 +429,73 @@ fn synced_generator(dialect: SqlDialect) -> TestGenerator {
     // init creates via the namespace bootstrap — replicate that here.
     crate::import::create_bootstrap_namespaces(&conn).unwrap();
     let mut registry = crate::bin_cartridge::registry::BinCartridgeRegistry::new();
+    registry.register_cartridge(crate::bin_cartridge::prelude::create_prelude_cartridge());
     registry.register_cartridge(crate::bin_cartridge::predicates::create_predicates_cartridge());
     crate::bootstrap::sync_bin_cartridges_to_bootstrap(&conn, &registry).unwrap();
     let pack = DialectPack::load(&conn).unwrap();
     TestGenerator::with_pack(dialect, Arc::new(pack), Some(Arc::new(registry)))
 }
 
+fn sql_comparison(generator: &TestGenerator, name: &str, namespace: &[&str]) -> DomainExpression {
+    DomainExpression::PredicateRewrite {
+        name: name.to_string(),
+        namespace: namespace.iter().map(|part| part.to_string()).collect(),
+        args: vec![
+            generator.column("age"),
+            DomainExpression::literal(LiteralValue::Number("1".into())),
+        ],
+        negated: false,
+    }
+}
+
+/// `sql_eq` / `sql_ne` render as the target's ORDINARY comparison — never a
+/// null-safe spelling — through the dialect's own operator row, and the
+/// generator looks the entity up by the identity the resolver selected.
+#[test]
+fn sql_comparison_predicates_render_the_targets_ordinary_operator() {
+    for (dialect, ne) in [
+        (SqlDialect::SQLite, "!="),
+        (SqlDialect::PostgreSQL, "!="),
+        (SqlDialect::DuckDB, "!="),
+        (SqlDialect::MySQL, "<>"),
+        (SqlDialect::SqlServer, "<>"),
+    ] {
+        let generator = synced_generator(dialect);
+        assert_eq!(
+            generator
+                .render_expression(&sql_comparison(&generator, "sql_eq", &[]))
+                .unwrap(),
+            "age = 1",
+            "{dialect:?}"
+        );
+        assert_eq!(
+            generator
+                .render_expression(&sql_comparison(&generator, "sql_ne", &[]))
+                .unwrap(),
+            format!("age {ne} 1"),
+            "{dialect:?}"
+        );
+    }
+    // The qualified identity is looked up EXACTLY: the prelude namespace
+    // answers, and a namespace that never held the entity refuses rather
+    // than falling back to a bare-name search.
+    let sqlite = synced_generator(SqlDialect::SQLite);
+    assert_eq!(
+        sqlite
+            .render_expression(&sql_comparison(&sqlite, "sql_eq", &["std", "prelude"]))
+            .unwrap(),
+        "age = 1"
+    );
+    let refused = sqlite
+        .render_expression(&sql_comparison(&sqlite, "sql_eq", &["std", "predicates"]))
+        .unwrap_err();
+    assert!(format!("{refused:?}").contains("Unknown predicate rewrite: 'sql_eq'"));
+}
+
 fn like_predicate(generator: &TestGenerator, negated: bool) -> DomainExpression {
     DomainExpression::PredicateRewrite {
         name: "like".to_string(),
+        namespace: Vec::new(),
         args: vec![
             generator.column("email"),
             DomainExpression::literal(LiteralValue::String("%@GMAIL.com".into())),
@@ -500,6 +546,7 @@ fn sigma_form_rule_fires_per_dialect() {
         let generator = synced_generator(dialect);
         let between = DomainExpression::PredicateRewrite {
             name: "between".to_string(),
+            namespace: Vec::new(),
             args: vec![
                 generator.column("age"),
                 DomainExpression::literal(LiteralValue::Number("18".into())),
@@ -520,11 +567,13 @@ fn canonical_sigma_propagates_a_nested_rendering_error() {
     let generator = synced_generator(SqlDialect::SQLite);
     let nested = DomainExpression::PredicateRewrite {
         name: "missing_nested_predicate".to_string(),
+        namespace: Vec::new(),
         args: Vec::new(),
         negated: false,
     };
     let outer = DomainExpression::PredicateRewrite {
         name: "between".to_string(),
+        namespace: Vec::new(),
         args: vec![
             nested,
             DomainExpression::literal(LiteralValue::Number("1".into())),
@@ -600,18 +649,11 @@ fn tvf_join_case(
     use crate::pipeline::sql_ast::*;
     let registry = Box::leak(Box::new(Registry::new(&[])));
     let source_name = registry.intern("t_1", false);
-    let source_scope =
-        registry.mint_scope(ScopeOrigin::AnonRelation, Hint::User(source_name), None);
+    let source_scope = registry.anonymous_scope(Some(source_name));
     let column_name = registry.intern("j", false);
-    let source_column = registry.mint_column(
-        source_scope,
-        ColumnOrigin::Bound { position: 0 },
-        Some(column_name),
-        Addressing::Published,
-        ValueFacts::default(),
-    );
+    let source_column = registry.sql_column(source_scope, Some(column_name), Addressing::Published);
     let tvf_name = registry.intern("_narrow_2", false);
-    let tvf_scope = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::User(tvf_name), None);
+    let tvf_scope = registry.anonymous_scope(Some(tvf_name));
     let function = match function_name.into() {
         FunctionName::User(name) => {
             let spelling = registry.intern(&name, false);
@@ -619,26 +661,16 @@ fn tvf_join_case(
         }
         FunctionName::Intrinsic(intrinsic) => registry.mint_intrinsic(intrinsic),
     };
-    let result_scope = registry.mint_scope(
-        ScopeOrigin::Join {
-            left: source_scope,
-            right: tvf_scope,
-        },
-        Hint::None,
-        None,
-    );
+    let result_scope = registry.join_scope();
 
-    let source = crate::pipeline::transformer::builder::publish_at(
-        source_scope,
-        [source_column],
-        SelectStatement::builder().select(SelectItem::expression_with_alias(
-            DomainExpression::literal(crate::pipeline::asts::core::literals::LiteralValue::Number(
-                "1".into(),
-            )),
-            source_column,
+    let source = (SelectStatement::builder().select(SelectItem::expression_with_alias(
+        DomainExpression::literal(crate::pipeline::asts::core::literals::LiteralValue::Number(
+            "1".into(),
         )),
-        registry,
-    )
+        source_column,
+    )))
+    .standing_at(source_scope)
+    .map_err(crate::error::DelightQLError::parse_error)
     .unwrap();
     let tvf = TableExpression::TVF {
         function,
@@ -656,26 +688,22 @@ fn tvf_join_case(
             crate::pipeline::asts::core::literals::LiteralValue::Boolean(true),
         )),
     };
-    let select = crate::pipeline::transformer::builder::publish_at(
-        result_scope,
-        [],
-        SelectStatement::builder()
-            .select(SelectItem::star_over_nothing())
-            .from_tables(vec![joined]),
-        registry,
-    )
+    let select = (SelectStatement::builder()
+        .select(SelectItem::star_over_nothing())
+        .from_tables(vec![joined]))
+    .standing_at(result_scope)
+    .map_err(crate::error::DelightQLError::parse_error)
     .unwrap();
     let statement = SqlStatement::with_ctes(None, QueryExpression::Select(Box::new(select)));
     let names = Box::leak(Box::new(
         baptise(
             registry,
-            &Bundle {
-                statements: vec![Statement {
-                    scopes: vec![source_scope, tvf_scope, result_scope],
-                    headings: vec![vec![source_column]],
-                    refs: vec![source_column],
-                }],
-            },
+            &Bundle::gather(vec![Statement {
+                scopes: vec![source_scope, tvf_scope, result_scope],
+                headings: vec![vec![source_column]],
+                refs: vec![source_column],
+            }])
+            .reserve_authored(registry),
         )
         .unwrap(),
     ));
@@ -1093,4 +1121,132 @@ fn contract_n5_unknown_rust_handler_is_loud() {
         format!("{err:?}").contains("no_such_handler"),
         "unknown rust_handler must name the missing handler, got: {err:?}"
     );
+}
+
+/// Build a statement whose single CTE must be evaluated once, and the same
+/// statement without that requirement, for `dialect`.
+///
+/// The requirement is what a closed configured rule value produces: one
+/// carrier holding an evaluation every spend of the value must share.
+fn once_only_cte_case(
+    dialect: SqlDialect,
+) -> (
+    TestGenerator,
+    crate::pipeline::sql_ast::SqlStatement,
+    crate::pipeline::sql_ast::SqlStatement,
+) {
+    use crate::pipeline::sql_ast::*;
+    let registry = Box::leak(Box::new(Registry::new(&[])));
+    let cte_name = registry.intern("capture_1", false);
+    let cte_scope = registry.anonymous_scope(Some(cte_name));
+    let value_name = registry.intern("v", false);
+    let cte_column = registry.sql_column(cte_scope, Some(value_name), Addressing::Published);
+    let result_scope = registry.join_scope();
+
+    let body = (SelectStatement::builder().select(SelectItem::expression_with_alias(
+        DomainExpression::literal(LiteralValue::Number("1".into())),
+        cte_column,
+    )))
+    .standing_at(cte_scope)
+    .map_err(crate::error::DelightQLError::parse_error)
+    .unwrap();
+    let outer = || {
+        (SelectStatement::builder()
+            .select(SelectItem::star_over_nothing())
+            .from_tables(vec![TableExpression::Scope(cte_scope)]))
+        .standing_at(result_scope)
+        .map_err(crate::error::DelightQLError::parse_error)
+        .unwrap()
+    };
+    let ordinary = Cte::ordinary(cte_scope, QueryExpression::Select(Box::new(body.clone())));
+    let once_only = Cte::ordinary(cte_scope, QueryExpression::Select(Box::new(body)))
+        .requiring_materialization();
+    let names = Box::leak(Box::new(
+        baptise(
+            registry,
+            &Bundle::gather(vec![Statement {
+                scopes: vec![cte_scope, result_scope],
+                headings: vec![vec![cte_column]],
+                refs: vec![cte_column],
+            }])
+            .reserve_authored(registry),
+        )
+        .unwrap(),
+    ));
+    let generator = TestGenerator {
+        _registry: registry,
+        names,
+        at: result_scope,
+        columns: HashMap::from([("v", cte_column)]),
+        dialect,
+        pack: seeded_pack(),
+        bin_registry: None,
+    };
+    (
+        generator,
+        SqlStatement::with_ctes(
+            Some(vec![once_only]),
+            QueryExpression::Select(Box::new(outer())),
+        ),
+        SqlStatement::with_ctes(
+            Some(vec![ordinary]),
+            QueryExpression::Select(Box::new(outer())),
+        ),
+    )
+}
+
+/// CONTRACT N6 — THREE TARGETS CAN PROMISE ONCE-ONLY EVALUATION.
+///
+/// SQLite, PostgreSQL and DuckDB all spell the promise in the binding
+/// itself, and it is the binding — not a hint outside it — that a spend
+/// reads.
+#[test]
+fn contract_n6_once_only_cte_is_spelled_where_the_target_can_promise_it() {
+    for dialect in [
+        SqlDialect::SQLite,
+        SqlDialect::PostgreSQL,
+        SqlDialect::DuckDB,
+    ] {
+        let (generator, once_only, ordinary) = once_only_cte_case(dialect);
+        let sql = generator.generate_statement(&once_only).unwrap();
+        assert!(
+            sql.contains(" AS MATERIALIZED ("),
+            "{dialect:?} must spell the once-only requirement in the binding, got: {sql}"
+        );
+        let plain = generator.generate_statement(&ordinary).unwrap();
+        assert!(
+            !plain.contains("MATERIALIZED"),
+            "{dialect:?} must not materialize a binding that made no such \
+             requirement, got: {plain}"
+        );
+    }
+}
+
+/// CONTRACT N6 — MYSQL AND SQL SERVER REFUSE, LOUDLY AND ON PURPOSE.
+///
+/// Neither target has a spelling that forbids re-evaluating a CTE, so a
+/// plain binding there would silently re-run a volatile configuration once
+/// per spend. The refusal names the target and the guarantee it cannot
+/// make. An ordinary binding on the same targets is unaffected.
+#[test]
+fn contract_n6_once_only_cte_refuses_where_the_target_cannot_promise_it() {
+    for dialect in [SqlDialect::MySQL, SqlDialect::SqlServer] {
+        let (generator, once_only, ordinary) = once_only_cte_case(dialect);
+        let error = generator
+            .generate_statement(&once_only)
+            .expect_err("a guarantee this target cannot make must refuse");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("once-only materialization")
+                && rendered.contains(&format!("{dialect:?}")),
+            "{dialect:?} must refuse by naming itself and the guarantee, got: {rendered}"
+        );
+        let plain = generator
+            .generate_statement(&ordinary)
+            .expect("an ordinary binding is lawful on every target");
+        assert!(
+            !plain.contains("MATERIALIZED"),
+            "{dialect:?} emits an ordinary binding unchanged, got: {plain}"
+        );
+    }
 }

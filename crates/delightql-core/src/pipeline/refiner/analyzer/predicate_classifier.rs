@@ -16,7 +16,7 @@ pub(super) fn classify_predicate(
     pred: &FlatPredicate,
     flat: &FlatSegment,
     _scope_point: &ScopePoint,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<PredicateClass> {
     log::debug!(
         "classify_predicate: expr={:?}, origin={:?}",
@@ -80,7 +80,7 @@ pub(super) fn classify_predicate(
 }
 
 /// Check if two tables are in a join relationship
-fn are_in_join_relationship(
+pub(in crate::pipeline::refiner) fn are_in_join_relationship(
     left: &crate::names::ScopeId,
     right: &crate::names::ScopeId,
     flat: &FlatSegment,
@@ -98,7 +98,7 @@ pub(super) fn apply_laws(
     pred: &FlatPredicate,
     context: &laws::LawContext,
     _scope_point: &ScopePoint,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<PredicateClass> {
     match &initial_class {
         PredicateClass::FJC { left, right } => {

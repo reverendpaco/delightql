@@ -1,28 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Verdict types for assertion and error hook outcomes.
+//! Verdict types for assertion-effect and expected-error outcomes.
 //!
 //! The pipeline produces verdicts; the runner (CLI, test harness, CI)
 //! consumes them and applies a strategy (fail-early, collect-all, log-only).
 
-/// Whether the assertion or error hook passed or failed.
+/// Whether the assertion effect or error hook passed or failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerdictOutcome {
     Pass,
     Fail,
 }
 
-/// Identifies which assertion or error hook produced the verdict.
+/// Identifies which assertion effect or error hook produced the verdict.
 #[derive(Debug, Clone)]
 pub struct VerdictIdentity {
-    /// Author-supplied name (`(~~assert:"name" ... ~~)`), if any.
+    /// Author-supplied assertion label, if any.
     pub name: Option<String>,
     /// Display text for the assertion or error hook.
     pub body_text: String,
 }
 
-/// A structured verdict produced by the pipeline for each assertion
-/// or error hook it encounters.
+/// A structured verdict produced for an assertion effect or error hook.
 #[derive(Debug, Clone)]
 pub struct Verdict {
     pub outcome: VerdictOutcome,

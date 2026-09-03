@@ -39,7 +39,7 @@ use crate::pipeline::asts::refined as ast_refined;
 /// A single pipe segment: the operator applied and the schema it produces.
 pub(super) struct PipeSegment<P: crate::pipeline::asts::core::Phase> {
     pub step: PipeStep<P>,
-    pub cpr_schema: <P as crate::pipeline::asts::core::Phase>::Scope,
+    pub result: <P as crate::pipeline::asts::core::Phase>::Scope,
 }
 
 /// One step of the trailing run: an operator, or a dimension access.
@@ -58,8 +58,7 @@ use crate::pipeline::sql_ast::TableExpression;
 
 use super::anchors;
 use super::builder::{
-    wrap_origin, Alignment, Builder, NameGenerator, Projected, Publication, Qualify, ScopeName,
-    Unprojected,
+    wrap_origin, Builder, NameGenerator, Projected, Qualify, ScopeName, SqlLayout, Unprojected,
 };
 use super::scalar;
 use super::tree_group;
@@ -73,9 +72,7 @@ use crate::pipeline::asts::core::{NamedReference, Reference};
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn lower_join_type(
-    join_type: Option<ast_refined::JoinType>,
-) -> crate::pipeline::sql_ast::JoinType {
+fn lower_join_type(join_type: Option<ast_refined::JoinType>) -> crate::pipeline::sql_ast::JoinType {
     use crate::pipeline::sql_ast::JoinType as SqlJoinType;
 
     match join_type {
@@ -86,26 +83,144 @@ fn lower_join_type(
     }
 }
 
-/// The relation the outermost node of a chain publishes.
+/// The semantic result the outermost node of a chain publishes.
 #[stacksafe::stacksafe]
-pub(crate) fn extract_cpr_schema(expr: &ast_refined::Chain) -> crate::names::ScopeId {
-    use crate::pipeline::asts::core::expressions::relational::Relation;
-    use crate::pipeline::asts::core::Grelex;
-    if let Some(continuation) = expr.continuations.last() {
-        return *continuation
-            .cpr_schema()
-            // Only an ER edge carries no publication, and an edge is
-            // expanded into ordinary members by the resolver.
-            .expect("an ER edge cannot reach lowering");
+pub(crate) fn extract_relation(expr: &ast_refined::Chain) -> &crate::relation::SemanticRelation {
+    match expr.continuations().last() {
+        Some(step) => step.result(),
+        None => expr.head().result(),
     }
-    match &expr.head {
-        Grelex::Literal(anon) => anon.table.cpr_schema,
-        Grelex::Reference(rel) => match rel {
-            Relation::Ground { cpr_schema, .. }
-            | Relation::InnerRelation { cpr_schema, .. }
-            | Relation::FunctorCall { cpr_schema, .. } => *cpr_schema,
-            Relation::ConsultedView { scoped, .. } => *scoped,
-        },
+}
+
+/// The registry occurrence that relation is stored under.
+///
+/// LOWERING'S ONE ROAD from the semantic result to a physical question.
+/// It projects; it does not invert — nothing here can turn a scope back
+/// into a relation, so no lowering can mint one.
+/// One branch's physical output list, as the transformer laid it out.
+///
+/// Both halves come off the [`SetArm`] that made it, and there is no
+/// constructor: the struct is written only inside that value's two layout
+/// methods, which read the relation from themselves. Nothing anywhere
+/// takes a relation beside a column list.
+pub(crate) struct BranchLayout {
+    arm: crate::relation::SemanticRelation,
+    columns: Vec<crate::names::ColId>,
+}
+
+impl BranchLayout {
+    /// A layout stated outright, for the witnesses that must be able to
+    /// make one DISAGREE with its evidence. Production has no such road:
+    /// the two halves come off one `SetArm`.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        arm: crate::relation::SemanticRelation,
+        columns: Vec<crate::names::ColId>,
+    ) -> Self {
+        BranchLayout { arm, columns }
+    }
+
+    pub(crate) fn arm(&self) -> &crate::relation::SemanticRelation {
+        &self.arm
+    }
+
+    pub(crate) fn columns(&self) -> &[crate::names::ColId] {
+        &self.columns
+    }
+}
+
+/// ONE LOWERED SET ARM: the statement, and the relation the chain it was
+/// lowered from carries.
+///
+/// Made from a CHAIN and nothing else, so the two halves have no separate
+/// existence to be paired wrongly. There is no entrance anywhere that takes
+/// a relation beside an output list — the layout an arm hands the physical
+/// binding comes out of this value, which knows both because it lowered
+/// both from one expression.
+pub(super) struct SetArm {
+    builder: Builder<Projected>,
+    relation: crate::relation::SemanticRelation,
+}
+
+impl SetArm {
+    /// THE ONE PRODUCER.
+    pub(super) fn lower(
+        expr: ast_refined::Chain,
+        names: &NameGenerator,
+        ctx: &TransformCtx,
+    ) -> Result<Self> {
+        let relation = *extract_relation(&expr);
+        Ok(SetArm {
+            builder: super::descend::descend_as_query(expr, names, ctx)?,
+            relation,
+        })
+    }
+
+    /// AS IT STANDS: the positional stack adds no boundary, so what a
+    /// branch emits is what its own builder already publishes.
+    pub(super) fn as_it_stands(&self) -> BranchLayout {
+        BranchLayout {
+            arm: self.relation,
+            columns: self
+                .builder
+                .columns()
+                .iter()
+                .map(ColumnMetadata::identity)
+                .collect(),
+        }
+    }
+
+    /// Republished under the boundary the operation gives it. Minting that
+    /// boundary, rewriting the statement to it, and recording what the
+    /// branch now emits are ONE act.
+    pub(super) fn lay_out(
+        self,
+        index: usize,
+        ctx: &TransformCtx,
+        names: &NameGenerator,
+    ) -> Result<(
+        crate::pipeline::sql_ast::QueryExpression,
+        crate::names::ScopeId,
+        Vec<ColumnMetadata>,
+        Vec<ColumnMetadata>,
+        BranchLayout,
+        crate::sql_binding::SqlSiteId,
+    )> {
+        let metadata = self.builder.columns().to_vec();
+        let scope = ColumnMetadata::common_identity_scope(&metadata, &ctx.identities)
+            .map_or_else(
+                || names.anonymous(),
+                |input| names.set_arm(input, index as u16),
+            )
+            .identity();
+        let mut query = self.builder.to_sql()?;
+        let republished =
+            super::builder::republish_under(&mut query, scope, &metadata, &ctx.identities)?;
+        let layout = BranchLayout {
+            arm: self.relation,
+            columns: republished.iter().map(ColumnMetadata::identity).collect(),
+        };
+        // THE BRANCH REPUBLISHES THE ARM, position for position: each
+        // republication stands where the arm's own port stands, stated one
+        // at a time rather than zipped against a list.
+        let mut row = ctx
+            .identities
+            .bindings()
+            .emitting(&ctx.relations, &self.relation)?;
+        for (slot, port) in layout
+            .columns
+            .iter()
+            .copied()
+            .zip(ctx.relations.interface(&self.relation)?.ports().to_vec())
+        {
+            row.publishes(slot, port)?;
+        }
+        let site = row.close(&ctx.relations)?;
+        Ok((query, scope, metadata, republished, layout, site))
+    }
+
+    pub(super) fn into_builder(self) -> Builder<Projected> {
+        self.builder
     }
 }
 
@@ -121,61 +236,40 @@ fn qualified_col_expr(col: &ColumnMetadata) -> crate::pipeline::sql_ast::DomainE
 fn passthrough_item(col: &ColumnMetadata) -> crate::pipeline::sql_ast::SelectItem {
     use crate::pipeline::sql_ast::SelectItem;
 
-    SelectItem::Expression {
+    SelectItem::Publishing {
         expr: qualified_col_expr(col),
-        alias: Some(col.identity()),
+        slot: col.identity(),
+        printed: true,
     }
 }
 
-/// Project builder columns according to the scope a segment publishes.
+/// Project the exact source port recorded for every output position.
 ///
-/// That heading is the resolver's authoritative answer about which columns
-/// survive and in what order. This function matches each published column to
-/// the corresponding builder column using original/provenance names (which are
-/// stable across the transformer's `_2` disambiguation).
-///
-/// Used by pipe operators that filter or reorder columns (project-out,
-/// reposition, rename-cover, etc.) to ensure the transformer respects
-/// the resolver's decisions.
-fn select_items_from_cpr_schema(
-    builder_columns: &[ColumnMetadata],
-    cpr_schema: crate::names::ScopeId,
-    identities: &crate::names::Registry,
+/// These edit forms only carry positions: none computes a value or merges
+/// several inputs. The authority's source record is therefore total and
+/// single-valued here. SQL lowering binds that semantic source at the current
+/// physical site and never searches values, names, provenance, or columns.
+fn select_carried_items(
+    builder: &Builder<Unprojected>,
+    result: &crate::relation::SemanticRelation,
+    relations: &crate::relation::Relations,
 ) -> Result<Vec<crate::pipeline::sql_ast::SelectItem>> {
-    let schema_columns = identities.known_heading(cpr_schema)?;
-
-    let mut items = Vec::with_capacity(schema_columns.len());
-    let mut used = vec![false; builder_columns.len()];
-    for target in schema_columns {
-        let found_idx = builder_columns
-            .iter()
-            .enumerate()
-            .position(|(idx, candidate)| {
-                !used[idx] && identities.same_value(candidate.identity(), target)
-            });
-        let Some(idx) = found_idx else {
-            crate::probe::probe!(
-                published,
-                "unpaired {:?} among {:?}",
-                crate::probe::chain(identities, target),
-                builder_columns
-                    .iter()
-                    .map(|c| crate::probe::chain(identities, c.identity()))
-                    .collect::<Vec<_>>()
-            );
-            return Err(DelightQLError::parse_error(
-                "a published column has no column of this statement to stand for it",
-            ));
-        };
-        used[idx] = true;
-        let bc = &builder_columns[idx];
-        items.push(crate::pipeline::sql_ast::SelectItem::Expression {
-            expr: qualified_col_expr(bc),
-            alias: Some(target),
-        });
-    }
-
-    Ok(items)
+    relations
+        .carried_sources(result)?
+        .into_iter()
+        .map(|(output, sources)| {
+            let [source] = sources.as_slice() else {
+                return Err(DelightQLError::parse_error(format!(
+                    "a carried output position must have exactly one construction-recorded source; {:?} has {}",
+                    output,
+                    sources.len()
+                )));
+            };
+            Ok(crate::pipeline::sql_ast::SelectItem::Publishing { expr: crate::pipeline::sql_ast::DomainExpression::Column(
+                    builder.rebind_port(*source)?,
+                ), slot: output.column(), printed: true })
+        })
+        .collect()
 }
 
 /// Build a `json_each(source.column) AS alias` table-valued function expression.
@@ -206,7 +300,7 @@ fn json_each_tvf(
 fn r_lower_tvf(
     function: crate::names::FnId,
     ho_arguments: crate::pipeline::asts::core::operators::CallArguments<Refined>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
@@ -215,22 +309,12 @@ fn r_lower_tvf(
     let arguments: Vec<TvfArgument> = ho_arguments
         .ho_members()
         .filter_map(|arg| match arg {
-            // A TVF argument is a resolved column or a literal, and a
-            // crossing is neither — it says so here rather than reaching a
-            // conversion that would make one look like a value.
-            crate::pipeline::asts::core::operators::HoArgument::Value(
-                crate::pipeline::asts::core::ArgumentValue::Truth(_),
-            ) => Some(Err(DelightQLError::ParseError {
-                message: "a TVF argument is a resolved column or a literal; a truth read \
-                          as a value is neither"
-                    .to_string(),
-                source: None,
-                subcategory: None,
-            })),
-            crate::pipeline::asts::core::operators::HoArgument::Value(
-                crate::pipeline::asts::core::ArgumentValue::Domain { value, .. },
-            ) => Some(lower_tvf_argument(value.clone())),
-            crate::pipeline::asts::core::operators::HoArgument::Relation(_) => None,
+            crate::pipeline::asts::core::operators::HoArgument::Value(value) => {
+                Some(lower_tvf_argument(value.value.clone()))
+            }
+            crate::pipeline::asts::core::operators::HoArgument::Relation(_)
+            | crate::pipeline::asts::core::operators::HoArgument::Rule(_)
+            | crate::pipeline::asts::core::operators::HoArgument::Landed(_) => None,
             crate::pipeline::asts::core::operators::HoArgument::Skip => None,
             crate::pipeline::asts::core::operators::HoArgument::Landing(landing) => {
                 match *landing {}
@@ -238,7 +322,7 @@ fn r_lower_tvf(
         })
         .collect::<Result<_>>()?;
 
-    let scope = cpr_schema;
+    let scope = result.scope();
 
     let table_expr = TableExpression::TVF {
         function,
@@ -246,7 +330,7 @@ fn r_lower_tvf(
         alias: scope,
     };
 
-    let columns = columns_from_cpr_schema(cpr_schema, &ctx.identities);
+    let columns = columns_from_relation(&result, ctx)?;
 
     Builder::from_table(
         table_expr,
@@ -269,7 +353,10 @@ fn lower_tvf_argument(
         )) => Ok(TvfArgument::Literal(value)),
         ast_refined::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { column, .. },
-        ))) => Ok(TvfArgument::Column(column)),
+        ))) => Ok(TvfArgument::Column(column.column())),
+        ast_refined::DomainExpression::Reference(Reference::Physical(column)) => {
+            Ok(TvfArgument::Column(column))
+        }
         _ => Err(DelightQLError::ParseError {
             message: "TVF arguments must be resolved columns or literals".to_string(),
             source: None,
@@ -284,17 +371,18 @@ fn lower_tvf_argument(
 /// Lower an anonymous table head.
 pub(super) fn r_lower_anon_table(
     anon: ast_refined::AnonRelation,
+    result: crate::relation::SemanticRelation,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
-    r_lower_anonymous(anon.table.body.rows, anon.table.cpr_schema, names, ctx)
+    r_lower_anonymous(anon.table.body.rows, result, names, ctx)
 }
 
 fn r_lower_anonymous(
     rows: crate::pipeline::asts::vocabulary::Vec1<
         crate::pipeline::asts::core::TabularRow<crate::pipeline::asts::core::Datum<Refined>>,
     >,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
@@ -302,13 +390,13 @@ fn r_lower_anonymous(
         query::SetOperator, QueryExpression, SelectBuilder, SelectItem,
     };
 
-    let scope = cpr_schema;
-    let output_columns = cpr_output_columns(cpr_schema, &ctx.identities);
+    let scope = result.scope();
+    let output_columns = relation_output_columns(&result, ctx)?;
 
     let dummy = DummyQualify(&ctx.identities);
     // The publication belongs to the union's result, not to any one row: the
     // first row publishes it and every row after aligns with it.
-    let published = Publication::at(
+    let published = SqlLayout::new(
         scope,
         output_columns
             .iter()
@@ -316,7 +404,7 @@ fn r_lower_anonymous(
             .map(ColumnMetadata::new)
             .collect(),
         &ctx.identities,
-    )?;
+    );
 
     let mut row_queries: Vec<QueryExpression> = Vec::new();
     for (row_idx, row) in rows.into_vec().into_iter().enumerate() {
@@ -332,14 +420,16 @@ fn r_lower_anonymous(
             let alias = output_columns.get(col_idx).copied();
             // Only first row gets aliases (SQL UNION ALL infers from first branch)
             if row_idx == 0 {
-                sb = sb.select(SelectItem::Expression {
-                    expr: sql_expr,
-                    alias,
+                sb = sb.select(match alias {
+                    Some(alias) => SelectItem::expression_with_alias(sql_expr, alias),
+                    None => {
+                        SelectItem::scaffolding_value(sql_expr, ctx.identities.scaffolding_slot())
+                    }
                 });
             } else {
-                sb = sb.select(SelectItem::Expression {
+                sb = sb.select(SelectItem::Scaffolding {
                     expr: sql_expr,
-                    alias: None,
+                    slot: ctx.identities.scaffolding_slot(),
                 });
             }
         }
@@ -351,7 +441,7 @@ fn r_lower_anonymous(
         let stmt = if row_idx == 0 {
             published.publish(sb)?
         } else {
-            Alignment::with(&published).align(sb)?
+            sb.standing_at(scope).map_err(DelightQLError::parse_error)?
         };
         row_queries.push(QueryExpression::Select(Box::new(stmt)));
     }
@@ -369,15 +459,20 @@ fn r_lower_anonymous(
             subcategory: None,
         })?;
 
-    let columns = columns_from_cpr_schema(cpr_schema, &ctx.identities);
+    let columns = columns_from_relation(&result, ctx)?;
 
+    // A LITERAL RELATION BINDS LIKE ANY OTHER. The join road reaches this
+    // one directly, so the site is recorded here rather than by the descent
+    // that would otherwise have bound it — a sibling's reference to one of
+    // these positions has nowhere else to ask.
     Builder::from_frozen(
         query,
         ScopeName::Resolved(scope),
         columns,
         names.fork(),
         std::rc::Rc::clone(&ctx.identities),
-    )
+    )?
+    .bind_relation(result, &ctx.relations)
 }
 
 /// Lower an inner relation (interior subquery).
@@ -391,12 +486,17 @@ fn r_lower_anonymous(
 /// as any exterior query. Induction handles depth.
 fn r_lower_inner_relation(
     pattern: ast_refined::InnerRelationPattern,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
     use super::descend;
 
+    let carries_correlation = matches!(
+        pattern,
+        ast_refined::InnerRelationPattern::CorrelatedScalarJoin { .. }
+            | ast_refined::InnerRelationPattern::CorrelatedGroupJoin { .. }
+    );
     let subquery = match pattern {
         ast_refined::InnerRelationPattern::Indeterminate { .. } => {
             return Err(DelightQLError::ParseError {
@@ -412,15 +512,20 @@ fn r_lower_inner_relation(
         | ast_refined::InnerRelationPattern::CorrelatedGroupJoin { subquery, .. } => subquery,
     };
 
-    let scope = cpr_schema;
-
-    // A correlation carrier rides this relation's boundary, so this scope is
-    // where the refiner put it and this scope is what says whether one
-    // exists. The synthesized passthrough projection has to keep it: the
-    // hoisted condition above names it, and a projection that drops it leaves
-    // that condition standing on nothing.
-    let carries_correlation =
-        !super::builder::correlation_carriers(scope, &ctx.identities)?.is_empty();
+    let body = subquery.semantic_relation();
+    // A PHYSICAL WRAP STANDS AT A RANGE OF ITS OWN. Where the relation
+    // inside the subquery is the relation outside it, nothing was published
+    // across the boundary and the semantic scope still belongs to the level
+    // beneath — reusing it for the derived table would name two different
+    // FROM entries the same, and a base-table scope reused this way makes a
+    // wrap's own column indistinguishable from a catalog column.
+    let scope = if body == result {
+        names
+            .wrap(result.scope(), crate::names::WrapReason::Limit)
+            .identity()
+    } else {
+        result.scope()
+    };
 
     // Recursive descent into the subquery — same path as any exterior query.
     let inner_names = names.fork();
@@ -429,13 +534,22 @@ fn r_lower_inner_relation(
     } else {
         descend::descend_as_query(*subquery, &inner_names, ctx)?
     };
-    let cpr_columns = columns_from_cpr_schema(cpr_schema, &ctx.identities);
-    let cpr_output = cpr_output_columns(cpr_schema, &ctx.identities);
-
     // Compare inner output names with the published heading. If they differ
     // (e.g., the heading says "fn" but inner outputs "first_name"), inject a
     // rename projection so the finalized SQL outputs the published names.
-    let query = reconcile_heading(inner_builder, &cpr_output)?;
+    //
+    // A PHYSICAL WRAP PUBLISHES NOTHING SEMANTICALLY, AND STILL EMITS. The
+    // refiner stands a bounded body inside a subquery so a later step
+    // observes the bounded rows; the relation on both sides is one relation,
+    // so no boundary is republished. But a derived table is a RANGE, and a
+    // column it offers must belong to the range it is aliased by — a body
+    // column carried through unchanged qualifies by the FROM entry the
+    // enclosing statement does not have.
+    let (query, cpr_columns) = if body == result {
+        requalify_physical_wrap(inner_builder, scope, ctx)?
+    } else {
+        publish_relation_body(inner_builder, &result, ctx)?
+    };
 
     // Hygienic columns (__dql_corr_0 etc.) are in the subquery output for
     // JOIN ON but NOT in the published scope. The Qualify fallback uses the
@@ -445,36 +559,46 @@ fn r_lower_inner_relation(
     // handler's into_table_expr() passes the TableExpression through
     // directly instead of wrapping it again with a generated alias.
     let table_expr = TableExpression::subquery(query, scope);
+    // THE DERIVED TABLE IS THE RELATION IT PUBLISHES. Binding it here is what
+    // tells the join above which of its offered columns are the boundary's
+    // positions and which are the support it still owes.
     Builder::from_table(
         table_expr,
         ScopeName::Resolved(scope),
         cpr_columns,
         names.fork(),
         std::rc::Rc::clone(&ctx.identities),
-    )
+    )?
+    .bind_relation(result, &ctx.relations)
 }
 
 /// Lower a ConsultedView: view body inlined as a subquery, reconciled
 /// against the boundary the resolver published.
 fn r_lower_consulted_view(
     body: ast_refined::Query,
-    scoped: crate::names::ScopeId,
+    scoped: crate::relation::SemanticRelation,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
-    let scope = scoped;
-    let cpr_columns = columns_from_cpr_schema(scope, &ctx.identities);
-    let cpr_output = cpr_output_columns(scope, &ctx.identities);
+    let scope = scoped.scope();
+    let cpr_columns = ctx
+        .relations
+        .interface(&scoped)?
+        .ports()
+        .iter()
+        .map(|port| ColumnMetadata::new(port.column()))
+        .collect();
 
     let body_sql = {
-        let ast_refined::Query { cfes: (), ctes, body } = body;
+        let ast_refined::Query { locals, body } = body;
+        let ctes = locals.into_ctes();
         let sql_ctes: Vec<crate::pipeline::sql_ast::Cte> = ctes
             .into_iter()
             .map(|binding| lower_cte_binding(binding, names, ctx))
             .collect::<Result<_>>()?;
 
         let inner_builder = super::descend::descend_as_final(body, names, ctx)?;
-        let main_query = reconcile_heading(inner_builder, &cpr_output)?;
+        let (main_query, _) = publish_relation_body(inner_builder, &scoped, ctx)?;
 
         if sql_ctes.is_empty() {
             main_query
@@ -521,66 +645,91 @@ fn r_lower_consulted_view(
 /// subquery SELECT but will be stripped by a wrapping layer when the
 /// resolver-lifted Filter node is processed.
 fn r_lower_positional_relation(
-    table_expr: TableExpression,
-    access: &ast_refined::Access,
     scope: crate::names::ScopeId,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
     use crate::pipeline::sql_ast::{
         DomainExpression as SqlDomainExpr, QueryExpression, SelectBuilder, SelectItem,
     };
-    let columns = columns_from_cpr_schema(cpr_schema, &ctx.identities);
+    let mut columns = columns_from_relation(&result, ctx)?;
+    let carried = ctx.relations.carried_sources(&result)?;
+    let Some(input) = ctx.relations.read_source(&result)? else {
+        return Err(DelightQLError::parse_error(
+            "a positional relation has no construction-recorded read to stand on",
+        ));
+    };
+    let input_ports = ctx.relations.interface(&input)?;
+    let input_site = ctx
+        .identities
+        .bindings()
+        .bind_interface(&ctx.relations, &input)?;
+    let from = ground_table_expression(&input, ctx)?;
     let mut select_items = Vec::new();
-    let mut read_scopes: Vec<crate::names::ScopeId> = Vec::new();
-    for col in &columns {
+    for (col, (port, sources)) in columns.iter().zip(carried) {
         let output = col.identity();
-        let source = match ctx.identities.origin_of_col(output) {
-            crate::names::ColumnOrigin::Republished { from, .. } => from,
-            _ => output,
-        };
-        let read = ctx.identities.scope_of(source);
-        if !read_scopes.contains(&read) {
-            read_scopes.push(read);
+        if port.column() != output {
+            return Err(DelightQLError::parse_error(
+                "a positional output disagrees with its construction record",
+            ));
         }
-        select_items.push(SelectItem::Expression {
+        if sources.len() != 1 {
+            return Err(DelightQLError::parse_error(
+                "a positional output does not carry exactly one source",
+            ));
+        }
+        // WHICH POSITION OF THE READ THIS OUTPUT NAMES, from the record and
+        // nothing else. Two kinds of edge answer: the position the
+        // construction recorded this output as CARRYING, and the position a
+        // refinement recorded it as REPLACING. Both are things the authority
+        // wrote down; neither is preferred over the other, because a
+        // precedence between two records is a choice this road has no
+        // grounds to make. They must agree on ONE position of the read, and
+        // where they do not this refuses rather than taking the first.
+        let mut named: Vec<crate::relation::PortId> = Vec::new();
+        for candidate in ctx
+            .relations
+            .ancestors_into(&result, port)?
+            .into_iter()
+            .chain(sources.iter().copied())
+        {
+            if input_ports.ports().contains(&candidate) && !named.contains(&candidate) {
+                named.push(candidate);
+            }
+        }
+        let source = match named.as_slice() {
+            [source] => *source,
+            [] => {
+                return Err(DelightQLError::parse_error(
+                    "a positional output has no construction-recorded source port",
+                ))
+            }
+            _ => {
+                return Err(DelightQLError::parse_error(
+                    "a positional output carries several source ports",
+                ))
+            }
+        };
+        let source = ctx.identities.bindings().at(input_site, source)?;
+        select_items.push(SelectItem::Publishing {
             expr: SqlDomainExpr::Column(source),
-            alias: Some(output),
+            slot: output,
+            printed: true,
         });
     }
-
-    // `scope` is what this SELECT PUBLISHES; the select items read the source
-    // occurrences the pattern republished from. Those are two different scopes
-    // whenever a pattern renames, so the FROM must name the one being read.
-    // Naming the published scope puts the projection's own output in its own
-    // FROM, and every reference in the list is then owned by a scope the
-    // statement never brought into view.
-    //
-    // A pattern binds the slots of one relation, so its heading reads exactly
-    // one scope: either the relation `table_expr` names, or the scope those
-    // slots were republished from. Anything else has no FROM this select list
-    // can be read against, and refusing here says so where it is known rather
-    // than emitting a statement for the self-check to reject.
-    let from = match read_scopes.as_slice() {
-        [read] if *read == scope => table_expr,
-        // The scope read is a relation like any other, and how it is read is
-        // the same question asked of `scope` above. Naming it instead spells
-        // the occurrence, and an occurrence of something already named holds
-        // no spelling of its own.
-        [read] => ground_table_expression(*read, &ctx.identities),
-        sources => {
-            return Err(DelightQLError::ParseError {
-                message: format!(
-                    "a positional pattern's heading reads {} source scopes; \
-                     one relation's pattern reads one",
-                    sources.len()
-                ),
-                source: None,
-                subcategory: None,
-            })
-        }
-    };
+    for dependency in ctx.relations.dependencies(&result)? {
+        let source = ctx.identities.bindings().at(input_site, dependency)?;
+        let support = ctx
+            .identities
+            .sql_column(scope, None, crate::names::Addressing::Hygienic);
+        select_items.push(SelectItem::Publishing {
+            expr: SqlDomainExpr::Column(source),
+            slot: support,
+            printed: true,
+        });
+        columns.push(ColumnMetadata::new(support));
+    }
 
     // THE CROSSED SLOT UNIFIES, NULL-SAFELY. The slot carries the column and
     // the truth read as a VALUE, and the comparison between them is spelled
@@ -588,73 +737,51 @@ fn r_lower_positional_relation(
     // resolution, where the value operand would have to be able to hold a
     // truth. Plain SQL equality is the wrong operator: unification answers
     // yes when a null meets a null, and `=` answers unknown.
-    let read = read_scopes.first().copied().unwrap_or(scope);
-    let unifications = slot_unifications(access, read, ctx)?;
+    //
+    // Both operands are the READ's positions: the slot names one of them and
+    // the truth's interior names others. Qualifying against this access
+    // instead would answer with the support alias it emits for the same
+    // value — a name the level's own WHERE cannot rely on surviving.
 
-    let mut select = SelectBuilder::new()
+    // THE ROW IS THE INTERFACE AND THEN THE SUPPORT IT EMITTED. The
+    // hygienic slots a crossed truth needed are the compiler's own: they
+    // realize no occurrence and nothing above addresses them, and saying so
+    // one position at a time is what keeps the interface from being carved
+    // out of the row by width.
+    let mut row = ctx
+        .identities
+        .bindings()
+        .emitting(&ctx.relations, &result)?;
+    let mut emitted = columns.iter().map(ColumnMetadata::identity);
+    for port in ctx.relations.interface(&result)?.ports().to_vec() {
+        let slot = emitted.next().ok_or_else(|| {
+            DelightQLError::parse_error(
+                "a positional relation emits fewer positions than it publishes",
+            )
+        })?;
+        row.publishes(slot, port)?;
+    }
+    for slot in emitted {
+        row.scaffolds(slot);
+    }
+    let site = row.close(&ctx.relations)?;
+
+    let select = SelectBuilder::new()
         .select_all(select_items)
         .from_tables(vec![from]);
-    if let Some(condition) = unifications {
-        select = select.where_clause(condition);
-    }
-    let stmt = super::builder::publish_at(
-        scope,
-        columns.iter().map(ColumnMetadata::identity),
-        select,
-        &ctx.identities,
-    )?;
+    let stmt = select
+        .standing_at(scope)
+        .map_err(crate::error::DelightQLError::parse_error)?;
 
     let query = QueryExpression::Select(Box::new(stmt));
-    Builder::from_frozen(
+    Builder::from_frozen_at_site(
         query,
         ScopeName::Resolved(scope),
         columns,
         names.fork(),
         std::rc::Rc::clone(&ctx.identities),
+        site,
     )
-}
-
-/// The null-safe unifications a pattern's CROSSED slots state, conjoined.
-///
-/// Every other slot kind was spent at resolution — a binder became a
-/// republished occurrence, a literal and a term became filters. The crossing
-/// is the one whose comparison waits, because the exact slot is what carries
-/// both of its operands.
-fn slot_unifications(
-    access: &ast_refined::Access,
-    read: crate::names::ScopeId,
-    ctx: &TransformCtx,
-) -> Result<Option<crate::pipeline::sql_ast::DomainExpression>> {
-    use crate::pipeline::asts::core::{Slot, SlotConstraint};
-    use crate::pipeline::sql_ast::DomainExpression as SqlDomainExpr;
-
-    let ast_refined::Access::Slots(slots) = access else {
-        return Ok(None);
-    };
-    // The crossing's interior was resolved against the relation's OWN
-    // heading, which is the one this select reads from.
-    let qualify = HeadingQualify {
-        identities: &ctx.identities,
-        columns: columns_from_cpr_schema(read, &ctx.identities),
-    };
-    let mut conditions = Vec::new();
-    for slot in slots.iter() {
-        let Slot::Constraint(SlotConstraint::Truth { column, value }) = slot else {
-            continue;
-        };
-        // The truth becomes ONE operand, so it wears its own parentheses:
-        // `a IS NOT DISTINCT FROM b IS NOT DISTINCT FROM c` re-associates
-        // into a different question.
-        let crossed = SqlDomainExpr::Parens(Box::new(
-            super::scalar::s_lower_boolean(value.truth().clone(), &qualify, ctx)?.into_expr(),
-        ));
-        conditions.push(SqlDomainExpr::Column(*column).is_not_distinct_from(crossed));
-    }
-    Ok(match conditions.len() {
-        0 => None,
-        1 => conditions.pop(),
-        _ => Some(SqlDomainExpr::and(conditions)),
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -714,125 +841,88 @@ fn annihilated_read(
 
 /// values by table order.
 fn cte_occurrence(
-    scope: crate::names::ScopeId,
+    occurrence: &crate::relation::SemanticRelation,
     cte: crate::names::ScopeId,
-    identities: &crate::names::Registry,
-) -> TableExpression {
+    ctx: &TransformCtx,
+) -> Result<TableExpression> {
     use crate::pipeline::sql_ast::{
         DomainExpression as SqlDomainExpr, QueryExpression, SelectItem, SelectStatement,
     };
-    let inner = identities.heading(cte).columns_seen();
-    let outer = identities.heading(scope).columns_seen();
-    if inner.is_empty() || outer.is_empty() {
-        return TableExpression::Scope(scope);
+    let scope = occurrence.scope();
+    let carried = ctx.relations.carried_sources(occurrence)?;
+    if carried.is_empty() {
+        return Ok(TableExpression::Scope(scope));
     }
-    let matched: Vec<Vec<crate::names::ColId>> = outer
-        .iter()
-        .map(|target| {
-            inner
-                .iter()
-                .copied()
-                .filter(|source| identities.republishes(*target, *source))
-                .collect()
-        })
-        .collect();
-    if matched.iter().any(|sources| sources.len() > 1) {
-        return TableExpression::Scope(scope);
-    }
-    let pairs: Vec<_> = if matched.iter().all(|sources| sources.len() == 1) {
-        matched
-            .iter()
-            .zip(outer.iter())
-            .map(|(sources, target)| (sources[0], *target))
-            .collect()
-    } else {
-        let positional_agrees = inner.len() == outer.len()
-            && matched.iter().enumerate().all(|(index, sources)| {
-                sources.is_empty()
-                    || sources.first().copied().is_some_and(|source| {
-                        inner
-                            .iter()
-                            .nth(index)
-                            .is_some_and(|column| source == *column)
-                    })
-            });
-        if !positional_agrees {
-            return TableExpression::Scope(scope);
-        }
-        inner.iter().copied().zip(outer.iter().copied()).collect()
-    };
-    let items: Vec<SelectItem> = pairs
+    let items: Vec<SelectItem> = carried
         .into_iter()
-        .map(|(source, target)| SelectItem::Expression {
-            expr: SqlDomainExpr::Column(source),
-            alias: Some(target),
+        .map(|(target, sources)| {
+            let [source] = sources.as_slice() else {
+                return Err(DelightQLError::parse_error(
+                    "a CTE occurrence output must carry exactly one definition port",
+                ));
+            };
+            Ok(SelectItem::Publishing {
+                expr: SqlDomainExpr::Column(source.column()),
+                slot: target.column(),
+                printed: true,
+            })
         })
-        .collect();
-    match super::builder::publish_at(
-        scope,
-        outer.iter().copied(),
-        SelectStatement::builder()
-            .select_all(items)
-            .from_tables(vec![TableExpression::Scope(cte)]),
-        identities,
-    ) {
-        Ok(select) => TableExpression::subquery(QueryExpression::Select(Box::new(select)), scope),
-        Err(_) => TableExpression::Scope(scope),
+        .collect::<Result<_>>()?;
+    match (SelectStatement::builder()
+        .select_all(items)
+        .from_tables(vec![TableExpression::Scope(cte)]))
+    .standing_at(scope)
+    .map_err(crate::error::DelightQLError::parse_error)
+    {
+        Ok(select) => Ok(TableExpression::subquery(
+            QueryExpression::Select(Box::new(select)),
+            scope,
+        )),
+        Err(error) => Err(error),
     }
 }
 
 fn ground_table_expression(
-    scope: crate::names::ScopeId,
-    identities: &crate::names::Registry,
-) -> TableExpression {
+    relation: &crate::relation::SemanticRelation,
+    ctx: &TransformCtx,
+) -> Result<TableExpression> {
+    let scope = relation.scope();
     // A ground names the entity it reads, and an alias beside it so references
     // have something to qualify by. Emitting the scope alone leaves the FROM
     // entry spelled by whatever name the scope is given — and a scope competing
     // for the table's own name loses it, so the statement reads from a table
     // that does not exist. The entity is not a name to be assigned; it is the
     // one thing here that already has one.
-    crate::probe::probe!(
-        ground,
-        "{scope:?} {:?} heading={:?}",
-        identities.origin_of(scope),
-        identities.heading(scope)
-    );
-    match identities.origin_of(scope) {
-        crate::names::ScopeOrigin::BaseTable { entity } => {
-            if identities.is_annihilated(scope) {
-                annihilated_read(entity, scope)
-            } else {
-                TableExpression::Entity {
-                    entity,
-                    alias: Some(scope),
-                }
-            }
-        }
-        crate::names::ScopeOrigin::UserAlias { of } => {
-            match identities.origin_of(of) {
-                crate::names::ScopeOrigin::BaseTable { entity } => {
-                    if identities.is_annihilated(scope) || identities.is_annihilated(of) {
-                        annihilated_read(entity, scope)
-                    } else {
-                        TableExpression::Entity {
-                            entity,
-                            alias: Some(scope),
-                        }
-                    }
-                }
-                // An occurrence of a CTE is a second scope over a relation that
-                // already has a name, and a FROM entry naming the occurrence
-                // instead names nothing: the CTE holds the spelling, so the
-                // occurrence is given a disambiguated one and the statement
-                // reads from a table no WITH clause defines. A subquery over
-                // the CTE puts the occurrence where SQL can carry it — on an
-                // alias — and re-publishes the heading under it.
-                crate::names::ScopeOrigin::Cte { .. } => cte_occurrence(scope, of, identities),
-                _ => TableExpression::Scope(scope),
-            }
-        }
-        _ => TableExpression::Scope(scope),
+    if let Some(entity) = ctx.relations.entity(relation)? {
+        let input_annihilated = ctx
+            .relations
+            .inputs(relation)?
+            .iter()
+            .any(|input| ctx.identities.is_annihilated(input.scope()));
+        return if ctx.identities.is_annihilated(scope) || input_annihilated {
+            Ok(annihilated_read(entity, scope))
+        } else {
+            Ok(TableExpression::Entity {
+                entity,
+                alias: Some(scope),
+            })
+        };
     }
+
+    // A CTE use is a fresh semantic occurrence over one exact definition
+    // relation. The construction record says both facts; a naming-scope kind
+    // and parent walk cannot become evidence for either one.
+    if ctx.relations.instance_kind(relation)? == Some(crate::relation::form::DefinitionKind::Cte) {
+        let inputs = ctx.relations.inputs(relation)?;
+        let [definition] = inputs.as_slice() else {
+            return Err(DelightQLError::parse_error(
+                "a CTE occurrence does not have exactly one construction-recorded definition",
+            ));
+        };
+        return cte_occurrence(relation, definition.scope(), ctx);
+    }
+
+    Ok(TableExpression::Scope(scope))
 }
 
 /// into a fresh `Builder<Unprojected>`.
@@ -841,49 +931,42 @@ fn ground_table_expression(
 pub(super) fn r_lower_read(
     rel: ast_refined::Relation,
     access: Option<ast_refined::Access>,
+    result: crate::relation::SemanticRelation,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
     match rel {
-        ast_refined::Relation::Ground { cpr_schema, .. } => {
+        ast_refined::Relation::Ground { .. } => {
             let access = access.unwrap_or(ast_refined::Access::All);
-            let scope = cpr_schema;
-            let table_expr = ground_table_expression(scope, &ctx.identities);
+            let scope = result;
 
             // A caller pattern: emit SELECT original AS alias for each column
             if matches!(access, ast_refined::Access::Slots(_)) {
-                return r_lower_positional_relation(
-                    table_expr, &access, scope, cpr_schema, names, ctx,
-                );
+                return r_lower_positional_relation(scope.scope(), result, names, ctx);
             }
 
             // Glob/bare: all columns, no rename
-            let columns = columns_from_cpr_schema(cpr_schema, &ctx.identities);
+            let table_expr = ground_table_expression(&scope, ctx)?;
+            let columns = columns_from_relation(&result, ctx)?;
 
             Builder::from_table(
                 table_expr,
-                ScopeName::Resolved(scope),
+                ScopeName::Resolved(scope.scope()),
                 columns,
                 names.fork(),
                 std::rc::Rc::clone(&ctx.identities),
             )
         }
 
-        ast_refined::Relation::InnerRelation {
-            pattern,
-            cpr_schema,
-            ..
-        } => r_lower_inner_relation(pattern, cpr_schema, names, ctx),
-
-        ast_refined::Relation::ConsultedView { body, scoped, .. } => {
-            r_lower_consulted_view(*body, scoped, names, ctx)
+        ast_refined::Relation::InnerRelation { pattern, .. } => {
+            r_lower_inner_relation(pattern, result, names, ctx)
         }
 
-        ast_refined::Relation::FunctorCall {
-            call,
-            alias: (),
-            cpr_schema,
-        } => {
+        ast_refined::Relation::ConsultedView { body, .. } => {
+            r_lower_consulted_view(*body, result, names, ctx)
+        }
+
+        ast_refined::Relation::FunctorCall { call, alias: () } => {
             // A mutation call heading a chain is consumed WHOLE by dml.rs;
             // reaching this relation lowering means further terms stand on
             // it — the multi-step DML shape (comma=dataflow,
@@ -901,7 +984,7 @@ pub(super) fn r_lower_read(
             }
             let call = call.into_inner();
             let function = call.callee;
-            r_lower_tvf(function, call.arguments, cpr_schema, names, ctx)
+            r_lower_tvf(function, call.arguments, result, names, ctx)
         }
     }
 }
@@ -920,27 +1003,29 @@ pub(super) fn r_lower_read(
 ///
 /// Returns empty if the heading has duplicate column names (e.g., from a join
 /// before disambiguation), since reconciling would create duplicate SQL aliases.
-pub(super) fn cte_cpr_columns(
-    expr: &ast_refined::Chain,
-    identities: &crate::names::Registry,
-) -> Vec<crate::names::ColId> {
-    cpr_output_columns(extract_cpr_schema(expr), identities)
-}
-
 /// Argumentative binding on the recursive
 /// self-reference (`c(m)` inside c's own definition) does not bind today:
 /// the rename mis-merges into a NULL-padded two-column union and returns
 /// SILENTLY WRONG results. Hard-refuse until the rename-hoist legalization
-/// (`WITH c(m) AS (…)` — needs the Cte column list) lands. Checked here,
-/// at the one site that lowers every CTE binding, with its own walk — the
-/// upstream is_recursive flag is not trusted (it historically never
-/// engaged).
+/// (`WITH c(m) AS (…)` — needs the Cte column list) lands.
+///
+/// WHETHER a binding is recursive is not re-decided here: the authority's
+/// answer travels on the binding and gates this walk. What the walk asks is
+/// the SHAPE of the self-reference the decision already found — a question
+/// the decision does not answer, and the reason there is a walk at all.
 fn check_recursive_argumentative_binding(
     binding: &ast_refined::CteBinding,
     identities: &crate::names::Registry,
 ) -> Result<()> {
-    let binding_scope = binding.subject;
-    if expr_has_positional_self_ref(&binding.expression, binding_scope, identities) {
+    if !binding.body().is_fixpoint() {
+        return Ok(());
+    }
+    let binding_scope = *binding.subject();
+    if binding
+        .parts()
+        .into_iter()
+        .any(|part| expr_has_positional_self_ref(part, binding_scope.scope(), identities))
+    {
         return Err(DelightQLError::ValidationError {
             message: "a recursive CTE reference uses argumentative binding; renames and \
                  constraints on the self-reference do not bind inside a recursive \
@@ -959,41 +1044,46 @@ fn expr_has_positional_self_ref(
     binding: crate::names::ScopeId,
     identities: &crate::names::Registry,
 ) -> bool {
-    if let ast_refined::Grelex::Reference(rel) = &expr.head {
-        if read_is_positional_self_ref(rel, expr.head_access(), binding, identities) {
+    if let ast_refined::GroundForm::Reference(rel) = expr.head().form() {
+        if read_is_positional_self_ref(
+            rel,
+            expr.head().result(),
+            expr.head_access(),
+            binding,
+            identities,
+        ) {
             return true;
         }
     }
-    expr.continuations
-        .iter()
-        .any(|continuation| match continuation {
-            ast_refined::Continuation::Member { rhs, .. } => {
-                expr_has_positional_self_ref(rhs, binding, identities)
-            }
-            ast_refined::Continuation::BagOp { arm, .. } => {
-                expr_has_positional_self_ref(arm, binding, identities)
-            }
-            ast_refined::Continuation::Access { .. }
-            | ast_refined::Continuation::Restrict { .. }
-            | ast_refined::Continuation::Correlate { .. }
-            | ast_refined::Continuation::Bound { .. }
-            | ast_refined::Continuation::Destructure { .. }
-            | ast_refined::Continuation::Pipe { .. }
-            | ast_refined::Continuation::Structural(_)
-            | ast_refined::Continuation::ErJoin(_) => false,
-        })
+    expr.forms().any(|continuation| match continuation {
+        ast_refined::Continuation::Member { rhs, .. } => {
+            expr_has_positional_self_ref(rhs, binding, identities)
+        }
+        ast_refined::Continuation::BagOp { arm, .. } => {
+            expr_has_positional_self_ref(arm, binding, identities)
+        }
+        ast_refined::Continuation::Access { .. }
+        | ast_refined::Continuation::Restrict { .. }
+        | ast_refined::Continuation::Correlate { .. }
+        | ast_refined::Continuation::Bound { .. }
+        | ast_refined::Continuation::Destructure { .. }
+        | ast_refined::Continuation::Pipe { .. }
+        | ast_refined::Continuation::Structural(_)
+        | ast_refined::Continuation::ErJoin(_) => false,
+    })
 }
 
 fn read_is_positional_self_ref(
     rel: &ast_refined::Relation,
+    read: &crate::relation::SemanticRelation,
     access: Option<&ast_refined::Access>,
     binding: crate::names::ScopeId,
     identities: &crate::names::Registry,
 ) -> bool {
     match rel {
-        ast_refined::Relation::Ground { cpr_schema, .. } => {
+        ast_refined::Relation::Ground { .. } => {
             matches!(access, Some(ast_refined::Access::Slots(_)))
-                && identities.contains_scope(*cpr_schema, binding)
+                && crate::relation::contains_scope(identities, read, binding).unwrap_or(false)
         }
         ast_refined::Relation::InnerRelation { pattern, .. } => {
             use ast_refined::InnerRelationPattern as P;
@@ -1012,13 +1102,26 @@ fn read_is_positional_self_ref(
 
 /// Lower a single CTE binding to a SQL CTE, reconciling body columns with
 /// the heading the binding publishes.
-pub(super) fn lower_cte_binding(
+///
+/// THE ONE TRANSITION from a decided binding to a SQL binding. What arrives
+/// is one value the authority built — the body IS the decision — and what
+/// leaves is one `Cte` carrying the same variant. There is nothing here to
+/// split, nothing to pair, and no flavor to guess: this function knows only
+/// how a chain becomes SQL.
+pub(in crate::pipeline) fn lower_cte_binding(
     binding: ast_refined::CteBinding,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<crate::pipeline::sql_ast::Cte> {
     check_recursive_argumentative_binding(&binding, &ctx.identities)?;
-    let cte_scope = binding.subject;
+    let cte_scope = *binding.subject();
+    let materialized_once = ctx.relations.is_materialized_once(&cte_scope)?;
+    let carries_hygiene = ctx
+        .relations
+        .interface(&cte_scope)?
+        .ports()
+        .iter()
+        .any(|port| ctx.identities.addressing(port.column()) == crate::names::Addressing::Hygienic);
     // What a CTE publishes is its binding's heading — that is what every
     // reference through the name was addressed against. The body's own schema
     // answers only where the binding has none: reconciling to the body instead
@@ -1026,27 +1129,75 @@ pub(super) fn lower_cte_binding(
     crate::probe::probe!(
         recursion,
         "binding {cte_scope:?} {:?}",
-        crate::probe::scope_chain(&ctx.identities, cte_scope)
+        crate::probe::scope_chain(&ctx.identities, cte_scope.scope())
     );
-    let cte_cpr = match ctx.identities.known_heading(cte_scope)? {
-        heading if !heading.is_empty() => heading,
-        _ => crate::names::Candidates::from_vec(cte_cpr_columns(
-            &binding.expression,
-            &ctx.identities,
-        )),
-    };
-    let inner_builder = super::descend::descend_as_final(binding.expression, names, ctx)?;
-    let cte_query = if cte_cpr.is_empty() {
-        inner_builder.to_sql()?
+    // ONE VALUE IN, ONE VALUE OUT. The binding says what it is and what it
+    // stands on; this lowering says how a chain becomes SQL and nothing
+    // else. It does not learn the variant, choose the anchor, hold an
+    // accumulation, or name the scope the result binds — there is no
+    // argument here for any of them.
+    let cte = binding.into_sql(
+        |anchor| {
+            let builder = if carries_hygiene {
+                super::descend::descend_as_query_carrying_hygiene(anchor, names, ctx)?
+            } else {
+                super::descend::descend_as_final(anchor, names, ctx)?
+            };
+            publish_relation_body(builder, &cte_scope, ctx)
+        },
+        |clause, published| {
+            let builder = if carries_hygiene {
+                super::descend::descend_as_query_carrying_hygiene(clause, names, ctx)?
+            } else {
+                super::descend::descend_as_final(clause, names, ctx)?
+            };
+            publish_fixpoint_member(builder, &cte_scope, published, ctx)
+        },
+    )?;
+    Ok(if materialized_once {
+        cte.requiring_materialization()
     } else {
-        publish_cte_body(inner_builder, cte_scope, &cte_cpr.to_vec())?
-    };
-    // The resolver's stored decision, read — not re-derived.
-    Ok(if binding.recursion.is_recursive() {
-        crate::pipeline::sql_ast::Cte::new_recursive(cte_scope, cte_query)
-    } else {
-        crate::pipeline::sql_ast::Cte::new(cte_scope, cte_query)
+        cte
     })
+}
+
+/// Re-alias one clause of a fixpoint onto the occurrences the binding
+/// publishes.
+///
+/// EVERY PART OF A BODY EMITS THE BINDING'S OWN HEADING — that is what every
+/// reader through the name addresses, and a part still emitting its own
+/// leaves the binding claiming columns the statement under it does not
+/// output. Pairing is POSITIONAL and is not a judgment: the recursion
+/// authority already judged that the clauses publish one heading, and a
+/// fixpoint accumulates by ordinal.
+fn publish_fixpoint_member(
+    builder: Builder<Projected>,
+    cte: &crate::relation::SemanticRelation,
+    published: &[ColumnMetadata],
+    ctx: &TransformCtx,
+) -> Result<crate::pipeline::sql_ast::QueryExpression> {
+    if builder.columns().len() != published.len() {
+        return Err(DelightQLError::parse_error(format!(
+            "a fixpoint clause publishing {} positions cannot accumulate under a \
+             binding publishing {}",
+            builder.columns().len(),
+            published.len()
+        )));
+    }
+    let pairs: Vec<_> = builder
+        .columns()
+        .iter()
+        .map(ColumnMetadata::identity)
+        .zip(published.iter().map(ColumnMetadata::identity))
+        .collect();
+    let mut query = builder.to_sql()?;
+    super::builder::state::rewrite_output_aliases(
+        &mut query,
+        cte.scope(),
+        &pairs,
+        &ctx.identities,
+    )?;
+    Ok(query)
 }
 
 /// Publish a CTE body under the heading its name carries.
@@ -1060,216 +1211,111 @@ pub(super) fn lower_cte_binding(
 ///
 /// Anything that does not line up — a discarding caller pattern, a permuted
 /// heading — is a real projection and goes the ordinary way.
-fn publish_cte_body(
+/// Re-alias a physical wrap's body into the range the wrap is named by.
+///
+/// The wrap adds no semantic boundary: the relation inside it is the relation
+/// outside it, and this act mints no port and consults no interface. What it
+/// answers is a RANGE question — a derived table offers the columns of the
+/// range it is aliased by, and the body's own occurrences belong to the level
+/// beneath. Emitting them unchanged would leave every reader above qualifying
+/// by a FROM entry the enclosing statement does not have.
+fn requalify_physical_wrap(
     inner_builder: Builder<Projected>,
-    cte_scope: crate::names::ScopeId,
-    cte_cpr: &[crate::names::ColId],
-) -> Result<crate::pipeline::sql_ast::QueryExpression> {
-    let identities = std::rc::Rc::clone(inner_builder.identities());
+    scope: crate::names::ScopeId,
+    ctx: &TransformCtx,
+) -> Result<(
+    crate::pipeline::sql_ast::QueryExpression,
+    Vec<ColumnMetadata>,
+)> {
+    let columns = inner_builder.columns().to_vec();
+    let mut query = inner_builder.to_sql()?;
+    let republished =
+        super::builder::republish_under(&mut query, scope, &columns, &ctx.identities)?;
+    Ok((query, republished))
+}
+
+fn publish_relation_body(
+    inner_builder: Builder<Projected>,
+    cte: &crate::relation::SemanticRelation,
+    ctx: &TransformCtx,
+) -> Result<(
+    crate::pipeline::sql_ast::QueryExpression,
+    Vec<ColumnMetadata>,
+)> {
+    use crate::pipeline::sql_ast::{DomainExpression, SelectItem};
+
+    let ports = ctx.relations.interface(cte)?.ports().to_vec();
+    if ports.is_empty() {
+        let columns = inner_builder.columns().to_vec();
+        return Ok((inner_builder.to_sql()?, columns));
+    }
+    let carried = ctx.relations.carried_sources(cte)?;
+    let mut sources = Vec::with_capacity(carried.len());
+    for (_, input) in &carried {
+        let [source] = input.as_slice() else {
+            return Err(DelightQLError::parse_error(
+                "a CTE output must carry exactly one body position",
+            ));
+        };
+        sources.push(inner_builder.rebind_port(*source)?);
+    }
+    // WHAT THE BOUNDARY OWES CROSSES IT. A correlation carrier is a
+    // dependency of this relation, so the body emits it beside the published
+    // heading and the enclosing statement can still read it.
+    let dependencies = ctx.relations.dependencies(cte)?;
+    let mut support = Vec::with_capacity(dependencies.len());
+    for dependency in &dependencies {
+        support.push((
+            inner_builder.rebind_port(*dependency)?,
+            ctx.identities
+                .sql_column(cte.scope(), None, crate::names::Addressing::Hygienic),
+        ));
+    }
     let outputs: Vec<_> = inner_builder
         .columns()
         .iter()
         .map(ColumnMetadata::identity)
         .collect();
-    if !heading_lines_up(&outputs, cte_cpr, &identities) {
-        return reconcile_heading(inner_builder, cte_cpr);
+    if outputs != sources || !support.is_empty() {
+        let mut items: Vec<_> = sources
+            .into_iter()
+            .zip(&ports)
+            .map(|(source, output)| {
+                SelectItem::expression_with_alias(DomainExpression::Column(source), output.column())
+            })
+            .collect();
+        let mut columns: Vec<_> = ports
+            .iter()
+            .map(|port| ColumnMetadata::new(port.column()))
+            .collect();
+        for (source, alias) in support {
+            items.push(SelectItem::expression_with_alias(
+                DomainExpression::Column(source),
+                alias,
+            ));
+            columns.push(ColumnMetadata::new(alias));
+        }
+        let published = inner_builder.add_projection_publishing(items, cte.scope(), columns)?;
+        let columns = published.columns().to_vec();
+        return Ok((published.to_sql()?, columns));
     }
     let pairs: Vec<_> = outputs
         .iter()
         .copied()
-        .zip(cte_cpr.iter().copied())
+        .zip(ports.iter().map(|port| port.column()))
         .collect();
     let mut query = inner_builder.to_sql()?;
-    super::builder::state::rewrite_output_aliases(&mut query, cte_scope, &pairs, &identities)?;
-    Ok(query)
-}
-
-/// Reconcile an inner query's output with the heading its caller publishes.
-///
-/// THE reconciliation — every lowering road arrives here, and which
-/// strategy applies is decided from the schema itself rather than from
-/// which lowering function happens to be running: deciding by AST shape
-/// at each call site instead tempts a regression, where a road added
-/// later gets whichever strategy its author copied.
-///
-/// A published heading does not always describe the inner output index-for-index:
-/// a positional caller pattern with discards keeps a SUBSET of the body
-/// heading, so the source column must be IDENTIFIED, never taken from the
-/// list index. Zipping by index misbinds — it shifts every binding after a
-/// non-trailing discard.
-///
-/// The key is occurrence lineage: each published column is paired with the
-/// nearest unconsumed inner occurrence on its republication chain. Discarded
-/// heading columns are dropped here, not by downstream narrowing; unconsumed
-/// hygienic columns pass through because a JOIN ON above may still need them.
-///
-/// Falls back to the aligned-rename reconciliation when neither key
-/// addresses the inner output unambiguously.
-pub(super) fn reconcile_heading(
-    inner_builder: Builder<Projected>,
-    cpr_columns: &[crate::names::ColId],
-) -> Result<crate::pipeline::sql_ast::QueryExpression> {
-    use crate::pipeline::sql_ast::{DomainExpression as SqlDomainExpr, SelectItem};
-
-    if cpr_columns.is_empty() {
-        return inner_builder.to_sql();
-    }
-
-    let identities = std::rc::Rc::clone(inner_builder.identities());
-    let inner_columns: Vec<_> = inner_builder
-        .columns()
+    super::builder::state::rewrite_output_aliases(
+        &mut query,
+        cte.scope(),
+        &pairs,
+        &ctx.identities,
+    )?;
+    let columns = ports
         .iter()
-        .map(ColumnMetadata::identity)
+        .map(|port| ColumnMetadata::new(port.column()))
         .collect();
-    if inner_columns == cpr_columns {
-        return inner_builder.to_sql();
-    }
-
-    crate::probe::probing!(reconcile, {
-        crate::probe::probe!(
-            reconcile,
-            "reconcile into {:?}",
-            crate::probe::scope_chain(&identities, identities.scope_of(cpr_columns[0]))
-        );
-        for target in cpr_columns {
-            crate::probe::probe!(
-                reconcile,
-                "publishes {:?} {:?}",
-                identities.addressing(*target),
-                crate::probe::chain(&identities, *target)
-            );
-        }
-        for candidate in &inner_columns {
-            crate::probe::probe!(
-                reconcile,
-                "  inner  {:?} {:?}",
-                identities.addressing(*candidate),
-                crate::probe::chain(&identities, *candidate)
-            );
-        }
-    });
-    let mut consumed = std::collections::HashSet::new();
-    let mut items = Vec::with_capacity(cpr_columns.len());
-    let mut kept = Vec::with_capacity(cpr_columns.len());
-    for (position, target) in cpr_columns.iter().enumerate() {
-        // Pair by where the two meet, nearest first.
-        //
-        // Sharing a value is too coarse on its own: a higher-order view called
-        // `f(x(*), x(*))` puts two inner columns carrying ONE value in front
-        // of two published slots, and both answer "same value" for both slots.
-        // They are told apart by WHERE they diverge — one published column and
-        // the inner column it stands for meet at the argument they came
-        // through, which is nearer the leaves than the single source they
-        // ultimately share.
-        //
-        // So walk the published column's own chain outward and stop at the
-        // first ancestor any inner column carries. Candidates only accumulate
-        // as the walk descends — everything on an ancestor's chain is on its
-        // descendant's — so the first non-empty answer is the nearest one, and
-        // its size decides. Being the target itself is the first step, being
-        // on its chain is a later one, and sharing only a progenitor is the
-        // last: three tiers, one rule, ordered by construction.
-        let hits = {
-            let mut cur = *target;
-            loop {
-                let hits: Vec<_> = inner_columns
-                    .iter()
-                    .copied()
-                    .filter(|candidate| {
-                        !consumed.contains(candidate) && identities.republishes(*candidate, cur)
-                    })
-                    .collect();
-                if !hits.is_empty() {
-                    break hits;
-                }
-                match identities.origin_of_col(cur) {
-                    crate::names::ColumnOrigin::Republished { from, .. } => cur = from,
-                    _ => break Vec::new(),
-                }
-            }
-        };
-        let source = match hits.as_slice() {
-            [source] => *source,
-            [] if inner_columns.len() == cpr_columns.len() => inner_columns[position],
-            // A hygienic target no inner column carries is a spent carrier:
-            // the constraint that read it was applied inside the body, whose
-            // final projection rightly dropped it, while the published heading
-            // was minted from the pre-narrowing scope and still lists it.
-            // Nothing above addresses a carrier, so the slot is omitted rather
-            // than refused. A carrier still riding — one the body DOES offer —
-            // never reaches this arm; it pairs like any other column or passes
-            // through unconsumed below.
-            [] if identities.addressing(*target) == crate::names::Addressing::Hygienic => continue,
-            [] => {
-                return Err(DelightQLError::parse_error(
-                    "An inner heading cannot be reconciled with its published subset",
-                ))
-            }
-            _ => {
-                return Err(DelightQLError::validation_error_categorized(
-                    "resolution/ambiguous",
-                    "More than one inner column carries the published output value",
-                    "disambiguate the inner heading before publishing it",
-                ))
-            }
-        };
-        consumed.insert(source);
-        kept.push(*target);
-        items.push(SelectItem::Expression {
-            expr: SqlDomainExpr::Column(source),
-            alias: Some(*target),
-        });
-    }
-    // A hygienic column rides along in the SQL because a JOIN ON above still
-    // needs it, but riding along under its OWN occurrence claims it as an
-    // output of the scope this statement stands at, which does not own it.
-    // Republishing costs the same act as emitting it and is the only spelling
-    // that leaves the statement outputting what it says it outputs.
-    let published = identities.scope_of(cpr_columns[0]);
-    for column in inner_columns {
-        if !consumed.contains(&column)
-            && identities.addressing(column) == crate::names::Addressing::Hygienic
-        {
-            let carried = identities.republish_column(
-                column,
-                published,
-                crate::names::Republish::Passthrough,
-                identities.published(column),
-                crate::names::Addressing::Hygienic,
-                |_| {},
-            );
-            items.push(SelectItem::Expression {
-                expr: SqlDomainExpr::Column(column),
-                alias: Some(carried),
-            });
-            // A carrier the statement emits is an output of the statement.
-            // Leaving it out of the heading while emitting it is the split
-            // this authority exists to close: the layer would advertise less
-            // than it produces, and the wrap above would read the shorter
-            // list. It enters as a hygienic output, which is what keeps it
-            // out of the VIEW without keeping it out of the publication.
-            kept.push(carried);
-        }
-    }
-
-    // Publish the heading just reconciled to, rather than minting over it.
-    // `add_projection` re-aliases every item into a scope of its own, which
-    // would throw away the correspondence built above and leave the statement
-    // publishing occurrences no caller was addressed against — reconciling to
-    // a heading and then not publishing it is the same act as not reconciling.
-    if kept
-        .iter()
-        .all(|column| identities.scope_of(*column) == published)
-    {
-        let columns = kept
-            .iter()
-            .map(|column| ColumnMetadata::new(*column))
-            .collect();
-        return inner_builder
-            .add_projection_publishing(items, published, columns)?
-            .to_sql();
-    }
-    inner_builder.add_projection(items)?.to_sql()
+    Ok((query, columns))
 }
 
 /// Extract `Vec<ColumnMetadata>` from a scope, pushing a scope transition
@@ -1278,23 +1324,32 @@ pub(super) fn reconcile_heading(
 /// This is the translation boundary: the scope the refiner bound flows in, and
 /// the builder gets `Vec<ColumnMetadata>` with the identity stack updated to
 /// reflect the current SQL scope. No information is discarded.
-pub(super) fn columns_from_cpr_schema(
-    schema: crate::names::ScopeId,
-    identities: &crate::names::Registry,
-) -> Vec<ColumnMetadata> {
-    identities
-        .heading(schema)
-        .columns_seen()
+pub(super) fn columns_from_relation(
+    relation: &crate::relation::SemanticRelation,
+    ctx: &TransformCtx,
+) -> Result<Vec<ColumnMetadata>> {
+    Ok(ctx
+        .relations
+        .interface(relation)?
+        .ports()
+        .iter()
+        .map(|port| port.column())
         .into_iter()
         .map(ColumnMetadata::new)
-        .collect()
+        .collect())
 }
 
-fn cpr_output_columns(
-    schema: crate::names::ScopeId,
-    identities: &crate::names::Registry,
-) -> Vec<crate::names::ColId> {
-    identities.heading(schema).columns_seen()
+fn relation_output_columns(
+    relation: &crate::relation::SemanticRelation,
+    ctx: &TransformCtx,
+) -> Result<Vec<crate::names::ColId>> {
+    Ok(ctx
+        .relations
+        .interface(relation)?
+        .ports()
+        .iter()
+        .map(|port| port.column())
+        .collect())
 }
 
 /// The values a publication list computes. A spread computes none — it
@@ -1363,7 +1418,7 @@ pub(super) fn into_published_value(
     item: ast_refined::OutItem,
 ) -> Option<ast_refined::DomainExpression> {
     match item {
-        ast_refined::OutItem::One(one) => one.expr.into_domain(),
+        ast_refined::OutItem::One(one) => Some(one.expr),
         ast_refined::OutItem::Many(_) | ast_refined::OutItem::Whole => None,
     }
 }
@@ -1372,12 +1427,10 @@ pub(super) fn alias_unaliased(
     item: &mut crate::pipeline::sql_ast::SelectItem,
     column: crate::names::ColId,
 ) {
-    if let crate::pipeline::sql_ast::SelectItem::Expression {
-        alias: alias @ None,
-        ..
-    } = item
-    {
-        *alias = Some(column);
+    if item.printed_alias().is_none() {
+        if let Some(named) = item.realizing(column) {
+            *item = named;
+        }
     }
 }
 
@@ -1393,29 +1446,51 @@ pub(super) fn r_lower_filter(
         reason = "all filter origins currently share one lowering"
     )]
     origin: ast_refined::FilterOrigin,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
     let (child, condition) = anchors::publishing_in_condition(child, condition, ctx)?;
-    let predicate = scalar::s_lower_boolean(condition, &child, ctx)?;
+    // The level the predicate lands on is settled BEFORE it is lowered: a
+    // bound or a grouping under it gives the filter a level of its own, and
+    // the references must name what that level emits.
+    let child = child.ready_for_filter()?;
+    // A HOISTED PREDICATE STILL NAMES WHAT IT NAMED. Refinement moves a
+    // condition onto the relation it constrains, and the position it reads
+    // may be an operand's or one this relation replaced. The
+    // construction-recorded ancestry translates it; nothing searches.
+    let predicate = {
+        let ancestral = super::builder::AncestralQualify::over(&result, &ctx.relations, &child)?;
+        scalar::s_lower_boolean(condition, &ancestral, ctx)?
+    };
     child.add_where(predicate)
 }
 
-/// Lower a row bound: `#<n` is LIMIT n, `#>n` its OFFSET.
+/// Lower the ARBITRARY row bound: `#<n` is LIMIT n, `#>n` its OFFSET.
 /// THE OPERATOR SAYS WHICH BOUND IT IS.
 ///
 /// `#<n` caps the rows; `#>n` says where the count starts and selects no
 /// maximum. Both are bounds and both denote a relation, so each stands on
 /// its own level unless the refiner has already composed a skip into the
-/// cap that follows it.
+/// cap that follows it. The bound an ordering consumed never arrives here:
+/// it is the ordering's own node and `r_lower_order_by` emits it in the
+/// ordering's scope.
 pub(super) fn r_lower_bound(
     child: Builder<Unprojected>,
+    bound: crate::pipeline::asts::core::TupleOrdinalClause,
+) -> Result<Builder<Unprojected>> {
+    row_clause(child, bound)
+}
+
+/// The row clause a bound spells, added to the level it bounds.
+fn row_clause(
+    level: Builder<Unprojected>,
     bound: crate::pipeline::asts::core::TupleOrdinalClause,
 ) -> Result<Builder<Unprojected>> {
     use crate::pipeline::asts::core::TupleOrdinalOperator;
 
     match bound.operator {
-        TupleOrdinalOperator::LessThan => child.add_limit(bound.value, bound.offset),
-        TupleOrdinalOperator::GreaterThan => child.add_offset(bound.value),
+        TupleOrdinalOperator::LessThan => level.add_limit(bound.value, bound.offset),
+        TupleOrdinalOperator::GreaterThan => level.add_offset(bound.value),
         // `#=` has no authored spelling: `row_bound` derives `#<` and `#>`
         // and nothing builds this arm.
         TupleOrdinalOperator::Exactly => Err(DelightQLError::transformation_error(
@@ -1434,13 +1509,10 @@ pub(super) fn r_lower_bound(
 pub(super) fn r_lower_join(
     left: Builder<Unprojected>,
     right: Builder<Unprojected>,
-    correlation: Option<ast_refined::MemberCorrelation>,
+    correlation: ast_refined::MemberCorrelation,
     join_type: Option<ast_refined::JoinType>,
-    #[expect(
-        unused_variables,
-        reason = "join operands currently determine the lowered heading"
-    )]
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
+    emitted_swapped: bool,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
     use crate::pipeline::sql_ast::{JoinCondition as SqlJoinCondition, JoinType as SqlJoinType};
@@ -1460,89 +1532,56 @@ pub(super) fn r_lower_join(
         inner: &left_op,
         outer: &right_op,
     };
+    let operation = super::builder::AncestralQualify::over(&result, &ctx.relations, &combined)?;
 
     // Lower the join condition against the POST-WRAP scopes.
     // ChainedQualify lives in the builder module — the qualify logic stays
     // in one place instead of being reimplemented here.
-    let condition =
-        match correlation {
-            Some(ast_refined::MemberCorrelation::Correspond(correspondence)) => {
-                let mut using_columns = Vec::new();
-                for name in correspondence.columns {
-                    // Name-answering occurrences take the key. A chained USING
-                    // join carries the previously merged key as a HYGIENIC
-                    // rider, and counting riders alongside the answering
-                    // occurrence would refuse every second join on the same
-                    // key as ambiguous. But a heading can also carry the key
-                    // ONLY hygienically (a constrained pattern slot mints its
-                    // column hygienic), so when nothing answers the name, a
-                    // sole hygienic occurrence still serves.
-                    let hits = |columns: &[ColumnMetadata]| -> Vec<crate::names::ColId> {
-                        let named: Vec<_> = columns
-                            .iter()
-                            .map(ColumnMetadata::identity)
-                            .filter(|column| ctx.identities.published_sym(*column) == Some(name))
-                            .collect();
-                        let answering: Vec<_> = named
-                            .iter()
-                            .copied()
-                            .filter(|column| {
-                                ctx.identities.addressing(*column)
-                                    != crate::names::Addressing::Hygienic
-                            })
-                            .collect();
-                        if answering.is_empty() {
-                            named
-                        } else {
-                            answering
-                        }
-                    };
-                    let left_hits = hits(&left_op.columns);
-                    let right_hits = hits(&right_op.columns);
-                    let left = match left_hits.as_slice() {
-                        [column] => *column,
-                        [] => {
-                            return Err(DelightQLError::parse_error(
-                                "A resolved USING column is absent from the left heading",
-                            ))
-                        }
-                        _ => return Err(DelightQLError::validation_error_categorized(
-                            "resolution/ambiguous",
-                            "A resolved USING column appears more than once in the left heading",
-                            "publish a unique join key before lowering",
-                        )),
-                    };
-                    match right_hits.as_slice() {
-                        [_] => {}
-                        [] => {
-                            return Err(DelightQLError::parse_error(
-                                "A resolved USING column is absent from the right heading",
-                            ))
-                        }
-                        _ => return Err(DelightQLError::validation_error_categorized(
-                            "resolution/ambiguous",
-                            "A resolved USING column appears more than once in the right heading",
-                            "publish a unique join key before lowering",
-                        )),
-                    }
-                    using_columns.push(left);
-                }
-                if sql_join_type == SqlJoinType::Full {
-                    // Full outer must project USING columns as COALESCE —
-                    // either side's orphan rows carry the key alone.
-                    return Builder::from_join_full_outer_using(left_op, right_op, using_columns)?
-                        .demote();
-                }
-                SqlJoinCondition::Using(using_columns)
+    let condition = match correlation {
+        ast_refined::MemberCorrelation::Correspond(correspondence) => {
+            // THE PAIR NAMES THE OPERANDS THE RESOLVER SAW. Refinement
+            // rebuilds a join, and the rebuilt operand publishes its own
+            // positions; the ancestry the construction recorded is what
+            // carries the recorded pair onto them. Each side asks over its
+            // OWN operand, because a merged output has an ancestor in both
+            // and asking over the pair would reach two columns for one.
+            let left_ancestry =
+                super::builder::AncestralQualify::over(&result, &ctx.relations, &left_op)?;
+            let right_ancestry =
+                super::builder::AncestralQualify::over(&result, &ctx.relations, &right_op)?;
+            let mut merged = Vec::new();
+            for pair in correspondence.pairs {
+                // A merged pair names the EMITTED sides. A right outer join
+                // is emitted with its operands exchanged, and the pair still
+                // names the semantic left and right, so the exchange is
+                // applied here rather than left for the physical map to
+                // discover as one column standing at two positions.
+                let (near, far) = if emitted_swapped {
+                    (pair.right, pair.left)
+                } else {
+                    (pair.left, pair.right)
+                };
+                let left = left_ancestry.rebind_port(near)?;
+                let right = right_ancestry.rebind_port(far)?;
+                merged.push(crate::pipeline::sql_ast::MergedSlots { left, right });
             }
-            Some(ast_refined::MemberCorrelation::Condition(bool_expr)) => {
-                let pred = scalar::s_lower_boolean(bool_expr, &combined, ctx)?;
-                SqlJoinCondition::On(pred.into_expr())
+            if sql_join_type == SqlJoinType::Full {
+                // Full outer must project merged columns as COALESCE —
+                // either side's orphan rows carry the key alone.
+                return Builder::from_join_full_outer_merge(left_op, right_op, merged)?.demote();
             }
-            None => SqlJoinCondition::Natural,
-        };
+            SqlJoinCondition::Merge(merged)
+        }
+        ast_refined::MemberCorrelation::Condition(bool_expr) => {
+            let pred = scalar::s_lower_boolean(bool_expr, &operation, ctx)?;
+            SqlJoinCondition::On(pred.into_expr())
+        }
+        // The semantic step carries the deliberate cross itself; nothing
+        // here may manufacture one from an absence.
+        ast_refined::MemberCorrelation::Cartesian(()) => SqlJoinCondition::Cartesian,
+    };
 
-    Builder::from_join(left_op, right_op, sql_join_type, condition)
+    Builder::from_join(left_op, right_op, sql_join_type, condition, emitted_swapped)
 }
 
 /// Lower a join where the right side is an anonymous table.
@@ -1560,15 +1599,16 @@ pub(super) fn r_lower_join(
 pub(super) fn r_lower_join_anonymous(
     left: Builder<Unprojected>,
     anon: ast_refined::AnonRelation,
-    correlation: Option<ast_refined::MemberCorrelation>,
+    anon_relation: crate::relation::SemanticRelation,
+    correlation: ast_refined::MemberCorrelation,
     join_type: Option<ast_refined::JoinType>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
     let ast_refined::AnonRelation { table, alias, .. } = anon;
     let rows = table.body.rows;
-    let anon_cpr_schema = table.cpr_schema;
+    let anonymous_relation = anon_relation;
 
     // Check if any row value contains a column reference.
     let has_column_refs = rows
@@ -1577,8 +1617,8 @@ pub(super) fn r_lower_join_anonymous(
 
     if !has_column_refs {
         // No correlated refs — use normal UNION ALL path.
-        let right = r_lower_anonymous(rows, anon_cpr_schema, names, ctx)?;
-        return r_lower_join(left, right, correlation, join_type, cpr_schema, ctx);
+        let right = r_lower_anonymous(rows, anonymous_relation, names, ctx)?;
+        return r_lower_join(left, right, correlation, join_type, result, false, ctx);
     }
 
     // --- JSON melt path ---
@@ -1586,10 +1626,10 @@ pub(super) fn r_lower_join_anonymous(
         left,
         rows,
         alias,
-        anon_cpr_schema,
+        anonymous_relation,
         correlation,
         join_type,
-        cpr_schema,
+        result,
         names,
         ctx,
     )
@@ -1603,10 +1643,10 @@ fn r_lower_melt_join(
         crate::pipeline::asts::core::TabularRow<crate::pipeline::asts::core::Datum<Refined>>,
     >,
     _alias: Option<delightql_types::SqlIdentifier>,
-    anon_cpr_schema: crate::names::ScopeId,
-    correlation: Option<ast_refined::MemberCorrelation>,
+    anonymous_relation: crate::relation::SemanticRelation,
+    correlation: ast_refined::MemberCorrelation,
     join_type: Option<ast_refined::JoinType>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
@@ -1617,33 +1657,17 @@ fn r_lower_melt_join(
 
     let source_metadata = left.columns().to_vec();
     let input_scope = ColumnMetadata::common_identity_scope(&source_metadata, &ctx.identities)
-        .unwrap_or_else(|| {
-            ctx.identities.mint_scope(
-                crate::names::ScopeOrigin::AnonRelation,
-                crate::names::Hint::None,
-                None,
-            )
-        });
+        .unwrap_or_else(|| ctx.identities.anonymous_scope(None));
     // The packet is an output of this projection, not an extra output of the
     // relation being read. Owning it by the input mutates that input's
     // heading; a second melt over the same occurrence then mistakes the first
     // packet for caller data and emits a reference no input table publishes.
-    let packet_scope = ctx.identities.mint_derived_scope(
-        crate::names::ScopeOrigin::Wrap {
-            input: input_scope,
-            why: crate::names::WrapReason::Pivot,
-        },
-        crate::names::Hint::None,
-    );
-    let packet = ctx.identities.mint_column(
-        packet_scope,
-        crate::names::ColumnOrigin::Minted {
-            by: crate::names::MintReason::Pivot,
-        },
-        None,
-        crate::names::Addressing::Hygienic,
-        crate::names::ValueFacts::default(),
-    );
+    let packet_scope = ctx
+        .identities
+        .wrap_scope(input_scope, crate::names::WrapReason::Pivot);
+    let packet = ctx
+        .identities
+        .sql_column(packet_scope, None, crate::names::Addressing::Hygienic);
     let row_exprs = rows
         .iter()
         .map(|row| {
@@ -1654,9 +1678,10 @@ fn r_lower_melt_join(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut source_items: Vec<_> = source_metadata.iter().map(passthrough_item).collect();
-    source_items.push(SelectItem::Expression {
+    source_items.push(SelectItem::Publishing {
         expr: SqlDomainExpr::function("json_array", row_exprs),
-        alias: Some(packet),
+        slot: packet,
+        printed: true,
     });
     let projected = left.add_projection(source_items)?;
     let projected_columns = projected.columns().to_vec();
@@ -1680,31 +1705,22 @@ fn r_lower_melt_join(
         source_scope,
         &projected_columns,
         &ctx.identities,
-        crate::names::Republish::BoundaryExport,
     )?
     .into_iter()
     .map(|column| column.identity())
     .collect();
     let wrapped_packet = *wrapped_columns.last().expect("packet column exists");
 
-    let tvf_scope = names
-        .fresh(crate::names::ScopeOrigin::Interior {
-            of: projected_packet,
-        })
-        .identity();
+    let tvf_scope = names.interior_emission(projected_packet).identity();
     let value_spelling = ctx.identities.intern("value", false);
-    let value_column = ctx.identities.mint_column(
+    let value_column = ctx.identities.sql_column(
         tvf_scope,
-        crate::names::ColumnOrigin::Computed {
-            via: crate::names::Computation::Function,
-        },
         Some(value_spelling),
         crate::names::Addressing::Published,
-        crate::names::ValueFacts::default(),
     );
 
-    let output_ids = cpr_output_columns(cpr_schema, &ctx.identities);
-    let melt_ids = cpr_output_columns(anon_cpr_schema, &ctx.identities);
+    let output_ids = relation_output_columns(&result, ctx)?;
+    let melt_ids = relation_output_columns(&anonymous_relation, ctx)?;
     let melt_metadata: Vec<_> = melt_ids.iter().copied().map(ColumnMetadata::new).collect();
     // The predicate is addressed against the logical join heading. The SQL
     // FROM below exposes neither half under those identities: the left half
@@ -1713,35 +1729,65 @@ fn r_lower_melt_join(
     // replace every logical occurrence with the expression its FROM exposes.
     let mut condition_columns = source_metadata.clone();
     condition_columns.extend(melt_metadata);
+    // The logical heading IS the join's interface, position for position, so
+    // the predicate's references are answered by the join's own binding
+    // rather than by a search over loose columns. A zero-width anonymous
+    // table keeps its cells OUT of that interface; the condition still
+    // reads them, so they ride the site as support — realized below as
+    // extraction expressions, never published.
+    let logical_site = {
+        let mut row = ctx
+            .identities
+            .bindings()
+            .emitting(&ctx.relations, &result)?;
+        let interface: Vec<_> = ctx.relations.interface(&result)?.ports().to_vec();
+        for port in &interface {
+            row.publishes(port.column(), *port)?;
+        }
+        for port in crate::relation::published_ports(&ctx.identities, &anonymous_relation)? {
+            if !interface.contains(&port) {
+                row.supports(port.column(), port)?;
+            }
+        }
+        row.close(&ctx.relations)?
+    };
     let condition_qualify = MeltJoinQualify {
         columns: condition_columns,
+        site: logical_site,
         identities: &ctx.identities,
     };
 
     let mut lowered_condition = match correlation {
-        Some(ast_refined::MemberCorrelation::Correspond(_)) => {
+        ast_refined::MemberCorrelation::Correspond(_) => {
             return Err(DelightQLError::validation_error_categorized(
                 "transform/melt-join/using",
                 "a correlated anonymous join cannot lower an implicit USING condition",
                 "write an explicit predicate between the left and anonymous columns",
             ));
         }
-        Some(ast_refined::MemberCorrelation::Condition(condition)) => {
+        ast_refined::MemberCorrelation::Condition(condition) => {
             scalar::s_lower_boolean(condition, &condition_qualify, ctx)?.into_expr()
         }
-        None => SqlDomainExpr::literal(crate::pipeline::asts::core::LiteralValue::Boolean(true)),
+        ast_refined::MemberCorrelation::Cartesian(()) => {
+            SqlDomainExpr::literal(crate::pipeline::asts::core::LiteralValue::Boolean(true))
+        }
     };
 
     let mut replacements = std::collections::HashMap::new();
     // `projected` is constructed as every source column followed by exactly
     // one packet, and `republish_under` preserves that order. Taking the first
     // source-width entries therefore enumerates the complete left heading.
-    for (source, wrapped) in source_metadata
+    // The predicate names the join's OWN positions, so the map that carries
+    // it onto the FROM below is keyed on those.
+    for (position, wrapped) in wrapped_columns
         .iter()
-        .map(ColumnMetadata::identity)
-        .zip(wrapped_columns.iter().copied())
+        .copied()
+        .take(source_metadata.len())
+        .enumerate()
     {
-        replacements.insert(source, SqlDomainExpr::Column(wrapped));
+        if let Some(output) = output_ids.get(position) {
+            replacements.insert(*output, SqlDomainExpr::Column(wrapped));
+        }
     }
     let mut select_items = Vec::new();
     for (position, column) in wrapped_columns
@@ -1749,9 +1795,11 @@ fn r_lower_melt_join(
         .take(source_metadata.len())
         .enumerate()
     {
-        select_items.push(SelectItem::Expression {
-            expr: SqlDomainExpr::Column(*column),
-            alias: output_ids.get(position).copied(),
+        select_items.push(match output_ids.get(position).copied() {
+            Some(output) => {
+                SelectItem::expression_with_alias(SqlDomainExpr::Column(*column), output)
+            }
+            None => SelectItem::bare_column(*column),
         });
     }
     for (position, column) in melt_ids.iter().enumerate() {
@@ -1764,33 +1812,33 @@ fn r_lower_melt_join(
                 ))),
             ],
         );
-        replacements.insert(*column, extracted.clone());
-        select_items.push(SelectItem::Expression {
-            expr: extracted,
-            alias: Some(
-                output_ids
-                    .get(source_metadata.len() + position)
-                    .copied()
-                    .unwrap_or(*column),
-            ),
-        });
+        // A zero-width anonymous table gives this cell no slot in the join
+        // heading: the extraction is spent entirely inside the condition,
+        // and selecting it would emit a column the wrap above has no
+        // target for.
+        match output_ids.get(source_metadata.len() + position).copied() {
+            Some(output) => {
+                replacements.insert(output, extracted.clone());
+                select_items.push(SelectItem::expression_with_alias(extracted, output));
+            }
+            None => {
+                replacements.insert(*column, extracted);
+            }
+        }
     }
     replace_melt_join_columns(&mut lowered_condition, &replacements);
-    let output_scope = cpr_schema;
-    let columns = columns_from_cpr_schema(cpr_schema, &ctx.identities);
-    let select = super::builder::publish_at(
-        output_scope,
-        columns.iter().map(ColumnMetadata::identity),
-        SelectStatement::builder()
-            .set_select(select_items)
-            .from_tables(vec![TableExpression::Join {
-                left: Box::new(TableExpression::subquery(source_query, source_scope)),
-                right: Box::new(json_each_tvf(wrapped_packet, tvf_scope, &ctx.identities)),
-                join_type: lower_join_type(join_type),
-                join_condition: SqlJoinCondition::On(lowered_condition),
-            }]),
-        &ctx.identities,
-    )?;
+    let output_scope = result.scope();
+    let columns = columns_from_relation(&result, ctx)?;
+    let select = (SelectStatement::builder()
+        .set_select(select_items)
+        .from_tables(vec![TableExpression::Join {
+            left: Box::new(TableExpression::subquery(source_query, source_scope)),
+            right: Box::new(json_each_tvf(wrapped_packet, tvf_scope, &ctx.identities)),
+            join_type: lower_join_type(join_type),
+            join_condition: SqlJoinCondition::On(lowered_condition),
+        }]))
+    .standing_at(output_scope)
+    .map_err(crate::error::DelightQLError::parse_error)?;
     Builder::from_query(
         QueryExpression::Select(Box::new(select)),
         ScopeName::Resolved(output_scope),
@@ -1803,6 +1851,7 @@ fn r_lower_melt_join(
 
 struct MeltJoinQualify<'a> {
     columns: Vec<ColumnMetadata>,
+    site: crate::sql_binding::SqlSiteId,
     identities: &'a crate::names::Registry,
 }
 
@@ -1811,8 +1860,16 @@ impl Qualify for MeltJoinQualify<'_> {
         self.identities
     }
 
+    crate::pipeline::transformer::builder::qualifies_by_emitting!();
+
     fn scope_columns(&self) -> Vec<ColumnMetadata> {
         self.columns.clone()
+    }
+}
+
+impl crate::pipeline::transformer::builder::Emitting for MeltJoinQualify<'_> {
+    fn site(&self) -> crate::sql_binding::SqlSiteId {
+        self.site
     }
 }
 
@@ -1853,7 +1910,14 @@ fn replace_melt_join_columns(
 /// references to the left-side scope (e.g., `json` in `json:{.path}`).
 /// False positives are harmless: the melt/json_each path is functionally
 /// correct for non-correlated rows too, just slightly less optimal SQL.
+///
+/// A relation standing beneath the value is its own scope and may read the
+/// left-side scope from inside; the walk's scope judgment answers for every
+/// value alike before any shape is read.
 fn contains_column_reference(expr: &ast_refined::DomainExpression) -> bool {
+    if expr.nests_relation() {
+        return true;
+    }
     match expr {
         ast_refined::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { .. },
@@ -1887,7 +1951,7 @@ fn contains_column_reference(expr: &ast_refined::DomainExpression) -> bool {
                     match enclyph {
                         Enclyph::Record(record) => {
                             record.members.iter().any(|member| match member {
-                                RecordMember::SelfKeyed(_) => true,
+                                RecordMember::SelfKeyed(_) | RecordMember::Metadata { .. } => true,
                                 RecordMember::Keyed { value, .. } => {
                                     contains_column_reference(value)
                                 }
@@ -1897,32 +1961,22 @@ fn contains_column_reference(expr: &ast_refined::DomainExpression) -> bool {
                             })
                         }
                         Enclyph::EmptyRecord(_) => false,
-                        Enclyph::Tuple(tuple) => {
-                            tuple.elements.iter().any(contains_column_reference)
-                        }
+                        Enclyph::Tuple(tuple) => tuple
+                            .elements
+                            .iter()
+                            .any(|element| contains_column_reference(element.value())),
                     }
                 }
+                // A crossed truth reads what its truth reads.
+                crate::pipeline::asts::core::FunctionApplication::Crossed(crossing) => crossing
+                    .truth()
+                    .scalar_operands()
+                    .into_iter()
+                    .any(contains_column_reference),
                 _ => false,
             }
         }
         _ => false,
-    }
-}
-
-/// The scope a lowering reads FROM, for an expression standing beside its
-/// select list rather than in it.
-struct HeadingQualify<'a> {
-    identities: &'a crate::names::Registry,
-    columns: Vec<ColumnMetadata>,
-}
-
-impl Qualify for HeadingQualify<'_> {
-    fn identities(&self) -> &crate::names::Registry {
-        self.identities
-    }
-
-    fn scope_columns(&self) -> Vec<ColumnMetadata> {
-        self.columns.clone()
     }
 }
 
@@ -1936,12 +1990,152 @@ impl Qualify for DummyQualify<'_> {
     fn identities(&self) -> &crate::names::Registry {
         self.0
     }
+
+    // AN ANONYMOUS ROW EMITS NOTHING TO NAME. Its cells are literals and
+    // computed values; there is no site under them and no column a
+    // reference could mean. It says so here, in its own words, rather than
+    // answering `None` to a question every scope used to be asked.
+    fn rebind_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId> {
+        Err(no_emission(port))
+    }
+
+    fn slot_of_port(&self, port: crate::relation::PortId) -> Result<usize> {
+        Err(no_emission(port))
+    }
+
+    fn slot_of_physical(&self, column: crate::names::ColId) -> Result<usize> {
+        Err(DelightQLError::parse_error(format!(
+            "physical column {column:?} was looked for in an anonymous row, which emits none"
+        )))
+    }
+}
+
+fn no_emission(port: crate::relation::PortId) -> DelightQLError {
+    DelightQLError::parse_error(format!(
+        "semantic port {port:?} was looked for in an anonymous row, which emits no column"
+    ))
+}
+
+/// The two exact physical sites named by one set correlation.
+///
+/// Correlation is the only scalar context here: its semantic carrier names
+/// both arms, and each lowered arm was bound to its emitted site in the same
+/// act that laid it out. A port must therefore occur at exactly one of those
+/// sites; there is no column-level replacement or heading search to fall back
+/// to.
+struct ArmPairQualify<'a> {
+    identities: &'a crate::names::Registry,
+    sites: [crate::sql_binding::SqlSiteId; 2],
+}
+
+impl Qualify for ArmPairQualify<'_> {
+    fn identities(&self) -> &crate::names::Registry {
+        self.identities
+    }
+
+    fn rebind_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId> {
+        let matches = self
+            .sites
+            .iter()
+            .filter_map(|site| self.identities.bindings().at(*site, port).ok())
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [column] => Ok(*column),
+            [] => Err(DelightQLError::parse_error(
+                "a set correlation names a port neither exact arm emits",
+            )),
+            _ => Err(DelightQLError::parse_error(
+                "a set correlation names a port both exact arms emit",
+            )),
+        }
+    }
+
+    fn sql_sites(&self) -> Vec<crate::sql_binding::SqlSiteId> {
+        self.sites.to_vec()
+    }
+
+    // A CORRELATION NAMES ONE OF TWO ARMS. Which one is the answer
+    // `rebind_port` gives; a POSITION is not, because the two arms lay
+    // their columns out independently and there is no one ordinal a
+    // reference could mean.
+    fn slot_of_port(&self, port: crate::relation::PortId) -> Result<usize> {
+        Err(DelightQLError::parse_error(format!(
+            "semantic port {port:?} was asked for a position across a set-arm pair, \
+             which lays out two"
+        )))
+    }
+
+    fn slot_of_physical(&self, column: crate::names::ColId) -> Result<usize> {
+        Err(DelightQLError::parse_error(format!(
+            "physical column {column:?} was asked for a position across a set-arm pair, \
+             which lays out two"
+        )))
+    }
 }
 
 /// Lower a pipe chain: left-fold segments over a base builder.
 ///
 /// The fold starts with `Builder<Unprojected>` (the base) and produces
 /// `Builder<Projected>` (the last segment must set a SELECT list).
+/// Emit a caller pattern's own ordered interface.
+///
+/// The published ports come first, each reading the operand position the
+/// authority recorded it as carrying. The dependencies follow as physical
+/// support — a constrained position is still read by the predicate standing
+/// behind the access — under fresh hygienic aliases, so the wrap above the
+/// predicate prunes them and no discarded position reaches the output. A
+/// position the pattern neither publishes nor constrains is neither.
+fn r_lower_access(
+    builder: Builder<Unprojected>,
+    relation: crate::relation::SemanticRelation,
+    ctx: &TransformCtx,
+) -> Result<Builder<Projected>> {
+    let ports = ctx.relations.interface(&relation)?.ports().to_vec();
+    let dependencies = ctx.relations.dependencies(&relation)?;
+    let mut items = Vec::with_capacity(ports.len() + dependencies.len());
+    let mut columns = Vec::with_capacity(ports.len() + dependencies.len());
+    {
+        // The pattern's own construction stands between the chain's relation
+        // and this one — an answering-name export, the access itself — and
+        // none of those intermediate occurrences is emitted. The recorded
+        // ancestry is what translates a published port onto the operand
+        // position the site actually binds.
+        let ancestral =
+            super::builder::AncestralQualify::over(&relation, &ctx.relations, &builder)?;
+        for port in ports {
+            items.push(crate::pipeline::sql_ast::SelectItem::Publishing {
+                expr: crate::pipeline::sql_ast::DomainExpression::Column(
+                    ancestral.rebind_port(port)?,
+                ),
+                slot: port.column(),
+                printed: true,
+            });
+            columns.push(ColumnMetadata::new(port.column()));
+        }
+        for port in dependencies {
+            let support = ctx.identities.sql_column(
+                relation.scope(),
+                None,
+                crate::names::Addressing::Hygienic,
+            );
+            items.push(crate::pipeline::sql_ast::SelectItem::Publishing {
+                expr: crate::pipeline::sql_ast::DomainExpression::Column(
+                    ancestral.rebind_port(port)?,
+                ),
+                slot: support,
+                printed: true,
+            });
+            columns.push(ColumnMetadata::new(support));
+        }
+    }
+    if items.is_empty() {
+        items.push(crate::pipeline::sql_ast::SelectItem::star_over_nothing());
+    }
+    builder
+        .add_projection_publishing(items, relation.scope(), columns)?
+        .bind_relation(relation, &ctx.relations)
+}
+
 pub(super) fn r_lower_pipe(
     base: Builder<Unprojected>,
     segments: Vec<PipeSegment<Refined>>,
@@ -1965,14 +2159,17 @@ pub(super) fn r_lower_pipe(
 
     let last_idx = segments.len() - 1;
     for (i, segment) in segments.into_iter().enumerate() {
-        let PipeSegment { step, cpr_schema } = segment;
+        let PipeSegment { step, result } = segment;
+        let operation_relation = result;
         let operator = match step {
             PipeStep::Operator(operator) => operator,
-            // Every access is a no-op in SQL: qualification and USING
-            // semantics are settled in the refiner's metadata, never
-            // materialized here.
+            // AN ACCESS PUBLISHES ITS OWN INTERFACE. A caller pattern names
+            // the positions it binds, discards the rest, and keeps the ones
+            // a constraint still reads as physical support — so the emitted
+            // list is the authority's ports followed by its dependencies,
+            // never the operand's heading passed through.
             PipeStep::Access => {
-                let result = current.project_all()?;
+                let result = r_lower_access(current, operation_relation, ctx)?;
                 if i == last_idx {
                     return Ok(result);
                 }
@@ -1986,37 +2183,36 @@ pub(super) fn r_lower_pipe(
                 let (published, step) = anchors::publishing_in_structural_step(current, step, ctx)?;
                 current = published;
                 let result: Builder<Projected> = match step.form {
-                    ast_refined::StructuralForm::Ordering { specs } => {
-                        r_lower_order_by(current, specs, cpr_schema, ctx)?
+                    ast_refined::StructuralForm::Ordering { specs, bound } => {
+                        r_lower_order_by(current, specs, bound, result.clone(), ctx)?
                     }
                     ast_refined::StructuralForm::Reposition { .. } => {
-                        r_lower_reposition(current, cpr_schema, ctx)?
+                        r_lower_reposition(current, result.clone(), ctx)?
                     }
-                    ast_refined::StructuralForm::Meta => {
-                        r_lower_meta_ize(current, cpr_schema, ctx)?
-                    }
+                    ast_refined::StructuralForm::Meta => r_lower_meta_ize(current, result, ctx)?,
                     ast_refined::StructuralForm::Witness { polarity } => {
-                        r_lower_witness(current, polarity, cpr_schema, ctx)?
+                        r_lower_witness(current, polarity, result, ctx)?
                     }
                     ast_refined::StructuralForm::SignedWitness => {
-                        r_lower_signed_witness(current, cpr_schema, ctx)?
+                        r_lower_signed_witness(current, result, ctx)?
                     }
                     ast_refined::StructuralForm::Drill { drill } => r_lower_interior_drill_down(
                         current,
                         drill.column,
                         drill.columns,
                         drill.groundings,
-                        cpr_schema,
+                        result,
                         ctx,
                     )?,
                     ast_refined::StructuralForm::Narrow {
                         nest,
                         pattern,
                         schema,
-                    } => r_lower_narrowing_destructure(
-                        current, nest, pattern, &schema, cpr_schema, ctx,
-                    )?,
-                };
+                    } => {
+                        r_lower_narrowing_destructure(current, nest, pattern, &schema, result, ctx)?
+                    }
+                }
+                .bind_relation(operation_relation, &ctx.relations)?;
                 if i == last_idx {
                     return Ok(result);
                 }
@@ -2029,35 +2225,44 @@ pub(super) fn r_lower_pipe(
         let (published, operator) = anchors::publishing_in_operator(current, operator, ctx)?;
         current = published;
         let result: Builder<Projected> = match operator {
-            PipeOp::Project(items) => r_lower_projection(current, items, Some(cpr_schema), ctx)?,
+            PipeOp::Project(items) => {
+                r_lower_projection(current, items, Some(result.clone()), ctx)?
+            }
 
             // Extension IS projection at this level: the resolved items
             // already carry the operand's expanded heading in front of the
             // added columns, so the two lower through one road.
-            PipeOp::Embed(items) => r_lower_projection(current, items, Some(cpr_schema), ctx)?,
+            PipeOp::Embed(items) => r_lower_projection(current, items, Some(result.clone()), ctx)?,
 
             PipeOp::ProjectOut(selector) => {
-                r_lower_project_out(current, selector, cpr_schema, ctx)?
+                r_lower_project_out(current, selector, result.clone(), ctx)?
             }
 
-            PipeOp::Rename(specs) => r_lower_rename_cover(current, specs, cpr_schema, ctx)?,
+            PipeOp::Rename(specs) => r_lower_rename_cover(current, specs, result.clone(), ctx)?,
 
-            PipeOp::Group(spec) => r_lower_group(current, spec, cpr_schema, ctx)?,
+            PipeOp::Group(spec) => r_lower_group(current, spec, result.clone(), ctx)?,
 
             PipeOp::Transform {
                 items: transformations,
                 guard: conditioned_on,
                 ..
-            } => r_lower_transform(current, transformations, conditioned_on, cpr_schema, ctx)?,
+            } => r_lower_transform(
+                current,
+                transformations,
+                conditioned_on,
+                result.clone(),
+                ctx,
+            )?,
 
             PipeOp::MapCover(MapCover { guard, cells, .. }) => {
-                r_lower_map_cover(current, cells, guard, cpr_schema, ctx)?
+                r_lower_map_cover(current, cells, guard, result.clone(), ctx)?
             }
 
             PipeOp::EmbedMapCover(EmbedMapCover { cells, .. }) => {
-                r_lower_embed_map(current, cells, cpr_schema, ctx)?
+                r_lower_embed_map(current, cells, result.clone(), ctx)?
             }
-        };
+        }
+        .bind_relation(operation_relation, &ctx.relations)?;
 
         // The stage's resolver-stamped schema knows tree-typedness the
         // structural re-derivation above cannot; adopt it so a later
@@ -2076,210 +2281,111 @@ pub(super) fn r_lower_pipe(
 
 /// Lower a bag operation with no correlation on any arm.
 pub(super) fn r_lower_set_op(
-    operands: Vec<Builder<Projected>>,
+    operands: Vec<SetArm>,
     operator: ast_refined::SetOperator,
-    cpr_schema: crate::names::ScopeId,
+    steps: &[crate::relation::SemanticRelation],
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     match operator {
         // The name-aligned operators shape each arm to the output heading:
-        // corresponding pads what an arm lacks, smart reorders. Positional
-        // aligns by ordinal, which the arms already stand in.
+        // corresponding pads what an arm lacks, smart reorders. Both read
+        // the binding the branches were laid out under rather than matching
+        // names again.
         ast_refined::SetOperator::UnionCorresponding | ast_refined::SetOperator::SmartUnionAll => {
-            r_lower_aligned_union(operands, operator, cpr_schema, ctx)
+            r_lower_correlated_set_op(operands, operator, Vec::new(), steps, ctx)
         }
+        // It still BINDS: a reference to a positional result's own position
+        // has to be told which emitted column stands under it, and stacking
+        // the branches is exactly the act that decides.
+        // POSITIONAL EMITS NO ITEM LIST TO DERIVE: arms stand in ordinal
+        // order and the branches stack as they are.
         ast_refined::SetOperator::UnionAllPositional => {
-            let mut iter = operands.into_iter();
-            let first = iter.next().ok_or_else(|| DelightQLError::ParseError {
-                message: "r_lower_set_op: empty operands".to_string(),
-                source: None,
-                subcategory: None,
-            })?;
-            iter.try_fold(first, |accumulated, next| accumulated.union_all(next))
+            let accumulation = crate::pipeline::sql_ast::SetOperator::UnionAll;
+            let layouts: Vec<_> = operands.iter().map(SetArm::as_it_stands).collect();
+            ctx.identities
+                .bindings()
+                .bind_run(&ctx.identities, steps, &layouts)?;
+            let mut iter = operands.into_iter().map(SetArm::into_builder);
+            let mut accumulated = iter.next().ok_or_else(|| empty_run())?;
+            // Each stack publishes ITS OWN step's positions: `a || b || c` is
+            // two steps, and the inner one is a result in its own right.
+            for (step, next) in steps.iter().zip(iter) {
+                let outputs = relation_output_columns(step, ctx)?;
+                accumulated =
+                    accumulated.stack_at(next, accumulation.clone(), step.scope(), &outputs)?;
+            }
+            Ok(accumulated)
         }
         // Minus reaches lowering with its correlation filled in — a bare
         // minus IS the whole-tuple anti-semijoin, and that is where the
         // predicate is written. There is no set-difference capability to
         // fall back to.
-        ast_refined::SetOperator::MinusCorresponding => Err(DelightQLError::ParseError {
-            message: "minus reached lowering without its anti-semijoin correlation".to_string(),
-            source: None,
-            subcategory: None,
-        }),
+        ast_refined::SetOperator::MinusCorresponding => Err(DelightQLError::parse_error(
+            "minus reached lowering without its anti-semijoin correlation",
+        )),
     }
 }
 
-/// Lower a name-aligned union: each arm is projected into the output
-/// heading's shape, then the arms are combined.
-fn r_lower_aligned_union(
-    operands: Vec<Builder<Projected>>,
-    operator: ast_refined::SetOperator,
-    cpr_schema: crate::names::ScopeId,
-    ctx: &TransformCtx,
-) -> Result<Builder<Projected>> {
-    use crate::pipeline::sql_ast::{QueryExpression, SetOperator as SqlSetOp};
-
-    let output_columns = cpr_output_columns(cpr_schema, &ctx.identities);
-    if output_columns.is_empty() {
-        let mut operands = operands.into_iter();
-        let first = operands.next().ok_or_else(|| DelightQLError::ParseError {
-            message: "r_lower_set_op: empty operands".to_string(),
-            source: None,
-            subcategory: None,
-        })?;
-        return operands.try_fold(first, |left, right| left.union_all(right));
-    }
-    let output_scope = cpr_schema;
-    let mut padded_queries = Vec::new();
-    for (arm, operand) in operands.into_iter().enumerate() {
-        let metadata = operand.columns().to_vec();
-        let mut query = operand.to_sql()?;
-        let arm_scope = boundary_scope(&metadata, arm, ctx)?;
-        let wrapped: Vec<_> = super::builder::republish_under(
-            &mut query,
-            arm_scope,
-            &metadata,
-            &ctx.identities,
-            crate::names::Republish::BoundaryExport,
-        )?
-        .into_iter()
-        .map(|column| column.identity())
-        .collect();
-        let items = align_arm_items(operator, &wrapped, &output_columns, ctx)?;
-        // Every arm publishes the merged heading, which is what makes them
-        // one set operation rather than two statements stacked.
-        let select = super::builder::publish_at(
-            output_scope,
-            output_columns.iter().copied(),
-            crate::pipeline::sql_ast::SelectStatement::builder()
-                .select_all(items)
-                .from_tables(vec![
-                    crate::pipeline::sql_ast::TableExpression::subquery(query, arm_scope),
-                ]),
-            &ctx.identities,
-        )?;
-        padded_queries.push(QueryExpression::Select(Box::new(select)));
-    }
-    let combined = padded_queries
-        .into_iter()
-        .reduce(|left, right| QueryExpression::SetOperation {
-            op: SqlSetOp::UnionAll,
-            left: Box::new(left),
-            right: Box::new(right),
-        })
-        .ok_or_else(|| DelightQLError::ParseError {
-            message: "r_lower_set_op: empty operands".to_string(),
-            source: None,
-            subcategory: None,
-        })?;
-    // Each arm's SELECT was built AT the output scope and aliased to its
-    // columns, so the combined query already publishes the heading it
-    // claims. Projecting it again would wrap the whole union in a SELECT
-    // that renames nothing — the positional road, which combines through
-    // `union_all`, adds no such layer either.
-    let output_metadata = columns_from_cpr_schema(cpr_schema, &ctx.identities);
-    Builder::adopt_finished(
-        combined,
-        ScopeName::Resolved(output_scope),
-        output_metadata,
-        ctx.names.clone(),
-        std::rc::Rc::clone(&ctx.identities),
-    )
+/// A bag run has one step per operator and one operand per arm.
+fn empty_run() -> DelightQLError {
+    DelightQLError::parse_error("a bag run reached lowering with no step to lower")
 }
 
-/// The scope one arm's rows cross into the operation under.
+/// Shape one branch to the operation's output heading, from the binding
+/// the branches were laid out under.
 ///
-/// Minted the same way on both roads, so a bare union and a correlated one
-/// name their arms alike.
-fn boundary_scope(
-    metadata: &[ColumnMetadata],
-    arm: usize,
-    ctx: &TransformCtx,
-) -> Result<crate::names::ScopeId> {
-    let origin = ColumnMetadata::common_identity_scope(metadata, &ctx.identities)
-        .map(|of| crate::names::ScopeOrigin::SetArm {
-            of,
-            arm: arm as u16,
-        })
-        .unwrap_or(crate::names::ScopeOrigin::AnonRelation);
-    Ok(ctx.names.fresh(origin).identity())
-}
-
-/// Shape one arm to the operation's output heading — the ONE home of the
-/// alignment law.
-///
-/// Corresponding aligns by name and pads what an arm lacks with a typed
-/// null. Smart aligns by name and requires the same names and count.
-/// Positional aligns by ordinal and requires the same count. Minus
-/// publishes its left operand's heading, so only its left arm is ever
-/// shaped here.
+/// NOT a judgment of any kind. The binding already says, position by
+/// position, what this branch emits there: a physical column of its own, or
+/// the typed null a padding stands for. Deciding it again here — by
+/// matching names, by walking lineage, or by taking the one candidate that
+/// happens to be left — would be a second authority over one fact.
 fn align_arm_items(
     operator: ast_refined::SetOperator,
-    arm_columns: &[crate::names::ColId],
-    output_columns: &[crate::names::ColId],
+    binding: crate::sql_binding::RunBinding,
+    arm: usize,
     ctx: &TransformCtx,
 ) -> Result<Vec<crate::pipeline::sql_ast::SelectItem>> {
     use crate::pipeline::asts::core::LiteralValue;
     use crate::pipeline::sql_ast::{DomainExpression as SqlDomainExpr, SelectItem};
+    use crate::sql_binding::SqlOutput;
 
-    let by_ordinal = matches!(operator, ast_refined::SetOperator::UnionAllPositional);
-    if by_ordinal || matches!(operator, ast_refined::SetOperator::SmartUnionAll) {
-        if arm_columns.len() != output_columns.len() {
-            return Err(DelightQLError::validation_error_categorized(
-                "set_operation/column_count_mismatch",
-                format!(
-                    "this set operator requires every operand to publish the same number \
-                     of columns, and one publishes {} where the result has {}",
-                    arm_columns.len(),
-                    output_columns.len()
-                ),
-                "project the operands to the same width, or use `;` which pads by name",
-            ));
-        }
-    }
-    if by_ordinal {
-        return Ok(arm_columns
-            .iter()
-            .zip(output_columns)
-            .map(|(source, output)| {
-                SelectItem::expression_with_alias(SqlDomainExpr::Column(*source), *output)
-            })
-            .collect());
-    }
-
-    let corresponding = ctx
-        .identities
-        .corresponding_slots(output_columns, arm_columns)?;
-    output_columns
+    // THE BINDING IS TOTAL OVER WHAT THIS SET EMITS. The positions it
+    // covers must be the positions being emitted, in that order — a select
+    // list longer, shorter or otherwise ordered is not the one this binding
+    // describes, and emitting it anyway would alias a branch's columns onto
+    // positions nobody bound.
+    ctx.identities
+        .bindings()
+        .branch(binding, arm)?
         .iter()
-        .zip(corresponding)
-        .map(|(output, corresponding)| match corresponding {
-            Some(column) => Ok(SelectItem::expression_with_alias(
-                SqlDomainExpr::Column(column),
-                *output,
-            )),
-            None if matches!(operator, ast_refined::SetOperator::UnionCorresponding) => {
+        .map(|(port, cell)| {
+            let output = &port.column();
+            match cell {
+                SqlOutput::Slot(slot) => Ok(SelectItem::expression_with_alias(
+                    SqlDomainExpr::Column(slot.column()),
+                    *output,
+                )),
                 // A typed NULL pad — `cast(NULL, t)`, not a bare NULL.
-                // Postgres resolves union types pairwise, so two untyped
-                // pad branches collapse the column to text before a typed
-                // branch arrives.
-                let null = SqlDomainExpr::literal(LiteralValue::Null);
-                let pad = match ctx.identities.facts(*output).declared_type {
-                    Some(type_name) => SqlDomainExpr::cast(null, type_name),
-                    None => null,
-                };
-                Ok(SelectItem::Expression {
-                    expr: pad,
-                    alias: Some(*output),
-                })
+                // Postgres resolves union types pairwise, so two untyped pad
+                // branches collapse the column to text before a typed branch
+                // arrives.
+                SqlOutput::Pad(_) => {
+                    debug_assert!(
+                        matches!(operator, ast_refined::SetOperator::UnionCorresponding),
+                        "only a corresponding set pads; the exact modes refuse before construction"
+                    );
+                    let null = SqlDomainExpr::literal(LiteralValue::Null);
+                    let pad = match ctx.identities.facts(*output).declared_type {
+                        Some(type_name) => SqlDomainExpr::cast(null, type_name),
+                        None => null,
+                    };
+                    Ok(SelectItem::Publishing {
+                        expr: pad,
+                        slot: *output,
+                        printed: true,
+                    })
+                }
             }
-            None => Err(DelightQLError::validation_error_categorized(
-                "set_operation/column_name_mismatch",
-                "smart union (|;|) requires every operand to publish the same names, \
-                 and one operand does not publish every name the result has",
-                "rename the operand's columns to match, use `;` to align by name and \
-                 pad what is missing, or use `||` to align by position",
-            )),
         })
         .collect()
 }
@@ -2292,67 +2398,53 @@ fn align_arm_items(
 ///
 /// Sets the SELECT list, transitioning Unprojected → Projected.
 ///
-/// When `cpr_schema` is provided, uses it to fill in aliases for select items
+/// When `result` is provided, uses it to fill in aliases for select items
 /// that don't have one (e.g., JSON path expressions where the AST node carries
 /// no alias but the refiner has computed one).
 pub(super) fn r_lower_projection(
     builder: Builder<Unprojected>,
     publication: crate::pipeline::asts::vocabulary::Vec1<ast_refined::OutItem>,
-    cpr_schema: Option<crate::names::ScopeId>,
+    result: Option<crate::relation::SemanticRelation>,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    // Lower the items first — this processes computed expressions,
-    // function calls, etc. into SQL items via qualify().
-    let items: Vec<_> = publication
-        .into_vec()
-        .into_iter()
-        .map(|item| scalar::s_lower_out_item(item, &builder, ctx))
-        .collect::<Result<_>>()?;
-
-    // Now use the published heading to fix up aliases. It carries the
-    // resolver's authoritative output names. Apply them positionally to the
-    // lowered items.
-    let items = if let Some(cpr) = cpr_schema {
-        let cpr_columns = cpr_output_columns(cpr, &ctx.identities);
-        let mut name_idx = 0;
-        items
-            .into_iter()
-            .map(|item| match item {
-                crate::pipeline::sql_ast::SelectItem::Star { .. } => {
-                    name_idx += builder.columns().len();
-                    item
-                }
-                crate::pipeline::sql_ast::SelectItem::Expression { expr, alias } => {
-                    let cpr_alias = cpr_columns.get(name_idx).copied().or(alias);
-                    name_idx += 1;
-                    crate::pipeline::sql_ast::SelectItem::Expression {
-                        expr,
-                        alias: cpr_alias,
+    // THE WHOLE OPERAND EXPANDS HERE, into one item per operand position.
+    // A star is a hole in the emitted list: the site binds ports to the
+    // columns a statement selects, and a star selects a list nobody stated.
+    // The expansion carries the operand's hygienic carriers too — an
+    // internal column may be CARRIED, it may not be NAMED by an author, and
+    // the guard below is the author's.
+    let mut items = Vec::with_capacity(publication.len());
+    for item in publication.into_vec() {
+        if matches!(item, ast_refined::OutItem::Whole) {
+            for column in builder.columns() {
+                // SUPPORT IS NOT PART OF THE WHOLE. A position the operand
+                // emits to pay a debt is not one of its dimensions, so a
+                // star over the operand does not enumerate it.
+                {
+                    let site = builder.publication().site();
+                    if ctx
+                        .identities
+                        .bindings()
+                        .is_support(site, column.identity())?
+                    {
+                        continue;
                     }
                 }
-            })
-            .collect()
-    } else {
-        items
-    };
-
-    // Check for hygienic column references
-    for item in &items {
-        if let crate::pipeline::sql_ast::SelectItem::Expression { expr, .. } = item {
-            if let crate::pipeline::sql_ast::DomainExpression::Column(column) = expr {
-                if ctx.identities.addressing(*column) == crate::names::Addressing::Hygienic {
-                    return Err(DelightQLError::ParseError {
-                        message: "an internal hygiene column is not available for projection"
-                            .to_string(),
-                        source: None,
-                        subcategory: None,
-                    });
-                }
+                items.push(crate::pipeline::sql_ast::SelectItem::Scaffolding {
+                    slot: ctx.identities.scaffolding_slot(),
+                    expr: crate::pipeline::sql_ast::DomainExpression::Column(column.identity()),
+                });
             }
+            continue;
         }
+        let lowered = scalar::s_lower_out_item(item, &builder, ctx)?;
+        // A resolved reference to a hygienic position is construction-owned:
+        // authored resolution cannot name one. It may feed a temporary
+        // compiler position or continue as hidden physical row support.
+        items.push(lowered);
     }
 
-    project_publishing_resolved(builder, items, cpr_schema, ctx)
+    project_publishing_resolved(builder, items, result, ctx)
 }
 
 /// Set a pipe segment's SELECT list, publishing the scope the resolver bound
@@ -2366,14 +2458,48 @@ pub(super) fn r_lower_projection(
 fn project_publishing_resolved(
     builder: Builder<Unprojected>,
     mut items: Vec<crate::pipeline::sql_ast::SelectItem>,
-    cpr_schema: Option<crate::names::ScopeId>,
+    result: Option<crate::relation::SemanticRelation>,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    if let Some(scope) = cpr_schema {
-        if adopt_heading(&mut items, scope, &ctx.identities) {
-            let columns = columns_from_cpr_schema(scope, &ctx.identities);
-            return builder.add_projection_publishing(items, scope, columns);
+    if let Some(relation) = result {
+        let ports = ctx.relations.interface(&relation)?.ports().to_vec();
+        if ports.len() != items.len() {
+            return Err(DelightQLError::parse_error(
+                "a lowered semantic operation emitted a different number of positions than its interface",
+            ));
         }
+        for (item, port) in items.iter_mut().zip(&ports) {
+            let Some(realized) = item.realizing(port.column()) else {
+                return Err(DelightQLError::parse_error(
+                    "a semantic output position reached lowering as an unexpanded star",
+                ));
+            };
+            *item = realized;
+        }
+        let mut columns: Vec<_> = ports
+            .iter()
+            .map(|port| ColumnMetadata::new(port.column()))
+            .collect();
+        // WHAT THE OPERATION STILL OWES IS EMITTED, NOT PUBLISHED. A
+        // dependency is a position of the OPERAND a later operation reads;
+        // it rides beside the heading as physical support under a name
+        // nothing addresses.
+        for dependency in ctx.relations.dependencies(&relation)? {
+            let support = ctx.identities.sql_column(
+                relation.scope(),
+                None,
+                crate::names::Addressing::Hygienic,
+            );
+            items.push(crate::pipeline::sql_ast::SelectItem::Publishing {
+                expr: crate::pipeline::sql_ast::DomainExpression::Column(
+                    builder.rebind_port(dependency)?,
+                ),
+                slot: support,
+                printed: true,
+            });
+            columns.push(ColumnMetadata::new(support));
+        }
+        return builder.add_projection_publishing(items, relation.scope(), columns);
     }
 
     builder.add_projection(items)
@@ -2384,151 +2510,50 @@ fn project_publishing_resolved(
 fn group_by_publishing_resolved(
     builder: Builder<Unprojected>,
     mut spec: super::builder::GroupBySpec,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    if let Some(scope) = Some(cpr_schema) {
-        let keys = spec.keys.len();
-        let mut items = spec.keys;
-        items.append(&mut spec.aggregates);
-        if adopt_heading(&mut items, scope, &ctx.identities) {
-            let aggregates = items.split_off(keys);
-            let columns = columns_from_cpr_schema(scope, &ctx.identities);
-            return builder.add_group_by_publishing(
-                super::builder::GroupBySpec {
-                    keys: items,
-                    aggregates,
-                },
-                scope,
-                columns,
-            );
-        }
-        let aggregates = items.split_off(keys);
-        spec = super::builder::GroupBySpec {
+    let key_count = spec.keys.len();
+    let mut items = spec.keys;
+    items.append(&mut spec.aggregates);
+    let ports = ctx.relations.interface(&result)?.ports().to_vec();
+    if ports.len() != items.len() {
+        return Err(DelightQLError::parse_error(
+            "a grouped operation emitted a different number of positions than its interface",
+        ));
+    }
+    for (item, port) in items.iter_mut().zip(&ports) {
+        let Some(realized) = item.realizing(port.column()) else {
+            return Err(DelightQLError::parse_error(
+                "a grouped semantic position reached lowering as an unexpanded star",
+            ));
+        };
+        *item = realized;
+    }
+    let aggregates = items.split_off(key_count);
+    let columns = ports
+        .into_iter()
+        .map(|port| ColumnMetadata::new(port.column()))
+        .collect();
+    builder.add_group_by_publishing(
+        super::builder::GroupBySpec {
             keys: items,
             aggregates,
-        };
-    }
-
-    builder.add_group_by(spec)
+        },
+        result.scope(),
+        columns,
+    )
 }
 
-/// Re-alias a lowered select list onto the occurrences the resolver published
-/// for this segment, reporting whether it took.
+/// Lower ORDER BY: `|> #(col1, col2 descending)` — and, when the ordering
+/// carries the bound that consumed it, `#(col), #<n` as ONE query scope.
 ///
-/// Slot *i* of the published heading stands for slot *i* of the list when the
-/// two occurrences are the same occurrence, or the published one is what a
-/// boundary made of the list's — the directional test a reference crossing a
-/// boundary answers. Failing that, they may still be one value reached by two
-/// routes: a subquery the transformer inserted between segments republishes
-/// the previous heading, and so does the scope the resolver minted for this
-/// segment, which leaves the two *siblings* — neither on the other's chain.
-/// Pairing siblings is sound only while the pairing is forced, so that tier
-/// additionally requires each slot's value to be claimable by one published
-/// column and no other; a heading that permutes its input therefore adopts
-/// nothing.
-///
-/// Lining up is the whole condition otherwise: a list of a different length,
-/// one that dropped a slot it could not place, or one carrying a glob or a
-/// hygiene column is not this heading, adopts nothing, and is left untouched
-/// for the caller to mint over as before.
-/// Does slot *i* of `heading` stand for slot *i* of `outputs`?
-///
-/// Same occurrence, or the published one is what a boundary made of the
-/// output's — the directional test a reference crossing a boundary answers.
-/// Failing that, the two may still be one value reached by two routes, which
-/// is what a resolver-minted scope and a transformer-inserted subquery leave
-/// behind: siblings, neither on the other's chain. Pairing siblings is sound
-/// only while forced, so that tier additionally requires each output's value
-/// to be claimable by one published column and no other — a heading that
-/// permutes its input therefore lines up with nothing.
-fn heading_lines_up(
-    outputs: &[crate::names::ColId],
-    heading: &[crate::names::ColId],
-    identities: &crate::names::Registry,
-) -> bool {
-    if outputs.len() != heading.len() {
-        return false;
-    }
-    let on_chain = outputs.iter().zip(heading).all(|(output, published)| {
-        *published == *output || identities.republishes(*published, *output)
-    });
-    on_chain
-        || outputs.iter().zip(heading).all(|(output, published)| {
-            identities.same_value(*output, *published)
-                && heading
-                    .iter()
-                    .filter(|other| identities.same_value(*output, **other))
-                    .count()
-                    == 1
-        })
-}
-
-fn adopt_heading(
-    items: &mut [crate::pipeline::sql_ast::SelectItem],
-    scope: crate::names::ScopeId,
-    identities: &crate::names::Registry,
-) -> bool {
-    use crate::pipeline::sql_ast::SelectItem;
-
-    let heading = identities.heading(scope).columns_seen();
-    // Whether a pairing is possible is a fact about the two chains, so the
-    // probe prints the chains and not just the ids: "col#5 vs col#12" says
-    // nothing, "both descend from col#3" says the tier applies and "col#12
-    // descends from nothing" says the item was minted rather than republished.
-    crate::probe::probing!(adopt, {
-        crate::probe::probe!(adopt, "{scope:?}");
-        for published in heading.iter() {
-            crate::probe::probe!(
-                adopt,
-                "  wants {:?}",
-                crate::probe::chain(identities, *published)
-            );
-        }
-        for item in items.iter() {
-            match item {
-                SelectItem::Expression {
-                    alias: Some(alias), ..
-                } => crate::probe::probe!(
-                    adopt,
-                    "  has   {:?}",
-                    crate::probe::chain(identities, *alias)
-                ),
-                other => crate::probe::probe!(adopt, "  has   {other:?}"),
-            }
-        }
-    });
-    if heading.len() != items.len() {
-        return false;
-    }
-    let Some(aliases) = items
-        .iter()
-        .map(|item| match item {
-            SelectItem::Expression {
-                alias: Some(alias), ..
-            } => Some(*alias),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-
-    if !heading_lines_up(&aliases, &heading.to_vec(), identities) {
-        return false;
-    }
-    for (item, published) in items.iter_mut().zip(heading) {
-        if let SelectItem::Expression { alias, .. } = item {
-            *alias = Some(published);
-        }
-    }
-    true
-}
-
-/// Lower ORDER BY: `|> #(col1, col2 descending)`.
-///
-/// Adds ORDER BY terms to the builder, then projects all (SELECT *) at the
-/// scope the resolver bound to the segment.
+/// Adds the ORDER BY terms and then the bound's row clause to the SAME
+/// level, then projects all at the scope the resolver bound to the segment.
+/// That one scope is the membership act: `ORDER BY … LIMIT n` in one block
+/// is what the standard promises, where an ordering carried through a
+/// derived table is an engine courtesy — and a later presentation ordering
+/// then stands over the chosen members and cannot replace them.
 ///
 /// Leaving the heading unchanged is not the same as standing at the input's
 /// scope: the segment has one of its own, and every reference downstream of it
@@ -2536,14 +2561,15 @@ fn adopt_heading(
 pub(super) fn r_lower_order_by(
     builder: Builder<Unprojected>,
     specs: Vec<ast_refined::OrderingSpec>,
-    cpr_schema: crate::names::ScopeId,
+    bound: Option<crate::pipeline::asts::core::TupleOrdinalClause>,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::sql_ast::{OrderDirection as SqlDir, OrderTerm};
 
-    // Ensure we're not Frozen before lowering expressions — add_order_by
-    // on Frozen wraps as subquery, changing the scope. Expressions must be
-    // qualified against the post-wrap scope.
+    // Expressions must be lowered against the post-wrap scope: a frozen body
+    // wraps when the terms are added, and terms named against the pre-wrap
+    // level would name aliases the statement no longer emits.
     let builder = builder.ensure_not_frozen()?;
 
     let terms: Vec<OrderTerm> = specs
@@ -2558,21 +2584,20 @@ pub(super) fn r_lower_order_by(
         })
         .collect::<Result<_>>()?;
 
-    let (builder, mut items) = builder.add_order_by(terms)?.projectable_star_items()?;
-    if let Some(scope) = Some(cpr_schema) {
-        if !items.is_empty() && adopt_heading(&mut items, scope, &ctx.identities) {
-            let columns = columns_from_cpr_schema(scope, &ctx.identities);
-            return builder.add_projection_publishing(items, scope, columns);
-        }
-    }
-    builder.project_all()
+    let ordered = builder.add_order_by(terms)?;
+    let bounded = match bound {
+        Some(bound) => row_clause(ordered, bound)?,
+        None => ordered,
+    };
+    let (builder, items) = bounded.projectable_star_items()?;
+    project_publishing_resolved(builder, items, Some(result), ctx)
 }
 
 /// Lower the Group operator: DISTINCT (`GroupSpec::Distinct`) or GROUP BY (`GroupSpec::Reduce`).
 fn r_lower_group(
     builder: Builder<Unprojected>,
     spec: ast_refined::GroupSpec,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     match spec {
@@ -2583,7 +2608,7 @@ fn r_lower_group(
                 .into_iter()
                 .map(|item| scalar::s_lower_out_item(item, &builder, ctx))
                 .collect::<Result<_>>()?;
-            let projected = project_publishing_resolved(builder, items, Some(cpr_schema), ctx)?;
+            let projected = project_publishing_resolved(builder, items, Some(result), ctx)?;
             projected.add_distinct()
         }
 
@@ -2617,7 +2642,13 @@ fn r_lower_group(
                 // positional re-threading.
                 let arbitrary = delegates.into_iter().flat_map(|d| d.payload).collect();
                 return r_lower_group_by_spec(
-                    builder, keys, reductions, plan, arbitrary, cpr_schema, ctx,
+                    builder,
+                    keys,
+                    reductions,
+                    plan,
+                    arbitrary,
+                    Some(result),
+                    ctx,
                 );
             }
 
@@ -2626,13 +2657,19 @@ fn r_lower_group(
             // join to make.
             if reductions.is_empty() && delegates.len() == 1 {
                 let delegate = delegates.into_iter().next().unwrap();
-                return r_lower_single_ordered_delegate(builder, keys, delegate, cpr_schema, ctx);
+                return r_lower_single_ordered_delegate(
+                    builder,
+                    keys,
+                    delegate,
+                    result.scope(),
+                    ctx,
+                );
             }
 
             // General case: an aggregate relation (when there are aggregates)
             // plus one `row_number()=1` relation per delegate, joined on the
             // group key.
-            r_lower_n_way_delegate_join(builder, keys, reductions, plan, delegates, cpr_schema, ctx)
+            r_lower_n_way_delegate_join(builder, keys, reductions, plan, delegates, ctx)
         }
     }
 }
@@ -2671,7 +2708,7 @@ fn build_delegate_relation(
     // projection. A spread key publishes several and partitions by none.
     let partition: Vec<SqlDomainExpr> = keys
         .iter()
-        .filter_map(ast_refined::OutItem::domain_value)
+        .filter_map(ast_refined::OutItem::value)
         .map(|expr| bare(expr.clone(), &builder))
         .collect::<Result<_>>()?;
     let sql_order: Vec<(SqlDomainExpr, OrderDirection)> = order
@@ -2688,22 +2725,10 @@ fn build_delegate_relation(
 
     // Tag each row with row_number, wrap as a subquery, filter to the first.
     let owner = ColumnMetadata::common_identity_scope(builder.columns(), &ctx.identities)
-        .unwrap_or_else(|| {
-            ctx.identities.mint_scope(
-                crate::names::ScopeOrigin::AnonRelation,
-                crate::names::Hint::None,
-                None,
-            )
-        });
-    let row_number = ctx.identities.mint_column(
-        owner,
-        crate::names::ColumnOrigin::Minted {
-            by: crate::names::MintReason::RowNumber,
-        },
-        None,
-        crate::names::Addressing::Hygienic,
-        crate::names::ValueFacts::default(),
-    );
+        .unwrap_or_else(|| ctx.identities.anonymous_scope(None));
+    let row_number = ctx
+        .identities
+        .sql_column(owner, None, crate::names::Addressing::Hygienic);
     let tagged = builder.project_all()?.add_window_column(
         "ROW_NUMBER",
         vec![],
@@ -2725,12 +2750,7 @@ fn build_delegate_relation(
     // layer's — the pre-demote occurrence renders under an alias no FROM
     // entry of the filtered select carries.
     let demoted = tagged.demote()?;
-    let row_number_here = demoted
-        .columns()
-        .iter()
-        .map(ColumnMetadata::identity)
-        .find(|candidate| ctx.identities.republishes(*candidate, emitted_row_number))
-        .unwrap_or(emitted_row_number);
+    let row_number_here = demoted.rebind_physical(emitted_row_number)?;
     demoted.add_where(SqlPredicate::new(SqlDomainExpr::Binary {
         left: Box::new(SqlDomainExpr::Column(row_number_here)),
         op: BinaryOperator::Equal,
@@ -2749,7 +2769,7 @@ fn r_lower_single_ordered_delegate(
     builder: Builder<Unprojected>,
     keys: Vec<ast_refined::OutItem>,
     delegate: ast_refined::DelegateSpec,
-    _cpr_schema: crate::names::ScopeId,
+    _relation: crate::names::ScopeId,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     let filtered = build_delegate_relation(builder, &keys, &delegate.order, ctx)?;
@@ -2767,12 +2787,9 @@ fn r_lower_single_ordered_delegate(
     // duplicates a group key, already emitted in group position), `Some(col)`
     // = emit, aliased from the stamp. Deduplication is the resolver's.
     for item in delegate.payload {
-        let ast_refined::OutItem::One(one) = &item else {
+        let ast_refined::OutItem::One(_) = &item else {
             continue;
         };
-        if one.output.is_none() {
-            continue; // resolver stamped None — no output column
-        }
         output_items.push(scalar::s_lower_out_item(item, &filtered, ctx)?);
     }
 
@@ -2804,7 +2821,6 @@ fn r_lower_n_way_delegate_join(
     reductions: Vec<ast_refined::ReductionItem>,
     plan: ast_refined::ReductionPlan,
     delegates: Vec<ast_refined::DelegateSpec>,
-    cpr_schema: crate::names::ScopeId,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::sql_ast::{
@@ -2816,7 +2832,7 @@ fn r_lower_n_way_delegate_join(
     // (e.g. `lower(name)`) combined with ordered delegates are a later slice.
     let key_columns: Vec<crate::names::ColId> = keys
         .iter()
-        .filter_map(ast_refined::OutItem::domain_value)
+        .filter_map(ast_refined::OutItem::value)
         .map(
             |expr| match scalar::s_lower_expression(expr.clone(), &builder, ctx)? {
                 SqlDomainExpr::Column(column) => Ok(column),
@@ -2830,7 +2846,6 @@ fn r_lower_n_way_delegate_join(
             },
         )
         .collect::<Result<_>>()?;
-    let key_set: std::collections::HashSet<_> = key_columns.iter().copied().collect();
 
     // Freeze the source once and rebuild a fresh frozen Builder per relation.
     // (Duplicating the source subquery is correct; CTE-hoisting it is a future
@@ -2838,9 +2853,11 @@ fn r_lower_n_way_delegate_join(
     let cols = builder.columns().to_vec();
     let names = builder.names().clone();
     let identities = std::rc::Rc::clone(builder.identities());
-    let src = builder.project_all()?.to_sql()?;
+    let projected_source = builder.project_all()?;
+    let source_site = projected_source.publication().site();
+    let src = projected_source.to_sql()?;
     let fresh_source = || {
-        Builder::from_frozen(
+        Builder::from_frozen_at_site(
             src.clone(),
             ScopeName::Fresh(names.fresh(wrap_origin(
                 &cols,
@@ -2850,6 +2867,7 @@ fn r_lower_n_way_delegate_join(
             cols.clone(),
             names.clone(),
             std::rc::Rc::clone(&identities),
+            source_site,
         )
     };
 
@@ -2865,7 +2883,7 @@ fn r_lower_n_way_delegate_join(
             reductions,
             plan,
             vec![],
-            cpr_schema,
+            None,
             ctx,
         )?;
         operands.push(agg.demote()?.into_join_operand()?);
@@ -2884,34 +2902,52 @@ fn r_lower_n_way_delegate_join(
     // per non-anchor operand.
     let conditions: Vec<(JoinType, JoinCondition)> = operands
         .iter()
+        .enumerate()
         .skip(1)
-        .map(|operand| {
+        .map(|(operand_index, operand)| {
             let conds: Vec<SqlDomainExpr> = key_columns
                 .iter()
-                .filter_map(|key| {
-                    let anchor = operands[0]
-                        .columns
-                        .iter()
-                        .find(|column| identities.same_value(column.identity(), *key))?
-                        .identity();
-                    let other = operand
-                        .columns
-                        .iter()
-                        .find(|column| identities.same_value(column.identity(), *key))?
-                        .identity();
-                    Some(SqlDomainExpr::Binary {
+                .enumerate()
+                .map(|(position, key)| {
+                    let anchor = if has_agg {
+                        operands[0]
+                            .columns()
+                            .get(position)
+                            .map(ColumnMetadata::identity)
+                            .ok_or_else(|| {
+                                DelightQLError::parse_error(
+                                    "an aggregate operand omitted a group key",
+                                )
+                            })?
+                    } else {
+                        exact_republication(*key, &cols, operands[0].columns())?
+                    };
+                    let other = if has_agg && operand_index == 0 {
+                        operand
+                            .columns()
+                            .get(position)
+                            .map(ColumnMetadata::identity)
+                            .ok_or_else(|| {
+                                DelightQLError::parse_error(
+                                    "a delegate operand omitted a group key",
+                                )
+                            })?
+                    } else {
+                        exact_republication(*key, &cols, operand.columns())?
+                    };
+                    Ok(SqlDomainExpr::Binary {
                         left: Box::new(SqlDomainExpr::Column(anchor)),
                         op: BinaryOperator::IsNotDistinctFrom,
                         right: Box::new(SqlDomainExpr::Column(other)),
                     })
                 })
-                .collect();
-            (
+                .collect::<Result<_>>()?;
+            Ok((
                 JoinType::Inner,
                 JoinCondition::On(SqlDomainExpr::and(conds)),
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     // Output projection in cpr order: keys, aggregates, then per-delegate
     // payloads — each explicitly qualified to the operand that owns it, so the
@@ -2921,18 +2957,23 @@ fn r_lower_n_way_delegate_join(
 
     // (a) group keys — from the anchor operand, each aliased from its own
     // output stamp. The n-way path admits only plain-column keys.
-    for (key, item) in key_columns.iter().zip(keys.iter()) {
-        let anchor = operands[0]
-            .columns
-            .iter()
-            .find(|column| identities.same_value(column.identity(), *key))
-            .map(ColumnMetadata::identity)
-            .unwrap_or(*key);
-        let mut select = SelectItem::Expression {
-            expr: SqlDomainExpr::Column(anchor),
-            alias: None,
+    for (position, item) in keys.iter().enumerate() {
+        let anchor = if has_agg {
+            operands[0]
+                .columns()
+                .get(position)
+                .ok_or_else(|| {
+                    DelightQLError::parse_error("an aggregate operand omitted a group key")
+                })?
+                .identity()
+        } else {
+            exact_republication(key_columns[position], &cols, operands[0].columns())?
         };
-        if let Some(col) = item.output() {
+        let mut select = SelectItem::Scaffolding {
+            slot: ctx.identities.scaffolding_slot(),
+            expr: SqlDomainExpr::Column(anchor),
+        };
+        if let Some(col) = item.output().map(crate::relation::PortId::column) {
             alias_unaliased(&mut select, col);
         }
         output_items.push(select);
@@ -2945,18 +2986,14 @@ fn r_lower_n_way_delegate_join(
     // own reductions stamp), so it self-aliases by its column name — again
     // byte-identical to the retired positional thread.
     if has_agg {
-        for col in &operands[0].columns {
-            if !key_set
-                .iter()
-                .any(|key| identities.same_value(col.identity(), *key))
-            {
-                let mut item = SelectItem::Expression {
-                    expr: SqlDomainExpr::Column(col.identity()),
-                    alias: None,
-                };
-                alias_unaliased(&mut item, col.identity());
-                output_items.push(item);
-            }
+        // The group law publishes keys first, then reductions.
+        for col in operands[0].columns().iter().skip(key_columns.len()) {
+            let mut item = SelectItem::Scaffolding {
+                slot: ctx.identities.scaffolding_slot(),
+                expr: SqlDomainExpr::Column(col.identity()),
+            };
+            alias_unaliased(&mut item, col.identity());
+            output_items.push(item);
         }
     }
 
@@ -2967,12 +3004,15 @@ fn r_lower_n_way_delegate_join(
     // Deduplication is the resolver's; the stamp IS its decision.
     for (op_idx, payload) in &delegate_slots {
         for entry in payload {
-            let (Some(col), Some(expr)) = (entry.output(), entry.value()) else {
+            let (Some(col), Some(expr)) = (
+                entry.output().map(crate::relation::PortId::column),
+                entry.value(),
+            ) else {
                 continue; // resolver stamped None — no output column
             };
-            let mut item = SelectItem::Expression {
-                expr: scalar::s_lower_out_value(expr.clone(), &operands[*op_idx], ctx)?,
-                alias: None,
+            let mut item = SelectItem::Scaffolding {
+                slot: ctx.identities.scaffolding_slot(),
+                expr: scalar::s_lower_expression(expr.clone(), &operands[*op_idx], ctx)?,
             };
             alias_unaliased(&mut item, col);
             output_items.push(item);
@@ -2998,7 +3038,7 @@ fn r_lower_group_by_spec(
     reductions: Vec<ast_refined::ReductionItem>,
     plan: ast_refined::ReductionPlan,
     arbitrary: Vec<ast_refined::OutItem>,
-    cpr_schema: crate::names::ScopeId,
+    result: Option<crate::relation::SemanticRelation>,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use super::builder::GroupBySpec;
@@ -3012,8 +3052,11 @@ fn r_lower_group_by_spec(
         .any(|item| matches!(item, ast_refined::ReductionItem::Pivot(_)));
 
     if has_pivot {
+        let result = result.ok_or_else(|| {
+            DelightQLError::parse_error("an internal delegate aggregate cannot contain a pivot")
+        })?;
         let keys = published_values(keys);
-        return r_lower_pivot(builder, keys, reductions, cpr_schema, ctx);
+        return r_lower_pivot(builder, keys, reductions, result, ctx);
     }
 
     // Check if any keys expression is a tree group (a record or a
@@ -3025,11 +3068,14 @@ fn r_lower_group_by_spec(
         .any(|(index, _)| plan.needs_cte(ast_refined::TreeGroupLocation::InKeys, index));
 
     if by_needs_cte {
+        let result = result.ok_or_else(|| {
+            DelightQLError::parse_error("an internal delegate aggregate cannot contain a tree key")
+        })?;
         // Tree-group-in-keys lowering owns its output schema; unwrap the
         // stamps at the boundary.
         let reductions = published_reduction_values(reductions)?;
         let keys = published_values(keys);
-        return tree_group::r_lower_tree_group_in_keys(builder, keys, reductions, cpr_schema, ctx);
+        return tree_group::r_lower_tree_group_in_keys(builder, keys, reductions, result, ctx);
     }
 
     // Check if any reductions expression is a record or metadata level
@@ -3040,6 +3086,11 @@ fn r_lower_group_by_spec(
         .any(|(index, item)| tree_group::reduction_item_needs_cte(item, index, &plan));
 
     if needs_cte {
+        let result = result.ok_or_else(|| {
+            DelightQLError::parse_error(
+                "an internal delegate aggregate cannot contain a tree reduction",
+            )
+        })?;
         // A single pure tree reduction takes the CTE chain directly; a
         // MIX of CTE-needing trees with other reductions builds one arm
         // per tree joined to a straight arm on the keys.
@@ -3047,10 +3098,10 @@ fn r_lower_group_by_spec(
             // Tree-group CTE lowering owns its output schema; unwrap the stamps.
             let reductions = published_reductions(reductions);
             let keys = published_values(keys);
-            return tree_group::r_lower_tree_group_cte(builder, keys, reductions, cpr_schema, ctx);
+            return tree_group::r_lower_tree_group_cte(builder, keys, reductions, result, ctx);
         }
         return tree_group::r_lower_tree_group_mixed(
-            builder, keys, reductions, plan, arbitrary, cpr_schema, ctx,
+            builder, keys, reductions, plan, arbitrary, result, ctx,
         );
     }
 
@@ -3094,9 +3145,7 @@ fn r_lower_group_by_spec(
             }
         };
         let mut item = tree_group::s_lower_reduction_item(payload, &builder, ctx)?;
-        if let Some(col) = output {
-            alias_unaliased(&mut item, col);
-        }
+        alias_unaliased(&mut item, output.column());
         aggregates.push(item);
     }
 
@@ -3110,26 +3159,31 @@ fn r_lower_group_by_spec(
     // resolver decided this payload yields no column (dup-of-key already emitted
     // in group position), so it is skipped rather than positionally threaded.
     for entry in arbitrary {
-        use crate::pipeline::sql_ast::{DomainExpression as SqlDomainExpr, SelectItem};
-        let output = entry.output();
+        use crate::pipeline::sql_ast::DomainExpression as SqlDomainExpr;
+        let output = entry.output().map(crate::relation::PortId::column);
         let Some(expr) = into_published_value(entry) else {
             continue;
         };
         let Some(col) = output else {
             continue; // resolver stamped None — no output column
         };
-        let mut item = match scalar::s_lower_select_item(expr, &builder, ctx)? {
-            SelectItem::Expression { expr, alias } => SelectItem::Expression {
-                expr: SqlDomainExpr::intrinsic(crate::names::Intrinsic::Arbitrary, vec![expr]),
-                alias,
-            },
-            other => other,
+        let lowered = scalar::s_lower_select_item(expr, &builder, ctx)?;
+        let mut item = match lowered.expr() {
+            Some(expr) => lowered.with_expr(SqlDomainExpr::intrinsic(
+                crate::names::Intrinsic::Arbitrary,
+                vec![expr.clone()],
+            )),
+            None => lowered,
         };
         alias_unaliased(&mut item, col);
         aggregates.push(item);
     }
 
-    group_by_publishing_resolved(builder, GroupBySpec { keys, aggregates }, cpr_schema, ctx)
+    let spec = GroupBySpec { keys, aggregates };
+    match result {
+        Some(result) => group_by_publishing_resolved(builder, spec, result, ctx),
+        None => builder.add_group_by(spec),
+    }
 }
 
 /// Lower pivot: `|> %(keys ~> value_col of pivot_key)`.
@@ -3155,71 +3209,54 @@ enum StructuralPivotTerm {
 }
 
 fn pivot_internal_column(scope: crate::names::ScopeId, ctx: &TransformCtx) -> crate::names::ColId {
-    ctx.identities.mint_column(
-        scope,
-        crate::names::ColumnOrigin::Minted {
-            by: crate::names::MintReason::Pivot,
-        },
-        None,
-        crate::names::Addressing::Hygienic,
-        crate::names::ValueFacts::default(),
-    )
+    ctx.identities
+        .sql_column(scope, None, crate::names::Addressing::Hygienic)
 }
 
+/// Re-anchor one pivot term onto the site the CTE input emits.
+///
+/// The site is a VALUE here, not a question: a CTE input's columns are the
+/// realization of one exact site, and the term is rebound at it.
 fn rebind_pivot_expression(
     mut expr: crate::pipeline::sql_ast::DomainExpression,
-    candidates: &[ColumnMetadata],
+    site: crate::sql_binding::SqlSiteId,
     identities: &crate::names::Registry,
 ) -> Result<crate::pipeline::sql_ast::DomainExpression> {
     struct Rebind<'a> {
-        candidates: &'a [ColumnMetadata],
+        site: crate::sql_binding::SqlSiteId,
         identities: &'a crate::names::Registry,
-        ambiguous: bool,
+        error: Option<DelightQLError>,
     }
     impl crate::pipeline::sql_ast::walk::SqlVisitorMut for Rebind<'_> {
         fn expr(&mut self, expr: &mut crate::pipeline::sql_ast::DomainExpression) {
             let crate::pipeline::sql_ast::DomainExpression::Column(source) = expr else {
                 return;
             };
-            let source = *source;
-            let mut matches = self
-                .candidates
-                .iter()
-                .map(ColumnMetadata::identity)
-                .filter(|candidate| self.identities.same_value(*candidate, source));
-            match (matches.next(), matches.next()) {
-                (Some(column), None) => {
+            let site = self.site;
+            match self.identities.bindings().physical_at(site, *source) {
+                Ok(Some(column)) => {
                     *expr = crate::pipeline::sql_ast::DomainExpression::Column(column);
                 }
-                (None, None) => {}
-                (Some(_), Some(_)) => self.ambiguous = true,
-                (None, Some(_)) => unreachable!("second match requires a first"),
+                Ok(None) => {}
+                Err(error) => self.error = Some(error),
             }
         }
     }
 
     let mut rebind = Rebind {
-        candidates,
+        site,
         identities,
-        ambiguous: false,
+        error: None,
     };
     crate::pipeline::sql_ast::walk::visit_expression_mut(&mut expr, &mut rebind);
-    if rebind.ambiguous {
-        Err(DelightQLError::ParseError {
-            message: "pivot expression maps to more than one CTE column".to_string(),
-            source: None,
-            subcategory: None,
-        })
-    } else {
-        Ok(expr)
-    }
+    rebind.error.map_or(Ok(expr), Err)
 }
 
 fn r_lower_pivot(
     builder: Builder<Unprojected>,
     keys: Vec<ast_refined::DomainExpression>,
     reductions: Vec<ast_refined::ReductionItem>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use super::builder::CteBody;
@@ -3271,7 +3308,7 @@ fn r_lower_pivot(
         }
     }
 
-    let output_columns = cpr_output_columns(cpr_schema, &ctx.identities);
+    let output_columns = relation_output_columns(&result, ctx)?;
     let expected_outputs = keys.len()
         + terms
             .iter()
@@ -3346,11 +3383,7 @@ fn r_lower_pivot(
         });
     }
 
-    let internal_scope = ctx.identities.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-        None,
-    );
+    let internal_scope = ctx.identities.anonymous_scope(None);
     let key_aliases = groups
         .iter()
         .map(|_| pivot_internal_column(internal_scope, ctx))
@@ -3380,16 +3413,27 @@ fn r_lower_pivot(
         let value_aliases = value_aliases.clone();
         let identities = std::rc::Rc::clone(&ctx.identities);
         projected = projected.push_cte(move |input| {
-            let input_columns = input.scope_columns();
             let rebound_groups = group_sql
                 .iter()
                 .cloned()
-                .map(|expr| rebind_pivot_expression(expr, &input_columns, &identities))
+                .map(|expr| {
+                    rebind_pivot_expression(
+                        expr,
+                        crate::pipeline::transformer::builder::Emitting::site(input),
+                        &identities,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
             let rebound_keys = key_sql
                 .iter()
                 .cloned()
-                .map(|expr| rebind_pivot_expression(expr, &input_columns, &identities))
+                .map(|expr| {
+                    rebind_pivot_expression(
+                        expr,
+                        crate::pipeline::transformer::builder::Emitting::site(input),
+                        &identities,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
             let rebound_values = value_sql
                 .iter()
@@ -3397,7 +3441,13 @@ fn r_lower_pivot(
                     group
                         .iter()
                         .cloned()
-                        .map(|expr| rebind_pivot_expression(expr, &input_columns, &identities))
+                        .map(|expr| {
+                            rebind_pivot_expression(
+                                expr,
+                                crate::pipeline::transformer::builder::Emitting::site(input),
+                                &identities,
+                            )
+                        })
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -3423,23 +3473,22 @@ fn r_lower_pivot(
                         .map(|(expr, alias)| SelectItem::expression_with_alias(expr, alias)),
                 );
             }
-            let (at, outputs) = super::builder::stand_cte_body_at(
+            let (at, outputs, physical_aliases) = super::builder::stand_cte_body_at(
                 &mut items,
                 input.scope(),
                 crate::names::WrapReason::Pivot,
                 &identities,
             )?;
-            let query = super::builder::publish_at(
-                at,
-                outputs.iter().copied(),
-                SelectBuilder::new()
-                    .set_select(items)
-                    .from_tables(vec![TableExpression::Scope(input.scope())])
-                    .group_by(rebound_groups.into_iter().chain(rebound_keys).collect()),
-                &identities,
-            )?;
+            let query = (SelectBuilder::new()
+                .set_select(items)
+                .from_tables(vec![TableExpression::Scope(input.scope())])
+                .group_by(rebound_groups.into_iter().chain(rebound_keys).collect()))
+            .standing_at(at)
+            .map_err(crate::error::DelightQLError::parse_error)?;
             Ok(CteBody {
                 query: QueryExpression::Select(Box::new(query)),
+                input_slots: vec![None; outputs.len()],
+                physical_aliases,
                 output_columns: outputs,
             })
         })?;
@@ -3497,12 +3546,24 @@ fn r_lower_pivot(
             let groups = group_sql_for_prepivot
                 .iter()
                 .cloned()
-                .map(|expr| rebind_pivot_expression(expr, &input_columns, &identities))
+                .map(|expr| {
+                    rebind_pivot_expression(
+                        expr,
+                        crate::pipeline::transformer::builder::Emitting::site(input),
+                        &identities,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
             let keys = key_sql_for_prepivot
                 .iter()
                 .cloned()
-                .map(|expr| rebind_pivot_expression(expr, &input_columns, &identities))
+                .map(|expr| {
+                    rebind_pivot_expression(
+                        expr,
+                        crate::pipeline::transformer::builder::Emitting::site(input),
+                        &identities,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
             let values = value_sql_for_prepivot
                 .iter()
@@ -3510,7 +3571,13 @@ fn r_lower_pivot(
                     group
                         .iter()
                         .cloned()
-                        .map(|expr| rebind_pivot_expression(expr, &input_columns, &identities))
+                        .map(|expr| {
+                            rebind_pivot_expression(
+                                expr,
+                                crate::pipeline::transformer::builder::Emitting::site(input),
+                                &identities,
+                            )
+                        })
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -3519,7 +3586,13 @@ fn r_lower_pivot(
         let regular = regular_sql_for_prepivot
             .iter()
             .cloned()
-            .map(|expr| rebind_pivot_expression(expr, &input_columns, &identities))
+            .map(|expr| {
+                rebind_pivot_expression(
+                    expr,
+                    crate::pipeline::transformer::builder::Emitting::site(input),
+                    &identities,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut items = groups
             .iter()
@@ -3548,7 +3621,7 @@ fn r_lower_pivot(
                 packet_aliases_for_prepivot[group_index],
             ));
         }
-        let (at, outputs) = super::builder::stand_cte_body_at(
+        let (at, outputs, physical_aliases) = super::builder::stand_cte_body_at(
             &mut items,
             input.scope(),
             crate::names::WrapReason::Pivot,
@@ -3560,9 +3633,13 @@ fn r_lower_pivot(
         if !groups.is_empty() {
             select = select.group_by(groups);
         }
-        let query = super::builder::publish_at(at, outputs.iter().copied(), select, &identities)?;
+        let query = (select)
+            .standing_at(at)
+            .map_err(crate::error::DelightQLError::parse_error)?;
         Ok(CteBody {
             query: QueryExpression::Select(Box::new(query)),
+            input_slots: vec![None; outputs.len()],
+            physical_aliases,
             output_columns: outputs,
         })
     })?;
@@ -3662,12 +3739,12 @@ fn json_path_segment(key: &str) -> String {
 ///
 /// For each scope column: if it appears in `columns`, wrap it with `function`;
 /// otherwise pass through unchanged. The curried function's existing arguments
-/// are kept — the column value is prepended as the first argument.
+/// are kept — the column value takes the row's final place after them.
 pub(super) fn r_lower_map_cover(
     builder: Builder<Unprojected>,
     cells: Vec<ast_refined::AppliedCell>,
     guard: Option<Box<ast_refined::TruthExpression>>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::sql_ast::{DomainExpression as SqlDomainExpr, SelectItem, WhenClause};
@@ -3680,18 +3757,43 @@ pub(super) fn r_lower_map_cover(
 
     // RESOLUTION ALREADY APPLIED THE CALLABLE: each covered cell carries
     // the closed expression its application produced, so lowering reads
-    // cells rather than substituting anything.
+    // cells rather than substituting anything. The stage's published
+    // heading is POSITIONAL over its input, so each item aliases the
+    // resolver occurrence its slot publishes — which is what keeps two
+    // repeated publications independently addressable downstream.
+    let outputs = ctx.relations.interface(&result)?.ports().to_vec();
+    if outputs.len() != builder.columns().len() {
+        return Err(DelightQLError::parse_error(
+            "a map cover and its input have different widths",
+        ));
+    }
+    let cell_slots: std::collections::HashMap<usize, &ast_refined::AppliedCell> = cells
+        .iter()
+        .map(|cell| Ok((builder.slot_of_port(cell.column)?, cell)))
+        .collect::<Result<_>>()?;
+    let reads = ctx
+        .relations
+        .carried_sources(&result)?
+        .into_iter()
+        .map(|(_, sources)| {
+            let [source] = sources.as_slice() else {
+                return Err(DelightQLError::parse_error(
+                    "a map cover output must carry exactly one input position",
+                ));
+            };
+            builder.rebind_port(*source)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let items: Vec<SelectItem> = builder
         .columns()
         .iter()
-        .map(|c| {
-            let column = c.identity();
-            let applied = cells
-                .iter()
-                .find(|cell| ctx.identities.same_value(cell.column, column));
+        .enumerate()
+        .map(|(slot, _)| {
+            let applied = cell_slots.get(&slot);
+            let alias = outputs[slot].column();
+            let col_expr = SqlDomainExpr::Column(reads[slot]);
             match applied {
                 Some(cell) => {
-                    let col_expr = qualified_col_expr(c);
                     let result = scalar::s_lower_expression(cell.expr.clone(), &builder, ctx)?;
                     // Wrap in CASE WHEN guard THEN fn(col) ELSE col END
                     let final_expr = match &sql_condition {
@@ -3702,17 +3804,22 @@ pub(super) fn r_lower_map_cover(
                         },
                         None => result,
                     };
-                    Ok(SelectItem::Expression {
+                    Ok(SelectItem::Publishing {
                         expr: final_expr,
-                        alias: Some(column),
+                        slot: alias,
+                        printed: true,
                     })
                 }
-                None => Ok(passthrough_item(c)),
+                None => Ok(SelectItem::Publishing {
+                    expr: col_expr,
+                    slot: alias,
+                    printed: true,
+                }),
             }
         })
         .collect::<Result<_>>()?;
 
-    project_publishing_resolved(builder, items, Some(cpr_schema), ctx)
+    project_publishing_resolved(builder, items, Some(result), ctx)
 }
 
 /// Lower project-out: `|> -(cols)`.
@@ -3722,11 +3829,11 @@ pub(super) fn r_lower_map_cover(
 pub(super) fn r_lower_project_out(
     builder: Builder<Unprojected>,
     _selector: Vec<ast_refined::SelectorItem>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    let items = select_items_from_cpr_schema(builder.columns(), cpr_schema, &ctx.identities)?;
-    project_publishing_resolved(builder, items, Some(cpr_schema), ctx)
+    let items = select_carried_items(&builder, &result, &ctx.relations)?;
+    project_publishing_resolved(builder, items, Some(result), ctx)
 }
 
 /// Lower rename-cover: `|> *(old as new)`.
@@ -3736,11 +3843,11 @@ pub(super) fn r_lower_project_out(
 pub(super) fn r_lower_rename_cover(
     builder: Builder<Unprojected>,
     _specs: crate::pipeline::asts::vocabulary::Vec1<ast_refined::RenameSpec>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    let items = select_items_from_cpr_schema(builder.columns(), cpr_schema, &ctx.identities)?;
-    project_publishing_resolved(builder, items, Some(cpr_schema), ctx)
+    let items = select_carried_items(&builder, &result, &ctx.relations)?;
+    project_publishing_resolved(builder, items, Some(result), ctx)
 }
 
 /// Lower transform (basic-cover): `|> $$(expr as col)`.
@@ -3751,7 +3858,7 @@ pub(super) fn r_lower_transform(
     builder: Builder<Unprojected>,
     transformations: crate::pipeline::asts::vocabulary::Vec1<ast_refined::NamedOutItem>,
     conditioned_on: Option<Box<ast_refined::TruthExpression>>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::sql_ast::{DomainExpression as SqlDomainExpr, SelectItem, WhenClause};
@@ -3760,11 +3867,12 @@ pub(super) fn r_lower_transform(
     // once, against the heading the transform stands on; re-addressing the
     // same characters here would answer against a later heading, and a
     // folded second answer is free to disagree with the first.
-    let replacements: Vec<(crate::names::ColId, ast_refined::OutValue)> = transformations
-        .into_vec()
-        .into_iter()
-        .filter_map(|item| item.output.map(|target| (target, item.expr)))
-        .collect();
+    let replacements: Vec<(crate::relation::PortId, ast_refined::DomainExpression)> =
+        transformations
+            .into_vec()
+            .into_iter()
+            .map(|item| (*item.output(), item.expr))
+            .collect();
 
     // Lower the guard condition once (if present)
     let sql_condition: Option<SqlDomainExpr> = match conditioned_on {
@@ -3772,16 +3880,54 @@ pub(super) fn r_lower_transform(
         None => None,
     };
 
+    let carried: std::collections::HashMap<_, _> = ctx
+        .relations
+        .carried_sources(&result)?
+        .into_iter()
+        .collect();
+    let matched_slots: std::collections::HashMap<usize, &ast_refined::DomainExpression> =
+        replacements
+            .iter()
+            .map(|(output, expr)| {
+                let sources = carried.get(output).ok_or_else(|| {
+                    DelightQLError::parse_error("a transform output is absent from its relation")
+                })?;
+                let [source] = sources.as_slice() else {
+                    return Err(DelightQLError::parse_error(
+                        "a transformed output must carry exactly one input position",
+                    ));
+                };
+                Ok((builder.slot_of_port(*source)?, expr))
+            })
+            .collect::<Result<_>>()?;
+    let outputs = ctx.relations.interface(&result)?.ports().to_vec();
+    if outputs.len() != builder.columns().len() {
+        return Err(DelightQLError::parse_error(
+            "a transform and its input have different widths",
+        ));
+    }
+    let reads = ctx
+        .relations
+        .carried_sources(&result)?
+        .into_iter()
+        .map(|(_, sources)| {
+            let [source] = sources.as_slice() else {
+                return Err(DelightQLError::parse_error(
+                    "a transform output must carry exactly one input position",
+                ));
+            };
+            builder.rebind_port(*source)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let items: Vec<SelectItem> = builder
         .columns()
         .iter()
-        .map(|c| {
-            if let Some((_, replacement_expr)) = replacements
-                .iter()
-                .find(|(target, _)| ctx.identities.same_value(*target, c.identity()))
-            {
-                let col_expr = qualified_col_expr(c);
-                let sql_expr = scalar::s_lower_out_value(replacement_expr.clone(), &builder, ctx)?;
+        .enumerate()
+        .map(|(slot, _)| {
+            let col_expr = SqlDomainExpr::Column(reads[slot]);
+            if let Some(replacement_expr) = matched_slots.get(&slot) {
+                let sql_expr =
+                    scalar::s_lower_expression((*replacement_expr).clone(), &builder, ctx)?;
                 // Wrap in CASE WHEN guard THEN new_val ELSE original END
                 let final_expr = match &sql_condition {
                     Some(cond) => SqlDomainExpr::Case {
@@ -3791,17 +3937,22 @@ pub(super) fn r_lower_transform(
                     },
                     None => sql_expr,
                 };
-                Ok(SelectItem::Expression {
+                Ok(SelectItem::Publishing {
                     expr: final_expr,
-                    alias: Some(c.identity()),
+                    slot: outputs[slot].column(),
+                    printed: true,
                 })
             } else {
-                Ok(passthrough_item(c))
+                Ok(SelectItem::Publishing {
+                    expr: col_expr,
+                    slot: outputs[slot].column(),
+                    printed: true,
+                })
             }
         })
         .collect::<Result<_>>()?;
 
-    project_publishing_resolved(builder, items, Some(cpr_schema), ctx)
+    project_publishing_resolved(builder, items, Some(result), ctx)
 }
 
 /// Lower embed-map-cover: `|> +$(fn:() as :"{@}_suffix")(cols)`.
@@ -3811,12 +3962,18 @@ pub(super) fn r_lower_transform(
 pub(super) fn r_lower_embed_map(
     builder: Builder<Unprojected>,
     cells: Vec<ast_refined::AppliedCell>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::sql_ast::SelectItem;
 
-    let outputs = cpr_output_columns(cpr_schema, &ctx.identities);
+    let outputs: Vec<_> = ctx
+        .relations
+        .interface(&result)?
+        .ports()
+        .iter()
+        .map(|port| port.column())
+        .collect();
     let appended = outputs.get(builder.columns().len()..).unwrap_or(&[]);
 
     // Part 1: all existing columns pass through
@@ -3840,13 +3997,14 @@ pub(super) fn r_lower_embed_map(
                 subcategory: None,
             })?;
 
-        items.push(SelectItem::Expression {
+        items.push(SelectItem::Publishing {
             expr: fn_expr,
-            alias: Some(alias),
+            slot: alias,
+            printed: true,
         });
     }
 
-    project_publishing_resolved(builder, items, Some(cpr_schema), ctx)
+    project_publishing_resolved(builder, items, Some(result), ctx)
 }
 
 /// Lower meta-ize: `|> ^` — one application; `^^` arrives here as two
@@ -3858,7 +4016,7 @@ pub(super) fn r_lower_embed_map(
 /// regression: declaration echoes misreport derived columns.
 pub(super) fn r_lower_meta_ize(
     builder: Builder<Unprojected>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::sql_ast::{
@@ -3866,7 +4024,22 @@ pub(super) fn r_lower_meta_ize(
         SetOperator,
     };
     let source_columns = builder.columns().to_vec();
-    let output_columns = cpr_output_columns(cpr_schema, &ctx.identities);
+    let mut inputs = ctx.relations.inputs(&result)?.into_iter();
+    let subject = inputs
+        .next()
+        .ok_or_else(|| DelightQLError::parse_error("meta-ize has no semantic subject"))?;
+    if inputs.next().is_some() {
+        return Err(DelightQLError::parse_error(
+            "meta-ize has more than one semantic subject",
+        ));
+    }
+    let subject_ports = ctx.relations.interface(&subject)?.ports().to_vec();
+    if subject_ports.len() != source_columns.len() {
+        return Err(DelightQLError::parse_error(
+            "meta-ize's semantic and physical subjects have different widths",
+        ));
+    }
+    let output_columns = relation_output_columns(&result, ctx)?;
     if source_columns.is_empty() || output_columns.len() < 3 {
         return Err(DelightQLError::ParseError {
             message: "meta-ize requires an input heading and three output columns".to_string(),
@@ -3874,27 +4047,25 @@ pub(super) fn r_lower_meta_ize(
             subcategory: None,
         });
     }
-    let scope = ctx
-        .identities
-        .common_scope(&output_columns)
-        .ok_or_else(|| DelightQLError::parse_error("meta output has no common scope"))?;
-    let make_row = |position: usize, column: &ColumnMetadata| {
-        vec![
+    let scope = result.scope();
+    let make_row = |position: usize, column: &ColumnMetadata| -> Result<Vec<SqlDomainExpr>> {
+        let owner = ctx.relations.owner(subject_ports[position])?;
+        Ok(vec![
             // The relation the column BELONGS to, not the one publishing it
             // here. A join republishes both arms into one scope so it has a
             // heading of its own; reading that scope would report every
             // column of a two-relation join as one relation's, and the
             // reader's whole question is which relation a column is from.
-            SqlDomainExpr::ScopeNameLiteral(ctx.identities.owner_of(column.identity())),
+            SqlDomainExpr::ScopeNameLiteral(owner),
             SqlDomainExpr::PublishedNameLiteral(column.identity()),
             SqlDomainExpr::literal(ast_refined::LiteralValue::Number(
                 (position + 1).to_string(),
             )),
-        ]
+        ])
     };
     let mut rows = source_columns.iter().enumerate();
     let (position, column) = rows.next().expect("non-empty checked");
-    let published = Publication::at(
+    let published = SqlLayout::new(
         scope,
         output_columns
             .iter()
@@ -3902,10 +4073,10 @@ pub(super) fn r_lower_meta_ize(
             .map(ColumnMetadata::new)
             .collect(),
         &ctx.identities,
-    )?;
+    );
     let first = published.publish(
         SelectStatement::builder().select_all(
-            make_row(position, column)
+            make_row(position, column)?
                 .into_iter()
                 .zip(output_columns.iter())
                 .map(|(expr, output)| SelectItem::expression_with_alias(expr, *output))
@@ -3916,14 +4087,17 @@ pub(super) fn r_lower_meta_ize(
     for (position, column) in rows {
         // A later branch spells no aliases — SQL takes the output names from
         // the first — so it fills the same slots and names nothing.
-        let row = Alignment::with(&published).align(
-            SelectStatement::builder().select_all(
-                make_row(position, column)
+        let row = SelectStatement::builder()
+            .select_all(
+                make_row(position, column)?
                     .into_iter()
-                    .map(SelectItem::expression)
+                    .map(|expr| {
+                        SelectItem::scaffolding_value(expr, ctx.identities.scaffolding_slot())
+                    })
                     .collect(),
-            ),
-        )?;
+            )
+            .standing_at(scope)
+            .map_err(DelightQLError::parse_error)?;
         query = QueryExpression::SetOperation {
             op: SetOperator::UnionAll,
             left: Box::new(query),
@@ -3933,7 +4107,7 @@ pub(super) fn r_lower_meta_ize(
     Builder::from_query(
         query,
         ScopeName::Resolved(scope),
-        columns_from_cpr_schema(cpr_schema, &ctx.identities),
+        columns_from_relation(&result, ctx)?,
         builder.names().fork(),
         std::rc::Rc::clone(&ctx.identities),
     )
@@ -3947,7 +4121,7 @@ pub(super) fn r_lower_meta_ize(
 pub(super) fn r_lower_witness(
     builder: Builder<Unprojected>,
     polarity: crate::pipeline::asts::core::Polarity,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::sql_ast::{
@@ -3961,7 +4135,7 @@ pub(super) fn r_lower_witness(
     } else {
         SqlDomainExpr::not_exists(source_query)
     };
-    let output_columns = cpr_output_columns(cpr_schema, &ctx.identities);
+    let output_columns = relation_output_columns(&result, ctx)?;
     let output = output_columns
         .first()
         .copied()
@@ -3970,20 +4144,18 @@ pub(super) fn r_lower_witness(
             source: None,
             subcategory: None,
         })?;
-    let scope = ctx.identities.scope_of(output);
-    let select = super::builder::publish_at(
-        scope,
-        [output],
-        SelectStatement::builder().select(SelectItem::expression_with_alias(exists_expr, output)),
-        &ctx.identities,
-    )?;
+    let scope = result.scope();
+    let select = (SelectStatement::builder()
+        .select(SelectItem::expression_with_alias(exists_expr, output)))
+    .standing_at(scope)
+    .map_err(crate::error::DelightQLError::parse_error)?;
 
     let query = QueryExpression::Select(Box::new(select));
 
     Builder::from_query(
         query,
         ScopeName::Resolved(scope),
-        columns_from_cpr_schema(cpr_schema, &ctx.identities),
+        columns_from_relation(&result, ctx)?,
         names_fork,
         std::rc::Rc::clone(&ctx.identities),
     )
@@ -4006,12 +4178,10 @@ pub(super) fn r_lower_witness(
 /// ad-hoc `+-`).
 pub(super) fn r_lower_signed_witness(
     builder: Builder<Unprojected>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    use crate::names::{
-        Addressing, ColumnOrigin, Computation, Hint, Republish, ScopeOrigin, ValueFacts, WrapReason,
-    };
+    use crate::names::{Addressing, WrapReason};
     use crate::pipeline::asts::core::literals::LiteralValue;
     use crate::pipeline::sql_ast::{
         DomainExpression as SqlDomainExpr, JoinCondition, JoinType, QueryExpression, SelectItem,
@@ -4037,72 +4207,42 @@ pub(super) fn r_lower_signed_witness(
 
     let one = || SqlDomainExpr::literal(LiteralValue::Number("1".to_string()));
 
-    let dee_scope = ctx.identities.mint_derived_scope(
-        ScopeOrigin::Wrap {
-            input: source_scope,
-            why: WrapReason::Witness,
-        },
-        Hint::None,
-    );
-    let dee_column = ctx.identities.mint_column(
-        dee_scope,
-        ColumnOrigin::Computed {
-            via: Computation::Literal,
-        },
-        None,
-        Addressing::Hygienic,
-        ValueFacts::default(),
-    );
-    let dee = super::builder::publish_at(
-        dee_scope,
-        [dee_column],
-        SelectStatement::builder().select(SelectItem::expression_with_alias(one(), dee_column)),
-        &ctx.identities,
-    )?;
+    let dee_scope = ctx.identities.wrap_scope(source_scope, WrapReason::Witness);
+    let dee_column = ctx
+        .identities
+        .sql_column(dee_scope, None, Addressing::Hygienic);
+    let dee = (SelectStatement::builder()
+        .select(SelectItem::expression_with_alias(one(), dee_column)))
+    .standing_at(dee_scope)
+    .map_err(crate::error::DelightQLError::parse_error)?;
 
-    let source_alias_scope = ctx.identities.mint_derived_scope(
-        ScopeOrigin::Wrap {
-            input: source_scope,
-            why: WrapReason::Witness,
-        },
-        Hint::None,
-    );
+    let source_alias_scope = ctx.identities.wrap_scope(source_scope, WrapReason::Witness);
     let source_alias_columns: Vec<_> = super::builder::republish_under(
         &mut source_query,
         source_alias_scope,
         &source_columns,
         &ctx.identities,
-        Republish::Passthrough,
     )?
     .into_iter()
     .map(|column| column.identity())
     .collect();
-    let sentinel_scope = ctx.identities.mint_derived_scope(
-        ScopeOrigin::Wrap {
-            input: source_alias_scope,
-            why: WrapReason::Witness,
-        },
-        Hint::Exact(ctx.identities.intern("r", false)),
+    let sentinel_scope = ctx.identities.exact_emission_scope(
+        source_alias_scope,
+        WrapReason::Witness,
+        ctx.identities.intern("r", false),
     );
-    let sentinel_column = ctx.identities.mint_column(
+    let sentinel_column = ctx.identities.sql_column(
         sentinel_scope,
-        ColumnOrigin::Computed {
-            via: Computation::Literal,
-        },
         Some(ctx.identities.intern("__p", false)),
         Addressing::Hygienic,
-        ValueFacts::default(),
     );
     let sentinel_payload = source_alias_columns
         .iter()
         .map(|column| {
-            ctx.identities.republish_column(
+            ctx.identities.rebind_sql_column(
                 *column,
                 sentinel_scope,
-                Republish::Passthrough,
                 ctx.identities.published(*column),
-                ctx.identities.addressing(*column),
-                |_| {},
             )
         })
         .collect::<Vec<_>>();
@@ -4121,12 +4261,9 @@ pub(super) fn r_lower_signed_witness(
             source_query,
             source_alias_scope,
         )]);
-    let sentinel = super::builder::publish_at(
-        sentinel_scope,
-        std::iter::once(sentinel_column).chain(sentinel_payload.iter().copied()),
-        sentinel,
-        &ctx.identities,
-    )?;
+    let sentinel = (sentinel)
+        .standing_at(sentinel_scope)
+        .map_err(crate::error::DelightQLError::parse_error)?;
 
     let join = TableExpression::Join {
         left: Box::new(TableExpression::subquery(
@@ -4141,7 +4278,7 @@ pub(super) fn r_lower_signed_witness(
         join_condition: JoinCondition::On(SqlDomainExpr::eq(one(), one())),
     };
 
-    let output_columns = cpr_output_columns(cpr_schema, &ctx.identities);
+    let output_columns = relation_output_columns(&result, ctx)?;
     if output_columns.len() != sentinel_payload.len() + 1 {
         return Err(DelightQLError::ParseError {
             message: "signed witness output heading does not match its input".to_string(),
@@ -4155,7 +4292,7 @@ pub(super) fn r_lower_signed_witness(
         .zip(output_columns.iter().take(sentinel_payload.len()))
     {
         let read = SqlDomainExpr::Column(*source);
-        let expr = if ctx.identities.facts(*source).interior.is_some() {
+        let expr = if ctx.identities.is_tree_valued(*source) {
             SqlDomainExpr::function(
                 "coalesce",
                 vec![
@@ -4183,20 +4320,17 @@ pub(super) fn r_lower_signed_witness(
         .identities
         .common_scope(&output_columns)
         .ok_or_else(|| err("signed witness output has no common scope".to_string()))?;
-    let select = super::builder::publish_at(
-        scope,
-        output_columns.iter().copied(),
-        SelectStatement::builder()
-            .select_all(items)
-            .from_tables(vec![join]),
-        &ctx.identities,
-    )?;
+    let select = (SelectStatement::builder()
+        .select_all(items)
+        .from_tables(vec![join]))
+    .standing_at(scope)
+    .map_err(crate::error::DelightQLError::parse_error)?;
 
     let query = QueryExpression::Select(Box::new(select));
     Builder::from_query(
         query,
         ScopeName::Resolved(scope),
-        columns_from_cpr_schema(cpr_schema, &ctx.identities),
+        columns_from_relation(&result, ctx)?,
         names_fork,
         std::rc::Rc::clone(&ctx.identities),
     )
@@ -4208,11 +4342,11 @@ pub(super) fn r_lower_signed_witness(
 /// reordered column list.
 pub(super) fn r_lower_reposition(
     builder: Builder<Unprojected>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
-    let items = select_items_from_cpr_schema(builder.columns(), cpr_schema, &ctx.identities)?;
-    project_publishing_resolved(builder, items, Some(cpr_schema), ctx)
+    let items = select_carried_items(&builder, &result, &ctx.relations)?;
+    project_publishing_resolved(builder, items, Some(result), ctx)
 }
 
 /// Lower narrowing destructure: `|> .column{.field1, .field2}`.
@@ -4230,36 +4364,19 @@ pub(super) fn r_lower_narrowing_destructure(
     nest: ast_refined::Reference,
     pattern: ast_refined::RecordPattern,
     schema: &[ast_refined::DestructureMapping],
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::asts::core::{NamedReference, Reference};
 
-    let Reference::Named(NamedReference(ColumnOccurrence { column, .. })) = nest;
-    let matches = builder
-        .columns()
-        .iter()
-        .map(ColumnMetadata::identity)
-        .filter(|candidate| ctx.identities.same_value(*candidate, column))
-        .collect::<Vec<_>>();
-    let source_column = match matches.as_slice() {
-        [column] => *column,
-        [] => {
-            return Err(DelightQLError::ParseError {
-                message: "narrowing source is not present".to_string(),
-                source: None,
-                subcategory: None,
-            })
-        }
-        _ => {
-            return Err(DelightQLError::ParseError {
-                message: "narrowing source is ambiguous".to_string(),
-                source: None,
-                subcategory: None,
-            })
-        }
+    let Reference::Named(NamedReference(ColumnOccurrence { column, .. })) = nest else {
+        return Err(DelightQLError::transformation_error(
+            "narrowing requires a semantic source port",
+            "narrow/source",
+        ));
     };
-    let mut outputs = cpr_output_columns(cpr_schema, &ctx.identities)
+    let source_column = builder.rebind_port(column)?;
+    let mut outputs = relation_output_columns(&result, ctx)?
         .into_iter()
         .peekable();
 
@@ -4281,7 +4398,7 @@ pub(super) fn r_lower_narrowing_destructure(
         source_column,
         "_narrow",
         super::builder::JsonEachKind::Array,
-        |_source_columns| vec![],
+        |_source_columns, _source_slot| vec![],
         move |_key_column, value_column| {
             let source = crate::pipeline::sql_ast::DomainExpression::Column(value_column);
             items
@@ -4362,72 +4479,88 @@ fn narrowing_items(
 /// ```
 fn r_lower_interior_drill_down(
     builder: Builder<Unprojected>,
-    column: crate::names::ColId,
-    interior_cols: Vec<crate::names::ColId>,
+    column: crate::relation::PortId,
+    selected: Vec<crate::relation::PortId>,
     groundings: Vec<crate::pipeline::asts::core::operators::ResolvedInteriorGrounding>,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::sql_ast::{DomainExpression as SqlDomainExpr, SelectItem};
 
-    let matches = builder
-        .columns()
-        .iter()
-        .map(ColumnMetadata::identity)
-        .filter(|candidate| ctx.identities.same_value(*candidate, column))
-        .collect::<Vec<_>>();
-    let drilled = match matches.as_slice() {
-        [column] => *column,
-        [] => {
-            return Err(DelightQLError::ParseError {
-                message: "interior drill source is not present".to_string(),
-                source: None,
-                subcategory: None,
-            })
-        }
-        _ => {
-            return Err(DelightQLError::ParseError {
-                message: "interior drill source is ambiguous".to_string(),
-                source: None,
-                subcategory: None,
-            })
-        }
-    };
+    let drilled = builder.rebind_port(column)?;
+    // The drilled slot was resolved uniquely above, so the context is
+    // everything that is not that OCCURRENCE. Excluding by value class
+    // would take a sibling publication of the same value with it.
     let context_columns: Vec<_> = builder
         .columns()
         .iter()
         .map(ColumnMetadata::identity)
-        .filter(|candidate| !ctx.identities.same_value(*candidate, drilled))
+        .filter(|candidate| *candidate != drilled)
         .collect();
     let num_context = context_columns.len();
-    let output_columns = cpr_output_columns(cpr_schema, &ctx.identities);
-    if output_columns.len() < num_context + interior_cols.len() {
+    let output_columns = relation_output_columns(&result, ctx)?;
+    if output_columns.len() < num_context + selected.len() {
         return Err(DelightQLError::ParseError {
             message: "interior drill output heading is incomplete".to_string(),
             source: None,
             subcategory: None,
         });
     }
+    let interior = ctx.relations.interior(column)?.ok_or_else(|| {
+        DelightQLError::transformation_error(
+            "a drilled semantic port has no construction-recorded interior",
+            "drill/interior",
+        )
+    })?;
+    let interior_ports = ctx.relations.interface(&interior)?;
+    let result_ports = ctx.relations.interface(&result)?;
+    let json_keys = result_ports.ports()[num_context..num_context + selected.len()]
+        .iter()
+        .map(|output| {
+            let mut sources = ctx
+                .relations
+                .ancestors_into(&result, *output)?
+                .into_iter()
+                .filter(|source| interior_ports.ports().contains(source));
+            let source = sources.next().ok_or_else(|| {
+                DelightQLError::transformation_error(
+                    "a drill output has no construction-recorded interior source",
+                    "drill/interior",
+                )
+            })?;
+            if sources.next().is_some() {
+                return Err(DelightQLError::transformation_error(
+                    "a drill output carries several interior source ports",
+                    "drill/interior",
+                ));
+            }
+            Ok(source.column())
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     builder.expand_with_json_each(
         drilled,
         "_drill",
         super::builder::JsonEachKind::Array,
-        |source_columns| {
+        |source_columns, source_slot| {
             source_columns
                 .iter()
-                .filter(|candidate| !ctx.identities.same_value(**candidate, drilled))
                 .enumerate()
-                .map(|(i, source)| {
-                    SelectItem::expression_with_alias(
-                        SqlDomainExpr::Column(*source),
-                        output_columns[i],
+                .filter(|(slot, _)| *slot != source_slot)
+                .enumerate()
+                .map(|(output, (source, column))| {
+                    (
+                        source,
+                        SelectItem::expression_with_alias(
+                            SqlDomainExpr::Column(*column),
+                            output_columns[output],
+                        ),
                     )
                 })
                 .collect()
         },
         |_key_column, value_column| {
-            interior_cols
+            json_keys
                 .iter()
                 .enumerate()
                 .map(|(i, interior_column)| {
@@ -4465,50 +4598,31 @@ pub(super) fn r_lower_destructure(
     mode: ast_refined::DestructureMode,
     pattern: &ast_refined::TreePattern,
     mappings: &[ast_refined::DestructureMapping],
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
     let source_expr = scalar::s_lower_expression(json_column.clone(), &builder, ctx)?;
-    let input_columns: Vec<_> = builder
-        .columns()
-        .iter()
-        .map(ColumnMetadata::identity)
-        .collect();
-    let published = cpr_output_columns(cpr_schema, &ctx.identities);
+    let carried = ctx.relations.carried_sources(&result)?;
     crate::probe::probing!(destructure, {
-        for column in &input_columns {
-            crate::probe::probe!(
-                destructure,
-                "  input  {:?}",
-                crate::probe::chain(&ctx.identities, *column)
-            );
-        }
-        for column in &published {
-            let kept = !input_columns
-                .iter()
-                .any(|input| ctx.identities.same_value(*input, *column));
+        for (output, sources) in &carried {
             crate::probe::probe!(
                 destructure,
                 "  output {} {:?}",
-                if kept { "take" } else { "SKIP" },
-                crate::probe::chain(&ctx.identities, *column)
+                if sources.is_empty() { "take" } else { "SKIP" },
+                crate::probe::chain(&ctx.identities, output.column())
             );
         }
     });
-    let mut outputs = published
+    let mut outputs = carried
         .into_iter()
-        .filter(|output| {
-            !input_columns
-                .iter()
-                .any(|input| ctx.identities.same_value(*input, *output))
-        })
+        .filter_map(|(output, sources)| sources.is_empty().then_some(output.column()))
         .peekable();
 
     let lowered = if matches!(mode, ast_refined::DestructureMode::Aggregate) {
         let json_column = match &json_column {
             ast_refined::DomainExpression::Reference(Reference::Named(NamedReference(
                 ColumnOccurrence { column, .. },
-            ))) => *column,
+            ))) => builder.rebind_port(*column)?,
             _ => {
                 return Err(DelightQLError::ParseError {
                     message: "aggregate destructure: expected Lvar for json column".into(),
@@ -4542,20 +4656,9 @@ fn next_destructure_output(
 }
 
 fn destructure_temp(ctx: &TransformCtx) -> crate::names::ColId {
-    let scope = ctx.identities.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-        None,
-    );
-    ctx.identities.mint_column(
-        scope,
-        crate::names::ColumnOrigin::Computed {
-            via: crate::names::Computation::Operator,
-        },
-        None,
-        crate::names::Addressing::Hygienic,
-        crate::names::ValueFacts::default(),
-    )
+    let scope = ctx.identities.anonymous_scope(None);
+    ctx.identities
+        .sql_column(scope, None, crate::names::Addressing::Hygienic)
 }
 
 fn lower_destructure_pattern<I: Iterator<Item = crate::names::ColId>>(
@@ -4646,7 +4749,7 @@ fn lower_destructure_pattern<I: Iterator<Item = crate::names::ColId>>(
                     *alias,
                 ));
             }
-            let projected = builder.add_projection(proj)?;
+            let projected = builder.add_support_projection(proj)?;
             let mut cursor = existing_len + base_count;
             let mut explosion_columns = Vec::with_capacity(explosions.len());
             for (_key, pattern, _) in explosions {
@@ -4667,16 +4770,7 @@ fn lower_destructure_pattern<I: Iterator<Item = crate::names::ColId>>(
             }
 
             for (temp, nested_pattern) in navigation_columns {
-                let current = builder
-                    .columns()
-                    .iter()
-                    .find(|column| ctx.identities.same_value(column.identity(), temp))
-                    .map(ColumnMetadata::identity)
-                    .ok_or_else(|| DelightQLError::ParseError {
-                        message: "nested destructure source was not carried forward".to_string(),
-                        source: None,
-                        subcategory: None,
-                    })?;
+                let current = builder.rebind_physical(temp)?;
                 let nav_source = SqlDomainExpr::Column(current);
                 builder = lower_destructure_pattern(
                     builder,
@@ -4705,7 +4799,7 @@ fn lower_destructure_pattern<I: Iterator<Item = crate::names::ColId>>(
                     next_destructure_output(outputs)?,
                 ));
             }
-            builder.add_projection(items)?.demote()
+            builder.add_support_projection(items)?.demote()
         }
     }
 }
@@ -4734,8 +4828,9 @@ fn lower_metadata_level<I: Iterator<Item = crate::names::ColId>>(
         source.clone(),
         temp_alias,
     ));
-    let projected = builder.add_projection(proj)?;
-    let temp_column = projected.columns()[context_len].identity();
+    let projected = builder.add_support_projection(proj)?;
+    let temp_slot = context_len;
+    let temp_column = projected.columns()[temp_slot].identity();
     let builder = projected.demote()?;
     let key_output = next_destructure_output(outputs)?;
     let value_alias = destructure_temp(ctx);
@@ -4744,11 +4839,15 @@ fn lower_metadata_level<I: Iterator<Item = crate::names::ColId>>(
         temp_column,
         "_je",
         super::builder::JsonEachKind::Object,
-        |source_columns| {
+        |source_columns, _source_slot| {
             source_columns
                 .iter()
-                .map(|column| {
-                    SelectItem::expression_with_alias(SqlDomainExpr::Column(*column), *column)
+                .enumerate()
+                .map(|(slot, column)| {
+                    (
+                        slot,
+                        SelectItem::expression_with_alias(SqlDomainExpr::Column(*column), *column),
+                    )
                 })
                 .collect()
         },
@@ -4766,9 +4865,13 @@ fn lower_metadata_level<I: Iterator<Item = crate::names::ColId>>(
     // taken before one names a scope the next statement's FROM does not
     // offer. The slot is the same either side; the occurrence is not.
     let demoted = expanded.demote()?;
-    let value_column = demoted.columns()[context_len + 1].identity();
-    let builder = remove_column(demoted, temp_column, ctx)?;
-    let value_column = carried_now(builder.columns(), value_column, &ctx.identities)?;
+    let builder = remove_physical_slot(demoted, temp_slot, ctx)?;
+    let value_slot = if temp_slot < context_len + 1 {
+        context_len
+    } else {
+        context_len + 1
+    };
+    let value_column = builder.columns()[value_slot].identity();
     let builder = match target {
         PatternTarget::Pattern(inner) => {
             lower_with_json_each(builder, value_column, inner, mappings, outputs, ctx)?
@@ -4777,7 +4880,16 @@ fn lower_metadata_level<I: Iterator<Item = crate::names::ColId>>(
         // key, and nothing under it to reach.
         PatternTarget::Disregarded => builder,
     };
-    remove_column(builder, value_column, ctx)
+    // THE SLOT IS THE SAME EITHER SIDE; THE OCCURRENCE IS NOT. The nested
+    // expansion republishes the heading, so searching for the occurrence
+    // taken before it finds nothing — the position it stood at is what
+    // carries across, and the nested level only appends after it.
+    if builder.columns().len() <= value_slot {
+        return Err(DelightQLError::parse_error(
+            "a metadata level lost the position its value stood at",
+        ));
+    }
+    remove_physical_slot(builder, value_slot, ctx)
 }
 
 /// Eat a `~>`: wrap a column in json_each, then recurse into the nested
@@ -4802,11 +4914,15 @@ fn lower_with_json_each(
         column,
         "_destr",
         super::builder::JsonEachKind::Array,
-        |source_columns| {
+        |source_columns, _source_slot| {
             source_columns
                 .iter()
-                .map(|source| {
-                    SelectItem::expression_with_alias(SqlDomainExpr::Column(*source), *source)
+                .enumerate()
+                .map(|(slot, source)| {
+                    (
+                        slot,
+                        SelectItem::expression_with_alias(SqlDomainExpr::Column(*source), *source),
+                    )
                 })
                 .collect()
         },
@@ -4828,40 +4944,20 @@ fn lower_with_json_each(
     let value_source = SqlDomainExpr::Column(value_column);
     let builder =
         lower_destructure_pattern(demoted, &value_source, pattern, mappings, outputs, ctx)?;
-    remove_column(builder, value_column, ctx)
+    remove_physical_slot(builder, context_len, ctx)
 }
 
-/// The occurrence a builder carries now for a column it has republished.
-///
-/// Every wrap re-publishes the heading, so a column read before one is an
-/// ancestor of what the statement offers rather than the thing itself. Matching
-/// it back by value would find any sibling sharing a progenitor; descent finds
-/// the one this builder actually made of it.
-///
-/// One or none, and neither of the other two answers may be guessed at.
-/// Returning the pre-wrap occurrence when nothing carries it hands back
-/// exactly the dangling reference this function exists to prevent, and taking
-/// the first of several publishes one occurrence under a claim that two make
-/// equally — the refusal every other reader in this stack gives.
-fn carried_now(
-    columns: &[ColumnMetadata],
-    column: crate::names::ColId,
-    identities: &crate::names::Registry,
-) -> Result<crate::names::ColId> {
-    let mut carrying = columns
-        .iter()
-        .map(ColumnMetadata::identity)
-        .filter(|candidate| identities.republishes(*candidate, column));
-    match (carrying.next(), carrying.next()) {
-        (Some(carried), None) => Ok(carried),
-        (None, _) => Err(DelightQLError::parse_error(
-            "the column this step stands on is not published by the statement it now stands in",
-        )),
-        (Some(_), Some(_)) => Err(DelightQLError::parse_error(
-            "the column this step stands on is published more than once here, so naming it \
-             names no single column",
-        )),
-    }
+fn remove_physical_slot(
+    builder: Builder<Unprojected>,
+    slot: usize,
+    ctx: &TransformCtx,
+) -> Result<Builder<Unprojected>> {
+    let column = builder
+        .columns()
+        .get(slot)
+        .ok_or_else(|| DelightQLError::parse_error("physical support slot is absent"))?
+        .identity();
+    remove_current_column(builder, column, ctx)
 }
 
 fn remove_column(
@@ -4869,13 +4965,28 @@ fn remove_column(
     column: crate::names::ColId,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
+    let column = builder.rebind_physical(column)?;
+    remove_current_column(builder, column, ctx)
+}
+
+fn remove_current_column(
+    builder: Builder<Unprojected>,
+    column: crate::names::ColId,
+    ctx: &TransformCtx,
+) -> Result<Builder<Unprojected>> {
     use crate::pipeline::sql_ast::{DomainExpression as SqlDomainExpr, SelectItem};
 
-    let keep: Vec<_> = builder
+    // Removal is slot-exact. Excluding by value class drops every sibling
+    // publication of one value, where the caller named ONE of them.
+    let retained: Vec<_> = builder
         .columns()
         .iter()
-        .map(ColumnMetadata::identity)
-        .filter(|candidate| !ctx.identities.same_value(*candidate, column))
+        .enumerate()
+        .filter_map(|(slot, candidate)| (candidate.identity() != column).then_some(slot))
+        .collect();
+    let keep: Vec<_> = retained
+        .iter()
+        .map(|slot| builder.columns()[*slot].identity())
         .collect();
     crate::probe::probing!(destructure, {
         crate::probe::probe!(
@@ -4905,7 +5016,9 @@ fn remove_column(
         .iter()
         .map(|column| SelectItem::expression_with_alias(SqlDomainExpr::Column(*column), *column))
         .collect();
-    builder.add_projection(items)?.demote()
+    builder
+        .select_physical_projection(items, &retained)?
+        .demote()
 }
 
 fn make_json_extract_item(
@@ -4918,7 +5031,7 @@ fn make_json_extract_item(
 
 fn make_destructure_shorthand_item(
     source: &crate::pipeline::sql_ast::DomainExpression,
-    member: crate::names::ColId,
+    member: crate::relation::PortId,
     alias: crate::names::ColId,
     mappings: &[ast_refined::DestructureMapping],
 ) -> Result<crate::pipeline::sql_ast::SelectItem> {
@@ -4948,9 +5061,7 @@ fn make_json_extract_raw_item(
         source,
         json_path,
         alias,
-        crate::pipeline::sql_ast::FunctionName::Intrinsic(
-            crate::names::Intrinsic::JsonExtractRaw,
-        ),
+        crate::pipeline::sql_ast::FunctionName::Intrinsic(crate::names::Intrinsic::JsonExtractRaw),
     )
 }
 
@@ -5002,18 +5113,18 @@ pub(super) fn expand_whole_heading(
     let (left, right) = whole.arms();
     let (left, right) = (*left, *right);
 
-    let left_columns = identities.known_heading(left)?.to_vec();
-    let right_columns = identities.known_heading(right)?.to_vec();
-    let mut pairs: Vec<(crate::names::ColId, crate::names::ColId)> = Vec::new();
+    let left_columns = crate::relation::published_ports(identities, &left)?;
+    let right_columns = crate::relation::published_ports(identities, &right)?;
+    let mut pairs: Vec<(crate::relation::PortId, crate::relation::PortId)> = Vec::new();
     if by_name {
         for right_column in right_columns {
-            let Some(name) = identities.published_sym(right_column) else {
+            let Some(name) = identities.published_sym(right_column.column()) else {
                 continue;
             };
-            let matches: Vec<crate::names::ColId> = left_columns
+            let matches: Vec<crate::relation::PortId> = left_columns
                 .iter()
                 .copied()
-                .filter(|left| identities.published_sym(*left) == Some(name))
+                .filter(|left| identities.published_sym(left.column()) == Some(name))
                 .collect();
             match matches.as_slice() {
                 [] => {}
@@ -5049,18 +5160,16 @@ pub(super) fn expand_whole_heading(
             operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
             left: Box::new(ast_refined::DomainExpression::Reference(
                 crate::pipeline::asts::core::Reference::Named(
-                    crate::pipeline::asts::core::NamedReference(ColumnOccurrence {
-                        column: left,
-                        explicit_qualifier: true,
-                    }),
+                    crate::pipeline::asts::core::NamedReference(
+                        ColumnOccurrence::engine_qualified(left),
+                    ),
                 ),
             )),
             right: Box::new(ast_refined::DomainExpression::Reference(
                 crate::pipeline::asts::core::Reference::Named(
-                    crate::pipeline::asts::core::NamedReference(ColumnOccurrence {
-                        column: right,
-                        explicit_qualifier: true,
-                    }),
+                    crate::pipeline::asts::core::NamedReference(
+                        ColumnOccurrence::engine_qualified(right),
+                    ),
                 ),
             )),
         })
@@ -5089,15 +5198,16 @@ pub(super) struct ArmCorrelation {
 /// left arm's rows that have no match, which is what makes it
 /// bag-preserving where SQL `EXCEPT` is not.
 pub(super) fn r_lower_correlated_set_op(
-    operands: Vec<Builder<Projected>>,
+    operands: Vec<SetArm>,
     operator: ast_refined::SetOperator,
     correlations: Vec<ArmCorrelation>,
-    cpr_schema: crate::names::ScopeId,
+    steps: &[crate::relation::SemanticRelation],
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
+    use crate::pipeline::sql_ast::DomainExpression as SqlDomainExpr;
     use crate::pipeline::sql_ast::SqlPredicate;
-    use crate::pipeline::sql_ast::{DomainExpression as SqlDomainExpr, SelectItem};
 
+    let result = *steps.last().ok_or_else(|| empty_run())?;
     if operands.len() < 2 {
         return Err(DelightQLError::ParseError {
             message: "a correlated set operation requires at least 2 operands".to_string(),
@@ -5115,36 +5225,39 @@ pub(super) fn r_lower_correlated_set_op(
             });
         }
     }
-    let output_columns = cpr_output_columns(cpr_schema, &ctx.identities);
+    let output_columns = relation_output_columns(&result, ctx)?;
     let names = ctx.names.clone();
     let mut source_columns = Vec::with_capacity(operands.len());
     let mut queries = Vec::with_capacity(operands.len());
-    for operand in operands {
-        source_columns.push(operand.scope_columns());
-        queries.push(operand.to_sql()?);
-    }
-
-    let mut scopes = Vec::with_capacity(source_columns.len());
-    let mut active_columns = Vec::with_capacity(source_columns.len());
-    for (arm, columns) in source_columns.iter().enumerate() {
-        let origin = ColumnMetadata::common_identity_scope(columns, &ctx.identities)
-            .map(|of| crate::names::ScopeOrigin::SetArm {
-                of,
-                arm: arm as u16,
-            })
-            .unwrap_or(crate::names::ScopeOrigin::AnonRelation);
-        let scope = names.fresh(origin).identity();
+    let mut scopes = Vec::with_capacity(operands.len());
+    let mut active_columns = Vec::with_capacity(operands.len());
+    let mut layouts = Vec::with_capacity(operands.len());
+    let mut sites = Vec::with_capacity(operands.len());
+    for (index, operand) in operands.into_iter().enumerate() {
+        let (query, scope, before, republished, layout, site) =
+            operand.lay_out(index, ctx, &names)?;
+        source_columns.push(before);
+        queries.push(query);
         scopes.push(scope);
-        active_columns.push(super::builder::republish_under(
-            &mut queries[arm],
-            scope,
-            columns,
-            &ctx.identities,
-            crate::names::Republish::BoundaryExport,
-        )?);
+        layouts.push(layout);
+        sites.push(site);
+        active_columns.push(republished);
     }
 
     let is_minus = matches!(operator, ast_refined::SetOperator::MinusCorresponding);
+    // A MINUS EXPORTS ITS LEFT OPERAND and probes its right, so it binds
+    // ONE branch and the authority's exact-heading map is its evidence.
+    // Every other operator merges, and its contribution table is. Two
+    // evidences, ONE binding road: nothing here pairs ports with columns.
+    let binding = if is_minus {
+        ctx.identities
+            .bindings()
+            .bind_export(&ctx.identities, &result, &layouts[0])?
+    } else {
+        ctx.identities
+            .bindings()
+            .bind_run(&ctx.identities, steps, &layouts)?
+    };
     if !is_minus && queries.len() == 2 && correlations.iter().any(|c| c.min_multiplicity) {
         let correlation = &correlations[0];
         return r_lower_intersect_min_multiplicity(
@@ -5154,7 +5267,7 @@ pub(super) fn r_lower_correlated_set_op(
             &source_columns,
             &active_columns,
             &scopes,
-            &output_columns,
+            binding,
             &names,
             ctx,
         );
@@ -5172,18 +5285,15 @@ pub(super) fn r_lower_correlated_set_op(
                 (left, right) if right == i => left,
                 _ => continue,
             };
-            let candidates = active_columns[i]
-                .iter()
-                .chain(active_columns[counterpart].iter())
-                .cloned()
-                .collect::<Vec<_>>();
-            let predicate = scalar::s_lower_boolean(
+            let condition = scalar::s_lower_boolean(
                 correlation.predicate.clone(),
-                &DummyQualify(&ctx.identities),
+                &ArmPairQualify {
+                    identities: &ctx.identities,
+                    sites: [sites[i], sites[counterpart]],
+                },
                 ctx,
             )?
             .into_expr();
-            let condition = rebind_pivot_expression(predicate, &candidates, &ctx.identities)?;
             let inner = Builder::from_frozen(
                 queries[counterpart].clone(),
                 ScopeName::Resolved(scopes[counterpart]),
@@ -5210,23 +5320,9 @@ pub(super) fn r_lower_correlated_set_op(
         if !probes.is_empty() {
             outer = outer.add_where(SqlPredicate::new(SqlDomainExpr::and(probes)))?;
         }
-        let arm_columns = active_columns[i]
-            .iter()
-            .map(ColumnMetadata::identity)
-            .collect::<Vec<_>>();
-        // Minus publishes its left operand's heading; every other operator
-        // shapes each arm to the merged one.
-        let items = if is_minus {
-            arm_columns
-                .iter()
-                .zip(output_columns.iter())
-                .map(|(source, output)| {
-                    SelectItem::expression_with_alias(SqlDomainExpr::Column(*source), *output)
-                })
-                .collect()
-        } else {
-            align_arm_items(operator, &arm_columns, &output_columns, ctx)?
-        };
+        // ONE ROAD. A minus's single branch reads its export binding; every
+        // other operator reads its own branch's column of the run's.
+        let items = align_arm_items(operator, binding, i, ctx)?;
         // The items already carry the resolver's output occurrences as
         // their aliases — publish that scope. Minting a fresh set here
         // orphans the occurrences every downstream reference was
@@ -5234,14 +5330,18 @@ pub(super) fn r_lower_correlated_set_op(
         // exactly as the padded arms of the plain corresponding road do).
         halves.push(outer.add_projection_publishing(
             items,
-            cpr_schema,
-            columns_from_cpr_schema(cpr_schema, &ctx.identities),
+            result.scope(),
+            columns_from_relation(&result, ctx)?,
         )?);
     }
     let mut halves = halves.into_iter();
     let mut combined = halves.next().expect("operand count checked");
+    let accumulation = crate::pipeline::sql_ast::SetOperator::UnionAll;
     for half in halves {
-        combined = combined.union_all(half)?;
+        // Every half already claims the result's own positions; stacking
+        // them keeps that claim rather than minting a scope over it.
+        combined =
+            combined.stack_at(half, accumulation.clone(), result.scope(), &output_columns)?;
     }
     Ok(combined)
 }
@@ -5250,7 +5350,8 @@ fn resolved_column(expression: &ast_refined::DomainExpression) -> Option<crate::
     match expression {
         ast_refined::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { column, .. },
-        ))) => Some(*column),
+        ))) => Some(column.column()),
+        ast_refined::DomainExpression::Reference(Reference::Physical(column)) => Some(*column),
         _ => None,
     }
 }
@@ -5260,34 +5361,29 @@ fn intersection_column_pairs(
     operands: &[Vec<ColumnMetadata>],
     identities: &crate::names::Registry,
 ) -> Result<Vec<(crate::names::ColId, crate::names::ColId)>> {
+    /// WHICH OPERAND THE AUTHOR NAMED. A correlation's references are
+    /// resolved against the operands' own scopes, so the operand that
+    /// publishes the occurrence IS the operand — asking which heading
+    /// CARRIES its value would answer for a sibling that merely holds the
+    /// same value.
     fn owner(
         column: crate::names::ColId,
         operands: &[Vec<ColumnMetadata>],
-        identities: &crate::names::Registry,
+        _identities: &crate::names::Registry,
     ) -> Result<usize> {
-        let matches = operands
-            .iter()
-            .enumerate()
-            .filter(|(_, heading)| {
-                heading
-                    .iter()
-                    .any(|candidate| identities.same_value(candidate.identity(), column))
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [index] => Ok(*index),
-            [] => Err(DelightQLError::ParseError {
-                message: "intersection correlation references no operand".to_string(),
-                source: None,
-                subcategory: None,
-            }),
-            _ => Err(DelightQLError::ParseError {
-                message: "intersection correlation reference belongs to multiple operands"
-                    .to_string(),
-                source: None,
-                subcategory: None,
-            }),
+        let mut found = operands.iter().enumerate().filter(|(_, heading)| {
+            heading
+                .iter()
+                .any(|candidate| candidate.identity() == column)
+        });
+        match (found.next(), found.next()) {
+            (Some((index, _)), None) => Ok(index),
+            (Some(_), Some(_)) => Err(DelightQLError::parse_error(
+                "a bag intersection's correlation names a position both operands publish",
+            )),
+            (None, _) => Err(DelightQLError::parse_error(
+                "a bag intersection's correlation names a position neither operand publishes",
+            )),
         }
     }
 
@@ -5362,28 +5458,29 @@ fn intersection_column_pairs(
     Ok(pairs)
 }
 
-fn unique_same_value(
+fn exact_republication(
     source: crate::names::ColId,
-    candidates: &[ColumnMetadata],
-    identities: &crate::names::Registry,
+    before: &[ColumnMetadata],
+    after: &[ColumnMetadata],
 ) -> Result<crate::names::ColId> {
-    let matches = candidates
+    let mut positions = before
         .iter()
-        .map(ColumnMetadata::identity)
-        .filter(|candidate| identities.same_value(*candidate, source))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [column] => Ok(*column),
-        [] => Err(DelightQLError::ParseError {
-            message: "structural column was not carried into intersection".to_string(),
-            source: None,
-            subcategory: None,
-        }),
-        _ => Err(DelightQLError::ParseError {
-            message: "structural column is ambiguous inside intersection".to_string(),
-            source: None,
-            subcategory: None,
-        }),
+        .enumerate()
+        .filter(|(_, candidate)| candidate.identity() == source)
+        .map(|(position, _)| position);
+    match (positions.next(), positions.next()) {
+        (Some(position), None) => after
+            .get(position)
+            .map(ColumnMetadata::identity)
+            .ok_or_else(|| {
+                DelightQLError::parse_error("an exact republication dropped its source position")
+            }),
+        (None, _) => Err(DelightQLError::parse_error(
+            "an exact republication does not contain its source occurrence",
+        )),
+        (Some(_), Some(_)) => Err(DelightQLError::parse_error(
+            "an exact occurrence appears twice in one physical heading",
+        )),
     }
 }
 
@@ -5394,51 +5491,50 @@ fn r_lower_intersect_min_multiplicity(
     source_columns: &[Vec<ColumnMetadata>],
     active_columns: &[Vec<ColumnMetadata>],
     scopes: &[crate::names::ScopeId],
-    output_columns: &[crate::names::ColId],
+    binding: crate::sql_binding::RunBinding,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     use crate::pipeline::sql_ast::{
         ordering::OrderDirection, BinaryOperator, DomainExpression as SqlDomainExpr, JoinCondition,
-        JoinType, SelectItem,
+        JoinType,
     };
     let pairs = intersection_column_pairs(correlation, source_columns, &ctx.identities)?;
+    let row_scope = ctx.identities.anonymous_scope(None);
+    let left_row = ctx
+        .identities
+        .sql_column(row_scope, None, crate::names::Addressing::Hygienic);
+    let right_row = ctx
+        .identities
+        .sql_column(row_scope, None, crate::names::Addressing::Hygienic);
+    let left_base = Builder::from_frozen(
+        queries[0].clone(),
+        ScopeName::Resolved(scopes[0]),
+        active_columns[0].clone(),
+        names.clone(),
+        std::rc::Rc::clone(&ctx.identities),
+    )?;
+    let right_base = Builder::from_frozen(
+        queries[1].clone(),
+        ScopeName::Resolved(scopes[1]),
+        active_columns[1].clone(),
+        names.clone(),
+        std::rc::Rc::clone(&ctx.identities),
+    )?;
     let left_partition = pairs
         .iter()
         .map(|(left, _)| {
-            unique_same_value(*left, &active_columns[0], &ctx.identities).map(SqlDomainExpr::Column)
+            exact_republication(*left, &source_columns[0], left_base.columns())
+                .map(SqlDomainExpr::Column)
         })
         .collect::<Result<Vec<_>>>()?;
     let right_partition = pairs
         .iter()
         .map(|(_, right)| {
-            unique_same_value(*right, &active_columns[1], &ctx.identities)
+            exact_republication(*right, &source_columns[1], right_base.columns())
                 .map(SqlDomainExpr::Column)
         })
         .collect::<Result<Vec<_>>>()?;
-    let row_scope = ctx.identities.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-        None,
-    );
-    let left_row = ctx.identities.mint_column(
-        row_scope,
-        crate::names::ColumnOrigin::Minted {
-            by: crate::names::MintReason::RowNumber,
-        },
-        None,
-        crate::names::Addressing::Hygienic,
-        crate::names::ValueFacts::default(),
-    );
-    let right_row = ctx.identities.mint_column(
-        row_scope,
-        crate::names::ColumnOrigin::Minted {
-            by: crate::names::MintReason::RowNumber,
-        },
-        None,
-        crate::names::Addressing::Hygienic,
-        crate::names::ValueFacts::default(),
-    );
     let left_order = left_partition
         .iter()
         .cloned()
@@ -5449,29 +5545,19 @@ fn r_lower_intersect_min_multiplicity(
         .cloned()
         .map(|expr| (expr, OrderDirection::Asc))
         .collect();
-    let left = Builder::from_frozen(
-        queries[0].clone(),
-        ScopeName::Resolved(scopes[0]),
-        active_columns[0].clone(),
-        names.clone(),
-        std::rc::Rc::clone(&ctx.identities),
-    )?
-    .project_all()?
-    .add_window_column("ROW_NUMBER", vec![], left_partition, left_order, left_row)?;
+    let left = left_base.project_all()?.add_window_column(
+        "ROW_NUMBER",
+        vec![],
+        left_partition,
+        left_order,
+        left_row,
+    )?;
     let left_row = left
         .columns()
         .last()
         .expect("window column is appended")
         .identity();
-    let right = Builder::from_frozen(
-        queries[1].clone(),
-        ScopeName::Resolved(scopes[1]),
-        active_columns[1].clone(),
-        names.clone(),
-        std::rc::Rc::clone(&ctx.identities),
-    )?
-    .project_all()?
-    .add_window_column(
+    let right = right_base.project_all()?.add_window_column(
         "ROW_NUMBER",
         vec![],
         right_partition,
@@ -5483,12 +5569,14 @@ fn r_lower_intersect_min_multiplicity(
         .last()
         .expect("window column is appended")
         .identity();
+    let left_window_columns = left.columns().to_vec();
+    let right_window_columns = right.columns().to_vec();
     let left = left.demote()?.into_join_operand()?;
     let right = right.demote()?.into_join_operand()?;
     let mut conditions = Vec::new();
     for (source_left, source_right) in &pairs {
-        let left_column = unique_same_value(*source_left, &left.columns, &ctx.identities)?;
-        let right_column = unique_same_value(*source_right, &right.columns, &ctx.identities)?;
+        let left_column = exact_republication(*source_left, &source_columns[0], left.columns())?;
+        let right_column = exact_republication(*source_right, &source_columns[1], right.columns())?;
         conditions.push(SqlDomainExpr::Binary {
             left: Box::new(SqlDomainExpr::Column(left_column)),
             op: BinaryOperator::IsNotDistinctFrom,
@@ -5496,38 +5584,42 @@ fn r_lower_intersect_min_multiplicity(
         });
     }
     conditions.push(SqlDomainExpr::Binary {
-        left: Box::new(SqlDomainExpr::Column(unique_same_value(
+        left: Box::new(SqlDomainExpr::Column(exact_republication(
             left_row,
-            &left.columns,
-            &ctx.identities,
+            &left_window_columns,
+            left.columns(),
         )?)),
         op: BinaryOperator::Equal,
-        right: Box::new(SqlDomainExpr::Column(unique_same_value(
+        right: Box::new(SqlDomainExpr::Column(exact_republication(
             right_row,
-            &right.columns,
-            &ctx.identities,
+            &right_window_columns,
+            right.columns(),
         )?)),
     });
     // The kept rows are the LEFT arm's, shaped to the output heading by the
     // operator's own alignment law — a corresponding union's heading is
     // wider than either arm, so a positional zip would drop its tail.
-    let left_columns = active_columns[0]
+    // The binding named a column of the LEFT ARM'S BOUNDARY. The window
+    // layer and the join operand republish that boundary in order, so the
+    // road across is the position — asking which of the operand's columns
+    // carries the value would pick between two positions carrying one.
+    let across: std::collections::HashMap<_, _> = active_columns[0]
         .iter()
         .map(ColumnMetadata::identity)
-        .collect::<Vec<_>>();
-    let output_items = align_arm_items(operator, &left_columns, output_columns, ctx)?
+        .zip(left.columns().iter().map(ColumnMetadata::identity))
+        .collect();
+    let output_items = align_arm_items(operator, binding, 0, ctx)?
         .into_iter()
-        .map(|item| match item {
-            SelectItem::Expression {
-                expr: SqlDomainExpr::Column(source),
-                alias,
-            } => unique_same_value(source, &left.columns, &ctx.identities).map(|column| {
-                SelectItem::Expression {
-                    expr: SqlDomainExpr::Column(column),
-                    alias,
-                }
-            }),
-            other => Ok(other),
+        .map(|item| match item.expr() {
+            Some(SqlDomainExpr::Column(source)) => across
+                .get(source)
+                .map(|column| item.with_expr(SqlDomainExpr::Column(*column)))
+                .ok_or_else(|| {
+                    DelightQLError::parse_error(
+                        "a bound set column is not one the intersection's left operand carries",
+                    )
+                }),
+            _ => Ok(item),
         })
         .collect::<Result<Vec<_>>>()?;
     Builder::from_join(
@@ -5535,317 +5627,40 @@ fn r_lower_intersect_min_multiplicity(
         right,
         JoinType::Inner,
         JoinCondition::On(SqlDomainExpr::and(conditions)),
+        false,
     )?
     .add_projection(output_items)
 }
 
 #[cfg(test)]
-mod cte_occurrence_tests {
-    //! What `cte_occurrence` must REFUSE.
-    //!
-    //! It pairs an occurrence's heading with the CTE columns each target's
-    //! own chain carries. A wrong pairing is ordinary-looking SQL selecting
-    //! the wrong values, so ambiguity refuses by keeping the bare scope —
-    //! which fails loudly downstream — and position may stand in only where
-    //! no piece of chain evidence disputes it.
-
-    use super::cte_occurrence;
-    use crate::names::{
-        Addressing, ColId, ColumnOrigin, Computation, CteRole, Hint, Registry, Republish, ScopeId,
-        ScopeOrigin, ValueFacts,
-    };
-    use crate::pipeline::sql_ast::{
-        DomainExpression as SqlDomainExpr, QueryExpression, SelectItem, TableExpression,
-    };
-
-    fn cte_with(registry: &Registry, names: &[&str]) -> (ScopeId, Vec<ColId>) {
-        let entity = registry.mint_entity(registry.intern("t", false));
-        let base = registry.mint_scope(ScopeOrigin::BaseTable { entity }, Hint::None, None);
-        let cte = registry.mint_scope(
-            ScopeOrigin::Cte {
-                input: base,
-                role: CteRole::Materialize,
-            },
-            Hint::None,
-            None,
-        );
-        let columns = names
-            .iter()
-            .map(|name| {
-                registry.mint_column(
-                    cte,
-                    ColumnOrigin::Computed {
-                        via: Computation::Operator,
-                    },
-                    Some(registry.intern(name, false)),
-                    Addressing::Published,
-                    ValueFacts::default(),
-                )
-            })
-            .collect();
-        (cte, columns)
-    }
-
-    fn occurrence(registry: &Registry, cte: ScopeId) -> ScopeId {
-        registry.mint_derived_scope(
-            ScopeOrigin::Wrap {
-                input: cte,
-                why: crate::names::WrapReason::Projection,
-            },
-            Hint::None,
-        )
-    }
-
-    fn carried(registry: &Registry, source: ColId, into: ScopeId) -> ColId {
-        registry.republish_column(
-            source,
-            into,
-            Republish::Passthrough,
-            registry.published(source),
-            Addressing::Published,
-            |_| {},
-        )
-    }
-
-    fn computed(registry: &Registry, into: ScopeId, name: &str) -> ColId {
-        registry.mint_column(
-            into,
-            ColumnOrigin::Computed {
-                via: Computation::Operator,
-            },
-            Some(registry.intern(name, false)),
-            Addressing::Published,
-            ValueFacts::default(),
-        )
-    }
-
-    #[stacksafe::stacksafe]
-    fn pairs_of(expr: TableExpression) -> Vec<(ColId, ColId)> {
-        let TableExpression::Subquery { query, .. } = expr else {
-            panic!("expected the identified subquery form");
-        };
-        let QueryExpression::Select(select) = &**query else {
-            panic!("expected a select");
-        };
-        select
-            .select_list()
-            .iter()
-            .map(|item| match item {
-                SelectItem::Expression {
-                    expr: SqlDomainExpr::Column(source),
-                    alias: Some(target),
-                } => (*source, *target),
-                other => panic!("expected an aliased column, got {other:?}"),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn subset_pairs_by_chain_not_position() {
-        let registry = Registry::new(&[]);
-        let (cte, columns) = cte_with(&registry, &["a", "b", "c"]);
-        let scope = occurrence(&registry, cte);
-        let target = carried(&registry, columns[1], scope);
-        assert_eq!(
-            pairs_of(cte_occurrence(scope, cte, &registry)),
-            vec![(columns[1], target)]
-        );
-    }
-
-    #[test]
-    fn shifted_evidence_refuses_the_positional_zip() {
-        // Same width, one target with exact provenance NOT at its own index,
-        // one computed target without any. Zipping by position would remap
-        // the carried column to a different source than the one the arena
-        // already identified.
-        let registry = Registry::new(&[]);
-        let (cte, columns) = cte_with(&registry, &["a", "b"]);
-        let scope = occurrence(&registry, cte);
-        computed(&registry, scope, "x");
-        carried(&registry, columns[0], scope);
-        assert!(matches!(
-            cte_occurrence(scope, cte, &registry),
-            TableExpression::Scope(_)
-        ));
-    }
-
-    #[test]
-    fn two_sources_for_one_target_refuse() {
-        // Both CTE columns sit on the target's chain; picking either would
-        // decide by table order what the chain left ambiguous.
-        let registry = Registry::new(&[]);
-        let (cte, columns) = cte_with(&registry, &["a"]);
-        let rechained = carried(&registry, columns[0], cte);
-        let scope = occurrence(&registry, cte);
-        carried(&registry, rechained, scope);
-        assert!(matches!(
-            cte_occurrence(scope, cte, &registry),
-            TableExpression::Scope(_)
-        ));
-    }
-
-    #[test]
-    fn no_evidence_same_width_still_zips() {
-        let registry = Registry::new(&[]);
-        let (cte, columns) = cte_with(&registry, &["a", "b"]);
-        let scope = occurrence(&registry, cte);
-        let first = computed(&registry, scope, "x");
-        let second = computed(&registry, scope, "y");
-        assert_eq!(
-            pairs_of(cte_occurrence(scope, cte, &registry)),
-            vec![(columns[0], first), (columns[1], second)]
-        );
-    }
-
-    #[test]
-    fn evidence_agreeing_with_position_completes_the_zip() {
-        let registry = Registry::new(&[]);
-        let (cte, columns) = cte_with(&registry, &["a", "b"]);
-        let scope = occurrence(&registry, cte);
-        let first = carried(&registry, columns[0], scope);
-        let second = computed(&registry, scope, "y");
-        assert_eq!(
-            pairs_of(cte_occurrence(scope, cte, &registry)),
-            vec![(columns[0], first), (columns[1], second)]
-        );
-    }
-}
-
-#[cfg(test)]
-mod carried_now_tests {
-    //! What `carried_now` must REFUSE.
-    //!
-    //! It is asked for the occurrence a statement now carries for a column
-    //! read before a wrap. Answering with the pre-wrap column when nothing
-    //! carries it hands back exactly the dangling reference the call exists to
-    //! prevent, and answering with the first of several publishes one
-    //! occurrence under a claim two make equally.
-
-    use super::carried_now;
-    use crate::names::{
-        Addressing, ColId, ColumnOrigin, Hint, Registry, Republish, ScopeOrigin, ValueFacts,
-    };
-    use crate::pipeline::asts::core::ColumnMetadata;
-
-    fn source(registry: &Registry) -> ColId {
-        let entity = registry.mint_entity(registry.intern("t", false));
-        let scope = registry.mint_scope(ScopeOrigin::BaseTable { entity }, Hint::None, None);
-        registry.mint_column(
-            scope,
-            ColumnOrigin::CatalogColumn {
-                entity,
-                position: 0,
-            },
-            Some(registry.intern("a", false)),
-            Addressing::Published,
-            ValueFacts::default(),
-        )
-    }
-
-    fn wrap_of(registry: &Registry, column: ColId, how_many: usize) -> Vec<ColumnMetadata> {
-        let scope = registry.mint_derived_scope(
-            ScopeOrigin::Wrap {
-                input: registry.scope_of(column),
-                why: crate::names::WrapReason::Projection,
-            },
-            Hint::None,
-        );
-        (0..how_many)
-            .map(|_| {
-                let carried = registry.republish_column(
-                    column,
-                    scope,
-                    Republish::Passthrough,
-                    registry.published(column),
-                    Addressing::Published,
-                    |_| {},
-                );
-                ColumnMetadata::new(carried)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn one_carrier_answers() {
-        let registry = Registry::new(&[]);
-        let column = source(&registry);
-        let columns = wrap_of(&registry, column, 1);
-        assert_eq!(
-            carried_now(&columns, column, &registry).unwrap(),
-            columns[0].identity()
-        );
-    }
-
-    #[test]
-    fn no_carrier_refuses_rather_than_returning_the_stale_one() {
-        let registry = Registry::new(&[]);
-        let column = source(&registry);
-        let other = source(&registry);
-        let columns = wrap_of(&registry, other, 1);
-        let answer = carried_now(&columns, column, &registry);
-        assert!(answer.is_err());
-        assert_ne!(
-            answer.ok(),
-            Some(column),
-            "the pre-wrap occurrence is the defect"
-        );
-    }
-
-    #[test]
-    fn two_carriers_refuse() {
-        let registry = Registry::new(&[]);
-        let column = source(&registry);
-        let columns = wrap_of(&registry, column, 2);
-        assert!(carried_now(&columns, column, &registry).is_err());
-    }
-}
-
-#[cfg(test)]
 mod destructure_mapping_tests {
     use super::make_destructure_shorthand_item;
-    use crate::names::{
-        Addressing, ColumnOrigin, Computation, Hint, Registry, ScopeOrigin, ValueFacts,
-    };
+    use crate::names::{Addressing, Registry};
     use crate::pipeline::ast_refined::{DestructureMapping, LiteralValue};
     use crate::pipeline::sql_ast::{DomainExpression, SelectItem};
 
     #[test]
     fn shorthand_reads_the_authored_key_when_its_output_name_collides() {
         let registry = Registry::new(&[]);
-        let scope = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::None, None);
+        let scope = registry.anonymous_scope(None);
         let spelling = registry.intern("def", false);
-        registry.mint_column(
-            scope,
-            ColumnOrigin::Computed {
-                via: Computation::Operator,
-            },
-            Some(spelling),
-            Addressing::Published,
-            ValueFacts::default(),
-        );
-        let output = registry.mint_column(
-            scope,
-            ColumnOrigin::Computed {
-                via: Computation::Operator,
-            },
-            Some(spelling),
-            Addressing::Published,
-            ValueFacts::default(),
-        );
+        let member = crate::relation::named_port(&registry, "def");
+        let output = registry.sql_column(scope, Some(spelling), Addressing::Published);
         let source = DomainExpression::literal(LiteralValue::String("{}".to_string()));
         let item = make_destructure_shorthand_item(
             &source,
-            output,
+            member,
             output,
             &[DestructureMapping {
                 json_key: "def".to_string(),
-                column: output,
+                column: member,
             }],
         )
         .unwrap();
-        let SelectItem::Expression {
+        let SelectItem::Publishing {
             expr: DomainExpression::Function { args, .. },
-            alias: Some(alias),
+            slot: alias,
+            printed: true,
         } = item
         else {
             panic!("expected an aliased json_extract")
@@ -5855,158 +5670,6 @@ mod destructure_mapping_tests {
         assert_eq!(
             args[1],
             DomainExpression::literal(LiteralValue::String("$.def".to_string()))
-        );
-    }
-}
-
-#[cfg(test)]
-mod adopt_heading_tests {
-    //! What `adopt_heading` must REFUSE.
-    //!
-    //! Adoption re-aliases a select list onto occurrences the resolver
-    //! published, so a wrong pairing produces ordinary-looking SQL that returns
-    //! the right values under the wrong names — a wrong answer, not a compile
-    //! error. The sibling tier is what makes a wrong pairing conceivable at
-    //! all: it pairs occurrences that are merely the same value, so the two
-    //! bounds that keep it honest are pinned here rather than left to the
-    //! comment that states them.
-
-    use super::adopt_heading;
-    use crate::names::{
-        Addressing, ColId, ColumnOrigin, Hint, Registry, Republish, ScopeId, ScopeOrigin,
-        ValueFacts,
-    };
-    use crate::pipeline::sql_ast::{DomainExpression, SelectItem};
-
-    /// A base scope with `n` distinct catalog columns.
-    fn base(registry: &Registry, names: &[&str]) -> (ScopeId, Vec<ColId>) {
-        let entity = registry.mint_entity(registry.intern("t", false));
-        let scope = registry.mint_scope(ScopeOrigin::BaseTable { entity }, Hint::None, None);
-        let columns = names
-            .iter()
-            .enumerate()
-            .map(|(position, name)| {
-                registry.mint_column(
-                    scope,
-                    ColumnOrigin::CatalogColumn {
-                        entity,
-                        position: position as u32,
-                    },
-                    Some(registry.intern(name, false)),
-                    Addressing::Published,
-                    ValueFacts::default(),
-                )
-            })
-            .collect();
-        (scope, columns)
-    }
-
-    /// Republish `columns` into a fresh scope over `input` — one arm of the
-    /// sibling pair a pipe segment produces.
-    fn republished(
-        registry: &Registry,
-        input: ScopeId,
-        columns: &[ColId],
-    ) -> (ScopeId, Vec<ColId>) {
-        let scope = registry.mint_scope(ScopeOrigin::PipeStage { input }, Hint::None, None);
-        let republished = columns
-            .iter()
-            .map(|column| {
-                registry.republish_column(
-                    *column,
-                    scope,
-                    Republish::Passthrough,
-                    registry.published(*column),
-                    registry.addressing(*column),
-                    |_| {},
-                )
-            })
-            .collect();
-        (scope, republished)
-    }
-
-    fn items(columns: &[ColId]) -> Vec<SelectItem> {
-        columns
-            .iter()
-            .map(|column| {
-                SelectItem::expression_with_alias(DomainExpression::Column(*column), *column)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn siblings_in_the_same_order_adopt() {
-        let registry = Registry::new(&[]);
-        let (source, columns) = base(&registry, &["id", "age"]);
-        let (_, published) = republished(&registry, source, &columns);
-        let published_scope = registry.scope_of(published[0]);
-        let (_, emitted) = republished(&registry, source, &columns);
-
-        let mut list = items(&emitted);
-        assert!(
-            adopt_heading(&mut list, published_scope, &registry),
-            "slot-for-slot siblings of one heading are one value in one order"
-        );
-        assert_eq!(
-            list.iter()
-                .map(|item| match item {
-                    SelectItem::Expression { alias, .. } => *alias,
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            published.iter().copied().map(Some).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn a_permuted_sibling_heading_refuses() {
-        let registry = Registry::new(&[]);
-        let (source, columns) = base(&registry, &["id", "age"]);
-        let (published_scope, _) = republished(&registry, source, &columns);
-        let (_, emitted) = republished(&registry, source, &columns);
-
-        // The list carries the same two values in the other order, so pairing
-        // by position would publish `age` under `id`'s occurrence. Refused
-        // because the values differ slot by slot — the count guard never has
-        // to speak. Pinned anyway: it is the claim the comment makes, and a
-        // future tier that paired by name or by ordinal alone would break it
-        // here rather than in the corpus.
-        let mut list = items(&[emitted[1], emitted[0]]);
-        assert!(
-            !adopt_heading(&mut list, published_scope, &registry),
-            "a heading that permutes its input adopts nothing"
-        );
-    }
-
-    #[test]
-    fn duplicated_same_value_candidates_refuse() {
-        let registry = Registry::new(&[]);
-        let (source, columns) = base(&registry, &["id"]);
-
-        // `(id as a, id as b)` — two slots of one projection, one value.
-        let projected =
-            registry.mint_scope(ScopeOrigin::PipeStage { input: source }, Hint::None, None);
-        let twice: Vec<ColId> = ["a", "b"]
-            .iter()
-            .map(|name| {
-                registry.republish_column(
-                    columns[0],
-                    projected,
-                    Republish::Rename,
-                    Some(registry.intern(name, false)),
-                    Addressing::Published,
-                    |_| {},
-                )
-            })
-            .collect();
-
-        let (published_scope, _) = republished(&registry, projected, &twice);
-        let (_, emitted) = republished(&registry, projected, &twice);
-
-        let mut list = items(&emitted);
-        assert!(
-            !adopt_heading(&mut list, published_scope, &registry),
-            "when one value could claim either slot, nothing forces the pairing"
         );
     }
 }

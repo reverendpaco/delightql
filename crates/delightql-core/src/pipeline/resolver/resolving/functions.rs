@@ -2,7 +2,6 @@
 // Copyright 2026 Daniel Eklund
 
 use crate::error::{DelightQLError, Result};
-use crate::names::ColId;
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::asts::core::{NamedReference, Reference};
@@ -10,14 +9,18 @@ use crate::pipeline::asts::vocabulary::Vec1;
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
-fn resolved_ref(column: ColId) -> ast_resolved::DomainExpression {
-    ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
-        column,
-        explicit_qualifier: false,
-    })))
+fn resolved_ref(column: crate::relation::PortId) -> ast_resolved::DomainExpression {
+    ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+        ColumnOccurrence::engine(column),
+    )))
 }
 
-fn push_unique<T>(output: &mut Vec<T>, seen: &mut Vec<ColId>, column: ColId, value: T) {
+fn push_unique<T>(
+    output: &mut Vec<T>,
+    seen: &mut Vec<crate::relation::PortId>,
+    column: crate::relation::PortId,
+    value: T,
+) {
     if !seen.contains(&column) {
         seen.push(column);
         output.push(value);
@@ -30,21 +33,45 @@ pub(in crate::pipeline::resolver) fn resolve_tuple_via_fold(
     fold: &mut ResolverFold,
     tuple: ast_unresolved::Tuple,
 ) -> Result<ast_resolved::Tuple> {
+    use crate::pipeline::asts::core::TupleElement;
+    let available = fold.lexical.local_ports(&fold.core.identities)?;
     let mut seen = Vec::new();
     let mut resolved = Vec::new();
     for element in tuple.elements.into_vec() {
-        let expression = fold.transform_domain(element)?;
-        if let ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-            ColumnOccurrence { column, .. },
-        ))) = expression
-        {
-            push_unique(&mut resolved, &mut seen, column, resolved_ref(column));
-        } else {
-            resolved.push(expression);
+        match element {
+            // A TUPLE SPREAD EXPANDS THE COLUMNS IT ADDRESSES into
+            // positional elements, through the one expansion authority
+            // every other enumerating position uses.
+            TupleElement::Spread(spread) => {
+                let expanded = super::domain_expressions::projection::expand_spread(
+                    fold, &spread, &available, true,
+                )?;
+                for expression in expanded {
+                    if let ast_resolved::DomainExpression::Reference(Reference::Named(
+                        NamedReference(ColumnOccurrence { column, .. }),
+                    )) = expression
+                    {
+                        push_unique(&mut resolved, &mut seen, column, resolved_ref(column));
+                    } else {
+                        resolved.push(expression);
+                    }
+                }
+            }
+            TupleElement::Value(element) => {
+                let expression = fold.transform_domain(element)?;
+                if let ast_resolved::DomainExpression::Reference(Reference::Named(
+                    NamedReference(ColumnOccurrence { column, .. }),
+                )) = expression
+                {
+                    push_unique(&mut resolved, &mut seen, column, resolved_ref(column));
+                } else {
+                    resolved.push(expression);
+                }
+            }
         }
     }
     Ok(ast_resolved::Tuple {
-        elements: Vec1::try_from_vec(resolved)
+        elements: Vec1::try_from_vec(resolved.into_iter().map(TupleElement::Value).collect())
             .expect("a tuple's elements are values, and deduplication keeps one"),
     })
 }
@@ -57,7 +84,7 @@ fn resolve_record_members_via_fold(
 ) -> Result<Vec<ast_resolved::RecordMember>> {
     use crate::pipeline::asts::core::RecordMember;
 
-    let available = fold.available.clone();
+    let available = fold.lexical.local_ports(&fold.core.identities)?;
     let mut seen = Vec::new();
     let mut resolved = Vec::new();
 
@@ -89,40 +116,40 @@ fn resolve_record_members_via_fold(
                         &mut resolved,
                         &mut seen,
                         column,
-                        RecordMember::SelfKeyed(NamedReference(ColumnOccurrence {
-                            column,
-                            explicit_qualifier: false,
-                        })),
+                        RecordMember::SelfKeyed(NamedReference(ColumnOccurrence::engine(column))),
                     );
                 }
             }
+            // FN.22 (amended): a metadata group as an induced member's
+            // body. Outward-acting; whether the containing record stands
+            // for a group is judged where the record's position is known.
+            RecordMember::Metadata { key, group } => {
+                let group = fold.resolve_metadata_group(*group)?;
+                resolved.push(RecordMember::Metadata {
+                    key,
+                    group: Box::new(group),
+                });
+            }
             RecordMember::SelfKeyed(NamedReference(authored)) => {
-                use crate::pipeline::resolver::unification::{
-                    unify_columns, ColumnReference, UnificationResult,
-                };
+                use crate::pipeline::resolver::unification::{ColumnReference, UnificationResult};
                 let reference = ColumnReference::Named {
                     name: authored.name.clone(),
                     qualifier: authored.qualifier.clone(),
                 };
-                let result = unify_columns(
-                    vec![reference],
-                    &available,
-                    &fold.qualifier_scope,
-                    &fold.registry.identities,
-                )
-                .into_iter()
-                .next()
-                .expect("one self-keyed member produces one unification result");
+                let mut witness = crate::pipeline::resolver::Witness::default();
+                let result =
+                    fold.lexical
+                        .address(reference, false, &mut witness, &fold.core.identities)?;
                 match result {
-                    UnificationResult::Resolved(column) => push_unique(
-                        &mut resolved,
-                        &mut seen,
-                        column,
-                        RecordMember::SelfKeyed(NamedReference(ColumnOccurrence {
+                    UnificationResult::Resolved(occurrence) => {
+                        let column = occurrence.column;
+                        push_unique(
+                            &mut resolved,
+                            &mut seen,
                             column,
-                            explicit_qualifier: false,
-                        })),
-                    ),
+                            RecordMember::SelfKeyed(NamedReference(occurrence)),
+                        )
+                    }
                     UnificationResult::Unresolved(column) => {
                         return Err(DelightQLError::column_not_found_error(
                             column,
@@ -164,12 +191,10 @@ fn empty_record_call(fold: &ResolverFold) -> ast_resolved::FunctionApplication {
         crate::pipeline::asts::core::StandardApplication::plain(
             crate::pipeline::asts::core::PureCall::from_inner(ast_resolved::FunctorCall {
                 callee: fold
-                    .registry
+                    .core
                     .identities
                     .mint_intrinsic(crate::names::Intrinsic::JsonObject),
-                arguments: crate::pipeline::asts::core::operators::CallArguments::Scalar(
-                    Vec::new(),
-                ),
+                arguments: crate::pipeline::asts::core::operators::CallArguments::Scalar(Vec::new()),
                 marks: Default::default(),
             }),
         ),

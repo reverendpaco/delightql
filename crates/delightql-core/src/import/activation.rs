@@ -141,7 +141,7 @@ pub fn activate_entities_from_cartridge(
 /// - sys::entities: entity, referenced_entity, entity_attribute, entity_resolution,
 ///                  entity_type_enum, GroundedEntity, ExternalNamespaces,
 ///                  entity_clause, er_rule
-/// - sys::entities::ho: ho_param, ho_param_column, ho_param_ground_value
+/// - sys::entities::ho: ho_param, ho_param_column
 /// - sys::entities::interior: interior_entity, interior_entity_attribute
 /// - sys::ns: activated_entity, enlisted_entity, enlisted_namespace,
 ///            namespace_alias, namespace_local_alias, namespace_local_enlist,
@@ -210,7 +210,6 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         // sys::entities::ho (namespace_id = 15)
         ("ho_param", 15),
         ("ho_param_column", 15),
-        ("ho_param_ground_value", 15),
         // sys::entities::interior (namespace_id = 16)
         ("interior_entity", 16),
         ("interior_entity_attribute", 16),

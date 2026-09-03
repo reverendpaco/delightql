@@ -15,6 +15,7 @@ use crate::pipeline::sql_ast::statements::RelationTarget;
 pub enum PlanBuildError {
     Uncategorized { callable: CallableId },
     NonDml { category: CallableCategory },
+    TargetHasNoEntity,
 }
 
 /// One lowering/effect-plan mutation value.
@@ -29,7 +30,8 @@ pub struct Mutation<S> {
     category: CallableCategory,
     source: S,
     target: RelationTarget,
-    target_scope: ScopeId,
+    target_relation: crate::relation::SemanticRelation,
+    stage: crate::relation::SemanticRelation,
     receipt: Access<Refined>,
 }
 
@@ -40,8 +42,8 @@ impl<S> Mutation<S> {
         registry: &Registry,
         callable: CallableId,
         source: S,
-        target: RelationTarget,
-        target_scope: ScopeId,
+        target_relation: crate::relation::SemanticRelation,
+        stage: crate::relation::SemanticRelation,
         receipt: Access<Refined>,
     ) -> Result<Self, PlanBuildError> {
         let category = registry
@@ -50,12 +52,43 @@ impl<S> Mutation<S> {
         if !matches!(category, CallableCategory::Dml(_)) {
             return Err(PlanBuildError::NonDml { category });
         }
+        let target = crate::relation::entity(registry, &target_relation)
+            .map_err(|_| PlanBuildError::TargetHasNoEntity)?
+            .map(RelationTarget::Entity)
+            .ok_or(PlanBuildError::TargetHasNoEntity)?;
         Ok(Self {
             callable,
             category,
             source,
             target,
-            target_scope,
+            target_relation,
+            stage,
+            receipt,
+        })
+    }
+
+    #[cfg(test)]
+    fn try_new_for_test(
+        registry: &Registry,
+        callable: CallableId,
+        source: S,
+        stage: crate::relation::SemanticRelation,
+        receipt: Access<Refined>,
+    ) -> Result<Self, PlanBuildError> {
+        let category = registry
+            .callable_category(callable)
+            .ok_or(PlanBuildError::Uncategorized { callable })?;
+        if !matches!(category, CallableCategory::Dml(_)) {
+            return Err(PlanBuildError::NonDml { category });
+        }
+        let target_relation = crate::relation::any_relation(registry);
+        Ok(Mutation {
+            callable,
+            category,
+            source,
+            target: RelationTarget::Scope(target_relation.scope()),
+            target_relation,
+            stage,
             receipt,
         })
     }
@@ -76,7 +109,15 @@ impl<S> Mutation<S> {
 
     /// The scope of the relation being written.
     pub fn target_scope(&self) -> ScopeId {
-        self.target_scope
+        self.target_relation.scope()
+    }
+
+    pub fn target_relation(&self) -> crate::relation::SemanticRelation {
+        self.target_relation
+    }
+
+    pub fn stage(&self) -> crate::relation::SemanticRelation {
+        self.stage
     }
 
     /// The whole operand, borrowed. Nothing smaller is offered.
@@ -104,7 +145,8 @@ impl<S> Mutation<S> {
             category: self.category,
             source: transform(self.source)?,
             target: self.target,
-            target_scope: self.target_scope,
+            target_relation: self.target_relation,
+            stage: self.stage,
             receipt: self.receipt,
         })
     }
@@ -113,20 +155,19 @@ impl<S> Mutation<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::names::{CallableCategory, DmlVerb, Hint, ScopeOrigin};
+    use crate::names::{CallableCategory, DmlVerb};
     use crate::pipeline::sql_ast::QueryExpression;
 
     fn fixture(category: CallableCategory) -> Result<Mutation<QueryExpression>, PlanBuildError> {
         let registry = Registry::new(&[]);
         let spelling = registry.intern("mutation", false);
         let callable = registry.mint_callable(spelling, Vec::new(), category);
-        let scope = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::None, None);
-        Mutation::try_new(
+        let stage = crate::relation::any_relation(&registry);
+        Mutation::try_new_for_test(
             &registry,
             callable,
             QueryExpression::Values { rows: Vec::new() },
-            RelationTarget::Scope(scope),
-            scope,
+            stage,
             Access::All,
         )
     }
@@ -160,14 +201,13 @@ mod tests {
         let registry = Registry::new(&[]);
         let spelling = registry.intern("compatibility", false);
         let callable = registry.mint_function(spelling, Vec::new());
-        let scope = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::None, None);
+        let stage = crate::relation::any_relation(&registry);
         assert!(matches!(
-            Mutation::try_new(
+            Mutation::try_new_for_test(
                 &registry,
                 callable,
                 QueryExpression::Values { rows: Vec::new() },
-                RelationTarget::Scope(scope),
-                scope,
+                stage,
                 Access::All,
             ),
             Err(PlanBuildError::Uncategorized { callable: actual }) if actual == callable

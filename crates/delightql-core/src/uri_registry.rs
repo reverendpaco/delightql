@@ -142,7 +142,16 @@ pub const ERROR_TOP_SEGMENTS: &[&str] = &[
     // machinery segments, the sys::/std:: subtree). Its own top segment: a
     // creation-policy refusal, not a query semantic error.
     "namespace",
+    // The client's own incidents (repl::errors.incident): the parser
+    // containment worker, the prompt, the client database, the exit —
+    // facts about the PROCESS, recorded by the CLI, never minted by the
+    // compiler.
+    "client",
 ];
+
+/// A `ServerTerm::Error` that crossed the session boundary with no
+/// identity: recorded under this so the hole shows in the log.
+pub const INTERNAL_UNBADGED: &str = "delightql-error://internal/unbadged";
 
 /// The mintable top segments of the diagnostic kind — one per provider.
 /// Only `autoload` emits today; the rest are
@@ -162,18 +171,103 @@ pub mod subcat {
     pub const RECURSION_LIMIT_BOUND: &str = "recursion/limit_bound";
     pub const RECURSION_ARGUMENTATIVE_BINDING: &str = "recursion/argumentative_binding";
     pub const RECURSION_CONSULTED_CLAUSE_ORDER: &str = "recursion/consulted_clause_order";
+    pub const RECURSION_MUTUAL: &str = "recursion/mutual";
+    pub const RECURSION_SET_OPERATOR: &str = "recursion/set_operator";
+    /// Clauses of one target disagreeing about the fixpoint badge.
+    pub const RECURSION_MIXED_BADGE: &str = "recursion/mixed_badge";
+    /// A `%` badge on a target with no self-reference: a fixpoint flavor on
+    /// a non-fixpoint is a false statement.
+    pub const RECURSION_FALSE_FIXPOINT: &str = "recursion/false_fixpoint";
+    /// A self-reference of an in-progress parameterized definition with a
+    /// DIFFERENT semantic actual: parameters configure the fixpoint and
+    /// never widen; changing recursive state belongs in ordinary columns.
+    pub const RECURSION_PARAMETER_WIDENING: &str = "recursion/parameter-widening";
+    /// ground!'s No-intersection law: a name defined by both the library
+    /// and the data namespace refuses whole.
+    pub const GROUND_NAME_INTERSECTION: &str = "ground/name_intersection";
+    /// ground!'s strict validation over QUALIFIED references: a dangling
+    /// qualified reference refuses and nothing is created.
+    pub const GROUND_UNRESOLVED_REFERENCE: &str = "ground/unresolved_reference";
+    /// A free data name of a consulted declaration whose world no `ground!`
+    /// bound: a hole crosses worlds only through explicit grounding, never
+    /// through the caller's tables, CTEs, or session database.
+    pub const GROUNDING_DATA_HOLE_UNBOUND: &str = "grounding/data_hole_unbound";
+    /// A consulted goal that compiled to a statement which writes. A
+    /// consultation may READ user data only.
+    pub const CONSULT_WITNESS_READ_ONLY: &str = "consult/witness/read_only";
+    /// A liminal statement declaring something no load can spend.
+    pub const CONSULT_LIMINAL_DECLARATION: &str = "consult/liminal/declaration";
+    /// A consulted goal whose body has no canonical spelling.
+    pub const CONSULT_GOAL_UNSPELLABLE: &str = "consult/goal/unspellable";
     pub const COMPOUND_SCALAR_COLUMN: &str = "compound/scalar_column";
     pub const LIMIT_VALUE: &str = "limit/value";
     pub const RESOLUTION_SCHEMA: &str = "resolution/schema";
+    /// A minus whose operands do not publish the same exact heading.
+    ///
+    /// Its own identity under `setop/` rather than the general schema
+    /// refusal: the operands each have a perfectly good heading, and what
+    /// is wrong is that they are not the SAME one — which is a property of
+    /// the operator, not of either relation.
+    pub const RESOLUTION_SETOP_MINUS_HEADING: &str = "resolution/setop/minus_heading";
     pub const CONSTRAINT_POSITIONAL_ALIAS: &str = "constraint/positional_alias";
+    /// Exact `_` written as an authored name — reserved deixis, bare or
+    /// stropped (strops-law).
+    pub const IDENTIFIER_DEIXIS: &str = "identifier/deixis";
+    /// A reserved word written as a classic bare name (top-grammar: an
+    /// identifier only when stropped).
+    pub const IDENTIFIER_KEYWORD: &str = "identifier/keyword";
+    /// Two live scopes answering one canonical name (TWO LIVE SCOPES NEVER
+    /// SHARE A NAME), judged at scope activation.
+    pub const SCOPE_DUPLICATE: &str = "scope/duplicate";
+    /// An explicitly qualified callable name that no DQL entity answers.
+    /// Only an UNQUALIFIED miss falls through to the open target provider;
+    /// a qualified miss names DQL's own world and refuses.
+    pub const RESOLUTION_CALLABLE_UNKNOWN: &str = "resolution/callable_unknown";
+    /// A total fact function, armed with `_ -> outputs`, was demanded as a
+    /// relation. Its unbounded input complement has no finite row set.
+    pub const RESOLUTION_FACT_FUNCTION_RELATIONAL_FACE: &str =
+        "resolution/fact_function/relational_face";
+    /// A common higher-order expression whose body reaches itself: a
+    /// query-scoped parameterized rule has no fixpoint to re-enter.
+    pub const RESOLUTION_CHOE_RECURSION: &str = "resolution/choe/recursion";
+    /// The clauses of one common higher-order expression disagree — about
+    /// their arity, their published heading, or a position's name.
+    pub const RESOLUTION_CHOE_HEAD_AGREEMENT: &str = "resolution/choe/head_agreement";
+    /// A relation-valued higher-order actual whose form is not a closed
+    /// relation value: an argumentative access, whose names are binders.
+    pub const HO_RELATION_ACTUAL_FORM: &str = "resolution/ho/relation_actual_form";
+    /// A relation actual's interior reading the calling row: a relation
+    /// actual is closed and captures no caller lvar or column.
+    pub const HO_RELATION_ACTUAL_CAPTURE: &str = "resolution/ho/relation_actual_capture";
     pub const SEMANTIC_FAMILY: &[&str] = &[
         RECURSION_LIMIT_BOUND,
         RECURSION_ARGUMENTATIVE_BINDING,
         RECURSION_CONSULTED_CLAUSE_ORDER,
+        RECURSION_MUTUAL,
+        RECURSION_SET_OPERATOR,
+        RECURSION_MIXED_BADGE,
+        RECURSION_FALSE_FIXPOINT,
+        RECURSION_PARAMETER_WIDENING,
+        GROUND_NAME_INTERSECTION,
+        GROUND_UNRESOLVED_REFERENCE,
+        GROUNDING_DATA_HOLE_UNBOUND,
+        CONSULT_WITNESS_READ_ONLY,
+        CONSULT_LIMINAL_DECLARATION,
+        CONSULT_GOAL_UNSPELLABLE,
         COMPOUND_SCALAR_COLUMN,
         LIMIT_VALUE,
         RESOLUTION_SCHEMA,
+        RESOLUTION_SETOP_MINUS_HEADING,
+        RESOLUTION_CALLABLE_UNKNOWN,
+        RESOLUTION_FACT_FUNCTION_RELATIONAL_FACE,
+        RESOLUTION_CHOE_RECURSION,
+        RESOLUTION_CHOE_HEAD_AGREEMENT,
         CONSTRAINT_POSITIONAL_ALIAS,
+        IDENTIFIER_DEIXIS,
+        IDENTIFIER_KEYWORD,
+        SCOPE_DUPLICATE,
+        HO_RELATION_ACTUAL_FORM,
+        HO_RELATION_ACTUAL_CAPTURE,
     ];
 
     /// Operational family: the query is valid and this session refuses to
@@ -199,8 +293,11 @@ pub mod subcat {
     pub const PARSE_ANON_EMPTY: &str = "anon/empty";
     pub const PARSE_COMMENT: &str = "comment";
     pub const PARSE_SORT_MINUS: &str = "sort_minus";
+    /// A retired comparison glyph (`==`, `!==`): the target's own equality is
+    /// a prelude predicate, and DelightQL's is `=` / `!=`.
+    pub const PARSE_RETIRED_OPERATOR: &str = "retired_operator";
     pub const PARSE_SESSION_POSITION: &str = "session_position";
-    pub const PARSE_ASSERTION_DIRECTIVE: &str = "assertion_directive";
+    pub const PARSE_ASSERTION_RETIRED: &str = "assertion/retired";
     pub const PARSE_METADATA_INDUCTION: &str = "metadata_induction";
     pub const PARSE_PATH_VARIABLE: &str = "path_variable";
     /// A pure head over an effectful body: the grammar refuses the shape, and
@@ -209,8 +306,6 @@ pub mod subcat {
     /// A non-session directive written where only a relation derives. The law
     /// admits one under an effect head; its lowering is what is missing.
     pub const PARSE_DIRECTIVE_POSITION: &str = "directive/position";
-    /// An effect rule written with the assigning neck.
-    pub const PARSE_EFFECT_NECK: &str = "effect/neck";
     /// An effectful body bound under a pure label.
     pub const PARSE_EFFECT_LABEL: &str = "effect/label";
     /// A reserved structural head parameter.
@@ -227,6 +322,16 @@ pub mod subcat {
     pub const PARSE_LIFT_TAIL: &str = "lift_tail";
     /// A row of named values written as a definition's body.
     pub const PARSE_VALUE_NAMING: &str = "value_naming";
+    /// A bare iteration binder: `~> v` has no derivation. The binder for an
+    /// array of plain values is written inside brackets.
+    pub const PARSE_ITERATION_BINDER: &str = "iteration_binder";
+    /// A qualified name written as a pattern member. A pattern extracts
+    /// values; qualifying would assert an equality instead. The reach into
+    /// a document is the path binding.
+    pub const PARSE_PATTERN_QUALIFIED: &str = "pattern_qualified";
+    /// A compound relation expression — a set operator or pipe — inside a
+    /// higher-order argument list, which embeds no relation grammar.
+    pub const PARSE_HO_RELATION_ACTUAL: &str = "ho/relation_actual";
     pub const PARSE_FAMILY: &[&str] = &[
         PARSE_DDL,
         PARSE_SIGIL,
@@ -236,13 +341,13 @@ pub mod subcat {
         PARSE_ANON_EMPTY,
         PARSE_COMMENT,
         PARSE_SORT_MINUS,
+        PARSE_RETIRED_OPERATOR,
         PARSE_SESSION_POSITION,
-        PARSE_ASSERTION_DIRECTIVE,
+        PARSE_ASSERTION_RETIRED,
         PARSE_METADATA_INDUCTION,
         PARSE_PATH_VARIABLE,
         PARSE_EFFECT_PURITY,
         PARSE_DIRECTIVE_POSITION,
-        PARSE_EFFECT_NECK,
         PARSE_EFFECT_LABEL,
         PARSE_STRUCTURAL_HEAD,
         PARSE_GUARD_GROUPING,
@@ -250,6 +355,9 @@ pub mod subcat {
         PARSE_HEAD_COMPUTES,
         PARSE_LIFT_TAIL,
         PARSE_VALUE_NAMING,
+        PARSE_ITERATION_BINDER,
+        PARSE_PATTERN_QUALIFIED,
+        PARSE_HO_RELATION_ACTUAL,
     ];
 
     /// The parse teachings that name a rule the DEFINITION broke, rather than
@@ -260,7 +368,6 @@ pub mod subcat {
     pub const PARSE_DEFINITION_SHAPED: &[&str] = &[
         PARSE_EFFECT_PURITY,
         PARSE_DIRECTIVE_POSITION,
-        PARSE_EFFECT_NECK,
         PARSE_EFFECT_LABEL,
         PARSE_STRUCTURAL_HEAD,
         PARSE_GUARD_GROUPING,

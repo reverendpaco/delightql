@@ -107,18 +107,14 @@ fn the_compression_bound_keeps_the_operator_name() {
 /// An existence guard is the truth-compression and needs no authored one: it
 /// takes the ordinary interior, and that distinction stays visible.
 ///
-/// AN OCCURRENCE NEVER HAS TWO CARRIERS. The crossing's adapter admits a truth
-/// expression at the same out item, so both readings derive; the grammar says
-/// which is the carrier rather than leaving it to whichever stack survives.
+/// ONE TRUTH CARRIER IN EVERY POSITION. In value position the existence is
+/// the same `existence` node, read through the crossing; in comma position
+/// it stands bare. There is no second existence spelling for value position.
 #[test]
 fn existence_needs_no_authored_compression() {
     let value = admits("users(*) |> (+orders(, id = 1) as e)");
-    assert_eq!(count::<ExistsAsColumn>(&value), 1);
-    assert_eq!(
-        count::<Existence>(&value),
-        0,
-        "value position takes the value carrier, not the truth one"
-    );
+    assert_eq!(count::<Existence>(&value), 1);
+    assert_eq!(count::<CrossedTruth>(&value), 1);
     assert_eq!(count::<CompressedInterior>(&value), 0);
     assert_eq!(count::<InteriorContinuation>(&value), 1);
 
@@ -126,7 +122,7 @@ fn existence_needs_no_authored_compression() {
     // restricts the current relation; a semi/antijoin is only a lowering.
     let member = admits("users(*), +orders(, id = 1)");
     assert_eq!(count::<Existence>(&member), 1);
-    assert_eq!(count::<ExistsAsColumn>(&member), 0);
+    assert_eq!(count::<CrossedTruth>(&member), 0);
 }
 
 /// A mode-compressed call needs no authored compression either — one row by

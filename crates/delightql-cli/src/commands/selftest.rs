@@ -22,6 +22,8 @@ pub fn handle_selftest(json: bool, strict: bool) -> Result<()> {
         .iter()
         .any(|f| f.severity == Severity::Error || (strict && f.severity == Severity::Warn));
     if failed {
+        crate::client::exit::finish(None, 1);
+        crate::client::exit::announce();
         std::process::exit(1);
     }
     Ok(())

@@ -55,6 +55,10 @@ pub use asts::unresolved as ast_unresolved;
 // module sorted into that line.
 pub mod ast_transform; // Unified AST walk infrastructure
 pub mod ast_visit; // Non-consuming whole-tree inspection/collection sibling of ast_transform
+/// THE BINDING AUTHORITY: what a CTE binding is at every phase, the
+/// self-reference walk, the badge adjudication, and the one mint of a
+/// deduplicating accumulation.
+pub(crate) mod bindings;
 pub mod compiled_query; // Compiled query output bundle (primary SQL + assertions + emits)
 pub mod effect_executor; // Phase 1.X: Execute pseudo-predicates and rewrite AST
 pub mod refiner; // Phase 3: AST(resolved) → AST(refined)
@@ -62,7 +66,6 @@ pub mod resolver; // Phase 2: AST(unresolved) → AST(resolved)
 pub mod sql_ast; // CONTRACT for Phase 4 (proper SQL syntax tree with builders - PRODUCTION)
 pub mod sql_optimizer;
 pub mod sql_rewriter;
-pub mod sql_self_check; // Post-lowering name-binding verification (the transpiler's L1)
 
 pub mod danger_gates; // Danger gate system (named safety boundaries, OFF by default)
 pub mod dialect_pack; // Per-compile image of the dialect_* targeting tables
@@ -95,11 +98,80 @@ use crate::probe;
 use crate::probe::{probe, probing};
 use crate::sexp_formatter;
 use crate::system::DelightQLSystem;
-use std::rc::Rc;
 use syntax::SyntaxTree;
 
 /// Pipeline orchestrator with built-in diagnostics
 ///
+/// THE COMPILATION'S SEMANTIC EPOCH.
+///
+/// `Open` holds the one construction capability; `Closed` holds what is
+/// left after it was SPENT — the naming handle lowering reads and the
+/// records it binds against. [`Epoch::seal`] moves the capability out and
+/// replaces it with the closed state in the same act, so no road hands
+/// back a reader while an open capability survives beside it.
+enum Epoch {
+    Open(crate::relation::Planning),
+    /// The instant the capability is in flight. Unreachable from outside
+    /// [`Epoch::seal`]; it exists so the open value can be MOVED OUT
+    /// rather than copied.
+    Sealing,
+    Closed {
+        names: std::rc::Rc<crate::names::Registry>,
+        relations: crate::relation::Relations,
+    },
+}
+
+impl Epoch {
+    /// The naming handle, in either state.
+    fn names(&self) -> std::rc::Rc<crate::names::Registry> {
+        match self {
+            Epoch::Open(planning) => planning.names(),
+            Epoch::Closed { names, .. } => std::rc::Rc::clone(names),
+            Epoch::Sealing => unreachable!("the transition is not re-entrant"),
+        }
+    }
+
+    /// The construction capability, while the epoch is open. A closed
+    /// epoch REFUSES: there is nothing here to construct with, and saying
+    /// so is what keeps a later phase from quietly acquiring one.
+    fn planning(&self) -> Result<&crate::relation::Planning> {
+        match self {
+            Epoch::Open(planning) => Ok(planning),
+            Epoch::Closed { .. } | Epoch::Sealing => Err(DelightQLError::transformation_error(
+                "semantic construction was asked for after this compilation was sealed",
+                "semantic relation",
+            )),
+        }
+    }
+
+    /// SPEND THE CAPABILITY.
+    ///
+    /// The open value is MOVED OUT and consumed; what replaces it is the
+    /// closed state. There is no arrangement of these two lines in which a
+    /// `Planning` and the `Relations` it produced are both reachable.
+    fn seal(&mut self) -> crate::relation::Relations {
+        match std::mem::replace(self, Epoch::Sealing) {
+            Epoch::Open(planning) => {
+                let names = planning.names();
+                let relations = planning.seal();
+                *self = Epoch::Closed {
+                    names,
+                    relations: relations.clone(),
+                };
+                relations
+            }
+            Epoch::Closed { names, relations } => {
+                *self = Epoch::Closed {
+                    names,
+                    relations: relations.clone(),
+                };
+                relations
+            }
+            Epoch::Sealing => unreachable!("the transition is not re-entrant"),
+        }
+    }
+}
+
 /// This struct manages the entire compilation pipeline from source text to SQL,
 /// maintaining state at each stage and collecting diagnostics along the way.
 ///
@@ -111,9 +183,13 @@ pub(crate) struct Pipeline<'a> {
     // MUTABLE: Needed for pseudo-predicates that mutate system state (import!, etc.)
     system: &'a mut DelightQLSystem,
 
-    // One identity arena for this compilation. Nested pipeline work shares
-    // this allocation; a separate top-level compilation constructs another.
-    registry: Rc<Registry>,
+    // ONE IDENTITY ARENA FOR THIS COMPILATION, and the epoch over it.
+    // Nested pipeline work shares this allocation; a separate top-level
+    // compilation constructs another. The epoch is OPEN while resolution
+    // and refinement build relations and CLOSED once lowering has its
+    // reader — and the transition takes the capability by value, so the
+    // two states cannot stand side by side.
+    epoch: Epoch,
 
     // The reconstruction memo's scope. A stored definition asked for five
     // times during one compilation is read once, and the memo dies with the
@@ -124,6 +200,9 @@ pub(crate) struct Pipeline<'a> {
     // Source and configuration - PRIVATE
     query_text: String,
     resolution_config: resolver::ResolutionConfig,
+    /// The session scope queries resolve at: `home` at the prompt, the
+    /// namespace being consulted for a consulted file's top-level goal.
+    scope_fq: String,
     sql_optimization_level: sql_optimizer::OptimizationLevel,
     dialect_override: Option<generator::SqlDialect>,
 
@@ -136,9 +215,6 @@ pub(crate) struct Pipeline<'a> {
     sql_string: Option<String>,
     sql_kind: compiled_query::SqlKind,
 
-    // Data assertions (compiled from inline (~~assert ... ~~) hooks)
-    assertion_specs: Vec<ast_unresolved::AssertionSpec>,
-    assertion_sqls: Vec<compiled_query::CompiledAssertion>,
     /// Reads the primary statement may not run without, rendered.
     obligations: Vec<compiled_query::CompiledObligation>,
     /// The same, before the lowering sandwich and the generator.
@@ -169,12 +245,6 @@ pub(crate) struct Pipeline<'a> {
     connection_id: Option<i64>,
 }
 
-struct PendingAssertionSql {
-    statement: sql_ast::SqlStatement,
-    right: Option<sql_ast::SqlStatement>,
-    name: Option<String>,
-}
-
 impl<'a> Pipeline<'a> {
     /// Create a new pipeline for the given source text
     pub fn new(source: &str, system: &'a mut DelightQLSystem) -> Self {
@@ -198,7 +268,7 @@ impl<'a> Pipeline<'a> {
         system: &'a mut DelightQLSystem,
         resolution_config: resolver::ResolutionConfig,
         sql_optimization_level: sql_optimizer::OptimizationLevel,
-        registry: Rc<Registry>,
+        registry: crate::relation::Planning,
     ) -> Self {
         let mut pipeline = Self::new_with_config_and_registry(
             source,
@@ -208,7 +278,6 @@ impl<'a> Pipeline<'a> {
             registry,
         );
         pipeline.query_unresolved = Some(goal.query);
-        pipeline.assertion_specs = goal.declared.assertions;
         pipeline.danger_specs = goal.declared.dangers;
         pipeline.option_specs = goal.declared.options;
         pipeline.ddl_blocks = goal.declared.ddl_blocks;
@@ -222,16 +291,48 @@ impl<'a> Pipeline<'a> {
     pub fn new_from_unresolved_query(
         query: ast_unresolved::Query,
         system: &'a mut DelightQLSystem,
-        registry: Rc<Registry>,
+        registry: crate::relation::Planning,
     ) -> Self {
+        // A typed injected query is COMPILER-BUILT: the authored-environment
+        // judgments (duplicate answering names) stay with the submission
+        // that authored its relations, not with this replay.
         let mut pipeline = Self::new_with_config_and_registry(
             "<injected>",
+            system,
+            resolver::ResolutionConfig {
+                authored_environment: false,
+                ..resolver::ResolutionConfig::default()
+            },
+            sql_optimizer::OptimizationLevel::Basic,
+            registry,
+        );
+        pipeline.query_unresolved = Some(query);
+        pipeline
+    }
+
+    /// A CONSULTED FILE'S TOP-LEVEL GOAL, arriving typed.
+    ///
+    /// Not an injected replay: the text is a person's, so the
+    /// authored-environment judgments run exactly as they would at the
+    /// prompt. The goal resolves in the namespace being consulted — it is a
+    /// form OF that file, so what a sibling rule's body can name, it can
+    /// name.
+    pub(crate) fn new_consulted_goal(
+        goal: normalize::Goal,
+        system: &'a mut DelightQLSystem,
+        namespace: &str,
+        registry: crate::relation::Planning,
+    ) -> Self {
+        let source = goal.spelling.clone();
+        let mut pipeline = Self::from_goal(
+            goal,
+            &source,
             system,
             resolver::ResolutionConfig::default(),
             sql_optimizer::OptimizationLevel::Basic,
             registry,
         );
-        pipeline.query_unresolved = Some(query);
+        pipeline.scope_fq = namespace.to_string();
         pipeline
     }
 
@@ -247,7 +348,7 @@ impl<'a> Pipeline<'a> {
             system,
             resolution_config,
             sql_optimization_level,
-            Rc::new(Registry::new(&[])),
+            crate::relation::Planning::open(Registry::new(&[])),
         )
     }
 
@@ -256,7 +357,7 @@ impl<'a> Pipeline<'a> {
         system: &'a mut DelightQLSystem,
         resolution_config: resolver::ResolutionConfig,
         sql_optimization_level: sql_optimizer::OptimizationLevel,
-        registry: Rc<Registry>,
+        registry: crate::relation::Planning,
     ) -> Self {
         // COMPILATION ENTRY. The registry armed both budgets where its arena
         // was minted — shared with whatever compilation was EXECUTING then,
@@ -269,10 +370,11 @@ impl<'a> Pipeline<'a> {
         system.publish_compiler_limits(registry.limits());
         Self {
             system,
-            registry,
+            epoch: Epoch::Open(registry),
             _reconstruction: crate::ddl::reconstruct::Compilation::open(),
             query_text: source.to_string(),
             resolution_config,
+            scope_fq: "home".to_string(),
             sql_optimization_level,
             // Explicit override only (--dialect / DQL_DIALECT); without it
             // the dialect derives from the routed connection at compile
@@ -285,8 +387,6 @@ impl<'a> Pipeline<'a> {
             sql_ast: None,
             sql_string: None,
             sql_kind: compiled_query::SqlKind::Query,
-            assertion_specs: Vec::new(),
-            assertion_sqls: Vec::new(),
             obligations: Vec::new(),
             lowered_obligations: Vec::new(),
             prepare_sqls: Vec::new(),
@@ -407,17 +507,16 @@ impl<'a> Pipeline<'a> {
     /// Compile the query and return a bundled result.
     ///
     /// Runs the full pipeline (CST → AST → SQL) and returns a
-    /// `CompiledQuery` containing the primary SQL, assertion SQL,
-    /// emit streams, and connection routing. The host executes
-    /// each piece and decides how to display/route the results.
+    /// `CompiledQuery` containing the primary SQL, compiler obligations,
+    /// and connection routing. The host executes each piece and decides
+    /// how to display or route the results.
     pub fn compile(&mut self) -> Result<compiled_query::CompiledQuery> {
         let _running = self.running();
         self.execute_to_sql()?;
         let _ = self.determine_connection_id();
         Ok(compiled_query::CompiledQuery {
             primary_sql: self.sql_string.clone().unwrap_or_default(),
-            _kind: self.sql_kind,
-            assertion_sqls: self.assertion_sqls.clone(),
+            kind: self.sql_kind,
             obligations: self.obligations.clone(),
             prepare_sqls: self.prepare_sqls.clone(),
             cleanup_sqls: self.cleanup_sqls.clone(),
@@ -431,8 +530,8 @@ impl<'a> Pipeline<'a> {
     /// primary statement as ordered entries in the relay's execution order
     /// (see `From<CompiledQuery> for CompiledPlan`; order pinned by
     /// `compiled_query::tests::degenerate_entry_order_mirrors_relay`).
-    /// Multi-entry plans arrive with the effect transformer.
-    #[allow(dead_code)] // effect-algebra entry point; degenerate mapping pinned by compiled_query tests
+    /// Multi-entry plans arrive with the effect transformer. // effect-algebra entry point; degenerate mapping pinned by compiled_query tests
+    #[allow(dead_code)]
     pub fn compile_plan(&mut self) -> Result<compiled_query::CompiledPlan> {
         let _running = self.running();
         Ok(self.compile()?.into())
@@ -473,7 +572,7 @@ impl<'a> Pipeline<'a> {
                     let query_resolved = self.query_resolved().unwrap();
                     let query_refined = refiner::refine_query(
                         query_resolved.clone(),
-                        Rc::clone(&self.registry),
+                        self.epoch.planning()?,
                     )?;
                     Ok(sexp_formatter::custom_pretty_print(&query_refined.to_lispy()))
                 }
@@ -481,7 +580,8 @@ impl<'a> Pipeline<'a> {
             "ast-sql" => {
                 self.execute_to_sql_ast()?;
                 let sql_ast = self.sql_ast().unwrap();
-                let names = generator::baptise_statements(&self.registry, &[sql_ast])
+                let identities = self.epoch.names();
+                let names = generator::baptise_statements(&identities, &[sql_ast])
                     .map_err(|e| e.into_delightql_error("SQL AST naming error"))?;
                 let generator = generator::SqlGenerator::new(&names);
                 generator
@@ -503,25 +603,6 @@ impl<'a> Pipeline<'a> {
     // Diagnostics
     // ========================================================================
 
-    /// Record a DelightQLError to the errors table on bootstrap for session-level error history.
-    pub fn record_delightql_error(&self, _e: &crate::error::DelightQLError) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let uri = _e.error_uri();
-            let message = _e.to_string();
-
-            let conn = self
-                .system
-                .bootstrap_connection()
-                .lock()
-                .expect("FATAL: Failed to acquire bootstrap lock for errors recording");
-            let _ = conn.execute(
-                "INSERT INTO errors (uri, message, query_text) VALUES (?1, ?2, ?3)",
-                rusqlite::params![uri, message, self.query_text],
-            );
-        }
-    }
-
     /// The extent of this pipeline's EXECUTION.
     ///
     /// Opened by every method that runs compiler work and closed when it
@@ -529,7 +610,7 @@ impl<'a> Pipeline<'a> {
     /// anything is the compilation whose work it is — not whichever pipeline
     /// object happens to still be alive beside it.
     fn running(&self) -> crate::compiler_limits::Running {
-        crate::compiler_limits::Running::under(self.registry.limits_shared())
+        crate::compiler_limits::Running::under(self.epoch.names().limits_shared())
     }
 
     /// Execute pipeline to CST (parse only)
@@ -543,11 +624,7 @@ impl<'a> Pipeline<'a> {
             return Ok(self.cst.as_ref().unwrap());
         }
 
-        let tree =
-            parse::submission(&self.query_text, self.registry.limits().nesting()).map_err(|e| {
-                self.record_delightql_error(&e);
-                e
-            })?;
+        let tree = parse::submission(&self.query_text, self.epoch.names().limits().nesting())?;
 
         self.cst = Some(tree);
         Ok(self.cst.as_ref().unwrap())
@@ -563,12 +640,10 @@ impl<'a> Pipeline<'a> {
             return Ok(self.cst.as_ref().unwrap());
         }
 
-        let tree =
-            parse::submission_showing_defects(&self.query_text, self.registry.limits().nesting())
-                .map_err(|e| {
-                self.record_delightql_error(&e);
-                e
-            })?;
+        let tree = parse::submission_showing_defects(
+            &self.query_text,
+            self.epoch.names().limits().nesting(),
+        )?;
 
         self.cst = Some(tree);
         Ok(self.cst.as_ref().unwrap())
@@ -583,19 +658,11 @@ impl<'a> Pipeline<'a> {
 
         self.execute_to_cst()?;
         let tree = self.cst.as_ref().unwrap();
-        let normalized = normalize::submission(tree, Rc::clone(&self.registry));
-        let normalized = normalized.map_err(|e| {
-            self.record_delightql_error(&e);
-            e
-        })?;
+        let normalized = normalize::submission(tree, self.epoch.names())?;
 
-        let goal = one_goal(normalized).map_err(|e| {
-            self.record_delightql_error(&e);
-            e
-        })?;
+        let goal = one_goal(normalized)?;
 
         self.query_unresolved = Some(goal.query);
-        self.assertion_specs = goal.declared.assertions;
         self.danger_specs = goal.declared.dangers;
         self.option_specs = goal.declared.options;
         self.ddl_blocks = goal.declared.ddl_blocks;
@@ -617,33 +684,7 @@ impl<'a> Pipeline<'a> {
         let query_unresolved = self.query_unresolved.as_ref().unwrap();
 
         // Process inline DDL blocks before effects and resolution.
-        for ddl in std::mem::take(&mut self.ddl_blocks) {
-            // Scratch routes to `home`. Named blocks become
-            // ordinary lib-kind children `home::<name>`; the unnamed block lands
-            // its entities DIRECTLY in `home` — bare because home is enlisted, not
-            // because of any special rule for unnamed blocks.
-            let namespace = match ddl.namespace.as_deref() {
-                Some(suffix) => {
-                    // System name guard (catechism Deviation #3): the
-                    // user-typed scratch name is a creation target under
-                    // home. Guard it as `home::<suffix>` so prong (c) (the
-                    // `_` reservation) fires while prong (b) relaxes —
-                    // `home::sysinfo` legal, `home::_x` refused.
-                    let fq = format!("home::{}", suffix);
-                    crate::system::validate_user_namespace_target(&fq)?;
-                    fq
-                }
-                None => "home".to_string(),
-            };
-            inline_ddl::register_inline_ddl_block(&ddl.body, &namespace, self.system).map_err(
-                |e| {
-                    crate::error::DelightQLError::database_error(
-                        format!("Inline DDL error: {}", e),
-                        "inline DDL",
-                    )
-                },
-            )?;
-        }
+        inline_ddl::register_prompt_blocks(std::mem::take(&mut self.ddl_blocks), self.system)?;
 
         // Execute pseudo-predicates and rewrite AST
         // This must happen BEFORE resolution because pseudo-predicates
@@ -651,30 +692,32 @@ impl<'a> Pipeline<'a> {
         let query_after_effects = effect_executor::execute_effects(
             query_unresolved.clone(),
             &mut self.system,
-            &self.registry,
-        )
-        .map_err(|e| {
-            self.record_delightql_error(&e);
-            e
-        })?;
+            &self.epoch.names(),
+        )?;
 
         // Get schema from system (injected by CLI) - NO coupling to backends!
         let schema = self.system.get_schema()?;
 
         // Resolve (passing system for namespace resolution). Query-scoped
         // definitions ride WithCfes into the resolver, which spends them at
-        // their call sites.
+        // their call sites. The per-query danger gates ride in the config so
+        // scope activation judges duplicates under the same acknowledgments
+        // the refiner and transformer honor.
+        let mut resolution_config = self.resolution_config.clone();
+        resolution_config
+            .danger_gates
+            .apply_overrides(&self.cli_danger_overrides);
+        resolution_config
+            .danger_gates
+            .apply_overrides(&self.danger_specs);
         let resolution_result = resolver::resolve_query(
             query_after_effects,
             schema,
             Some(self.system),
-            &self.resolution_config,
-            Rc::clone(&self.registry),
-        )
-        .map_err(|e| {
-            self.record_delightql_error(&e);
-            e
-        })?;
+            &resolution_config,
+            self.epoch.planning()?,
+            &self.scope_fq,
+        )?;
 
         // Store connection_id for routing during execution
         self.connection_id = resolution_result.connection_id;
@@ -695,19 +738,13 @@ impl<'a> Pipeline<'a> {
 
         // Refine (only works for bare bodies — this inspection stage
         // predates CTE support and still presents one chain)
-        if !query_resolved.ctes.is_empty() {
+        if !query_resolved.ctes().is_empty() {
             panic!(
                 "catch-all hit in mod.rs execute_to_query_refined: unexpected resolved \
                  Query bindings"
             );
         }
-        let refined =
-            refiner::refine(query_resolved.body.clone(), Rc::clone(&self.registry)).map_err(
-                |e| {
-                    self.record_delightql_error(&e);
-                    e
-                },
-            )?;
+        let refined = refiner::refine(query_resolved.body.clone(), self.epoch.planning()?)?;
         self.ast_refined = Some(refined);
         Ok(self.ast_refined.as_ref().map(|r| r))
     }
@@ -732,35 +769,34 @@ impl<'a> Pipeline<'a> {
         let refined_query = refiner::refine_query_with_gates(
             query_resolved.clone(),
             query_danger_gates.clone(),
-            Rc::clone(&self.registry),
-        )
-        .map_err(|e| {
-            self.record_delightql_error(&e);
-            e
-        })?;
+            self.epoch.planning()?,
+        )?;
 
         // Build option map from per-query overrides
         let mut options = option_map::OptionMap::with_defaults();
         options.apply_overrides(&self.cli_option_overrides); // Session baseline (CLI --option)
         options.apply_overrides(&self.option_specs); // Per-query inline overrides
 
+        let relations = self.epoch.seal();
         let ctx = transformer::TransformCtx {
-            identities: Rc::clone(&self.registry),
-            names: transformer::builder::NameGenerator::new(Rc::clone(&self.registry)),
-            outer_columns: vec![],
+            relations: relations.clone(),
+            identities: self.epoch.names(),
+            outer_sites: Vec::new(),
+            names: transformer::builder::NameGenerator::new(self.epoch.names()),
             danger_gates: query_danger_gates.clone(),
         };
-        let lowered = transformer::transform(refined_query, &ctx).map_err(|e| {
-            self.record_delightql_error(&e);
-            e
-        })?;
+        let lowered = transformer::transform(refined_query, &ctx)?;
         self.lowered_obligations = lowered.obligations;
         self.lowered_prepare = lowered.prepare;
-        self.staged_scopes = lowered.staged;
+        self.staged_scopes = lowered
+            .staged
+            .iter()
+            .map(crate::relation::SemanticRelation::scope)
+            .collect();
         let sql_ast = lowered.statement;
 
         if log::log_enabled!(log::Level::Debug) {
-            if let Ok(names) = generator::baptise_statements(&self.registry, &[&sql_ast]) {
+            if let Ok(names) = generator::baptise_statements(&self.epoch.names(), &[&sql_ast]) {
                 let gen = generator::SqlGenerator::new(&names);
                 if let Ok(sql_preview) = gen.generate_statement(&sql_ast) {
                     log::debug!("execute_to_sql_ast: sql_preview={sql_preview}");
@@ -820,12 +856,8 @@ impl<'a> Pipeline<'a> {
             sql_ast.clone(),
             dialect,
             self.sql_optimization_level,
-            &self.registry,
-        )
-        .map_err(|e| {
-            self.record_delightql_error(&e);
-            e
-        })?;
+            &self.epoch.names(),
+        )?;
 
         // Resolve the dialect pack for this compile: one read of the
         // dialect_* tables, shared by every generator this compile
@@ -843,7 +875,7 @@ impl<'a> Pipeline<'a> {
                     statement,
                     dialect,
                     self.sql_optimization_level,
-                    &self.registry,
+                    &self.epoch.names(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -854,7 +886,7 @@ impl<'a> Pipeline<'a> {
                     sql_ast::SqlStatement::DropTempTable { table },
                     dialect,
                     self.sql_optimization_level,
-                    &self.registry,
+                    &self.epoch.names(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -867,7 +899,7 @@ impl<'a> Pipeline<'a> {
                     obligation.statement,
                     dialect,
                     self.sql_optimization_level,
-                    &self.registry,
+                    &self.epoch.names(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -883,177 +915,13 @@ impl<'a> Pipeline<'a> {
             | sql_ast::SqlStatement::DropTempTable { .. } => compiled_query::SqlKind::Query,
         };
 
-        let mut pending_assertions = Vec::new();
-
-        // Compile assertion bodies to SQL
-        if !self.assertion_specs.is_empty() {
-            let schema = self.system.get_schema()?;
-            let specs = std::mem::take(&mut self.assertion_specs);
-            pending_assertions.reserve(specs.len());
-
-            // Rebuild danger/option maps so assertions inherit per-query gates
-            let mut assert_danger_gates = danger_gates::DangerGateMap::with_defaults();
-            assert_danger_gates.apply_overrides(&self.cli_danger_overrides);
-            assert_danger_gates.apply_overrides(&self.danger_specs);
-            let mut assert_options = option_map::OptionMap::with_defaults();
-            assert_options.apply_overrides(&self.cli_option_overrides);
-            assert_options.apply_overrides(&self.option_specs);
-
-            // The main query's bindings, so assertions can reference CTE
-            // names and CFE definitions from the outer scope.
-            let (outer_ctes, outer_cfes): (
-                Vec<ast_unresolved::CteBinding>,
-                Vec<ast_unresolved::CfeDefinition>,
-            ) = match self.query_unresolved.as_ref() {
-                Some(query) => (query.ctes.clone(), query.cfes.clone()),
-                None => (vec![], vec![]),
-            };
-
-            for spec in &specs {
-                let body_demands_directive =
-                    !asts::effects::collect_directive_invocations(&spec.body).is_empty();
-                let right_demands_directive = spec.right_operand.as_ref().is_some_and(|right| {
-                    !asts::effects::collect_directive_invocations(right).is_empty()
-                });
-                if body_demands_directive || right_demands_directive {
-                    let error = DelightQLError::validation_error_categorized(
-                        "assertion/directive/not_permitted",
-                        "directives are not permitted in assertions",
-                        "assertions are read-only checks",
-                    );
-                    self.record_delightql_error(&error);
-                    return Err(error);
-                }
-
-                // The assertion body rides the outer bindings, so CTE
-                // references and CFE calls resolve exactly as in the main
-                // query.
-                let assertion_query = ast_unresolved::Query {
-                    cfes: outer_cfes.clone(),
-                    ctes: outer_ctes.clone(),
-                    body: spec.body.clone(),
-                };
-
-                // Resolve
-                let resolved_result = resolver::resolve_query(
-                    assertion_query,
-                    schema,
-                    Some(self.system),
-                    &self.resolution_config,
-                    Rc::clone(&self.registry),
-                )
-                .map_err(|e| {
-                    self.record_delightql_error(&e);
-                    e
-                })?;
-
-                // Refine (assertion uses same danger gates as main query)
-                let refined = refiner::refine_query_with_gates(
-                    resolved_result.query,
-                    assert_danger_gates.clone(),
-                    Rc::clone(&self.registry),
-                )
-                .map_err(|e| {
-                    self.record_delightql_error(&e);
-                    e
-                })?;
-                // Transform to SQL AST
-                let assert_ctx = transformer::TransformCtx {
-                    identities: Rc::clone(&self.registry),
-                    names: transformer::builder::NameGenerator::new(Rc::clone(&self.registry)),
-                    outer_columns: vec![],
-                    danger_gates: assert_danger_gates.clone(),
-                };
-                let sql_ast = transformer::transform(refined, &assert_ctx)
-                    .and_then(transformer::Lowered::without_obligations)
-                    .map_err(|e| {
-                        self.record_delightql_error(&e);
-                        e
-                    })?;
-
-                // The lowering sandwich: expand → cleanup → legalize.
-                let optimized = lower_statement(
-                    sql_ast,
-                    dialect,
-                    self.sql_optimization_level,
-                    &self.registry,
-                )
-                .map_err(|e| {
-                    self.record_delightql_error(&e);
-                    e
-                })?;
-
-                // `equals` compiles its right operand through the same
-                // pipeline, under the outer CTEs so a CTE name written on
-                // the right still resolves.
-                let right = match spec.right_operand.as_ref() {
-                    None => None,
-                    Some(right_rel) => {
-                        let right_query = ast_unresolved::Query {
-                            cfes: outer_cfes.clone(),
-                            ctes: outer_ctes.clone(),
-                            body: right_rel.clone(),
-                        };
-                        let right_resolved_result = resolver::resolve_query(
-                            right_query,
-                            schema,
-                            Some(self.system),
-                            &self.resolution_config,
-                            Rc::clone(&self.registry),
-                        )?;
-                        let right_refined = refiner::refine_query_with_gates(
-                            right_resolved_result.query,
-                            assert_danger_gates.clone(),
-                            Rc::clone(&self.registry),
-                        )?;
-                        let right_ctx = transformer::TransformCtx {
-                            identities: Rc::clone(&self.registry),
-                            names: transformer::builder::NameGenerator::new(Rc::clone(
-                                &self.registry,
-                            )),
-                            outer_columns: vec![],
-                            danger_gates: danger_gates::DangerGateMap::with_defaults(),
-                        };
-                        let right_sql_ast = transformer::transform(right_refined, &right_ctx)?
-                            .without_obligations()?;
-                        let right_optimized = lower_statement(
-                            right_sql_ast,
-                            dialect,
-                            self.sql_optimization_level,
-                            &self.registry,
-                        )?;
-                        Some(right_optimized)
-                    }
-                };
-
-                pending_assertions.push(PendingAssertionSql {
-                    statement: optimized,
-                    right,
-                    name: spec.name.clone(),
-                });
-            }
-
-            self.assertion_specs = specs;
-        }
-
-        let mut statements = Vec::with_capacity(
-            1 + pending_assertions.len()
-                + pending_assertions
-                    .iter()
-                    .filter(|assertion| assertion.right.is_some())
-                    .count(),
-        );
+        let mut statements = Vec::new();
         statements.push(&optimized);
         statements.extend(staging.iter());
         statements.extend(retirement.iter());
         statements.extend(checks.iter());
-        for assertion in &pending_assertions {
-            statements.push(&assertion.statement);
-            if let Some(right) = &assertion.right {
-                statements.push(right);
-            }
-        }
-        let names = generator::baptise_statements(&self.registry, &statements)
+        let identities = self.epoch.names();
+        let names = generator::baptise_statements(&identities, &statements)
             .map_err(|e| e.into_delightql_error("SQL bundle naming error"))?;
         let generator = generator::SqlGenerator::new(&names)
             .with_dialect(dialect)
@@ -1092,29 +960,49 @@ impl<'a> Pipeline<'a> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.assertion_sqls = pending_assertions
-            .into_iter()
-            .map(|assertion| {
-                let left = generator
-                    .generate_statement(&assertion.statement)
-                    .map_err(|e| e.into_delightql_error("Assertion SQL generation error"))?;
-                let right = assertion
-                    .right
-                    .as_ref()
-                    .map(|right| {
-                        generator.generate_statement(right).map_err(|e| {
-                            e.into_delightql_error("Equals right SQL generation error")
-                        })
-                    })
-                    .transpose()?;
-                Ok(compiled_query::CompiledAssertion {
-                    sql: assertion_bool_wrap(&left, right.as_deref()),
-                    name: assertion.name,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         Ok(self.sql_string.as_ref().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod reference_admission_tests {
+    use delightql_types::schema::{ColumnInfo, DatabaseSchema};
+
+    struct KeywordTable;
+
+    impl DatabaseSchema for KeywordTable {
+        fn get_table_columns(
+            &self,
+            _schema: Option<&str>,
+            table: &str,
+        ) -> delightql_types::Result<Option<Vec<ColumnInfo>>> {
+            Ok((table == "select").then(|| {
+                vec![ColumnInfo {
+                    name: "x".into(),
+                    nullable: true,
+                    position: 0,
+                    declared_type: Some("INTEGER".to_string()),
+                }]
+            }))
+        }
+
+        fn table_exists(
+            &self,
+            _schema: Option<&str>,
+            table: &str,
+        ) -> delightql_types::Result<bool> {
+            Ok(table == "select")
+        }
+    }
+
+    #[test]
+    fn a_backend_table_cannot_admit_a_bare_keyword_reference() {
+        let error = super::compile_source_to_sql("select(*)", &KeywordTable)
+            .expect_err("authored name admission precedes backend lookup");
+        assert_eq!(
+            error.error_uri(),
+            "delightql-error://semantic/identifier/keyword"
+        );
     }
 }
 
@@ -1282,7 +1170,9 @@ pub fn split_queries(source: &str) -> Result<Vec<String>> {
 /// a definition's own declarations — travels with it: there is one form here,
 /// so there is nothing for a file-level sidecar to belong to instead.
 pub(crate) fn one_goal(mut normalized: normalize::Normalized) -> Result<normalize::Goal> {
-    if normalized.queries.len() > 1 {
+    let file_level = std::mem::take(&mut normalized.declared);
+    let mut queries = normalized.into_queries();
+    if queries.len() > 1 {
         // ONE FACT, ONE TEACHING. A submission holding several queries is
         // refused here when it PARSED as a sequence and at the entrance when
         // it did not; both are the same fact about the same submission, so
@@ -1292,18 +1182,15 @@ pub(crate) fn one_goal(mut normalized: normalize::Normalized) -> Result<normaliz
                 "multi-query input rejected: found {} queries in one submission \
                  (send each query separately, or run the file through the \
                  sequential entrance)",
-                normalized.queries.len()
+                queries.len()
             ),
             source: None,
             subcategory: Some("multi_query"),
         });
     }
-    let mut goal = normalized
-        .queries
+    let mut goal = queries
         .pop()
         .ok_or_else(|| DelightQLError::parse_error("this submission declares nothing to run"))?;
-    let file_level = std::mem::take(&mut normalized.declared);
-    goal.declared.assertions.extend(file_level.assertions);
     goal.declared.dangers.extend(file_level.dangers);
     goal.declared.options.extend(file_level.options);
     goal.declared.ddl_blocks.extend(file_level.ddl_blocks);
@@ -1361,14 +1248,6 @@ fn lower_statement(
     probing!(sql, {
         probe!(sql, "{}", rendered_sql(&legal, dialect, identities));
     });
-    match sql_self_check::check(&legal, identities) {
-        Ok(()) => {}
-        // Reading the SQL behind a refusal is the only way to tell a real
-        // dangling reference from one whose spelling happens to resolve; the
-        // check has to be let past for the engine to answer that.
-        Err(error) if probe::enabled("nocheck") => probe!(nocheck, "{error}"),
-        Err(error) => return Err(error),
-    }
     Ok(legal)
 }
 
@@ -1387,11 +1266,18 @@ fn rendered_sql(
 }
 
 /// Generate SQL string from a single refined relational expression
-fn generate_sql_v3_only(ast_refined: ast_refined::Chain, registry: Rc<Registry>) -> Result<String> {
+fn generate_sql_v3_only(
+    ast_refined: ast_refined::Chain,
+    registry: crate::relation::Planning,
+) -> Result<String> {
+    // THE CAPABILITY IS SPENT HERE. Lowering is handed the names it reads
+    // and the records it binds against; the epoch that built them is gone.
+    let names = registry.names();
     let ctx = transformer::TransformCtx {
-        identities: Rc::clone(&registry),
-        names: transformer::builder::NameGenerator::new(Rc::clone(&registry)),
-        outer_columns: vec![],
+        relations: registry.seal(),
+        identities: std::rc::Rc::clone(&names),
+        outer_sites: Vec::new(),
+        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&names)),
         danger_gates: danger_gates::DangerGateMap::with_defaults(),
     };
     let query = ast_refined::Query::relational(ast_refined);
@@ -1400,9 +1286,9 @@ fn generate_sql_v3_only(ast_refined: ast_refined::Chain, registry: Rc<Registry>)
         sql_ast,
         generator::SqlDialect::SQLite,
         sql_optimizer::OptimizationLevel::Basic,
-        &registry,
+        &names,
     )?;
-    let names = generator::baptise_statements(&registry, &[&optimized_sql_ast])
+    let names = generator::baptise_statements(&names, &[&optimized_sql_ast])
         .map_err(|e| e.into_delightql_error("SQL naming error"))?;
     let generator = generator::SqlGenerator::new(&names);
     generator
@@ -1414,47 +1300,34 @@ fn generate_sql_v3_only(ast_refined: ast_refined::Chain, registry: Rc<Registry>)
 fn generate_sql_with_ctes(
     ctes: Vec<ast_resolved::CteBinding>,
     main_query: ast_resolved::Chain,
-    registry: Rc<Registry>,
+    registry: crate::relation::Planning,
 ) -> Result<String> {
-    use crate::pipeline::sql_ast::{Cte, SqlStatement};
+    use crate::pipeline::sql_ast::SqlStatement;
 
-    // Step 1: Refine each CTE expression
+    // Step 1: Refine each CTE binding. THE BINDING CROSSES WHOLE —
+    // refinement rewrites every chain it holds, and the subject and the
+    // body's variant travel unchanged, so there is nothing here to reduce,
+    // carry beside it, or re-pair.
     let mut refined_ctes = Vec::new();
     for cte in ctes {
-        // The resolver's decisions travel with the binding to its SQL
-        // constructor: the recursion fact AND the bound scope. Re-deriving
-        // the scope from the refined body names the body's own scope, which
-        // is not the one references through the binding were addressed
-        // against.
-        let recursive = cte.recursion.is_recursive();
-        let scope = cte.subject;
-        let refined_expr = refiner::refine(cte.expression, Rc::clone(&registry))?;
-        refined_ctes.push((scope, refined_expr, recursive));
+        refined_ctes.push(cte.refined(|chain| refiner::refine(chain, &registry))?);
     }
 
     // Step 2: Refine main query
-    let refined_main = refiner::refine(main_query, Rc::clone(&registry))?;
+    let refined_main = refiner::refine(main_query, &registry)?;
 
-    // Step 3: Transform each CTE to SQL AST
+    // Step 3: Transform each CTE to SQL AST. THE CAPABILITY IS SPENT HERE.
+    let names = registry.names();
     let ctx = transformer::TransformCtx {
-        identities: Rc::clone(&registry),
-        names: transformer::builder::NameGenerator::new(Rc::clone(&registry)),
-        outer_columns: vec![],
+        relations: registry.seal(),
+        identities: std::rc::Rc::clone(&names),
+        outer_sites: Vec::new(),
+        names: transformer::builder::NameGenerator::new(std::rc::Rc::clone(&names)),
         danger_gates: danger_gates::DangerGateMap::with_defaults(),
     };
     let mut sql_ctes = Vec::new();
-    for (scope, expr, recursive) in refined_ctes {
-        let cte_stmt = transformer::transform(ast_refined::Query::relational(expr), &ctx)?
-            .without_obligations()?;
-        let cte_query_expr = match cte_stmt {
-            SqlStatement::Query { query, .. } => query,
-            _ => unreachable!("CTE body cannot be DML"),
-        };
-        sql_ctes.push(if recursive {
-            Cte::new_recursive(scope, cte_query_expr)
-        } else {
-            Cte::new(scope, cte_query_expr)
-        });
+    for binding in refined_ctes {
+        sql_ctes.push(transformer::lower_cte_binding(binding, &ctx.names, &ctx)?);
     }
 
     // Step 4: Transform main query to SQL AST
@@ -1478,9 +1351,9 @@ fn generate_sql_with_ctes(
         statement,
         generator::SqlDialect::SQLite,
         sql_optimizer::OptimizationLevel::Basic,
-        &registry,
+        &names,
     )?;
-    let names = generator::baptise_statements(&registry, &[&optimized])
+    let names = generator::baptise_statements(&names, &[&optimized])
         .map_err(|e| e.into_delightql_error("CTE SQL naming error"))?;
     let generator = generator::SqlGenerator::new(&names);
     generator
@@ -1495,34 +1368,6 @@ fn generate_sql_with_ctes(
 ///
 /// This is the main entry point for compiling DelightQL queries with full CTE support.
 
-/// The assertion body → boolean-SQL wrap (one row, one column).
-/// Shared vocabulary for the ordinary pipeline's assertion compilation
-/// and the typed assertion steps; the two sites compile their operand
-/// SQL differently but wrap identically.
-///
-/// A body that ends in a receipt view has already reduced its
-/// proposition to a presence, so testing the body for a row is the whole
-/// of it — the negation lives in `notexists`, not here.
-///
-/// `equals` is the exception, and it is the POSITIONAL pairing that makes
-/// it one: `EXCEPT` compares columns by position, which is a different
-/// predicate from the by-name relational minus. Bag equality needs the
-/// count too — `EXCEPT` is set-valued and cannot tell `{1, 1}` from `{1}`.
-pub(crate) fn assertion_bool_wrap(left_sql: &str, right_sql: Option<&str>) -> String {
-    let Some(right) = right_sql else {
-        return format!("SELECT EXISTS({}) AS bool", left_sql);
-    };
-    format!(
-        "SELECT (\
-        (SELECT COUNT(*) FROM ({left})) = (SELECT COUNT(*) FROM ({right})) \
-        AND NOT EXISTS(SELECT * FROM ({left}) EXCEPT SELECT * FROM ({right})) \
-        AND NOT EXISTS(SELECT * FROM ({right}) EXCEPT SELECT * FROM ({left}))\
-        ) AS bool",
-        left = left_sql,
-        right = right,
-    )
-}
-
 /// Compile one body to SQL against a supplied schema, on its own arena.
 ///
 /// A SUB-COMPILATION when a compilation is running — a stored view's body, a
@@ -1533,14 +1378,14 @@ pub(crate) fn compile_source_to_sql(
     source: &str,
     schema: &dyn resolver::DatabaseSchema,
 ) -> Result<String> {
-    let registry = Rc::new(Registry::new(&[]));
+    let registry = crate::relation::Planning::open(Registry::new(&[]));
     let _running = crate::compiler_limits::Running::under(registry.limits_shared());
 
     // Phase 0: Text → typed CST
     let tree = parse::prompt(source)?;
 
     // Phase 1: typed CST → Query (supports CTEs)
-    let query = one_goal(normalize::definition_file(&tree, Rc::clone(&registry))?)?.query;
+    let query = one_goal(normalize::definition_file(&tree, registry.names())?)?.query;
 
     // Phase 2: Query → AST(resolved) (with CTE support, no namespace resolution)
     let resolved_result = resolver::resolve_query(
@@ -1548,17 +1393,19 @@ pub(crate) fn compile_source_to_sql(
         schema,
         None,
         &resolver::ResolutionConfig::default(),
-        Rc::clone(&registry),
+        &registry,
+        "home",
     )?;
     // Note: connection_id from resolved_result is ignored here since this is a standalone compile function
 
     // Phase 3: Query(resolved) → Query(refined) - handle CTEs properly
-    let ast_resolved::Query { cfes: (), ctes, body } = resolved_result.query;
+    let ast_resolved::Query { locals, body } = resolved_result.query;
+    let ctes = locals.into_ctes();
     if ctes.is_empty() {
         // Simple query - refine, address, and generate SQL directly
-        let refined_expr = refiner::refine(body, Rc::clone(&registry))?;
-        generate_sql_v3_only(refined_expr, Rc::clone(&registry))
+        let refined_expr = refiner::refine(body, &registry)?;
+        generate_sql_v3_only(refined_expr, registry)
     } else {
-        generate_sql_with_ctes(ctes, body, Rc::clone(&registry))
+        generate_sql_with_ctes(ctes, body, registry)
     }
 }

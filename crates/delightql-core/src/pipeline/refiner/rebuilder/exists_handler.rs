@@ -12,7 +12,7 @@ use std::collections::HashMap;
 pub(super) fn nest_interdependent_exists(
     op_predicates: &mut HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
     exists_deps: &analyzer::ExistsDependencies,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<()> {
     log::debug!(
         "nest_interdependent_exists: roots={:?}, deps={:?}",
@@ -28,7 +28,7 @@ pub(super) fn nest_interdependent_exists(
 
         for pred in top_preds.drain(..) {
             if matches!(
-                pred.expr,
+                pred.expr.truth(),
                 resolved::TruthExpression::Existence(Existence { .. })
             ) {
                 exists_preds.push(pred);
@@ -42,11 +42,10 @@ pub(super) fn nest_interdependent_exists(
             let mut exists_map: HashMap<crate::names::ScopeId, AnalyzedPredicate> = HashMap::new();
             for pred in exists_preds {
                 if let resolved::TruthExpression::Existence(Existence {
-                    relation: ref subquery,
-                    ..
-                }) = pred.expr
+                    relation: subquery, ..
+                }) = pred.expr.truth()
                 {
-                    let scope = super::super::pattern_classifier::relational_scope(subquery)?;
+                    let scope = subquery.semantic_relation().scope();
                     exists_map.insert(scope, pred);
                 }
             }
@@ -93,7 +92,7 @@ pub(super) fn nest_exists_recursive(
     parent_scope: crate::names::ScopeId,
     dependencies: &HashMap<crate::names::ScopeId, std::collections::HashSet<crate::names::ScopeId>>,
     exists_map: &mut HashMap<crate::names::ScopeId, AnalyzedPredicate>,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<()> {
     // Find EXISTS that depend on this parent
     let mut dependents = Vec::new();
@@ -106,12 +105,12 @@ pub(super) fn nest_exists_recursive(
         }
     }
 
-    // If we have dependents, inject them into the parent's subquery
+    // If we have dependents, inject them into the parent's subquery. THE
+    // INTERIOR IS A RELATION: the settled truth hands out its existence's
+    // interior and nothing else, and a parent that is not an existence never
+    // runs the rebuild — exactly as the match this replaces did nothing there.
     if !dependents.is_empty() {
-        if let resolved::TruthExpression::Existence(Existence {
-            relation: subquery, ..
-        }) = &mut parent_pred.expr
-        {
+        parent_pred.expr.rebuild_existence_interior(|subquery| {
             // For each dependent, recursively nest its dependents first
             let mut nested_dependents = Vec::new();
             for (dependent_scope, mut dep_pred) in dependents {
@@ -125,13 +124,8 @@ pub(super) fn nest_exists_recursive(
                 nested_dependents.push(dep_pred);
             }
 
-            // Now inject the dependents into the parent's subquery
-            *subquery = Box::new(inject_exists_into_subquery(
-                *subquery.clone(),
-                nested_dependents,
-                identities,
-            )?);
-        }
+            inject_exists_into_subquery(subquery, nested_dependents, identities)
+        })?;
     }
 
     Ok(())
@@ -141,75 +135,90 @@ pub(super) fn nest_exists_recursive(
 pub(super) fn inject_exists_into_subquery(
     subquery: resolved::Chain,
     exists_predicates: Vec<AnalyzedPredicate>,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<resolved::Chain> {
-    // Find the filter in the subquery or create one
-    let mut subquery = subquery;
-    match subquery.continuations.pop() {
-        Some(resolved::Continuation::Restrict {
-            condition,
-            origin,
-            cpr_schema,
-        }) => {
-            let source = subquery;
-            let exists_exprs = exists_predicates.into_iter().map(|p| p.expr).collect();
-            let combined_pred = combine_resolved_predicates_opt(Some(condition), exists_exprs);
-            Ok(source.then(resolved::Continuation::Restrict {
-                condition: combined_pred.unwrap_or_else(create_resolved_true_literal),
-                origin,
-                cpr_schema,
-            }))
-        }
-        // A bound selects by position, so the EXISTS belongs UNDER it: added
-        // above, it would filter rows the bound had already chosen.
-        Some(resolved::Continuation::Bound { bound, cpr_schema }) => {
-            let source = inject_exists_into_subquery(subquery, exists_predicates, identities)?;
-            Ok(source.then(resolved::Continuation::Bound { bound, cpr_schema }))
-        }
-        Some(step @ resolved::Continuation::Destructure { .. }) => {
-            Err(DelightQLError::validation_error_categorized(
-                "refiner/exists/injection_condition",
-                format!(
-                    "A dependent EXISTS cannot be placed through this parent condition: \
-                     {step:?}"
-                ),
-                "dependent EXISTS placement",
-            ))
-        }
-        last => {
-            // No filter yet, create one with the EXISTS predicates
-            if let Some(last) = last {
-                subquery.continuations.push(last);
+    // Find the filter in the subquery or create one. The outermost step
+    // travels WITH its operand, so nothing here holds a step beside a chain
+    // it did not come off.
+    let subquery = match subquery.peel() {
+        Err(bare) => bare,
+        Ok(peeled) => match peeled.last().form() {
+            resolved::Continuation::Restrict { .. } => {
+                let Ok((source, resolved::Transparent::Restrict { condition, origin })) =
+                    peeled.transparent()
+                else {
+                    unreachable!("just matched a restriction")
+                };
+                let exists_exprs = exists_predicates
+                    .into_iter()
+                    .map(|p| p.expr.into_truth())
+                    .collect();
+                let combined_pred = combine_resolved_predicates_opt(Some(condition), exists_exprs);
+                // A wider predicate over the same rows publishes the same
+                // relation, so the result is RESTATED from the operand
+                // rather than carried over from the step that came off.
+                return Ok(source.transparently(resolved::Transparent::Restrict {
+                    condition: combined_pred.unwrap_or_else(create_resolved_true_literal),
+                    origin,
+                }));
             }
-            let exists_exprs: Vec<_> = exists_predicates.into_iter().map(|p| p.expr).collect();
-            let combined_pred = if !exists_exprs.is_empty() {
-                Some(combine_resolved_predicates_with_and(exists_exprs))
-            } else {
-                None
-            };
+            // A bound selects by position, so the EXISTS belongs UNDER it:
+            // added above, it would filter rows the bound had already chosen.
+            resolved::Continuation::Bound { .. } => {
+                let Ok((source, resolved::Transparent::Bound { bound })) = peeled.transparent()
+                else {
+                    unreachable!("just matched a bound")
+                };
+                let source = inject_exists_into_subquery(source, exists_predicates, identities)?;
+                return Ok(source.transparently(resolved::Transparent::Bound { bound }));
+            }
+            resolved::Continuation::Destructure { .. } => {
+                return Err(DelightQLError::validation_error_categorized(
+                    "refiner/exists/injection_condition",
+                    format!(
+                        "A dependent EXISTS cannot be placed through this parent condition: \
+                         {:?}",
+                        peeled.last().form()
+                    ),
+                    "dependent EXISTS placement",
+                ))
+            }
+            _ => peeled.rejoin(),
+        },
+    };
 
-            if let Some(pred) = combined_pred {
-                // A filter publishes what it filters.
-                let cpr_schema =
-                    crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(&subquery);
-                Ok(subquery.then(resolved::Continuation::Restrict {
-                    condition: pred,
-                    origin: resolved::FilterOrigin::Generated,
-                    cpr_schema,
-                }))
-            } else {
-                Ok(subquery)
-            }
-        }
-    }
+    // No filter yet, create one with the EXISTS predicates
+    let exists_exprs: Vec<_> = exists_predicates
+        .into_iter()
+        .map(|p| p.expr.into_truth())
+        .collect();
+    let combined_pred = if !exists_exprs.is_empty() {
+        Some(combine_resolved_predicates_with_and(exists_exprs))
+    } else {
+        None
+    };
+
+    let _ = identities;
+    Ok(match combined_pred {
+        // A filter publishes what it filters.
+        Some(pred) => subquery.transparently(resolved::Transparent::Restrict {
+            condition: pred,
+            origin: resolved::FilterOrigin::Generated,
+        }),
+        None => subquery,
+    })
 }
 
 /// Create a resolved "1 = 1" true literal expression
 pub(super) fn create_resolved_true_literal() -> resolved::TruthExpression {
     resolved::TruthExpression::Comparison(Comparison {
         operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
-        left: Box::new(resolved::DomainExpression::Application(resolved::FunctionApplication::Ground(resolved::LiteralValue::Number("1".to_string()),))),
-        right: Box::new(resolved::DomainExpression::Application(resolved::FunctionApplication::Ground(resolved::LiteralValue::Number("1".to_string()),))),
+        left: Box::new(resolved::DomainExpression::Application(
+            resolved::FunctionApplication::Ground(resolved::LiteralValue::Number("1".to_string())),
+        )),
+        right: Box::new(resolved::DomainExpression::Application(
+            resolved::FunctionApplication::Ground(resolved::LiteralValue::Number("1".to_string())),
+        )),
     })
 }
 
@@ -245,64 +254,79 @@ mod tests {
     fn comparison(value: &str) -> resolved::TruthExpression {
         resolved::TruthExpression::Comparison(Comparison {
             operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
-            left: Box::new(resolved::DomainExpression::Application(resolved::FunctionApplication::Ground(resolved::LiteralValue::Number(value.to_string()),))),
-            right: Box::new(resolved::DomainExpression::Application(resolved::FunctionApplication::Ground(resolved::LiteralValue::Number(value.to_string()),))),
+            left: Box::new(resolved::DomainExpression::Application(
+                resolved::FunctionApplication::Ground(resolved::LiteralValue::Number(
+                    value.to_string(),
+                )),
+            )),
+            right: Box::new(resolved::DomainExpression::Application(
+                resolved::FunctionApplication::Ground(resolved::LiteralValue::Number(
+                    value.to_string(),
+                )),
+            )),
         })
     }
 
-    fn schema(identities: &crate::names::Registry) -> crate::names::ScopeId {
-        identities.mint_scope(
-            crate::names::ScopeOrigin::AnonRelation,
-            crate::names::Hint::None,
-            None,
-        )
+    fn schema(identities: &crate::relation::Planning) -> crate::relation::SemanticRelation {
+        crate::relation::any_relation(identities)
     }
 
-    fn relation(identities: &crate::names::Registry) -> resolved::Chain {
+    fn relation(identities: &crate::relation::Planning) -> resolved::Chain {
         let table = resolved::AnonTable::from_values(
             None,
-            vec![vec![resolved::DomainExpression::Application(resolved::FunctionApplication::Ground(resolved::LiteralValue::Number("1".into()),))]],
-            schema(identities),
+            vec![vec![resolved::DomainExpression::Application(
+                resolved::FunctionApplication::Ground(resolved::LiteralValue::Number("1".into())),
+            )]],
         )
         .unwrap();
-        resolved::Chain::ground(resolved::Grelex::Literal(resolved::AnonRelation::plain(
-            table,
-        )))
+        resolved::Chain::ground(
+            identities
+                .authority()
+                .reading(crate::relation::builder::ReadHead::Anonymous {
+                    relation: resolved::AnonRelation::plain(table),
+                    published: schema(identities),
+                })
+                .expect("an anonymous head"),
+        )
     }
 
     #[test]
     fn dependent_exists_enters_below_a_parent_tuple_limit() {
-        let identities = crate::names::Registry::new(&[]);
+        let identities = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         let existing = comparison("1");
         let dependent = comparison("2");
-        let source = relation(&identities).then(resolved::Continuation::Restrict {
+        let source = relation(&identities).transparently(resolved::Transparent::Restrict {
             condition: existing.clone(),
             origin: resolved::FilterOrigin::Generated,
-            cpr_schema: schema(&identities),
         });
         let limit = resolved::TupleOrdinalClause {
             operator: resolved::TupleOrdinalOperator::LessThan,
             value: 5,
             offset: None,
         };
-        let limited = source.then(resolved::Continuation::Bound {
+        let limited = source.transparently(resolved::Transparent::Bound {
             bound: limit.clone(),
-            cpr_schema: schema(&identities),
         });
         let predicates = vec![AnalyzedPredicate {
             class: PredicateClass::Fx,
-            expr: dependent.clone(),
+            expr: crate::pipeline::refiner::settled::fixtures::settled_over_nothing(
+                dependent.clone(),
+                &identities,
+            ),
             operator_ref: OperatorRef::TopLevel,
             origin: resolved::FilterOrigin::Generated,
         }];
 
         let mut injected = inject_exists_into_subquery(limited, predicates, &identities).unwrap();
-        let Some(resolved::Continuation::Bound { bound, .. }) = injected.continuations.pop() else {
+        let Some(resolved::Continuation::Bound { bound, .. }) =
+            injected.pop_continuation().map(|step| step.into_form())
+        else {
             panic!("the parent tuple limit disappeared");
         };
         assert_eq!(bound, limit);
 
-        let Some(resolved::Continuation::Restrict { condition, .. }) = injected.continuations.pop()
+        let Some(resolved::Continuation::Restrict { condition, .. }) =
+            injected.pop_continuation().map(|step| step.into_form())
         else {
             panic!("the dependent predicate was not injected below the tuple limit");
         };

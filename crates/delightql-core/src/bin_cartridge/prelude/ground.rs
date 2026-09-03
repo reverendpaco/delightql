@@ -112,7 +112,9 @@ impl EffectExecutable for GroundPredicate {
 /// Extract a string literal value from a DomainExpression
 fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<String> {
     match expr {
-        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => Ok(s.clone()),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
+            Ok(s.clone())
+        }
         _ => Err(DelightQLError::database_error(
             format!("ground!() {} must be a string literal", arg_name),
             "Invalid argument type",

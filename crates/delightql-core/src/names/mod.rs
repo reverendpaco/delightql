@@ -50,10 +50,10 @@
 //! 2. **Baptism seals a [`Bundle`], not a statement.** A temporary object
 //!    referenced across several statements of one program must get one
 //!    name.
-//! 3. **Visibility is a property of a lexical position**, carried by
-//!    [`ScopeEnv`], not a field on a scope. The same relation seen from a
-//!    join condition and from a correlated subquery does not see the same
-//!    things.
+//! 3. **Visibility is a property of a lexical position**, carried by the
+//!    resolver's semantic-relation environment, not a field on a scope. The
+//!    same relation seen from a join condition and from a correlated subquery
+//!    does not see the same things.
 //! 4. **Nothing rebinds.** Crossing a boundary mints a new [`ColId`] linked
 //!    to the old one, because the compiler still holds the pre-optimization
 //!    tree and a mutated identity would silently reinterpret it.
@@ -68,27 +68,35 @@
 //! interner is where it becomes load-bearing.
 
 pub mod baptism;
+pub mod birth;
+#[cfg(test)]
+mod fences;
 pub mod id;
+pub mod identifier;
 pub mod origin;
 pub mod policy;
 pub mod registry;
+pub mod scope;
 pub mod sink;
 
 #[cfg(test)]
 pub use baptism::BaptismError;
 pub use baptism::{baptise, Baptised, Bundle, Statement};
+pub use birth::CteLabel;
 pub use id::{
     CallableCategory, CallableId, ColId, DmlVerb, EntityId, FnId, ScopeId, Spelling, Sym,
+};
+pub use identifier::{
+    CteName, DefinitionName, PublishedName, ReferenceName, RenameName, StageName,
 };
 #[cfg(test)]
 pub use origin::FunctionSpellingError;
 pub use origin::{
-    Addressing, ColumnOrigin, Computation, CteRole, FnOrigin, Hint, HoRole, Intrinsic, MintReason,
-    Republish, ScopeOrigin, ScratchRole, ValueFacts, ValueShape, WrapReason,
+    Addressing, CteRole, FnOrigin, HoRole, Intrinsic, ScopeKind, ScratchRole, ValueFacts,
+    ValueShape, WrapReason,
 };
-pub use registry::{
-    AddressError, Candidates, CorrespondenceError, HeadingKnowledge, Reference, Registry, ScopeEnv,
-};
+pub use registry::{CorrespondenceError, Registry};
+pub use scope::DuplicateScopePolicy;
 pub use sink::{SqlOut, Teaching};
 
 impl From<CorrespondenceError> for crate::error::DelightQLError {

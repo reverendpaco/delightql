@@ -71,9 +71,9 @@ Error assertions and data assertions can appear in the same file,
 documenting both correct and incorrect forms:
 
 ```delightql
--- correct: semicolons produce a single-column multi-row relation
-users(*), age in (1;2;3)
-  (~~assert , age > 0 |> exists(*) ~~)
+-- correct: an ordinary assertion effect checks the established relation
+users(*), age > 0
+  !> assert!(exists(*), "a positive-age row exists")(*)
 
 -- incorrect: commas produce a multi-column single-row relation
 users(*), age in (1,2,3) (~~error://validation ~~)

@@ -27,7 +27,9 @@ impl<'t> Normalizer<'t> {
         &self,
         node: cst::Ground<'t>,
     ) -> Result<DomainExpression<Unresolved>> {
-        Ok(DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(self.ground(node)?)))
+        Ok(DomainExpression::Application(
+            crate::pipeline::asts::core::FunctionApplication::Ground(self.ground(node)?),
+        ))
     }
 
     pub(crate) fn literal(&self, node: cst::Literal<'t>) -> Result<LiteralValue> {

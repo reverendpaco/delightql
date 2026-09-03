@@ -28,9 +28,9 @@
 //!   Read-only view of the builder's scope for column qualification.
 //!   `r_lower_*` functions never call qualify() directly — they pass `&builder`
 //!   to `s_lower_expression()`, which uses `Qualify` internally.
+pub(in crate::pipeline) mod layout;
 pub(in crate::pipeline) mod names;
-pub(in crate::pipeline) mod publication;
-pub(in crate::pipeline::transformer) mod state;
+pub(in crate::pipeline) mod state;
 
 use std::marker::PhantomData;
 
@@ -45,52 +45,49 @@ use crate::pipeline::sql_ast::{
 // QualifiedColumn — what `Qualify` returns
 // ---------------------------------------------------------------------------
 
-
+pub(in crate::pipeline) use layout::{Hygiene, SqlLayout};
 pub(in crate::pipeline) use names::NameGenerator;
 pub(in crate::pipeline::transformer) use names::ScopeName;
-pub(in crate::pipeline) use publication::{
-    correlation_carriers, publish_at, Alignment, Hygiene, Publication,
-};
 use state::BuilderState;
 
 pub(super) fn wrap_origin(
     columns: &[ColumnMetadata],
     identities: &crate::names::Registry,
     why: crate::names::WrapReason,
-) -> crate::names::ScopeOrigin {
-    ColumnMetadata::common_identity_scope(columns, identities)
-        .map(|input| crate::names::ScopeOrigin::Wrap { input, why })
-        .unwrap_or(crate::names::ScopeOrigin::AnonRelation)
+) -> crate::names::ScopeId {
+    ColumnMetadata::common_identity_scope(columns, identities).map_or_else(
+        || identities.anonymous_scope(None),
+        |input| identities.wrap_scope(input, why),
+    )
 }
 
 /// The GROUP BY clause is the key items' expressions — the clause groups by
 /// what the keys select, never by the names they publish under.
 fn group_by_expressions(keys: &[SelectItem]) -> Vec<DomainExpression> {
     keys.iter()
-        .filter_map(|item| match item {
-            SelectItem::Expression { expr, .. } => Some(expr.clone()),
-            _ => None,
-        })
+        .filter_map(|item| item.expr().cloned())
         .collect()
 }
 
 pub(super) fn pipe_origin(
     columns: &[ColumnMetadata],
     identities: &crate::names::Registry,
-) -> crate::names::ScopeOrigin {
-    ColumnMetadata::common_identity_scope(columns, identities)
-        .map(|input| crate::names::ScopeOrigin::PipeStage { input })
-        .unwrap_or(crate::names::ScopeOrigin::AnonRelation)
+) -> crate::names::ScopeId {
+    ColumnMetadata::common_identity_scope(columns, identities).map_or_else(
+        || identities.anonymous_scope(None),
+        |input| identities.stage_scope(input),
+    )
 }
 
 fn cte_origin(
     columns: &[ColumnMetadata],
     identities: &crate::names::Registry,
     role: crate::names::CteRole,
-) -> crate::names::ScopeOrigin {
-    ColumnMetadata::common_identity_scope(columns, identities)
-        .map(|input| crate::names::ScopeOrigin::Cte { input, role })
-        .unwrap_or(crate::names::ScopeOrigin::AnonRelation)
+) -> crate::names::ScopeId {
+    ColumnMetadata::common_identity_scope(columns, identities).map_or_else(
+        || identities.anonymous_scope(None),
+        |input| identities.cte_scope(input, role, crate::names::CteLabel::Anonymous),
+    )
 }
 
 /// Stand a CTE body at a scope of its own, re-aliasing its select list into it.
@@ -109,30 +106,27 @@ pub(in crate::pipeline::transformer) fn stand_cte_body_at(
     input: crate::names::ScopeId,
     why: crate::names::WrapReason,
     identities: &crate::names::Registry,
-) -> Result<(crate::names::ScopeId, Vec<crate::names::ColId>)> {
-    let at = identities.mint_scope(
-        crate::names::ScopeOrigin::Wrap { input, why },
-        crate::names::Hint::None,
-        None,
-    );
+) -> Result<(
+    crate::names::ScopeId,
+    Vec<crate::names::ColId>,
+    Vec<crate::names::ColId>,
+)> {
+    let at = identities.wrap_scope(input, why);
     let mut outputs = Vec::with_capacity(items.len());
+    let mut aliases = Vec::with_capacity(items.len());
     for item in items {
-        let SelectItem::Expression {
-            alias: Some(alias), ..
+        let SelectItem::Publishing {
+            slot: alias,
+            printed: true,
+            ..
         } = item
         else {
             return Err(crate::error::DelightQLError::parse_error(
                 "a CTE body has an output it does not name",
             ));
         };
-        let published = identities.republish_column(
-            *alias,
-            at,
-            crate::names::Republish::BoundaryExport,
-            identities.published(*alias),
-            identities.addressing(*alias),
-            |_| {},
-        );
+        aliases.push(*alias);
+        let published = identities.rebind_sql_column(*alias, at, identities.published(*alias));
         *alias = published;
         outputs.push(published);
     }
@@ -146,113 +140,57 @@ pub(in crate::pipeline::transformer) fn stand_cte_body_at(
             );
         }
     });
-    Ok((at, outputs))
+    Ok((at, outputs, aliases))
 }
 
 pub(super) fn remint_heading(
     columns: Vec<ColumnMetadata>,
     identities: &crate::names::Registry,
     into: crate::names::ScopeId,
-    how: crate::names::Republish,
 ) -> Vec<ColumnMetadata> {
-    crate::probe::probe!(
-        heading,
-        "remint into {into:?} {how:?} from {:?}\n{}",
-        columns
-            .iter()
-            .map(ColumnMetadata::identity)
-            .collect::<Vec<_>>(),
-        std::backtrace::Backtrace::force_capture()
-    );
     columns
         .into_iter()
         .map(|column| {
             let source = column.identity();
-            let identity = identities.republish_column(
-                source,
-                into,
-                how,
-                identities.published(source),
-                identities.addressing(source),
-                |_| {},
-            );
+            let identity = identities.rebind_sql_column(source, into, identities.published(source));
             ColumnMetadata::new(identity)
         })
         .collect()
 }
 
-/// Follow an occurrence owned by a join back to the arm that publishes it.
+/// Stage a statement into a plan-lifetime relation that HOLDS what it emits.
 ///
-/// A join names a heading but never an SQL alias — `FROM a JOIN b` offers `a`
-/// and `b` and nothing else — so a reference qualified by the join scope names
-/// a table no statement contains. The heading is still real, and a select list
-/// goes on *publishing* under it; only the reading side comes back down here.
-/// Both halves of a select item pass through: the expression reads the arm,
-/// the alias keeps the join's occurrence, and that split is what lets two
-/// arms' `id` be told apart in the output while staying unambiguous in the
-/// input.
-///
-/// The walk is a chain, not a search: an occurrence has one source, so there
-/// is nothing to choose between.
-///
-/// Each step lands in one of that join's own two operands, or the walk stops.
-/// A chain step is not by itself a road out of a join: an occurrence may
-/// republish something from outside the statement entirely — an interior
-/// expression carrying the segment occurrence it computes, say — and following
-/// that names a table this FROM does not offer. The operands are what the FROM
-/// establishes, so they are the only place to land.
-///
-/// It lands only on an occurrence its own scope publishes. An arm that renames
-/// or unifies on the way out — a positional pattern is both — holds a source
-/// column it never outputs, and reading through to that one names a column the
-/// arm does not have. Where the walk cannot land, the join's own occurrence
-/// stands, which is what it did before any of this.
-pub(super) fn read_through_joins(
+/// The authority derives the relation and republishes those occurrences into
+/// it in one act, so the stored interface IS the created table's heading.
+/// Rewriting the statement's aliases onto them afterwards is rendering: it
+/// names in SQL what the authority already published.
+pub(in crate::pipeline::transformer) fn stage_holding(
+    query: &mut QueryExpression,
+    emits: &[ColumnMetadata],
+    staged: crate::relation::SemanticRelation,
     identities: &crate::names::Registry,
-    column: crate::names::ColId,
-) -> crate::names::ColId {
-    let mut cur = column;
-    while let crate::names::ScopeOrigin::Join { left, right } =
-        identities.origin_of(identities.scope_of(cur))
-    {
-        let crate::names::ColumnOrigin::Republished { from, .. } = identities.origin_of_col(cur)
-        else {
-            return column;
-        };
-        let landed = identities.scope_of(from);
-        if landed != left && landed != right {
-            return column;
-        }
-        cur = from;
-    }
-    if identities
-        .heading(identities.scope_of(cur))
-        .columns_seen()
+) -> Result<(crate::relation::SemanticRelation, Vec<ColumnMetadata>)> {
+    let emitted: Vec<_> = emits.iter().map(ColumnMetadata::identity).collect();
+    let published: Vec<ColumnMetadata> = crate::relation::published_ports(identities, &staged)?
+        .into_iter()
+        .map(|port| ColumnMetadata::new(port.column()))
+        .collect();
+    let aliases: Vec<_> = emitted
         .iter()
-        .any(|column| *column == cur)
-    {
-        cur
-    } else {
-        column
-    }
+        .copied()
+        .zip(published.iter().map(ColumnMetadata::identity))
+        .collect();
+    state::rewrite_output_aliases(query, staged.scope(), &aliases, identities)?;
+    Ok((staged, published))
 }
 
-/// Republish a finished query's heading under the scope that is about to name
-/// it, and rewrite the query to output what it now claims.
-///
-/// Minting a scope over a body and rewriting that body are one act. Half of it
-/// leaves the alias claiming a heading the statement does not output — and
-/// nothing in the SQL text shows it, because the spelling under the new
-/// occurrence is the spelling under the old one. Every wrap goes through here
-/// so that half is not reachable.
 pub(in crate::pipeline::transformer) fn republish_under(
     query: &mut QueryExpression,
     scope: crate::names::ScopeId,
     columns: &[ColumnMetadata],
     identities: &crate::names::Registry,
-    how: crate::names::Republish,
 ) -> Result<Vec<ColumnMetadata>> {
-    let republished = remint_heading(columns.to_vec(), identities, scope, how);
+    let republished = remint_heading(columns.to_vec(), identities, scope);
     let aliases: Vec<_> = columns
         .iter()
         .zip(&republished)
@@ -286,18 +224,17 @@ fn reanchor_select_items(items: Vec<SelectItem>, qualify: &dyn Qualify) -> Resul
     let failure = std::cell::RefCell::new(None);
     let items = items
         .into_iter()
-        .map(|item| match item {
-            SelectItem::Expression { expr, alias } => SelectItem::Expression {
-                expr: expr.map_columns(&|column| match qualify.rebind(column) {
+        .map(|item| match item.expr() {
+            Some(expr) => item.with_expr(expr.clone().map_columns(&|column| {
+                match qualify.rebind_physical(column) {
                     Ok(landed) => landed,
                     Err(error) => {
                         failure.borrow_mut().get_or_insert(error);
                         column
                     }
-                }),
-                alias,
-            },
-            other => other,
+                }
+            })),
+            None => item,
         })
         .collect();
     match failure.into_inner() {
@@ -316,6 +253,14 @@ pub struct Unprojected;
 /// Marker: SELECT list is set. Ready for ORDER BY, LIMIT, CTE, finalization.
 pub struct Projected;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergeSources {
+    /// Ordinary consumers read the one retained output position.
+    Collapsed,
+    /// A full-outer projection still needs both operands to build COALESCE.
+    RetainedForProjection,
+}
+
 // ---------------------------------------------------------------------------
 // Qualify — the scalar lowering module's read-only interface
 // ---------------------------------------------------------------------------
@@ -330,177 +275,132 @@ pub struct Projected;
 pub(crate) trait Qualify {
     fn identities(&self) -> &crate::names::Registry;
 
+    /// Every exact site this qualifier's references may reach. Empty for a
+    /// scope that emits nothing.
+    fn sql_sites(&self) -> Vec<crate::sql_binding::SqlSiteId> {
+        Vec::new()
+    }
+
+    /// Bind a semantic port to the physical column emitted for it.
+    ///
+    /// NO DEFAULT. There is no universal "maybe this qualifier emits":
+    /// every scope answers this in its own words, and a scope that emits
+    /// nothing says exactly that. An emitting one delegates to
+    /// [`Emitted::emitted_port`], which reads the binding at the ONE site
+    /// its type carries.
+    fn rebind_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId>;
+
+    /// The exact physical output position occupied by a semantic port.
+    fn slot_of_port(&self, port: crate::relation::PortId) -> Result<usize>;
+
+    fn slot_of_physical(&self, column: crate::names::ColId) -> Result<usize>;
+
+    /// Re-anchor one physical slot through SQL-only wrapping recorded at
+    /// the exact emitted site. A slot absent from every site this
+    /// qualifier reaches is an outer physical reference and stays
+    /// unchanged.
+    fn rebind_physical(&self, column: crate::names::ColId) -> Result<crate::names::ColId> {
+        let matches = self
+            .sql_sites()
+            .into_iter()
+            .filter_map(|site| {
+                self.identities()
+                    .bindings()
+                    .physical_at(site, column)
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        match matches.as_slice() {
+            [] => Ok(column),
+            [landed] => Ok(*landed),
+            _ => Err(crate::error::DelightQLError::parse_error(format!(
+                "physical column {column:?} occurs at more than one exact SQL site"
+            ))),
+        }
+    }
 
     /// Snapshot this scope's columns for use as an outer scope.
     ///
     /// Called at scalar subquery entry points to capture the enclosing
     /// scope into `TransformCtx.outer_columns`. Default: empty (no columns
-    /// to contribute — appropriate for DummyQualify, ChainedQualify, etc.).
+    /// to contribute).
     fn scope_columns(&self) -> Vec<ColumnMetadata> {
         vec![]
     }
 
-    /// Re-anchor a resolved reference onto the occurrence this scope publishes
-    /// for it.
-    ///
-    /// A reference is addressed at resolution against the scope its operator
-    /// published then. Every boundary crossed since — a subquery wrapper, a
-    /// join operand — republishes that heading under fresh occurrences, and the
-    /// reference then names one no emitted statement carries. The republication
-    /// chain is the road back whenever there is one: a candidate stands for the
-    /// reference when the reference is on its chain.
-    ///
-    /// It is not the only road. The resolver republishes a heading into the
-    /// scope it minted for a segment, and the transformer republishes the same
-    /// heading across the boundary it had to insert — two routes from one
-    /// source, so the reference and the candidate come out *siblings*, with
-    /// neither on the other's chain. `rebind_by_value` is that case, and it is
-    /// bounded the same way the chain tier is: one candidate or none.
-    ///
-    /// A reference this scope does not publish — a correlated outer column —
-    /// has no candidate here and passes through untouched.
-    ///
-    /// One reference re-anchors onto one occurrence. A scope publishing the
-    /// reference twice — the same column selected into two slots — offers two
-    /// candidates with equal claim, and picking the earlier one silently
-    /// decides which slot the reference meant. Refuse instead: the reference
-    /// is genuinely ambiguous here, and only its author can say which slot.
-    fn rebind(&self, column: crate::names::ColId) -> Result<crate::names::ColId> {
-        let columns = self.scope_columns();
-        crate::probe::probing!(rebind, {
-            let ids = self.identities();
-            crate::probe::probe!(rebind, "ref {:?}", crate::probe::chain(ids, column));
-            for candidate in &columns {
-                let candidate = candidate.identity();
-                crate::probe::probe!(
-                    rebind,
-                    "  cand {:?} republishes={} same_value={}",
-                    crate::probe::chain(ids, candidate),
-                    ids.republishes(candidate, column),
-                    ids.same_value(candidate, column)
-                );
-            }
-        });
-        let landed = if columns
-            .iter()
-            .any(|candidate| candidate.identity() == column)
-        {
-            column
-        } else {
-            let mut candidates = columns
-                .iter()
-                .map(ColumnMetadata::identity)
-                .filter(|candidate| self.identities().republishes(*candidate, column));
-            match (candidates.next(), candidates.next()) {
-                (Some(candidate), None) => candidate,
-                (None, _) => match self.rebind_by_value(column, &columns)? {
-                    Some(candidate) => candidate,
-                    None => self.rebind_across_joins(column, &columns)?,
-                },
-                (Some(_), Some(_)) => {
-                    return Err(crate::error::DelightQLError::parse_error(format!(
-                        "{column:?} is published more than once here, so a reference to it names \
-                         no single column"
-                    )))
-                }
-            }
-        };
-        Ok(self.read_through_joins(landed))
-    }
-
-    /// Answer a reference with the one candidate carrying its value.
-    ///
-    /// The sibling case: a boundary the transformer inserted republishes the
-    /// same heading the resolver republished into the segment's own scope, so
-    /// the reference and the candidate meet at a shared source rather than on
-    /// one chain. Value identity is what relates them.
-    ///
-    /// Three outcomes, and they are three: no candidate carries the value, one
-    /// does, or more than one does.
-    ///
-    /// `Ok(None)` is "nothing here answers", which hands the question to the
-    /// next tier. More than one is not that — a scope carrying the value twice
-    /// (the same column selected into two slots) offers two with equal claim,
-    /// and choosing between them would decide which slot the reference meant.
-    /// Refusing is the whole reason the tier is bounded, so it refuses rather
-    /// than declining: declining would fall to a tier that answers a different
-    /// question and, failing that, leave the reference standing at a scope no
-    /// FROM entry establishes — the ambiguity emitted instead of reported.
-    fn rebind_by_value(
-        &self,
-        column: crate::names::ColId,
-        columns: &[ColumnMetadata],
-    ) -> Result<Option<crate::names::ColId>> {
-        let mut carrying = columns
-            .iter()
-            .map(ColumnMetadata::identity)
-            .filter(|candidate| self.identities().same_value(*candidate, column));
-        match (carrying.next(), carrying.next()) {
-            (Some(candidate), None) => Ok(Some(candidate)),
-            (None, _) => Ok(None),
-            (Some(_), Some(_)) => Err(crate::error::DelightQLError::parse_error(format!(
-                "{column:?} names a value this scope publishes more than once, so a \
-                 reference to it names no single column"
-            ))),
-        }
-    }
-
-    /// Answer a reference addressed at one join scope with the occurrence a
-    /// second join scope publishes for the same value.
-    ///
-    /// A join publishes a heading and carries no SQL alias, so two join scopes
-    /// standing over the same operands are indistinguishable downstream: the
-    /// headings hold the same values, and neither is on the other's
-    /// republication chain. They are siblings, and the chain test declines
-    /// correctly. Value identity decides between them instead — and only where
-    /// exactly one occurrence here carries the value, since a heading
-    /// publishing it twice offers two answers with equal claim.
-    ///
-    /// Confined to a join on both sides. Value identity alone is too loose to
-    /// re-anchor on: two aliases of one table publish the same values, so a
-    /// correlated outer reference would be captured by whichever local
-    /// occurrence happened to stand for the same column.
-    fn rebind_across_joins(
-        &self,
-        column: crate::names::ColId,
-        columns: &[ColumnMetadata],
-    ) -> Result<crate::names::ColId> {
-        let identities = self.identities();
-        let joined = |c: crate::names::ColId| {
-            matches!(
-                identities.origin_of(identities.scope_of(c)),
-                crate::names::ScopeOrigin::Join { .. }
-            )
-        };
-        if !joined(column) {
-            return Ok(column);
-        }
-        let mut candidates = columns
-            .iter()
-            .map(ColumnMetadata::identity)
-            .filter(|candidate| joined(*candidate) && identities.same_value(*candidate, column));
-        match (candidates.next(), candidates.next()) {
-            (Some(candidate), None) => Ok(candidate),
-            (None, _) => Ok(column),
-            // Equal claim is not the same as no claim. Passing the reference
-            // through leaves `read_through_joins` to walk the sibling it was
-            // already addressed at and land on that arm — an answer, arrived at
-            // by declining to choose. Only the author knows which was meant.
-            (Some(_), Some(_)) => Err(crate::error::DelightQLError::parse_error(format!(
-                "{column:?} names a value this join publishes more than once, so a \
-                 reference to it stands for no single column"
-            ))),
-        }
-    }
-
-    fn read_through_joins(&self, column: crate::names::ColId) -> crate::names::ColId {
-        read_through_joins(self.identities(), column)
-    }
-
     fn tree_valued(&self, column: crate::names::ColId) -> bool {
-        self.identities().facts(column).interior.is_some()
+        self.identities().is_tree_valued(column)
     }
 }
+
+/// A QUALIFIER WHOSE COLUMNS ARE THE REALIZATION OF ONE EXACT SITE.
+///
+/// Emission is a PROPERTY OF THE QUALIFIER, not a question asked of every
+/// one of them. A scope that emits nothing — an anonymous row's literals —
+/// is simply not one of these, and a scope that reaches TWO sites — a set
+/// correlation naming its arms, a chained inner-and-outer view — is not one
+/// either: it says which of its sites answers, in its own words.
+pub(crate) trait Emitting: Qualify {
+    fn site(&self) -> crate::sql_binding::SqlSiteId;
+}
+
+/// The answers every emitting qualifier gives the same way.
+///
+/// Blanket over [`Emitting`], so an implementor states its site and
+/// nothing else. There is no `Option` on this road: the site is a field,
+/// not a question.
+pub(crate) trait Emitted {
+    fn emitted_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId>;
+    fn emitted_slot(&self, port: crate::relation::PortId) -> Result<usize>;
+    fn emitted_physical_slot(&self, column: crate::names::ColId) -> Result<usize>;
+    fn emitted_sites(&self) -> Vec<crate::sql_binding::SqlSiteId>;
+}
+
+impl<T: Emitting + ?Sized> Emitted for T {
+    fn emitted_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId> {
+        self.identities().bindings().at(self.site(), port)
+    }
+
+    fn emitted_slot(&self, port: crate::relation::PortId) -> Result<usize> {
+        self.identities().bindings().slot_at(self.site(), port)
+    }
+
+    fn emitted_physical_slot(&self, column: crate::names::ColId) -> Result<usize> {
+        self.identities()
+            .bindings()
+            .physical_slot_at(self.site(), column)?
+            .ok_or_else(|| {
+                crate::error::DelightQLError::parse_error(format!(
+                    "physical column {column:?} is absent from this exact SQL site"
+                ))
+            })
+    }
+
+    fn emitted_sites(&self) -> Vec<crate::sql_binding::SqlSiteId> {
+        vec![self.site()]
+    }
+}
+
+/// One emitting qualifier's `Qualify` answers, all four from its site.
+macro_rules! qualifies_by_emitting {
+    () => {
+        fn sql_sites(&self) -> Vec<crate::sql_binding::SqlSiteId> {
+            <Self as crate::pipeline::transformer::builder::Emitted>::emitted_sites(self)
+        }
+        fn rebind_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId> {
+            <Self as crate::pipeline::transformer::builder::Emitted>::emitted_port(self, port)
+        }
+        fn slot_of_port(&self, port: crate::relation::PortId) -> Result<usize> {
+            <Self as crate::pipeline::transformer::builder::Emitted>::emitted_slot(self, port)
+        }
+        fn slot_of_physical(&self, column: crate::names::ColId) -> Result<usize> {
+            <Self as crate::pipeline::transformer::builder::Emitted>::emitted_physical_slot(
+                self, column,
+            )
+        }
+    };
+}
+pub(in crate::pipeline::transformer) use qualifies_by_emitting;
 
 // ---------------------------------------------------------------------------
 // GroupBySpec — builder input for GROUP BY operations
@@ -535,6 +435,7 @@ pub struct CteInput {
     scope: crate::names::ScopeId,
     /// The columns available from the previous step.
     columns: Vec<ColumnMetadata>,
+    site: crate::sql_binding::SqlSiteId,
     identities: std::rc::Rc<crate::names::Registry>,
 }
 
@@ -542,11 +443,13 @@ impl CteInput {
     pub(super) fn new(
         scope: crate::names::ScopeId,
         columns: Vec<ColumnMetadata>,
+        site: crate::sql_binding::SqlSiteId,
         identities: std::rc::Rc<crate::names::Registry>,
     ) -> Self {
         Self {
             scope,
             columns,
+            site,
             identities,
         }
     }
@@ -565,6 +468,14 @@ impl Qualify for CteInput {
     fn scope_columns(&self) -> Vec<ColumnMetadata> {
         self.columns.clone()
     }
+
+    crate::pipeline::transformer::builder::qualifies_by_emitting!();
+}
+
+impl crate::pipeline::transformer::builder::Emitting for CteInput {
+    fn site(&self) -> crate::sql_binding::SqlSiteId {
+        self.site
+    }
 }
 
 /// What a `push_cte` closure returns: the CTE body and its output columns.
@@ -574,6 +485,12 @@ pub struct CteBody {
     /// Column names this CTE produces. The builder assigns qualifiers
     /// (using the auto-generated CTE name).
     pub output_columns: Vec<crate::names::ColId>,
+    /// For every output, the exact input slot it carries. `None` marks an
+    /// output computed by this physical layer rather than a carried slot.
+    pub input_slots: Vec<Option<usize>>,
+    /// The exact physical aliases the body used before standing at its own
+    /// SQL scope, in output order.
+    pub physical_aliases: Vec<crate::names::ColId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -626,8 +543,21 @@ impl<P> Builder<P> {
     }
 
     /// What this builder publishes.
-    pub(in crate::pipeline::transformer) fn publication(&self) -> &Publication {
+    pub(in crate::pipeline::transformer) fn publication(&self) -> &SqlLayout {
         self.state.publication()
+    }
+
+    /// Complete one semantic-to-physical site after an exact relational
+    /// operation has produced its builder.
+    pub(in crate::pipeline::transformer) fn bind_relation(
+        mut self,
+        relation: crate::relation::SemanticRelation,
+        sealed: &crate::relation::Relations,
+    ) -> Result<Self> {
+        self.state
+            .publication_mut()
+            .bind(&relation, sealed, &self.identities)?;
+        Ok(self)
     }
 
     /// Internal: change the phase marker without changing any runtime state.
@@ -684,7 +614,7 @@ impl Builder<Unprojected> {
         Ok(Self {
             state: BuilderState::Table {
                 table,
-                scope: Publication::at(scope, columns, &identities)?,
+                scope: SqlLayout::new(scope, columns, &identities),
             },
             names,
             identities,
@@ -699,11 +629,28 @@ impl Builder<Unprojected> {
     /// (e.g., `SELECT 1 AS x UNION ALL SELECT 2`). The query is already final;
     /// further operations (filter, projection) will wrap it as a subquery.
     pub(in crate::pipeline::transformer) fn from_frozen(
+        query: QueryExpression,
+        scope_name: ScopeName,
+        columns: Vec<ColumnMetadata>,
+        names: NameGenerator,
+        identities: std::rc::Rc<crate::names::Registry>,
+    ) -> Result<Self> {
+        // A FROZEN QUERY IS STILL AN EMISSION: its columns get their slot
+        // identities here, so the layer it becomes has a site like every
+        // other. Which semantic ports those slots carry is a later act's.
+        let physical: Vec<crate::names::ColId> =
+            columns.iter().map(ColumnMetadata::identity).collect();
+        let site = identities.bindings().bind_physical(&physical);
+        Self::from_frozen_at_site(query, scope_name, columns, names, identities, site)
+    }
+
+    pub(in crate::pipeline::transformer) fn from_frozen_at_site(
         mut query: QueryExpression,
         scope_name: ScopeName,
         columns: Vec<ColumnMetadata>,
         names: NameGenerator,
         identities: std::rc::Rc<crate::names::Registry>,
+        prior_site: crate::sql_binding::SqlSiteId,
     ) -> Result<Self> {
         // When the entry remints the heading (the given columns live in
         // another scope), the frozen body still publishes the given
@@ -714,12 +661,7 @@ impl Builder<Unprojected> {
         let columns = if ColumnMetadata::common_identity_scope(&columns, &identities) == Some(at) {
             columns
         } else {
-            let reminted = remint_heading(
-                columns.clone(),
-                &identities,
-                at,
-                crate::names::Republish::Passthrough,
-            );
+            let reminted = remint_heading(columns.clone(), &identities, at);
             let renames: Vec<_> = columns
                 .iter()
                 .zip(&reminted)
@@ -729,7 +671,8 @@ impl Builder<Unprojected> {
             state::rewrite_output_aliases(&mut query, at, &renames, &identities)?;
             reminted
         };
-        let scope = Publication::at(at, columns, &identities)?;
+        let mut scope = SqlLayout::new(at, columns, &identities);
+        scope.resite(prior_site, layout::Resite::Rebound, &identities)?;
         Ok(Self {
             state: BuilderState::Frozen { query, scope },
             names,
@@ -741,6 +684,18 @@ impl Builder<Unprojected> {
 
     /// Add a WHERE predicate. ANDs with existing WHERE if present.
     /// If the current state has GROUP BY, wraps as subquery first.
+    /// Put this level in the state a predicate will be ADDED to, before the
+    /// predicate is lowered.
+    ///
+    /// A filter may need a level of its own — a grouping or a row bound
+    /// stands under it — and the references it lowers must name the SQL
+    /// aliases that level actually emits. The same reason
+    /// `into_join_operand` prepares a join's sides before its condition.
+    pub(in crate::pipeline::transformer) fn ready_for_filter(mut self) -> Result<Self> {
+        self.state = self.state.ensure_filterable(&self.names)?;
+        Ok(self)
+    }
+
     pub fn add_where(mut self, pred: SqlPredicate) -> Result<Self> {
         self.state = self.state.ensure_filterable(&self.names)?;
         let expr = pred.into_expr();
@@ -770,10 +725,10 @@ impl Builder<Unprojected> {
     /// post-wrap scopes (which is always the case — the condition's
     /// qualifiers must match the SQL aliases that actually appear).
     pub(in crate::pipeline::transformer) fn into_join_operand(self) -> Result<JoinOperand> {
-        let (table, scope) = self.state.into_table_expr(&self.names)?;
+        let (table, publication) = self.state.into_table_expr(&self.names)?;
         Ok(JoinOperand {
             table,
-            columns: scope.outputs().to_vec(),
+            publication,
             names: self.names,
             identities: self.identities,
             ctes: self.accumulated_ctes,
@@ -785,97 +740,126 @@ impl Builder<Unprojected> {
     /// For USING joins, right-side columns named in the USING list are excluded
     /// from the scope — SQL merges those columns automatically, and including
     /// them would produce duplicates in the SELECT list.
+    /// `emitted_swapped` says the SQL operands are the semantic operands the
+    /// other way round: a RIGHT OUTER join is emitted as a LEFT one over
+    /// swapped sides so every target can spell it. THE RELATION'S POSITIONS
+    /// DID NOT MOVE — the binding pairs them with the emitted list by
+    /// position — so the published block follows the interface while the
+    /// FROM clause follows the emission.
     pub(in crate::pipeline::transformer) fn from_join(
+        left: JoinOperand,
+        right: JoinOperand,
+        kind: JoinType,
+        condition: JoinCondition,
+        emitted_swapped: bool,
+    ) -> Result<Self> {
+        Self::from_join_with_merge_sources(
+            left,
+            right,
+            kind,
+            condition,
+            emitted_swapped,
+            MergeSources::Collapsed,
+        )
+    }
+
+    fn from_join_with_merge_sources(
         left: JoinOperand,
         mut right: JoinOperand,
         kind: JoinType,
         condition: JoinCondition,
+        emitted_swapped: bool,
+        merge_sources: MergeSources,
     ) -> Result<Self> {
         if let (Some(left_scope), Some(right_scope)) =
             (effective_scope(&left.table), effective_scope(&right.table))
         {
             if left_scope == right_scope {
-                let fresh_scope = left
-                    .names
-                    .fresh(crate::names::ScopeOrigin::UserAlias { of: right_scope })
-                    .identity();
+                let fresh_scope = left.names.emission_alias(right_scope).identity();
                 right.table = TableExpression::Scope(fresh_scope);
-                right.columns = Publication::at(right_scope, right.columns, &left.identities)?
-                    .requalified(
-                        fresh_scope,
-                        &left.identities,
-                        crate::names::Republish::Rename,
-                    )?
-                    .outputs()
-                    .to_vec();
+                // THE OPERAND RE-PUBLISHES ITSELF. What it emits and where
+                // that stands travel together, so the re-aliased side is
+                // this side re-stated rather than a layout assembled from a
+                // scope, a heading and a site picked separately.
+                right.publication = right
+                    .publication
+                    .requalified(fresh_scope, &left.identities)?;
             }
         }
-        let left_origin_scope =
-            ColumnMetadata::common_identity_scope(&left.columns, &left.identities);
-        let right_origin_scope =
-            ColumnMetadata::common_identity_scope(&right.columns, &left.identities);
         let join_expr = TableExpression::Join {
             left: Box::new(left.table),
             right: Box::new(right.table),
             join_type: kind,
             join_condition: condition.clone(),
         };
-        let mut columns = left.columns;
-        // For USING joins, SQL merges the USING columns — they appear once
-        // in a star expansion (from the left side). The right side's are
-        // held aside here and rejoin the heading below as HYGIENIC
-        // occurrences: never emitted by a star, never answering a name,
-        // but still on the republication chain, because a reference the
-        // resolver bound to the right arm has to reach the occurrence the
-        // right alias still publishes — dropping it entirely leaves that
-        // reference standing at a scope no FROM entry establishes.
-        let mut merged_right: Vec<ColumnMetadata> = Vec::new();
+        let split_support = |publication: &SqlLayout| -> Result<(Vec<_>, Vec<_>)> {
+            let mut semantic = Vec::new();
+            let mut support = Vec::new();
+            for column in publication.outputs() {
+                let is_support = left
+                    .identities
+                    .bindings()
+                    .is_support(publication.site(), column.identity())?;
+                if is_support {
+                    support.push(column.clone());
+                } else {
+                    semantic.push(column.clone());
+                }
+            }
+            Ok((semantic, support))
+        };
+        let (mut columns, left_support) = split_support(&left.publication)?;
+        let (right_columns, right_support) = split_support(&right.publication)?;
+        let mut emitted_left_width = columns.len();
+        let mut merge_aliases = Vec::new();
+        // A MERGED PAIR IS PUBLISHED ONCE. Semantic construction records
+        // both operand ports against the result port the SEMANTIC LEFT
+        // contributed, so the physical site keeps that slot and binding
+        // translates the other side's reference to it without a hidden
+        // output column. A right outer join is emitted with its operands
+        // exchanged, and then the slot to keep is the SQL right's.
         match &condition {
-            JoinCondition::Using(using_cols) => {
-                for column in right.columns {
-                    let merged = using_cols.iter().any(|using| {
-                        left.identities.published_sym(*using)
-                            == left.identities.published_sym(column.identity())
-                    });
-                    if merged {
-                        merged_right.push(column);
-                    } else {
+            JoinCondition::Merge(pairs) if emitted_swapped => {
+                let merged: Vec<_> = pairs.iter().map(|pair| pair.left).collect();
+                if merge_sources == MergeSources::Collapsed {
+                    merge_aliases.extend(pairs.iter().map(|pair| (pair.left, pair.right)));
+                }
+                columns.retain(|column| !merged.contains(&column.identity()));
+                emitted_left_width = columns.len();
+                columns.extend(right_columns);
+            }
+            JoinCondition::Merge(pairs) => {
+                if merge_sources == MergeSources::Collapsed {
+                    merge_aliases.extend(pairs.iter().map(|pair| (pair.right, pair.left)));
+                }
+                for column in right_columns {
+                    let merged = pairs.iter().any(|pair| pair.right == column.identity());
+                    if !merged {
                         columns.push(column);
                     }
                 }
             }
             _ => {
-                columns.extend(right.columns);
+                columns.extend(right_columns);
             }
         }
+        if emitted_swapped {
+            columns.rotate_left(emitted_left_width);
+        }
+        columns.extend(left_support);
+        columns.extend(right_support);
         let names = left.names;
         let identities = left.identities;
+        let operand_sites = [left.publication.site(), right.publication.site()];
         let mut ctes = left.ctes;
         ctes.extend(right.ctes);
-        let join_origin = match (left_origin_scope, right_origin_scope) {
-            (Some(left), Some(right)) => crate::names::ScopeOrigin::Join { left, right },
-            _ => crate::names::ScopeOrigin::AnonRelation,
-        };
-        let join_scope_name = names.fresh(join_origin);
-        let mut columns = remint_heading(
-            columns,
-            &identities,
-            join_scope_name.identity(),
-            crate::names::Republish::JoinArm,
-        );
-        for column in merged_right {
-            let source = column.identity();
-            let identity = identities.republish_column(
-                source,
-                join_scope_name.identity(),
-                crate::names::Republish::JoinArm,
-                identities.published(source),
-                crate::names::Addressing::Hygienic,
-                |_| {},
-            );
-            columns.push(ColumnMetadata::new(identity));
-        }
-        let scope = Publication::at(join_scope_name.identity(), columns, &identities)?;
+        let join_scope_name = names.join();
+        // A flat join emits the operand slots under the operand aliases.
+        // Reminting them into the synthetic join scope would bind every port
+        // to a qualifier no FROM entry emits (`j_*.column`).
+        let mut scope = SqlLayout::new(join_scope_name.identity(), columns, &identities);
+        scope.recognize_merge_aliases(&merge_aliases, &identities)?;
+        scope.recognize_operand_aliases(&operand_sites, &identities)?;
         Ok(Self {
             state: BuilderState::Segment {
                 from: vec![join_expr],
@@ -891,44 +875,26 @@ impl Builder<Unprojected> {
         })
     }
 
-    /// Join two operands FULL OUTER with USING, projecting each USING
+    /// Join two operands FULL OUTER on merged pairs, projecting each merged
     /// column as `COALESCE(left.col, right.col)`.
     ///
     /// The merged column must carry the key of WHICHEVER side is present.
     /// A one-sided qualified projection (`left.col`) is NULL on exactly
     /// the other side's orphan rows — the rows full outer exists to keep.
-    pub(in crate::pipeline::transformer) fn from_join_full_outer_using(
+    pub(in crate::pipeline::transformer) fn from_join_full_outer_merge(
         left: JoinOperand,
         right: JoinOperand,
-        using_cols: Vec<crate::names::ColId>,
+        pairs: Vec<crate::pipeline::sql_ast::MergedSlots>,
     ) -> Result<Builder<Projected>> {
-        let identities = std::rc::Rc::clone(&left.identities);
-        let coalesce_sides: Vec<_> = using_cols
-            .iter()
-            .filter_map(|using| {
-                let published = identities.published_sym(*using)?;
-                let left_hits: Vec<_> = left
-                    .columns
-                    .iter()
-                    .filter(|column| identities.published_sym(column.identity()) == Some(published))
-                    .collect();
-                let right_hits: Vec<_> = right
-                    .columns
-                    .iter()
-                    .filter(|column| identities.published_sym(column.identity()) == Some(published))
-                    .collect();
-                match (left_hits.as_slice(), right_hits.as_slice()) {
-                    ([left], [right]) => Some((published, left.identity(), right.identity())),
-                    _ => None,
-                }
-            })
-            .collect();
+        let coalesce_sides = pairs.clone();
 
-        let joined = Self::from_join(
+        let joined = Self::from_join_with_merge_sources(
             left,
             right,
             JoinType::Full,
-            JoinCondition::Using(using_cols),
+            JoinCondition::Merge(pairs),
+            false,
+            MergeSources::RetainedForProjection,
         )?;
 
         let scope_items = joined
@@ -936,30 +902,21 @@ impl Builder<Unprojected> {
             .select_items(&joined.identities, Hygiene::Drop);
         let items: Vec<SelectItem> = scope_items
             .into_iter()
-            .map(|item| match item {
-                SelectItem::Expression { expr, alias } => {
-                    let sides = alias.and_then(|column| {
-                        let published = identities.published_sym(column)?;
-                        coalesce_sides
-                            .iter()
-                            .find(|(name, _, _)| *name == published)
-                    });
-                    match sides {
-                        Some((_, left, right)) => SelectItem::Expression {
-                            expr: DomainExpression::Function {
-                                name: "coalesce".into(),
-                                args: vec![
-                                    DomainExpression::Column(*left),
-                                    DomainExpression::Column(*right),
-                                ],
-                                distinct: false,
-                            },
-                            alias,
-                        },
-                        _ => SelectItem::Expression { expr, alias },
-                    }
+            .map(|item| {
+                let crate::pipeline::sql_ast::Publishes::One(column) = item.publishes() else {
+                    return item;
+                };
+                match coalesce_sides.iter().find(|pair| pair.left == column) {
+                    Some(pair) => item.with_expr(DomainExpression::Function {
+                        name: "coalesce".into(),
+                        args: vec![
+                            DomainExpression::Column(pair.left),
+                            DomainExpression::Column(pair.right),
+                        ],
+                        distinct: false,
+                    }),
+                    None => item,
                 }
-                other => other,
             })
             .collect();
 
@@ -1001,7 +958,7 @@ impl Builder<Unprojected> {
         let mut iter = operands.into_iter();
         let first = iter.next().expect("non-empty checked above");
         let mut acc_table = first.table;
-        let mut acc_columns = first.columns;
+        let mut acc_columns = first.publication.outputs().to_vec();
         let mut acc_ctes = first.ctes;
         let names = first.names;
         let identities = first.identities;
@@ -1013,7 +970,7 @@ impl Builder<Unprojected> {
                 join_type: kind,
                 join_condition: condition,
             };
-            acc_columns.extend(operand.columns);
+            acc_columns.extend(operand.publication.outputs().to_vec());
             acc_ctes.extend(operand.ctes);
         }
 
@@ -1024,8 +981,7 @@ impl Builder<Unprojected> {
         // reminted into the join scope would be published by no alias any
         // reference can render against. The scope id stamps the segment; it
         // owns no columns, and the publication says so.
-        let scope =
-            Publication::over_operands(join_scope_name.identity(), acc_columns, &identities)?;
+        let scope = SqlLayout::new(join_scope_name.identity(), acc_columns, &identities);
         Ok(Self {
             state: BuilderState::Segment {
                 from: vec![acc_table],
@@ -1071,7 +1027,7 @@ impl Builder<Unprojected> {
                     select: select.set_select(items),
                     has_projection: true,
                     has_group_by,
-                    scope: Publication::at(scope, columns, &self.identities)?,
+                    scope: SqlLayout::new(scope, columns, &self.identities),
                 },
                 names: self.names,
                 identities: self.identities,
@@ -1104,30 +1060,24 @@ impl Builder<Unprojected> {
                 ..
             } => {
                 let input_columns = input_scope.outputs().to_vec();
-                // Set the projection and generate a new scope name.
                 let origin = wrap_origin(
                     &input_columns,
                     &self.identities,
                     crate::names::WrapReason::Projection,
                 );
-                let fresh_scope = self.names.fresh(origin);
-                let identity_scope = fresh_scope.identity();
-                // Atomic: derive columns AND write aliases back to items.
+                let identity_scope = self.names.fresh(origin).identity();
                 let (items, output_columns) = derive_columns_from_items(
                     items,
                     identity_scope,
                     &input_columns,
                     &self.identities,
-                    None,
-                    None,
                 );
-                let select = select.set_select(items);
                 Ok(Builder {
                     state: BuilderState::Select {
-                        select,
+                        select: select.set_select(items),
                         has_projection: true,
                         has_group_by,
-                        scope: Publication::at(identity_scope, output_columns, &self.identities)?,
+                        scope: SqlLayout::new(identity_scope, output_columns, &self.identities),
                     },
                     names: self.names,
                     identities: self.identities,
@@ -1137,6 +1087,37 @@ impl Builder<Unprojected> {
             }
             _ => unreachable!("ensure_projectable guarantees Select state"),
         }
+    }
+
+    /// Append SQL-only outputs while carrying the exact semantic site prefix.
+    pub(in crate::pipeline::transformer) fn add_support_projection(
+        self,
+        items: Vec<SelectItem>,
+    ) -> Result<Builder<Projected>> {
+        let prior = self.state.publication().site();
+        let mut projected = self.add_projection(items)?;
+        projected.state.publication_mut().resite(
+            prior,
+            layout::Resite::Extended,
+            &projected.identities,
+        )?;
+        Ok(projected)
+    }
+
+    /// Select exact physical positions while preserving every semantic port.
+    pub(in crate::pipeline::transformer) fn select_physical_projection(
+        self,
+        items: Vec<SelectItem>,
+        selected: &[usize],
+    ) -> Result<Builder<Projected>> {
+        let prior = self.state.publication().site();
+        let mut projected = self.add_projection(items)?;
+        projected.state.publication_mut().resite(
+            prior,
+            layout::Resite::Projected(selected),
+            &projected.identities,
+        )?;
+        Ok(projected)
     }
 
     /// Set GROUP BY and publish the scope the resolver already bound this
@@ -1169,7 +1150,7 @@ impl Builder<Unprojected> {
                         select,
                         has_projection: true,
                         has_group_by: true,
-                        scope: Publication::at(scope, columns, &self.identities)?,
+                        scope: SqlLayout::new(scope, columns, &self.identities),
                     },
                     names: self.names,
                     identities: self.identities,
@@ -1199,7 +1180,6 @@ impl Builder<Unprojected> {
                 let group_exprs = group_by_expressions(&spec.keys);
 
                 // SELECT list = keys ++ aggregates
-                let aggregate_from = spec.keys.len();
                 let mut select_items = spec.keys;
                 select_items.extend(spec.aggregates);
 
@@ -1216,8 +1196,6 @@ impl Builder<Unprojected> {
                     identity_scope,
                     &input_columns,
                     &self.identities,
-                    Some(aggregate_from),
-                    None,
                 );
 
                 let mut select = select.set_select(select_items);
@@ -1232,7 +1210,7 @@ impl Builder<Unprojected> {
                         select,
                         has_projection: true,
                         has_group_by: true,
-                        scope: Publication::at(identity_scope, output_columns, &self.identities)?,
+                        scope: SqlLayout::new(identity_scope, output_columns, &self.identities),
                     },
                     names: self.names,
                     identities: self.identities,
@@ -1273,8 +1251,42 @@ impl Builder<Unprojected> {
     fn project_all_with(mut self, hygiene: Hygiene) -> Result<Builder<Projected>> {
         self.state = self.state.ensure_projectable(&self.names)?;
         match &mut self.state {
-            BuilderState::Select { select, scope, .. } => {
-                let items = scope.select_items(&self.identities, hygiene);
+            BuilderState::Select {
+                select,
+                scope,
+                has_projection,
+                ..
+            } => {
+                if hygiene == Hygiene::Drop {
+                    scope.prune_hygienic(&self.identities)?;
+                }
+                let needs_output_scope = scope
+                    .outputs()
+                    .iter()
+                    .any(|column| self.identities.scope_of(column.identity()) != scope.at_scope());
+                let items = if needs_output_scope {
+                    let published = scope.requalified(scope.at_scope(), &self.identities)?;
+                    let items = scope
+                        .outputs()
+                        .iter()
+                        .zip(published.outputs())
+                        .map(|(source, output)| SelectItem::Publishing {
+                            expr: DomainExpression::Column(source.identity()),
+                            slot: output.identity(),
+                            printed: true,
+                        })
+                        .collect();
+                    *scope = published;
+                    // This level is now the ONE definition of the
+                    // republished occurrences: a later re-projection must
+                    // wrap it, never replace it, or every reference to an
+                    // output names a select that no longer exists. The
+                    // same-scope passthrough below stays replaceable.
+                    *has_projection = true;
+                    items
+                } else {
+                    scope.select_items(&self.identities, Hygiene::Carry)
+                };
                 let items = if items.is_empty() {
                     vec![SelectItem::star_over_nothing()]
                 } else {
@@ -1282,15 +1294,6 @@ impl Builder<Unprojected> {
                 };
                 let taken = std::mem::replace(select, SelectBuilder::new());
                 *select = taken.set_select(items);
-
-                // Hygienic columns were kept for qualify (e.g. a filter
-                // referencing _label_0) and no caller addresses them in the
-                // output. The view and the list are pruned together or not at
-                // all: a heading that keeps what the list dropped is the
-                // disagreement this whole species is made of.
-                if hygiene == Hygiene::Drop {
-                    scope.prune_hygienic(&self.identities);
-                }
             }
             _ => unreachable!("ensure_projectable guarantees Select"),
         }
@@ -1317,10 +1320,8 @@ impl Builder<Unprojected> {
 
     /// Ensure the builder is not in Frozen state by wrapping if necessary.
     ///
-    /// This is needed before lowering expressions that will be used in
-    /// ORDER BY or WHERE clauses — if the builder is Frozen, `add_order_by`
-    /// would wrap it as a subquery, changing the scope. Expressions must be
-    /// lowered against the post-wrap scope, so call this first.
+    /// Expressions that will be used in ORDER BY or WHERE must be lowered
+    /// against the post-wrap scope, so call this first.
     pub fn ensure_not_frozen(self) -> Result<Self> {
         match &self.state {
             BuilderState::Frozen { .. } => Ok(Self {
@@ -1518,14 +1519,41 @@ impl Builder<Unprojected> {
         self,
         values: Vec<(DomainExpression, crate::names::ColId)>,
     ) -> Result<Self> {
-        let (builder, mut items) = self.projectable_star_items()?;
+        // THE ANCHOR KEEPS THE OCCURRENCE IT WAS MINTED AS. Every expression
+        // that reads it was written against that occurrence before this
+        // level existed, so a projection that reminted the alias would leave
+        // all of them naming a column no statement emits. The level stands
+        // at the scope its input stands at, which is the scope the anchors
+        // were minted into.
+        let scope = self.publication().at_scope();
+        let prior = self.publication().site();
+        let mut columns = self.columns().to_vec();
+        let mut items: Vec<SelectItem> = columns
+            .iter()
+            .map(|column| SelectItem::Publishing {
+                expr: DomainExpression::Column(column.identity()),
+                slot: column.identity(),
+                printed: true,
+            })
+            .collect();
         for (expr, alias) in values {
-            items.push(SelectItem::Expression {
+            items.push(SelectItem::Publishing {
                 expr,
-                alias: Some(alias),
+                slot: alias,
+                printed: true,
             });
+            columns.push(ColumnMetadata::new(alias));
         }
-        builder.add_projection(items)?.demote()
+        // The anchors are SQL-only support: the semantic interface this level
+        // already realizes is the exact prefix of what it now emits, so the
+        // binding carries through rather than being abandoned.
+        let mut projected = self.add_projection_publishing(items, scope, columns)?;
+        projected.state.publication_mut().resite(
+            prior,
+            layout::Resite::Extended,
+            &projected.identities,
+        )?;
+        projected.demote()
     }
 
     /// A SKIP WITH NO MAXIMUM. `#>n` selects no cap, so it names no count —
@@ -1567,12 +1595,22 @@ impl Builder<Unprojected> {
         column: crate::names::ColId,
         _tvf_prefix: &str,
         kind: JsonEachKind,
-        context_items_fn: impl FnOnce(&[crate::names::ColId]) -> Vec<SelectItem>,
+        context_items_fn: impl FnOnce(&[crate::names::ColId], usize) -> Vec<(usize, SelectItem)>,
         interior_items_fn: impl FnOnce(crate::names::ColId, crate::names::ColId) -> Vec<SelectItem>,
         groundings: &[crate::pipeline::asts::core::operators::ResolvedInteriorGrounding],
     ) -> Result<Builder<Projected>> {
         let identities = std::rc::Rc::clone(&self.identities);
         let names = self.names().fork();
+        let column = self.rebind_physical(column)?;
+        let source_slot = self
+            .columns()
+            .iter()
+            .position(|candidate| candidate.identity() == column)
+            .ok_or_else(|| {
+                crate::error::DelightQLError::parse_error(
+                    "json expansion source column is not in the input heading",
+                )
+            })?;
         // Take the heading from the PROJECTED builder, not from this one.
         // `project_all` drops hygienic columns from both the select list and
         // the scope, so a heading read beforehand claims columns the subquery
@@ -1580,6 +1618,7 @@ impl Builder<Unprojected> {
         // into the source scope, where the expansion's context items name it
         // and no FROM entry offers it.
         let projected = self.project_all_carrying_hygiene()?;
+        let source_site = projected.publication().site();
         let source_metadata = projected.columns().to_vec();
         let source_origin = wrap_origin(
             &source_metadata,
@@ -1593,7 +1632,6 @@ impl Builder<Unprojected> {
             source_scope,
             &source_metadata,
             &identities,
-            crate::names::Republish::BoundaryExport,
         )?
         .into_iter()
         .map(|column| column.identity())
@@ -1612,53 +1650,34 @@ impl Builder<Unprojected> {
                 );
             }
         });
-        let source_column = source_columns
-            .iter()
-            .copied()
-            .find(|candidate| identities.same_value(*candidate, column))
-            .ok_or_else(|| crate::error::DelightQLError::ParseError {
-                message: "json expansion source column is not in the input heading".to_string(),
-                source: None,
-                subcategory: None,
-            })?;
+        let source_column = source_columns[source_slot];
 
-        let tvf_scope = names
-            .fresh(crate::names::ScopeOrigin::Interior { of: column })
-            .identity();
+        let tvf_scope = names.interior_emission(column).identity();
         let key_spelling = identities.intern("key", false);
         let value_spelling = identities.intern("value", false);
-        let key_column = identities.mint_column(
+        let key_column = identities.sql_column(
             tvf_scope,
-            crate::names::ColumnOrigin::Computed {
-                via: crate::names::Computation::Function,
-            },
             Some(key_spelling),
             crate::names::Addressing::Published,
-            crate::names::ValueFacts::default(),
         );
-        let value_column = identities.mint_column(
+        let value_column = identities.sql_column(
             tvf_scope,
-            crate::names::ColumnOrigin::Computed {
-                via: crate::names::Computation::Function,
-            },
             Some(value_spelling),
             crate::names::Addressing::Published,
-            crate::names::ValueFacts::default(),
         );
 
-        let mut items = context_items_fn(&source_columns);
-        items.extend(interior_items_fn(key_column, value_column));
-        let output_scope = names
-            .fresh(crate::names::ScopeOrigin::Join {
-                left: source_scope,
-                right: tvf_scope,
-            })
-            .identity();
+        let context = context_items_fn(&source_columns, source_slot);
+        let mut layout: Vec<Option<usize>> =
+            context.iter().map(|(source, _)| Some(*source)).collect();
+        let mut items: Vec<_> = context.into_iter().map(|(_, item)| item).collect();
+        let interior = interior_items_fn(key_column, value_column);
+        layout.extend(std::iter::repeat_n(None, interior.len()));
+        items.extend(interior);
+        let output_scope = names.join().identity();
         let mut inputs: Vec<_> = source_metadata.clone();
         inputs.push(ColumnMetadata::new(key_column));
         inputs.push(ColumnMetadata::new(value_column));
-        let (items, columns) =
-            derive_columns_from_items(items, output_scope, &inputs, &identities, None, None);
+        let (items, columns) = derive_columns_from_items(items, output_scope, &inputs, &identities);
         let joined_from = TableExpression::Join {
             left: Box::new(TableExpression::subquery(source_query, source_scope)),
             right: Box::new(TableExpression::TVF {
@@ -1675,7 +1694,7 @@ impl Builder<Unprojected> {
             .set_select(items.clone())
             .from_tables(vec![joined_from]);
         for grounding in groundings {
-            let path = DomainExpression::PublishedJsonPathLiteral(grounding.column);
+            let path = DomainExpression::PublishedJsonPathLiteral(grounding.column.column());
             let extracted = DomainExpression::function(
                 "json_extract",
                 vec![DomainExpression::Column(value_column), path],
@@ -1688,20 +1707,23 @@ impl Builder<Unprojected> {
                 )),
             });
         }
-        let select = publication::publish_at(
-            output_scope,
-            columns.iter().map(ColumnMetadata::identity),
-            select,
-            &identities,
-        )?;
+        let select = (select)
+            .standing_at(output_scope)
+            .map_err(crate::error::DelightQLError::parse_error)?;
         let query = QueryExpression::Select(Box::new(select));
-        Builder::from_query(
+        let mut result = Builder::from_query(
             query,
             ScopeName::Resolved(output_scope),
             columns,
             names,
             identities,
-        )
+        )?;
+        result.state.publication_mut().resite(
+            source_site,
+            layout::Resite::Reshaped(&layout),
+            &result.identities,
+        )?;
+        Ok(result)
     }
 }
 
@@ -1712,7 +1734,7 @@ impl Builder<Unprojected> {
 impl Builder<Projected> {
     /// Adopt a finished query that already publishes the heading it claims.
     ///
-    /// Used when embedding a pre-built query (e.g., from EntityRegistry)
+    /// Used when embedding a pre-built query (e.g., from ResolverCore)
     /// or after external construction (set operations, recursive CTEs).
     ///
     /// The heading is taken as given, not reminted into the scope. Reminting
@@ -1729,8 +1751,7 @@ impl Builder<Projected> {
         names: NameGenerator,
         identities: std::rc::Rc<crate::names::Registry>,
     ) -> Result<Self> {
-        let scope = Publication::at(scope_name.into_scope(), columns, &identities)?;
-        scope.check_query(&query)?;
+        let scope = SqlLayout::new(scope_name.into_scope(), columns, &identities);
         Ok(Self {
             state: BuilderState::Frozen { query, scope },
             names,
@@ -1763,7 +1784,7 @@ impl Builder<Projected> {
                     select: select.set_select(items),
                     has_projection: true,
                     has_group_by,
-                    scope: Publication::at(scope, columns, &self.identities)?,
+                    scope: SqlLayout::new(scope, columns, &self.identities),
                 },
                 names: self.names,
                 identities: self.identities,
@@ -1799,8 +1820,6 @@ impl Builder<Projected> {
                     identity_scope,
                     &input_columns,
                     &self.identities,
-                    None,
-                    None,
                 );
                 let select = select.set_select(items);
                 Ok(Self {
@@ -1808,7 +1827,7 @@ impl Builder<Projected> {
                         select,
                         has_projection: true,
                         has_group_by,
-                        scope: Publication::at(identity_scope, output_columns, &self.identities)?,
+                        scope: SqlLayout::new(identity_scope, output_columns, &self.identities),
                     },
                     names: self.names,
                     identities: self.identities,
@@ -1835,6 +1854,13 @@ impl Builder<Projected> {
         )>,
         alias: crate::names::ColId,
     ) -> Result<Self> {
+        let before_wrap = self
+            .state
+            .publication()
+            .outputs()
+            .iter()
+            .map(ColumnMetadata::identity)
+            .collect::<Vec<_>>();
         // Wrap current state as subquery so window function sees finalized rows
         let wrapped = Self {
             state: self.state.wrap_as_subquery(&self.names)?,
@@ -1851,26 +1877,38 @@ impl Builder<Projected> {
                 scope: ref input_scope,
                 ..
             } => {
+                let input_site = input_scope.site();
                 let input_columns = input_scope.outputs().to_vec();
+                if before_wrap.len() != input_columns.len() {
+                    return Err(crate::error::DelightQLError::parse_error(
+                        "a window wrap changed the width of its exact input publication",
+                    ));
+                }
+                let wrapped_positions = before_wrap
+                    .iter()
+                    .copied()
+                    .zip(input_columns.iter().map(ColumnMetadata::identity))
+                    .collect::<std::collections::HashMap<_, _>>();
 
-                // The caller lowered the window's argument, partition and
-                // order references against the pre-wrap builder; the wrap
-                // just moved every column one publication deeper. Each
-                // reference must land on the occurrence THIS layer's FROM
-                // publishes — an already-anchored reference republishes
-                // itself and passes through, and a reference two layer
-                // columns both republish is left alone for the self-check
-                // to name.
+                let failure = std::cell::RefCell::new(None);
                 let reanchor = |column: crate::names::ColId| -> crate::names::ColId {
-                    let mut owners = input_columns.iter().filter(|candidate| {
-                        wrapped.identities.republishes(candidate.identity(), column)
-                    });
-                    match (owners.next(), owners.next()) {
-                        (Some(owner), None) => owner.identity(),
-                        _ => column,
+                    if let Some(landed) = wrapped_positions.get(&column) {
+                        return *landed;
+                    }
+                    let answer = wrapped
+                        .identities
+                        .bindings()
+                        .physical_at(input_scope.site(), column);
+                    match answer {
+                        Ok(Some(landed)) => landed,
+                        Ok(None) => column,
+                        Err(error) => {
+                            failure.borrow_mut().get_or_insert(error);
+                            column
+                        }
                     }
                 };
-                let window_item = SelectItem::Expression {
+                let window_item = SelectItem::Publishing {
                     expr: DomainExpression::WindowFunction {
                         name: func_name.to_string(),
                         args,
@@ -1880,8 +1918,12 @@ impl Builder<Projected> {
                         frame: None,
                     }
                     .map_columns(&reanchor),
-                    alias: Some(alias),
+                    slot: alias,
+                    printed: true,
                 };
+                if let Some(error) = failure.into_inner() {
+                    return Err(error);
+                }
                 let origin = wrap_origin(
                     &input_columns,
                     &wrapped.identities,
@@ -1890,31 +1932,29 @@ impl Builder<Projected> {
                 let fresh_scope = wrapped.names.fresh(origin);
                 let identity_scope = fresh_scope.identity();
 
-                // Start with Star + window column
-                let items = vec![
-                    SelectItem::star(input_columns.iter().map(ColumnMetadata::identity).collect()),
-                    window_item,
-                ];
+                // Spell the carried positions out. A star has no SQL syntax
+                // with which a later wrapping alias can rename its individual
+                // outputs, while this support layer must carry the exact
+                // positions and append one physical-only slot.
+                let mut items = input_scope.select_items(&wrapped.identities, Hygiene::Carry);
+                items.push(window_item);
                 let (items, output_columns) = derive_columns_from_items(
                     items,
                     identity_scope,
                     &input_columns,
                     &wrapped.identities,
-                    None,
-                    Some(crate::names::MintReason::RowNumber),
                 );
                 let select = select.set_select(items);
 
+                let mut publication =
+                    SqlLayout::new(identity_scope, output_columns, &wrapped.identities);
+                publication.resite(input_site, layout::Resite::Extended, &wrapped.identities)?;
                 Ok(Self {
                     state: BuilderState::Select {
                         select,
                         has_projection: true,
                         has_group_by,
-                        scope: Publication::at(
-                            identity_scope,
-                            output_columns,
-                            &wrapped.identities,
-                        )?,
+                        scope: publication,
                     },
                     names: wrapped.names,
                     identities: wrapped.identities,
@@ -1956,35 +1996,73 @@ impl Builder<Projected> {
         }
     }
 
-    /// Adopt a finished query that already publishes the heading it claims.
-    ///
-    /// A complete SELECT or set operation IS a projected query — which is
-    /// what `set_operation` already relies on when it hands back a frozen
-    /// union. This is that same fact reached from the alignment road, where
-    /// every arm was built at the output scope and aliased to its columns.
-    pub(in crate::pipeline::transformer) fn adopt_finished(
-        query: QueryExpression,
-        scope_name: ScopeName,
-        columns: Vec<ColumnMetadata>,
-        names: NameGenerator,
-        identities: std::rc::Rc<crate::names::Registry>,
-    ) -> Result<Self> {
-        let scope = Publication::at(scope_name.into_scope(), columns, &identities)?;
-        scope.check_query(&query)?;
-        Ok(Self {
-            state: BuilderState::Frozen { query, scope },
-            names,
-            identities,
-            accumulated_ctes: Vec::new(),
-            _phase: PhantomData,
-        })
-    }
-
     // --- Set operations ---
 
-    /// UNION ALL with another builder. Both finalized, combined as set op.
-    pub fn union_all(self, right: Self) -> Result<Self> {
-        self.set_operation(right, crate::pipeline::sql_ast::SetOperator::UnionAll)
+    /// Stack two branches under the publication the SET RESULT already owns.
+    ///
+    /// The positions a set publishes are the result relation's, decided when
+    /// the authority derived it. Minting a scope over the stack instead
+    /// would publish positions nothing was addressed against and leave the
+    /// semantic ones standing for no emitted column — which is the recovery
+    /// question the physical binding exists to make unnecessary.
+    ///
+    /// Both branches are rewritten onto those positions, so what the
+    /// combined statement outputs and what it claims to publish are one act.
+    /// Stack two branches under one result, in the accumulation's flavor.
+    ///
+    /// `accumulation` is the SQL operator the DQL accumulation resolved to
+    /// — `UNION ALL` for a bag, `UNION` for a `%`-badged fixpoint's clauses.
+    /// The flavor is CARRIED here, never read back off the stacked tree.
+    pub fn stack_at(
+        self,
+        right: Self,
+        accumulation: crate::pipeline::sql_ast::SetOperator,
+        at: crate::names::ScopeId,
+        outputs: &[crate::names::ColId],
+    ) -> Result<Self> {
+        let mut ctes = self.accumulated_ctes;
+        ctes.extend(right.accumulated_ctes);
+        let mut stacked = Vec::with_capacity(2);
+        for (state, names) in [(self.state, &self.names), (right.state, &right.names)] {
+            let branch = state.publication().clone();
+            if branch.outputs().len() != outputs.len() {
+                return Err(crate::error::DelightQLError::parse_error(format!(
+                    "a set branch publishing {} positions cannot stack under a result \
+                     publishing {}",
+                    branch.outputs().len(),
+                    outputs.len()
+                )));
+            }
+            let paired: Vec<_> = branch
+                .outputs()
+                .iter()
+                .zip(outputs)
+                .map(|(source, target)| (source.identity(), *target))
+                .collect();
+            let mut query = state.materialize(names)?;
+            state::rewrite_output_aliases(&mut query, at, &paired, &self.identities)?;
+            stacked.push(query);
+        }
+        let right_query = stacked.pop().expect("two branches");
+        let left_query = stacked.pop().expect("two branches");
+        Ok(Self {
+            state: BuilderState::Frozen {
+                query: QueryExpression::SetOperation {
+                    op: accumulation,
+                    left: Box::new(left_query),
+                    right: Box::new(right_query),
+                },
+                scope: SqlLayout::new(
+                    at,
+                    outputs.iter().copied().map(ColumnMetadata::new).collect(),
+                    &self.identities,
+                ),
+            },
+            names: self.names,
+            identities: self.identities,
+            accumulated_ctes: ctes,
+            _phase: PhantomData,
+        })
     }
 
     // --- Lateral construction ---
@@ -2017,16 +2095,15 @@ impl Builder<Projected> {
                 );
                 let source_name = self.names.fresh(source_origin);
                 let source_identity = source_name.identity();
-                let columns = republish_under(
+                let requalified = scope_clone.requalified(source_identity, &self.identities)?;
+                state::rewrite_output_aliases(
                     &mut source_query,
                     source_identity,
-                    scope_clone.outputs(),
+                    &scope_clone.pairs_with(&requalified),
                     &self.identities,
-                    crate::names::Republish::BoundaryExport,
                 )?;
                 self.accumulated_ctes
-                    .push(Cte::new(source_identity, source_query));
-                let requalified = Publication::at(source_identity, columns, &self.identities)?;
+                    .push(Cte::ordinary(source_identity, source_query));
                 let cte_table = TableExpression::Scope(source_identity);
                 self.state = BuilderState::Select {
                     select: SelectBuilder::new()
@@ -2044,6 +2121,7 @@ impl Builder<Projected> {
         let input = CteInput::new(
             current_scope.at_scope(),
             current_scope.outputs().to_vec(),
+            current_scope.site(),
             std::rc::Rc::clone(&self.identities),
         );
 
@@ -2059,12 +2137,13 @@ impl Builder<Projected> {
         let fresh_cte = self.names.fresh(cte_origin);
         let cte_identity = fresh_cte.identity();
 
-        let output_columns = build_cte_output_columns(
-            &cte_body.output_columns,
-            current_scope.outputs(),
-            &self.identities,
-            cte_identity,
-        );
+        let output_columns =
+            build_cte_output_columns(&cte_body.output_columns, &self.identities, cte_identity);
+        if cte_body.input_slots.len() != output_columns.len() {
+            return Err(crate::error::DelightQLError::parse_error(
+                "a CTE body and its physical slot map have different widths",
+            ));
+        }
 
         // Naming the CTE and re-aliasing the body it binds are one act. Every
         // reader of the CTE addresses the occurrences just minted for it; a
@@ -2085,14 +2164,31 @@ impl Builder<Projected> {
 
         // Accumulate the CTE
         self.accumulated_ctes
-            .push(Cte::new(cte_identity, cte_body.query));
+            .push(Cte::ordinary(cte_identity, cte_body.query));
 
         // Transition to a new Select FROM the CTE.
         // The old state is discarded — the closure already used it to build the CTE body.
         // The new state references the CTE by name so that subsequent operations
         // (add_projection, another push_cte) operate on the CTE's output.
         let cte_table = TableExpression::Scope(cte_identity);
-        let new_scope = Publication::at(cte_identity, output_columns, &self.identities)?;
+        let mut new_scope = SqlLayout::new(cte_identity, output_columns, &self.identities);
+        new_scope.resite(
+            current_scope.site(),
+            layout::Resite::Reshaped(&cte_body.input_slots),
+            &self.identities,
+        )?;
+        let aliased = new_scope.site();
+        new_scope.resite(
+            aliased,
+            layout::Resite::Aliased(&cte_body.output_columns),
+            &self.identities,
+        )?;
+        let aliased = new_scope.site();
+        new_scope.resite(
+            aliased,
+            layout::Resite::Aliased(&cte_body.physical_aliases),
+            &self.identities,
+        )?;
         self.state = BuilderState::Select {
             select: SelectBuilder::new()
                 .from_tables(vec![cte_table])
@@ -2156,77 +2252,11 @@ impl Builder<Projected> {
             }
         }
     }
-
-    // --- Private helpers ---
-
-    /// Shared implementation for set operations (UNION ALL, INTERSECT, EXCEPT).
-    fn set_operation(
-        self,
-        right: Self,
-        op: crate::pipeline::sql_ast::SetOperator,
-    ) -> Result<Self> {
-        let mut ctes = self.accumulated_ctes;
-        ctes.extend(right.accumulated_ctes);
-
-        let left_scope = self.state.publication().clone();
-        let right_scope = right.state.publication().clone();
-        let mut left_query = self.state.materialize(&self.names)?;
-        let mut right_query = right.state.materialize(&right.names)?;
-
-        // Output scope: use left's columns with a new generated name
-        let set_origin = wrap_origin(
-            left_scope.outputs(),
-            &self.identities,
-            crate::names::WrapReason::SetOperation,
-        );
-        let set_scope_name = self.names.fresh(set_origin);
-        let set_identity = set_scope_name.identity();
-
-        // Both arms publish the merged heading, not just the one it was minted
-        // from. SQL takes the output names from the first arm, which is why
-        // rewriting only the left looks sufficient and is not: the second arm's
-        // items still name occurrences of its own scope, and every check that
-        // reads a set operation reads both sides.
-        let columns = republish_under(
-            &mut left_query,
-            set_identity,
-            left_scope.outputs(),
-            &self.identities,
-            crate::names::Republish::ArmMerge,
-        )?;
-        let paired: Vec<_> = right_scope
-            .outputs()
-            .iter()
-            .zip(&columns)
-            .map(|(source, target)| (source.identity(), target.identity()))
-            .collect();
-        state::rewrite_output_aliases(&mut right_query, set_identity, &paired, &self.identities)?;
-        let output_scope = Publication::at(set_identity, columns, &self.identities)?;
-
-        let combined = QueryExpression::SetOperation {
-            op,
-            left: Box::new(left_query),
-            right: Box::new(right_query),
-        };
-
-        Ok(Self {
-            state: BuilderState::Frozen {
-                query: combined,
-                scope: output_scope,
-            },
-            names: self.names,
-            identities: self.identities,
-            accumulated_ctes: ctes,
-            _phase: PhantomData,
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Qualify — phase-independent implementation
 // ---------------------------------------------------------------------------
-
-
 
 // ---------------------------------------------------------------------------
 // Builder Qualify — delegates to shared functions
@@ -2239,6 +2269,14 @@ impl<P> Qualify for Builder<P> {
 
     fn scope_columns(&self) -> Vec<ColumnMetadata> {
         self.state.publication().outputs().to_vec()
+    }
+
+    crate::pipeline::transformer::builder::qualifies_by_emitting!();
+}
+
+impl<P> crate::pipeline::transformer::builder::Emitting for Builder<P> {
+    fn site(&self) -> crate::sql_binding::SqlSiteId {
+        self.state.publication().site()
     }
 }
 
@@ -2256,7 +2294,11 @@ impl<P> Qualify for Builder<P> {
 /// reimplementing the lookup tiers outside the builder module.
 pub(in crate::pipeline::transformer) struct JoinOperand {
     pub table: TableExpression,
-    pub columns: Vec<ColumnMetadata>,
+    /// WHAT THIS SIDE PUBLISHES, WHOLE. The heading and the physical slots
+    /// it stands on are one value, taken from the level this operand was
+    /// prepared at — so an operand cannot be re-aliased by pairing a
+    /// heading with a binding site chosen anywhere else.
+    publication: SqlLayout,
     pub names: NameGenerator,
     pub identities: std::rc::Rc<crate::names::Registry>,
     pub ctes: Vec<Cte>,
@@ -2268,11 +2310,24 @@ impl Qualify for JoinOperand {
     }
 
     fn scope_columns(&self) -> Vec<ColumnMetadata> {
-        self.columns.clone()
+        self.publication.outputs().to_vec()
+    }
+
+    crate::pipeline::transformer::builder::qualifies_by_emitting!();
+}
+
+impl crate::pipeline::transformer::builder::Emitting for JoinOperand {
+    fn site(&self) -> crate::sql_binding::SqlSiteId {
+        self.publication.site()
     }
 }
 
 impl JoinOperand {
+    /// Everything this side publishes, in heading order.
+    pub fn columns(&self) -> &[ColumnMetadata] {
+        self.publication.outputs()
+    }
+
     /// Re-anchor this operand's TVF arguments onto the occurrences the other
     /// side of the join publishes.
     ///
@@ -2300,7 +2355,7 @@ fn rebind_tvf_arguments(table: &mut TableExpression, scope: &dyn Qualify) -> Res
         TableExpression::TVF { arguments, .. } => {
             for argument in arguments {
                 if let TvfArgument::Column(column) = argument {
-                    *column = scope.rebind(*column)?;
+                    *column = scope.rebind_physical(*column)?;
                 }
             }
             Ok(())
@@ -2323,6 +2378,183 @@ pub(in crate::pipeline::transformer) struct ChainedQualify<'a> {
     pub outer: &'a dyn Qualify,
 }
 
+/// Qualify references written against an operation result while its SQL is
+/// still being assembled from operand sites.
+///
+/// Refinement may move a predicate from a join result into the join itself.
+/// Its ports remain ports of that exact result; the construction-owned
+/// ancestry is the only evidence that can translate them onto an operand.
+pub(in crate::pipeline::transformer) struct AncestralQualify<'a> {
+    operands: &'a dyn Qualify,
+    /// THE TOTAL MAP, built ONCE from the construction record.
+    ///
+    /// Every position of the operation that the operands realize — its own
+    /// ports and the ports of relations refinement recorded it as
+    /// replacing — paired with the ONE operand column that realizes it.
+    /// Built here, at construction, over the enumerable set the record
+    /// names: nothing below searches, and nothing below picks a winner
+    /// among candidates one reference at a time.
+    landed: std::collections::HashMap<crate::relation::PortId, crate::names::ColId>,
+    /// The record the lazy descent below reads: a recorded pair may name a
+    /// port of a relation the rebuild replaced without a replacement row —
+    /// its own carry edges still say which base positions realize it.
+    relations: crate::relation::Relations,
+}
+
+impl<'a> AncestralQualify<'a> {
+    /// PRODUCE THE MAP FOR THIS OPERATION OVER THESE OPERAND SITES.
+    ///
+    /// Refinement may move a predicate from a join result into the join
+    /// itself. Its ports remain ports of that exact result; the
+    /// construction-owned ancestry is what carries them onto an operand,
+    /// and it is read HERE — once, for every position at once — rather
+    /// than consulted per reference.
+    ///
+    /// A position several operand columns realize is left OUT of the map:
+    /// a reference to it has no one column it could mean, and the refusal
+    /// belongs where the reference is written, naming the port.
+    pub(in crate::pipeline::transformer) fn over(
+        operation: &crate::relation::SemanticRelation,
+        relations: &crate::relation::Relations,
+        operands: &'a dyn Qualify,
+    ) -> Result<Self> {
+        let mut landed = std::collections::HashMap::new();
+        let published = relations.interface(operation)?.ports().to_vec();
+        // Each position of the operation, and each position of a relation
+        // this operation replaced — both are things a reference here can
+        // name, and the record says which output of this operation each
+        // one became.
+        // EVERY construction ancestor of an output can be named by a moved
+        // predicate — a merged key two joins deep as much as a directly
+        // replaced port — and each maps to the output its carry chain
+        // reaches. The walk reads recorded edges only.
+        let mut sources: Vec<(crate::relation::PortId, crate::relation::PortId)> = Vec::new();
+        for port in &published {
+            let mut frontier = vec![*port];
+            let mut seen: Vec<crate::relation::PortId> = Vec::new();
+            while let Some(ancestor) = frontier.pop() {
+                if seen.contains(&ancestor) {
+                    continue;
+                }
+                seen.push(ancestor);
+                sources.push((ancestor, *port));
+                frontier.extend(relations.carried_from(ancestor));
+            }
+        }
+        for (old, new) in relations.translated_ports(operation)? {
+            sources.push((old, new));
+        }
+        for (named, output) in sources {
+            if landed.contains_key(&named) {
+                continue;
+            }
+            // The walk DESCENDS the carry edges construction wrote and
+            // stops each branch the moment an operand realizes it: a
+            // merged key two joins deep is still the record's answer, one
+            // recorded edge at a time. Nothing here reads position,
+            // spelling, or width.
+            let mut columns = Vec::new();
+            let mut frontier = vec![output];
+            let mut walked: Vec<crate::relation::PortId> = Vec::new();
+            while let Some(port) = frontier.pop() {
+                if walked.contains(&port) {
+                    continue;
+                }
+                walked.push(port);
+                if port != named {
+                    if let Ok(column) = operands.rebind_port(port) {
+                        if !columns.contains(&column) {
+                            columns.push(column);
+                        }
+                        continue;
+                    }
+                }
+                frontier.extend(relations.carried_from(port));
+            }
+            if let [column] = columns.as_slice() {
+                landed.insert(named, *column);
+            }
+        }
+        Ok(AncestralQualify {
+            operands,
+            landed,
+            relations: relations.clone(),
+        })
+    }
+}
+
+impl Qualify for AncestralQualify<'_> {
+    fn identities(&self) -> &crate::names::Registry {
+        self.operands.identities()
+    }
+
+    fn rebind_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId> {
+        // AN OPERAND'S OWN POSITION IS THE OPERAND'S ANSWER.
+        if let Ok(column) = self.operands.rebind_port(port) {
+            return Ok(column);
+        }
+        if let Some(column) = self.landed.get(&port) {
+            return Ok(*column);
+        }
+        // A recorded pair may name a port of a relation the rebuild stood
+        // over without writing a replacement row for it — an intermediate
+        // join's merged output. Its own carry edges still say which
+        // positions realize it: descend them, stopping each branch at the
+        // first position an operand emits. One column is the answer;
+        // several is an ambiguity, and none is the refusal below.
+        let mut columns: Vec<crate::names::ColId> = Vec::new();
+        let mut frontier = self.relations.carried_from(port);
+        let mut walked: Vec<crate::relation::PortId> = vec![port];
+        while let Some(ancestor) = frontier.pop() {
+            if walked.contains(&ancestor) {
+                continue;
+            }
+            walked.push(ancestor);
+            if let Ok(column) = self.operands.rebind_port(ancestor) {
+                if !columns.contains(&column) {
+                    columns.push(column);
+                }
+                continue;
+            }
+            if let Some(column) = self.landed.get(&ancestor) {
+                if !columns.contains(column) {
+                    columns.push(*column);
+                }
+                continue;
+            }
+            frontier.extend(self.relations.carried_from(ancestor));
+        }
+        if let [column] = columns.as_slice() {
+            return Ok(*column);
+        }
+        Err(crate::error::DelightQLError::parse_error(format!(
+            "an operation-result port {port:?} has no construction-recorded \
+             physical operand among {:?}",
+            self.operands.sql_sites(),
+        )))
+    }
+
+    fn sql_sites(&self) -> Vec<crate::sql_binding::SqlSiteId> {
+        self.operands.sql_sites()
+    }
+
+    // A POSITION IS THE OPERANDS' ANSWER. This view translates a port onto
+    // an operand; where the operand lays it out is the operand's own
+    // business, and asking here would be asking a view for a layout it
+    // does not own.
+    fn slot_of_port(&self, port: crate::relation::PortId) -> Result<usize> {
+        self.operands.slot_of_port(port)
+    }
+
+    fn slot_of_physical(&self, column: crate::names::ColId) -> Result<usize> {
+        self.operands.slot_of_physical(column)
+    }
+
+    fn scope_columns(&self) -> Vec<ColumnMetadata> {
+        self.operands.scope_columns()
+    }
+}
+
 impl Qualify for ChainedQualify<'_> {
     fn identities(&self) -> &crate::names::Registry {
         self.inner.identities()
@@ -2332,6 +2564,35 @@ impl Qualify for ChainedQualify<'_> {
         let mut columns = self.inner.scope_columns();
         columns.extend(self.outer.scope_columns());
         columns
+    }
+
+    fn rebind_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId> {
+        match self.inner.rebind_port(port) {
+            Ok(column) => Ok(column),
+            Err(inner) => self.outer.rebind_port(port).or(Err(inner)),
+        }
+    }
+    fn sql_sites(&self) -> Vec<crate::sql_binding::SqlSiteId> {
+        let mut sites = self.inner.sql_sites();
+        sites.extend(self.outer.sql_sites());
+        sites
+    }
+
+    // A CHAIN OF TWO SCOPES LAYS OUT NEITHER. The inner one answers where
+    // it can and the outer one after it; a POSITION belongs to whichever
+    // one holds the reference, and that one is asked directly.
+    fn slot_of_port(&self, port: crate::relation::PortId) -> Result<usize> {
+        match self.inner.slot_of_port(port) {
+            Ok(slot) => Ok(slot),
+            Err(inner) => self.outer.slot_of_port(port).or(Err(inner)),
+        }
+    }
+
+    fn slot_of_physical(&self, column: crate::names::ColId) -> Result<usize> {
+        match self.inner.slot_of_physical(column) {
+            Ok(slot) => Ok(slot),
+            Err(inner) => self.outer.slot_of_physical(column).or(Err(inner)),
+        }
     }
 }
 
@@ -2349,7 +2610,7 @@ impl BuilderState {
     /// - Table → returns the table directly, scope unchanged
     /// - Segment → builds a subquery, requalifies to alias
     /// - Select / Frozen → builds a subquery, requalifies to alias
-    fn into_table_expr(self, names: &NameGenerator) -> Result<(TableExpression, Publication)> {
+    fn into_table_expr(self, names: &NameGenerator) -> Result<(TableExpression, SqlLayout)> {
         match self {
             Self::Table { table, scope } => Ok((table, scope)),
             // Segment flattening disabled. The core fixes (explicit
@@ -2368,11 +2629,7 @@ impl BuilderState {
                 // The wrap is emission plumbing around a join operand — the
                 // same relation, not a boundary that consumes it — so the
                 // republication kind keeps the ownership walk open.
-                let new_scope = scope.requalified(
-                    identity,
-                    names.identities(),
-                    crate::names::Republish::EmissionWrap,
-                )?;
+                let new_scope = scope.requalified(identity, names.identities())?;
                 // Requalifying the scope without re-publishing the query that
                 // fills it leaves the subquery emitting the occurrences it had
                 // inside while the alias over it claims the ones just minted —
@@ -2417,35 +2674,36 @@ fn derive_columns_from_items(
     scope: crate::names::ScopeId,
     input_columns: &[ColumnMetadata],
     identities: &crate::names::Registry,
-    aggregate_from: Option<usize>,
-    minted_reason: Option<crate::names::MintReason>,
 ) -> (Vec<SelectItem>, Vec<ColumnMetadata>) {
     let mut columns = Vec::new();
     let mut out_items = Vec::with_capacity(items.len());
-    for (i, item) in items.into_iter().enumerate() {
+    for item in items {
         match item {
-            SelectItem::Star { .. } => {
+            SelectItem::Star { reads, .. } => {
                 // The star's expansion is rewritten here, not carried over:
                 // this projection republishes every input into its own scope,
                 // so what the star stands for downstream is the occurrences
-                // just minted, not the ones it stood for above.
+                // just minted, not the ones it stood for above. With the
+                // resolver's heading in hand the star republishes THOSE
+                // occurrences through an emission wrap — the projection is
+                // the same relation re-staged for SQL, so ownership reports
+                // read through it to the scope the resolver bound.
                 let mut expansion = Vec::with_capacity(input_columns.len());
                 for col in input_columns {
                     let source = col.identity();
-                    let output = identities.republish_column(
-                        source,
-                        scope,
-                        crate::names::Republish::Passthrough,
-                        identities.published(source),
-                        identities.addressing(source),
-                        |_| {},
-                    );
+                    let output =
+                        identities.rebind_sql_column(source, scope, identities.published(source));
                     columns.push(ColumnMetadata::new(output));
                     expansion.push(output);
                 }
-                out_items.push(SelectItem::star(expansion));
+                out_items.push(SelectItem::Star { reads, expansion });
             }
-            SelectItem::Expression { expr, alias } => {
+            SelectItem::Publishing {
+                expr,
+                slot,
+                printed,
+            } => {
+                let alias = printed.then_some(slot);
                 let direct = match &expr {
                     DomainExpression::Column(column) => input_columns
                         .iter()
@@ -2476,62 +2734,25 @@ fn derive_columns_from_items(
                 // either name is available.
                 let carried = alias.or_else(|| direct.map(ColumnMetadata::identity));
                 let output = match carried {
-                    Some(source) => identities.republish_column(
-                        source,
-                        scope,
-                        crate::names::Republish::Passthrough,
-                        published,
-                        addressing,
-                        |_| {},
-                    ),
-                    None => identities.mint_column(
-                        scope,
-                        minted_reason
-                            .map(|by| crate::names::ColumnOrigin::Minted { by })
-                            .unwrap_or_else(|| crate::names::ColumnOrigin::Computed {
-                                via: aggregate_from
-                                    .filter(|start| i >= *start)
-                                    .map(|_| crate::names::Computation::Aggregate)
-                                    .unwrap_or_else(|| computation_for_sql_expr(&expr)),
-                            }),
-                        published,
-                        addressing,
-                        Default::default(),
-                    ),
+                    Some(source) => identities.rebind_sql_column(source, scope, published),
+                    None => identities.sql_column(scope, published, addressing),
                 };
                 columns.push(ColumnMetadata::new(output));
-                out_items.push(SelectItem::Expression {
+                out_items.push(SelectItem::Publishing {
                     expr,
-                    alias: Some(output),
+                    slot: output,
+                    printed: true,
                 });
+            }
+            // COMPILER SCAFFOLDING RIDES THROUGH. It publishes no
+            // occurrence, so this projection has none to re-stage for it and
+            // nothing downstream addresses the slot.
+            SelectItem::Scaffolding { expr, slot } => {
+                out_items.push(SelectItem::Scaffolding { expr, slot });
             }
         }
     }
     (out_items, columns)
-}
-
-fn computation_for_sql_expr(expr: &DomainExpression) -> crate::names::Computation {
-    match expr {
-        DomainExpression::Literal(_)
-        | DomainExpression::PublishedNameLiteral(_)
-        | DomainExpression::PublishedJsonPathLiteral(_)
-        | DomainExpression::JsonPathLiteral(_)
-        | DomainExpression::ScopeNameLiteral(_) => crate::names::Computation::Literal,
-        DomainExpression::Cast { .. } => crate::names::Computation::Cast,
-        DomainExpression::Function { .. } => crate::names::Computation::Function,
-        DomainExpression::WindowFunction { .. } => crate::names::Computation::Window,
-        DomainExpression::Case { .. } => crate::names::Computation::Case,
-        DomainExpression::Exists { .. } | DomainExpression::Subquery(_) => {
-            crate::names::Computation::Subquery
-        }
-        DomainExpression::Parens(inner) => computation_for_sql_expr(inner),
-        DomainExpression::Column(_)
-        | DomainExpression::Binary { .. }
-        | DomainExpression::Unary { .. }
-        | DomainExpression::Star
-        | DomainExpression::PredicateRewrite { .. }
-        | DomainExpression::Observation { .. } => crate::names::Computation::Operator,
-    }
 }
 
 /// Build output columns for a CTE, carrying forward provenance from input columns.
@@ -2543,170 +2764,15 @@ fn computation_for_sql_expr(expr: &DomainExpression) -> crate::names::Computatio
 /// spelling to pair on at all.
 fn build_cte_output_columns(
     output_columns: &[crate::names::ColId],
-    input_columns: &[ColumnMetadata],
     identities: &crate::names::Registry,
     scope: crate::names::ScopeId,
 ) -> Vec<ColumnMetadata> {
     output_columns
         .iter()
         .map(|output| {
-            let input_col = input_columns
-                .iter()
-                .find(|candidate| identities.same_value(candidate.identity(), *output));
-            let identity = match input_col {
-                Some(source) => identities.republish_column(
-                    source.identity(),
-                    scope,
-                    crate::names::Republish::BoundaryExport,
-                    identities.published(*output),
-                    identities.addressing(*output),
-                    |_| {},
-                ),
-                None => identities.republish_column(
-                    *output,
-                    scope,
-                    crate::names::Republish::BoundaryExport,
-                    identities.published(*output),
-                    identities.addressing(*output),
-                    |_| {},
-                ),
-            };
+            let identity =
+                identities.rebind_sql_column(*output, scope, identities.published(*output));
             ColumnMetadata::new(identity)
         })
         .collect()
-}
-
-
-
-#[cfg(test)]
-mod rebind_tests {
-    //! What `rebind` must REFUSE.
-    //!
-    //! The value tier answers a reference with the one candidate carrying its
-    //! value. "The one" is the bound that makes the tier sound, so a scope
-    //! carrying the value twice has to refuse — declining instead would fall
-    //! through to a tier answering a different question and, failing that,
-    //! leave the reference standing at a scope no FROM entry establishes: the
-    //! ambiguity emitted rather than reported.
-
-    use super::Qualify;
-    use crate::names::{
-        Addressing, ColId, ColumnOrigin, Hint, Registry, Republish, ScopeOrigin, ValueFacts,
-        WrapReason,
-    };
-    use crate::pipeline::asts::core::ColumnMetadata;
-
-    struct Scope {
-        identities: Registry,
-        columns: Vec<ColumnMetadata>,
-    }
-
-    impl Qualify for Scope {
-        fn identities(&self) -> &Registry {
-            &self.identities
-        }
-        fn scope_columns(&self) -> Vec<ColumnMetadata> {
-            self.columns.clone()
-        }
-    }
-
-    /// One base column, republished into `slots` slots of one projection —
-    /// `(id as a, id as b)` — and then across a boundary, so the reference and
-    /// the candidates are siblings rather than one chain.
-    fn one_value_in(slots: usize) -> (Registry, ColId, Vec<ColumnMetadata>) {
-        let reg = Registry::new(&[]);
-        let entity = reg.mint_entity(reg.intern("t", false));
-        let base = reg.mint_scope(ScopeOrigin::BaseTable { entity }, Hint::None, None);
-        let id = reg.mint_column(
-            base,
-            ColumnOrigin::CatalogColumn {
-                entity,
-                position: 0,
-            },
-            Some(reg.intern("id", false)),
-            Addressing::Published,
-            ValueFacts::default(),
-        );
-
-        let projected = reg.mint_scope(ScopeOrigin::PipeStage { input: base }, Hint::None, None);
-        let slotted: Vec<ColId> = (0..slots)
-            .map(|slot| {
-                reg.republish_column(
-                    id,
-                    projected,
-                    Republish::Rename,
-                    Some(reg.intern(&format!("s{slot}"), false)),
-                    Addressing::Published,
-                    |_| {},
-                )
-            })
-            .collect();
-
-        // What the resolver addressed the reference against.
-        let segment = reg.mint_scope(
-            ScopeOrigin::PipeStage { input: projected },
-            Hint::None,
-            None,
-        );
-        let reference = reg.republish_column(
-            slotted[0],
-            segment,
-            Republish::Passthrough,
-            reg.published(slotted[0]),
-            Addressing::Published,
-            |_| {},
-        );
-
-        // What the transformer's own boundary published — the sibling.
-        let wrapped = reg.mint_scope(
-            ScopeOrigin::Wrap {
-                input: projected,
-                why: WrapReason::Projection,
-            },
-            Hint::None,
-            None,
-        );
-        let columns = slotted
-            .iter()
-            .map(|slot| {
-                let column = reg.republish_column(
-                    *slot,
-                    wrapped,
-                    Republish::Passthrough,
-                    reg.published(*slot),
-                    Addressing::Published,
-                    |_| {},
-                );
-                ColumnMetadata::new(column)
-            })
-            .collect();
-        (reg, reference, columns)
-    }
-
-    #[test]
-    fn one_sibling_carrying_the_value_answers() {
-        let (identities, reference, columns) = one_value_in(1);
-        let scope = Scope {
-            identities,
-            columns,
-        };
-        let landed = scope.rebind(reference).expect("one candidate answers");
-        assert_eq!(landed, scope.columns[0].identity());
-    }
-
-    #[test]
-    fn two_siblings_carrying_one_value_refuse() {
-        let (identities, reference, columns) = one_value_in(2);
-        let scope = Scope {
-            identities,
-            columns,
-        };
-        let error = scope
-            .rebind(reference)
-            .expect_err("two candidates with equal claim must refuse, not decline");
-        assert!(
-            error.to_string().contains("more than once"),
-            "the refusal must say why: {error}"
-        );
-    }
 }

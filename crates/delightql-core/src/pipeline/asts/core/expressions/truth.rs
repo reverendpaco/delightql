@@ -4,9 +4,10 @@
 //!
 //! ONE CARRIER. Every form that answers yes-or-no about a tuple is a
 //! `TruthExpression`, in every position where one can stand. A truth reaches
-//! value position only through the licensed crossing, and a value never
-//! reaches truth position: a bare value where a predicate stands has no
-//! derivation, so no variant here admits one.
+//! value position only through the one directed crossing
+//! (`FunctionApplication::Crossed`), after which it is an ordinary value; a
+//! value never reaches truth position: a bare value where a predicate stands
+//! has no derivation, so no variant here admits one.
 
 use super::super::{Phase, Unresolved};
 use super::chain::Chain;
@@ -17,17 +18,23 @@ use crate::pipeline::asts::vocabulary::{Vec1, Vec2};
 use crate::{lispy::ToLispy, ToLispy};
 use delightql_types::SqlIdentifier;
 
-/// `+` and `\+` — the mark that says which way a named proof is observed.
+/// `+` and `\+` — the mark that says which way a named proof is read.
 ///
 /// DATA, one carrier, never a variant pair: the two spellings are one form
-/// observed two ways, so a consumer reads the polarity instead of matching a
+/// read two ways, so a consumer reads the polarity instead of matching a
 /// second variant that repeats every other field.
 ///
-/// POLARITY OBSERVES PROOF. `Positive` succeeds exactly where the named
-/// truth is proven; `Negative` succeeds everywhere `Positive` does not, the
-/// UNKNOWN-bodied rows included. The two equipartition their input. Inline
-/// `!( … )` is a different thing — Kleene NOT, which preserves UNKNOWN — and
-/// it is `TruthExpression::Negation`, not a polarity.
+/// POLARITY IS NOT OBSERVATION. `Positive` NAMES the proof and carries the
+/// named truth's own answer, UNKNOWN included; `Negative` is DEFINED as the
+/// two-valued "not proven TRUE", so it is already definite over every input,
+/// the UNKNOWN-bodied rows included. What becomes of a positive proof belongs
+/// to the position that consumes it (`TruthConsumer`, below): a query filter
+/// observes it, and THERE the two polarities equipartition the input; a value
+/// crossing and a database CHECK take the proof as it stands, so the
+/// partition is the filter's, not the polarity's.
+///
+/// Inline `!( … )` is a different thing — Kleene NOT, which preserves
+/// UNKNOWN — and it is `TruthExpression::Negation`, not a polarity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ToLispy)]
 pub enum Polarity {
     #[lispy("polarity:positive")]
@@ -37,7 +44,7 @@ pub enum Polarity {
 }
 
 impl Polarity {
-    /// Whether this polarity observes the proof positively.
+    /// Whether this polarity names the proof rather than its complement.
     pub fn is_positive(self) -> bool {
         matches!(self, Polarity::Positive)
     }
@@ -49,6 +56,48 @@ impl Polarity {
         } else {
             Polarity::Negative
         }
+    }
+}
+
+/// WHO CONSUMES A TRUTH — the one judgment, made by the POSITION.
+///
+/// Polarity says which way a proof is read; this says what the position does
+/// with the answer, and the two are distinct. Truth has exactly three
+/// consumers and each has its own acceptance law:
+///
+/// | consumer | law | UNKNOWN |
+/// |---|---|---|
+/// | value crossing | preserve the truth value | carried as null |
+/// | query filter | admit only TRUE | rejected |
+/// | database CHECK | reject only FALSE | admitted |
+///
+/// Only a filter PARTITIONS its input, so only a filter collapses a positive
+/// proof to a definite answer. A value carries the proof because the crossing
+/// preserves the denotation; a CHECK carries it because SQL's own CHECK rule
+/// already says what to do with UNKNOWN. Negative polarity is defined as "not
+/// TRUE" and is already two-valued, so every consumer spells it the same way.
+///
+/// The consumer is named by the POSITION that consumes, once, at the entrance
+/// — never rediscovered from the clause a lowering happened to emit into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruthConsumer {
+    /// A value crossing: the truth becomes data and nothing observes it.
+    Value,
+    /// `WHERE`, `HAVING`, a filtering `ON`: the position admits only TRUE.
+    Filter,
+    /// A database CHECK: the row is refused exactly when the truth is FALSE.
+    Constraint,
+}
+
+impl TruthConsumer {
+    /// Whether a POSITIVE proof is collapsed to a definite answer here.
+    ///
+    /// The collapse is what makes the two polarities equipartition an input,
+    /// and only a filter needs it. Wrapping a CHECK's positive proof in
+    /// `IS TRUE` refuses every row the property is UNKNOWN about — the rows
+    /// SQL's CHECK rule admits.
+    pub fn observes_positive_proof(self) -> bool {
+        matches!(self, TruthConsumer::Filter)
     }
 }
 
@@ -87,6 +136,13 @@ impl<P: Phase> Probe<P> {
         match self {
             Probe::Value(value) => vec![value],
             Probe::Row(values) => values.iter().collect(),
+        }
+    }
+
+    pub fn values_mut(&mut self) -> Vec<&mut DomainExpression<P>> {
+        match self {
+            Probe::Value(value) => vec![value.as_mut()],
+            Probe::Row(row) => row.iter_mut().collect(),
         }
     }
 
@@ -136,6 +192,10 @@ impl<P: Phase> ValueRow<P> {
 
     pub fn values(&self) -> impl Iterator<Item = &DomainExpression<P>> {
         self.0.iter()
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut DomainExpression<P>> {
+        self.0.iter_mut()
     }
 }
 
@@ -201,9 +261,9 @@ pub struct RelationalMembership<P: Phase = Unresolved> {
 /// `+rel(, …)` / `\+rel(, …)` — existence, which IS truth.
 ///
 /// One carrier in every home. In a comma continuation it restricts the
-/// current relation; in a value position the licensed crossing carries the
-/// same node. A lowering may choose a semi- or antijoin, but that strategy
-/// is not a second relational AST kind.
+/// current relation; in a value position the crossing carries the same
+/// node. A lowering may choose a semi- or antijoin, but that strategy is
+/// not a second relational AST kind.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("truth_expression:existence")]
 pub struct Existence<P: Phase = Unresolved> {
@@ -251,9 +311,11 @@ impl<P: Phase> NamedProof<P> {
 /// a sigma is not a second kind of expression that happens to contain a
 /// truth, so nothing wraps it.
 ///
-/// POLARITY OBSERVES, AND THE OBSERVATION IS A COLLAPSE. `+` succeeds where
-/// the named proof is TRUE and `\+` everywhere it is not — the UNKNOWN rows
-/// included — so the two equipartition their input.
+/// POLARITY NAMES WHICH ANSWER IS CARRIED. `+` carries the named proof's own
+/// three-valued answer; `\+` is the definite "not proven TRUE" answer. The
+/// consumer decides whether a positive proof is observed: only a filtering
+/// position collapses it and thereby makes the two polarities equipartition
+/// that position's input.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("truth_expression:sigma")]
 pub struct SigmaApplication<P: Phase = Unresolved> {
@@ -271,169 +333,32 @@ impl<P: Phase> SigmaApplication<P> {
     }
 }
 
-/// THE CROSSING'S ADAPTER — truth reified as a value.
-///
-/// ONE ADAPTER, ONE DIRECTION. A truth reaches value position only inside
-/// this wrapper, and only at the three positions that name it: an out item's
-/// value, an argument, and a slot constraint. Value never reaches truth
-/// position at all — no truth variant admits a bare value, so a bare value
-/// where a predicate stands has no derivation to refuse.
-///
-/// The wrapper is where three-valued logic changes behaviour: `x > 5` in
-/// truth position REJECTS a null row — the comparison is UNKNOWN and the
-/// position collapses it — while `(x > 5) as b` CARRIES that UNKNOWN into
-/// the value as NULL. The example is an ORDERING comparison because `=` is
-/// null-safe: it answers false on a null, so it carries false, not NULL.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TruthAsValue<T>(pub T);
-
-impl<T: ToLispy> ToLispy for TruthAsValue<T> {
-    fn to_lispy(&self) -> String {
-        format!("(truth_as_value {})", self.0.to_lispy())
-    }
-}
-
-impl<T> TruthAsValue<T> {
-    pub fn truth(&self) -> &T {
-        &self.0
-    }
-
-    pub fn into_truth(self) -> T {
-        self.0
-    }
-}
-
-/// What a PUBLICATION position computes: a domain value, or the licensed
-/// crossing. Read by `OneOut`, `NamedOutItem`, and group keys; no other
-/// position derives the crossing from them.
-#[derive(Debug, Clone, PartialEq, ToLispy)]
-pub enum OutValue<P: Phase = Unresolved> {
-    #[lispy("out_value:domain")]
-    Domain(DomainExpression<P>),
-    #[lispy("out_value:truth")]
-    Truth(TruthAsValue<TruthExpression<P>>),
-}
-
-impl<P: Phase> OutValue<P> {
-    /// The domain value this item computes, when it computes one. A crossed
-    /// truth answers `None`: a caller that wants a domain expression has not
-    /// been handed one and must say what it does with the crossing.
-    pub fn domain(&self) -> Option<&DomainExpression<P>> {
-        match self {
-            OutValue::Domain(value) => Some(value),
-            OutValue::Truth(_) => None,
-        }
-    }
-
-    pub fn domain_mut(&mut self) -> Option<&mut DomainExpression<P>> {
-        match self {
-            OutValue::Domain(value) => Some(value),
-            OutValue::Truth(_) => None,
-        }
-    }
-
-    pub fn into_domain(self) -> Option<DomainExpression<P>> {
-        match self {
-            OutValue::Domain(value) => Some(value),
-            OutValue::Truth(_) => None,
-        }
-    }
-}
-
-impl<P: Phase> From<DomainExpression<P>> for OutValue<P> {
-    fn from(value: DomainExpression<P>) -> Self {
-        OutValue::Domain(value)
-    }
-}
-
-/// What a caller-pattern slot CONSTRAINS its position with.
-///
-/// A constraining slot names nothing: it is consumed as a filter. The binder
-/// and the qualified-reference reuse are their own `Slot` variants, so
-/// neither arrives here, and an enumeration, path, or open hole is not a
-/// `SlotConstraint` at all.
-#[derive(Debug, Clone, PartialEq, ToLispy)]
-pub enum SlotConstraint<P: Phase = Unresolved> {
-    /// A ground term or compound application. One structural case: the
-    /// column unifies with the term, null-safely.
-    #[lispy("slot_constraint:value")]
-    Value(Box<DomainExpression<P>>),
-    /// The crossing: a truth expression is a VALUE the column unifies with,
-    /// never a predicate over the row.
-    ///
-    /// The column is PHASE-SELECTED, and it is what lets the unification be
-    /// built where it is spelled — at lowering, null-safely — instead of at
-    /// resolution, where writing it as a comparison would need a value
-    /// operand able to contain a truth.
-    #[lispy("slot_constraint:truth")]
-    Truth {
-        column: P::ConstrainedColumn,
-        value: TruthAsValue<TruthExpression<P>>,
-    },
-}
-
-impl SlotConstraint<Unresolved> {
-    /// The authored crossing. Which column it unifies with is the SLOT's
-    /// position, and no position has been resolved yet.
-    pub fn truth(value: TruthExpression<Unresolved>) -> Self {
-        SlotConstraint::Truth {
-            column: (),
-            value: TruthAsValue(value),
-        }
-    }
-}
-
-/// What an ARGUMENT supplies as a value.
+/// What an ARGUMENT supplies as a value, and the DISTINCT it asked for.
 ///
 /// DISTINCT is argument DATA — the `%` before an argument modifies that
 /// argument — so it lives here rather than in a domain variant any position
-/// could have manufactured.
+/// could have manufactured. The value is an ordinary domain expression: a
+/// truth argument is the crossing standing in it, not a second arm here.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
-pub enum ArgumentValue<P: Phase = Unresolved> {
-    #[lispy("argument_value:domain")]
-    Domain {
-        /// `%expr` — the argument's values dedupe before the function sees
-        /// them.
-        distinct: bool,
-        value: DomainExpression<P>,
-    },
-    #[lispy("argument_value:truth")]
-    Truth(TruthAsValue<TruthExpression<P>>),
+#[lispy("argument_value")]
+pub struct ArgumentValue<P: Phase = Unresolved> {
+    /// `%expr` — the argument's values dedupe before the function sees
+    /// them.
+    pub distinct: bool,
+    pub value: DomainExpression<P>,
 }
 
 impl<P: Phase> ArgumentValue<P> {
     /// An undecorated value argument.
     pub fn plain(value: DomainExpression<P>) -> Self {
-        ArgumentValue::Domain {
+        ArgumentValue {
             distinct: false,
             value,
         }
     }
 
-    /// The domain value this argument supplies, when it supplies one.
-    pub fn domain(&self) -> Option<&DomainExpression<P>> {
-        match self {
-            ArgumentValue::Domain { value, .. } => Some(value),
-            ArgumentValue::Truth(_) => None,
-        }
-    }
-
-    pub fn domain_mut(&mut self) -> Option<&mut DomainExpression<P>> {
-        match self {
-            ArgumentValue::Domain { value, .. } => Some(value),
-            ArgumentValue::Truth(_) => None,
-        }
-    }
-
-    pub fn into_domain(self) -> Option<DomainExpression<P>> {
-        match self {
-            ArgumentValue::Domain { value, .. } => Some(value),
-            ArgumentValue::Truth(_) => None,
-        }
-    }
-
     pub fn is_distinct(&self) -> bool {
-        matches!(self, ArgumentValue::Domain { distinct: true, .. })
+        self.distinct
     }
 }
 
@@ -536,6 +461,93 @@ impl<P: Phase> TruthExpression<P> {
                 }
             }
             other => out.push(other),
+        }
+    }
+}
+
+impl<P: Phase> TruthExpression<P> {
+    /// THE VALUES THIS TRUTH READS AT ITS OWN SCOPE, in authored order: a
+    /// comparison's operands, a membership's probe and rows, a relational
+    /// membership's probe, a sigma application's arguments — or, once the
+    /// rule's body has been fetched, that body's own reads — through every
+    /// connective and negation. A nested RELATION — an existence's or a
+    /// relational membership's interior — is its own scope and is not
+    /// entered: resolution, not this reading, says which of its names
+    /// correlate outward.
+    ///
+    /// ONE STATEMENT of what a truth reads. A walk over VALUES reaches a
+    /// crossed truth's reads through it the way it reaches an arithmetic
+    /// operand, without enumerating truth's families itself. Whether a
+    /// relation stands beneath any of those reads is the walk's judgment,
+    /// `nests_relation`, asked of a value or a truth alike.
+    pub fn scalar_operands(&self) -> Vec<&DomainExpression<P>> {
+        let mut out = Vec::new();
+        self.collect_scalar_operands(&mut out);
+        out
+    }
+
+    /// The same reads, writable in place.
+    pub fn scalar_operands_mut(&mut self) -> Vec<&mut DomainExpression<P>> {
+        let mut out = Vec::new();
+        self.collect_scalar_operands_mut(&mut out);
+        out
+    }
+
+    fn collect_scalar_operands<'a>(&'a self, out: &mut Vec<&'a DomainExpression<P>>) {
+        match self {
+            TruthExpression::Comparison(Comparison { left, right, .. }) => {
+                out.push(left);
+                out.push(right);
+            }
+            TruthExpression::Conjunction(parts) | TruthExpression::Disjunction(parts) => {
+                for part in parts.iter() {
+                    part.collect_scalar_operands(out);
+                }
+            }
+            TruthExpression::Not { expr } => expr.collect_scalar_operands(out),
+            TruthExpression::Membership(Membership { probe, rows, .. }) => {
+                out.extend(probe.values());
+                for row in rows.iter() {
+                    out.extend(row.values());
+                }
+            }
+            TruthExpression::RelationalMembership(RelationalMembership { probe, .. }) => {
+                out.extend(probe.values());
+            }
+            TruthExpression::Existence(_) => {}
+            TruthExpression::Sigma(SigmaApplication { proof, .. }) => match proof {
+                NamedProof::Call(call) => out.extend(call.call().arguments.value_domains()),
+                NamedProof::Body(body) => P::sigma_body(body).collect_scalar_operands(out),
+            },
+        }
+    }
+
+    fn collect_scalar_operands_mut<'a>(&'a mut self, out: &mut Vec<&'a mut DomainExpression<P>>) {
+        match self {
+            TruthExpression::Comparison(Comparison { left, right, .. }) => {
+                out.push(left.as_mut());
+                out.push(right.as_mut());
+            }
+            TruthExpression::Conjunction(parts) | TruthExpression::Disjunction(parts) => {
+                for part in parts.iter_mut() {
+                    part.collect_scalar_operands_mut(out);
+                }
+            }
+            TruthExpression::Not { expr } => expr.collect_scalar_operands_mut(out),
+            TruthExpression::Membership(Membership { probe, rows, .. }) => {
+                out.extend(probe.values_mut());
+                for row in rows.iter_mut() {
+                    out.extend(row.values_mut());
+                }
+            }
+            TruthExpression::RelationalMembership(RelationalMembership { probe, .. }) => {
+                out.extend(probe.values_mut());
+            }
+            TruthExpression::Existence(_) => {}
+            TruthExpression::Sigma(SigmaApplication { proof, .. }) => match proof {
+                NamedProof::Call(call) => out.extend(call.call_mut().arguments.value_domains_mut()),
+                NamedProof::Body(body) => P::sigma_body_mut(body).collect_scalar_operands_mut(out),
+            },
         }
     }
 }

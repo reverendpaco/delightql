@@ -11,7 +11,7 @@ use std::collections::HashSet;
 /// Build context for law checking
 pub(super) fn build_law_context(
     flat: &FlatSegment,
-    _identities: &crate::names::Registry,
+    _identities: &crate::relation::Planning,
 ) -> laws::LawContext {
     // A bag operation reaches the segment as ONE opaque relation. Which
     // tables those are is what Law 1 needs: a join condition must not reach
@@ -25,7 +25,7 @@ pub(super) fn build_law_context(
                 .as_ref()
                 .is_some_and(|chain| chain.stands_on_bag_step())
         })
-        .map(|table| table.identity)
+        .map(|table| table.relation.scope())
         .collect::<HashSet<_>>();
 
     laws::LawContext { bag_tables }
@@ -40,7 +40,7 @@ pub(super) fn build_scope_sequence(
 
     // Add tables to scope as they appear - use their actual positions!
     for table in &flat.tables {
-        current_scope.insert(table.identity);
+        current_scope.insert(table.relation.scope());
         sequence.push((table.position, current_scope.clone()));
     }
 

@@ -21,18 +21,45 @@ use crate::error::{DelightQLError, Result};
 use crate::names::{ColId, ScopeId};
 use crate::pipeline::asts::core::ColumnMetadata;
 use crate::pipeline::asts::refined as ast_refined;
-use crate::pipeline::sql_ast::statements::RelationTarget;
 use crate::pipeline::sql_ast::{
     Cte, DomainExpression, QueryExpression, SelectItem, SelectStatement, SqlStatement,
     TableExpression,
 };
 
-use super::builder::{Builder, NameGenerator, Projected};
+use super::builder::{Builder, NameGenerator, Projected, Qualify};
 use super::relational;
 use super::{descend, Lowered, Mutation, Obligation, TransformCtx};
 
-/// The operand a mutation consumes: the shared lowered relation, entire.
-type Operand = Builder<Projected>;
+/// The operand a mutation consumes: one semantic relation and the SQL builder
+/// lowered from that same tree.
+struct Operand {
+    relation: crate::relation::SemanticRelation,
+    builder: Builder<Projected>,
+}
+
+impl Operand {
+    fn lower(
+        source: ast_refined::Chain,
+        names: &NameGenerator,
+        ctx: &TransformCtx,
+    ) -> Result<Self> {
+        let relation = source.semantic_relation();
+        let builder = descend::descend_as_query(source, names, ctx)?;
+        Ok(Operand { relation, builder })
+    }
+
+    fn into_builder(self) -> Builder<Projected> {
+        self.builder
+    }
+}
+
+impl std::ops::Deref for Operand {
+    type Target = Builder<Projected>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.builder
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -53,7 +80,8 @@ pub(super) fn transform_dml(
     query: ast_refined::Query,
     ctx: &TransformCtx,
 ) -> std::result::Result<Result<Lowered>, ast_refined::Query> {
-    let ast_refined::Query { cfes: (), ctes, body } = query;
+    let ast_refined::Query { locals, body } = query;
+    let ctes = locals.into_ctes();
     match take_mutation(body, ctx) {
         Ok(mutation) => Ok((|| {
             let sql_ctes: Vec<Cte> = ctes
@@ -74,7 +102,10 @@ pub(super) fn transform_dml(
             merge_ctes_into_statement(&mut lowered.statement, sql_ctes);
             Ok(lowered)
         })()),
-        Err(body) => Err(ast_refined::Query { cfes: (), ctes, body }),
+        Err(body) => Err(ast_refined::Query::binding(
+            crate::pipeline::asts::core::QueryLocals::spent(ctes),
+            body,
+        )),
     }
 }
 
@@ -82,8 +113,14 @@ pub(super) fn transform_dml(
 /// receipt, and the restriction/bound steps folded above it.
 struct MutationTerminal {
     call: ast_refined::SealedCall,
+    stage: crate::relation::SemanticRelation,
     receipt: Option<ast_refined::Access>,
-    trailing: Vec<ast_refined::Continuation>,
+    /// The shaping continuations that stood above the terminal, outermost
+    /// first. Carried as the TRANSPARENT forms they are, not as steps: they
+    /// land on the call's source relation rather than the chain they came
+    /// off, and only a form that publishes its operand's own relation may
+    /// make that move.
+    trailing: Vec<ast_refined::Transparent>,
 }
 
 /// The one mutation partition: a chain headed by a mutation call comes back
@@ -95,13 +132,16 @@ fn take_mutation(
     chain: ast_refined::Chain,
     ctx: &TransformCtx,
 ) -> std::result::Result<MutationTerminal, ast_refined::Chain> {
+    // The Err arm hands back exactly what came in, so the chain is kept
+    // rather than reassembled from parts a caller could reorder.
+    let original = chain.clone();
     let mut chain = chain;
     let mut popped = Vec::new();
     // A restriction or bound standing after the terminal constrains the rows
     // the mutation touches; the RECEIPT is the access on what the mutation
     // publishes. Both stand above the terminal, so they come off first.
     while matches!(
-        chain.continuations.last(),
+        chain.continuations().last().map(|step| step.form()),
         Some(
             ast_refined::Continuation::Restrict { .. }
                 | ast_refined::Continuation::Bound { .. }
@@ -110,44 +150,40 @@ fn take_mutation(
     ) {
         popped.push(
             chain
-                .continuations
-                .pop()
+                .pop_continuation()
                 .expect("the loop just matched a step"),
         );
     }
-    let restore = |head, mut continuations: Vec<ast_refined::Continuation>, popped: Vec<_>| {
-        continuations.extend(popped.into_iter().rev());
-        ast_refined::Chain {
-            head,
-            continuations,
+    let (head, continuations) = chain.into_parts();
+    let is_mutation = match head.form() {
+        ast_refined::GroundForm::Reference(ast_refined::Relation::FunctorCall { call, .. }) => {
+            super::is_mutation_call(call, ctx)
         }
+        _ => false,
     };
-    let ast_refined::Chain {
-        head,
-        continuations,
-    } = chain;
-    if !continuations.is_empty() {
-        return Err(restore(head, continuations, popped));
+    if !continuations.is_empty() || !is_mutation {
+        return Err(original);
     }
-    match head {
-        ast_refined::Grelex::Reference(ast_refined::Relation::FunctorCall { call, .. })
-            if super::is_mutation_call(&call, ctx) =>
-        {
+    let stage = *head.result();
+    match head.into_form() {
+        ast_refined::GroundForm::Reference(ast_refined::Relation::FunctorCall { call, .. }) => {
             let mut receipt = None;
             let mut trailing = Vec::new();
             for step in popped {
-                match step {
-                    ast_refined::Continuation::Access { access, .. } => receipt = Some(access),
-                    step => trailing.push(step),
+                match ast_refined::Transparent::of(step.into_form()) {
+                    Ok(shaping) => trailing.push(shaping),
+                    Err(ast_refined::Continuation::Access { access, .. }) => receipt = Some(access),
+                    Err(_) => unreachable!("the loop matched only these three forms"),
                 }
             }
             Ok(MutationTerminal {
                 call,
+                stage,
                 receipt,
                 trailing,
             })
         }
-        head => Err(restore(head, continuations, popped)),
+        _ => unreachable!("the head was just matched as a mutation call"),
     }
 }
 
@@ -164,6 +200,7 @@ fn lower_mutation(
 ) -> Result<Lowered> {
     let MutationTerminal {
         call,
+        stage,
         receipt,
         trailing,
     } = mutation;
@@ -179,12 +216,12 @@ fn lower_mutation(
         .cloned()
         .ok_or_else(|| DelightQLError::parse_error("DML call has no source relation"))?;
     for restriction in trailing.into_iter().rev() {
-        source = source.then(restriction);
+        source = source.transparently(restriction);
     }
 
     // THE ORDINARY ROAD. The same function every other consumer's operand
     // comes out of.
-    let operand = descend::descend_as_query(source, names, ctx)?;
+    let operand = Operand::lower(source, names, ctx)?;
 
     let target_relation = call
         .call()
@@ -192,10 +229,11 @@ fn lower_mutation(
         .next()
         .cloned()
         .ok_or_else(|| DelightQLError::parse_error("DML call has no target relation"))?;
-    let target_scope = relational::extract_cpr_schema(&target_relation);
+    let target_semantic = target_relation.semantic_relation();
+    let target_scope = target_semantic.scope();
     let target = ctx
-        .identities
-        .entity_of_scope(target_scope)
+        .relations
+        .entity(&target_semantic)?
         .ok_or_else(|| DelightQLError::parse_error("DML target has no registry entity"))?;
     let callable = call.call().callee;
     // The statement names the relation and its correlated reads name it
@@ -207,8 +245,8 @@ fn lower_mutation(
         &ctx.identities,
         callable,
         operand,
-        RelationTarget::Entity(target),
-        target_scope,
+        target_semantic,
+        stage,
         receipt.unwrap_or(ast_refined::Access::Unasked),
     )
     .map_err(|error| DelightQLError::parse_error(format!("DML mutation boundary: {error:?}")))?;
@@ -244,10 +282,7 @@ fn refuse_bounded_mutation(mutation: &Mutation<Operand>, ctx: &TransformCtx) -> 
         crate::names::DmlVerb::Delete => "delete!",
         crate::names::DmlVerb::Update => "update!",
     };
-    if !ctx
-        .identities
-        .is_row_bounded(mutation.source().publication().at_scope())
-    {
+    if !ctx.relations.is_row_bounded(&mutation.source().relation)? {
         return Ok(());
     }
     Err(DelightQLError::validation_error_categorized(
@@ -279,8 +314,15 @@ fn refuse_bounded_mutation(mutation: &Mutation<Operand>, ctx: &TransformCtx) -> 
 /// landing in whatever column shares its position.
 fn build_insert(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<SqlStatement> {
     let target_scope = mutation.target_scope();
+    let target_relation = mutation.target_relation();
     let target = mutation.target().clone();
-    let heading = ctx.identities.known_heading(target_scope)?.to_vec();
+    let heading: Vec<_> = ctx
+        .relations
+        .interface(&target_relation)?
+        .ports()
+        .iter()
+        .map(|port| port.column())
+        .collect();
     let supplied = mutation.source().columns().to_vec();
 
     let mut columns = Vec::new();
@@ -314,6 +356,7 @@ fn build_insert(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<SqlSt
     // data heading through the ordinary projection every consumer uses.
     let narrowing = data.len() != supplied.len();
     let mutation = mutation.map_source(|operand| {
+        let operand = operand.into_builder();
         if narrowing {
             operand
                 .add_projection(
@@ -348,19 +391,27 @@ fn build_insert(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<SqlSt
 /// DELETE FROM target WHERE EXISTS (SELECT 1 FROM (<source>) AS _del WHERE target.c IS NOT DISTINCT FROM _del.c ...)
 fn build_delete(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<SqlStatement> {
     let target_scope = mutation.target_scope();
+    let target_relation = mutation.target_relation();
     let target = mutation.target().clone();
-    let columns = ctx.identities.known_heading(target_scope)?.to_vec();
-    let source_columns = mutation.source().columns().to_vec();
-    let source = mutation.into_source().to_sql()?;
-    let where_clause = build_exists_match(
-        target_scope,
+    let columns: Vec<_> = ctx
+        .relations
+        .interface(&target_relation)?
+        .ports()
+        .iter()
+        .map(|port| port.column())
+        .collect();
+    let pairs = pair_target_ports(
+        &target_relation,
         &columns,
-        source_columns,
-        source,
+        &mutation.source().relation,
+        &mutation.source().builder,
         "dml/shape/delete_column_identity",
         "delete!",
         ctx,
     )?;
+    let source_columns = mutation.source().columns().to_vec();
+    let source = mutation.into_source().into_builder().to_sql()?;
+    let where_clause = build_exists_match(target_scope, pairs, source_columns, source, ctx)?;
     Ok(SqlStatement::Delete {
         target,
         target_scope,
@@ -390,9 +441,17 @@ fn build_delete(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<SqlSt
 /// two equal rows that the bound was relying on.
 fn build_update(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<Lowered> {
     let target_scope = mutation.target_scope();
+    let target_relation = mutation.target_relation();
     let target = mutation.target().clone();
-    let heading = ctx.identities.known_heading(target_scope)?.to_vec();
+    let heading: Vec<_> = ctx
+        .relations
+        .interface(&target_relation)?
+        .ports()
+        .iter()
+        .map(|port| port.column())
+        .collect();
     let source_columns = mutation.source().columns().to_vec();
+    let stage = mutation.stage();
     // THE SOURCE IS STAGED, ONCE. Everything below reads the staged
     // relation: the check that each target row is described once, and the
     // mutation that acts on it. A NAME for the source would not have been
@@ -401,47 +460,48 @@ fn build_update(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<Lower
     // whenever the source is volatile, reads outside this engine, or is
     // written concurrently, and then the check has established something
     // about rows the mutation never saw.
-    let mut source_query = mutation.into_source().to_sql()?;
-    let staged_scope = ctx.identities.mint_derived_scope(
-        crate::names::ScopeOrigin::Scratch {
-            role: crate::names::ScratchRole::Snapshot,
-        },
-        crate::names::Hint::Prefix("dml_source"),
-    );
-    let published = super::builder::republish_under(
-        &mut source_query,
-        staged_scope,
-        &source_columns,
-        &ctx.identities,
-        crate::names::Republish::BoundaryExport,
+    let (assignments, match_columns) = classify_update_heading(&source_columns, &heading, ctx)?;
+    let source_pairs = pair_target_ports(
+        &target_relation,
+        &match_columns,
+        &mutation.source().relation,
+        &mutation.source().builder,
+        "dml/shape/update_column_identity",
+        "update!",
+        ctx,
     )?;
+    let mut source_query = mutation.into_source().into_builder().to_sql()?;
+    // THE STAGED RELATION HOLDS WHAT THE SOURCE EMITS. Its heading is
+    // derived with it, from columns this road already knows, so the stored
+    // interface and the created table's columns are one act. Aliasing the
+    // statement afterwards is rendering, not publication.
+    let (staged_scope, published) =
+        super::builder::stage_holding(&mut source_query, &source_columns, stage, &ctx.identities)?;
     let prepare = vec![
         // A run that ended early left this behind, and the next run of the
         // same statement asks for the same name.
         SqlStatement::DropTempTable {
-            table: staged_scope,
+            table: staged_scope.scope(),
         },
         SqlStatement::CreateTempTable {
-            table: staged_scope,
+            table: staged_scope.scope(),
             with_clause: None,
             query: source_query,
         },
     ];
 
-    let (assignments, match_columns) = classify_update_heading(&published, &heading, ctx)?;
-
-    // Which target row a source row IS. The occurrences are paired by value
-    // identity, never by spelling: a computed value that borrowed a column's
-    // name is a different column, and matching on the name would choose the
-    // rows to change by comparing the target against something it never
-    // carried.
-    let pairs = pair_by_identity(
-        &match_columns,
-        &published,
-        "dml/shape/update_column_identity",
-        "update!",
-        ctx,
-    )?;
+    let pairs = source_pairs
+        .into_iter()
+        .map(|(target, source)| {
+            exact_republication(source, &source_columns, &published).map(|source| (target, source))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let assignments = assignments
+        .into_iter()
+        .map(|(target, source)| {
+            exact_republication(source, &source_columns, &published).map(|source| (target, source))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let matched = DomainExpression::and(
         pairs
             .iter()
@@ -453,7 +513,7 @@ fn build_update(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<Lower
     );
 
     let where_clause = Some(DomainExpression::exists(read_source(
-        staged_scope,
+        staged_scope.scope(),
         DomainExpression::literal(crate::pipeline::ast_refined::LiteralValue::Number(
             "1".to_string(),
         )),
@@ -468,7 +528,7 @@ fn build_update(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<Lower
             Ok((
                 *target_column,
                 DomainExpression::Subquery(Box::new(read_source(
-                    staged_scope,
+                    staged_scope.scope(),
                     DomainExpression::Column(*written),
                     Some(*written),
                     matched.clone(),
@@ -486,7 +546,7 @@ fn build_update(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<Lower
     // established by reading the source before anything is written, in
     // ordinary SQL every target can answer, rather than by leaving each
     // engine to decide what a two-row scalar subquery means.
-    let obligation = single_valued_obligation(staged_scope, &pairs, ctx)?;
+    let obligation = single_valued_obligation(staged_scope.scope(), &pairs, ctx)?;
 
     Ok(Lowered {
         statement: SqlStatement::Update {
@@ -518,55 +578,47 @@ fn single_valued_obligation(
     identity: &[(ColId, ColId)],
     ctx: &TransformCtx,
 ) -> Result<Obligation> {
-    let grouped = ctx.identities.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-        None,
-    );
-    let ambiguous = super::builder::publish_at(
-        grouped,
-        [],
-        SelectStatement::builder()
-            .select(SelectItem::expression(DomainExpression::literal(
+    let grouped = ctx.identities.anonymous_scope(None);
+    let ambiguous = (SelectStatement::builder()
+        .select(SelectItem::scaffolding_value(
+            DomainExpression::literal(crate::pipeline::ast_refined::LiteralValue::Number(
+                "1".to_string(),
+            )),
+            ctx.identities.scaffolding_slot(),
+        ))
+        .from_tables(vec![TableExpression::Scope(staged)])
+        .group_by(
+            identity
+                .iter()
+                .map(|(_, source)| DomainExpression::Column(*source))
+                .collect(),
+        )
+        .having(
+            DomainExpression::Function {
+                name: crate::pipeline::sql_ast::FunctionName::from("count"),
+                args: vec![DomainExpression::Star],
+                distinct: false,
+            }
+            .gt(DomainExpression::literal(
                 crate::pipeline::ast_refined::LiteralValue::Number("1".to_string()),
-            )))
-            .from_tables(vec![TableExpression::Scope(staged)])
-            .group_by(
-                identity
-                    .iter()
-                    .map(|(_, source)| DomainExpression::Column(*source))
-                    .collect(),
-            )
-            .having(
-                DomainExpression::Function {
-                    name: crate::pipeline::sql_ast::FunctionName::from("count"),
-                    args: vec![DomainExpression::Star],
-                    distinct: false,
-                }
-                .gt(DomainExpression::literal(
-                    crate::pipeline::ast_refined::LiteralValue::Number("1".to_string()),
-                )),
-            ),
-        &ctx.identities,
-    )?;
+            )),
+        ))
+    .standing_at(grouped)
+    .map_err(crate::error::DelightQLError::parse_error)?;
 
-    let verdict = ctx.identities.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-        None,
-    );
-    let statement = super::builder::publish_at(
-        verdict,
-        [],
-        SelectStatement::builder()
-            .select(SelectItem::expression(DomainExpression::literal(
-                crate::pipeline::ast_refined::LiteralValue::Number("1".to_string()),
-            )))
-            .where_clause(DomainExpression::not_exists(QueryExpression::Select(
-                Box::new(ambiguous),
-            ))),
-        &ctx.identities,
-    )?;
+    let verdict = ctx.identities.anonymous_scope(None);
+    let statement = (SelectStatement::builder()
+        .select(SelectItem::scaffolding_value(
+            DomainExpression::literal(crate::pipeline::ast_refined::LiteralValue::Number(
+                "1".to_string(),
+            )),
+            ctx.identities.scaffolding_slot(),
+        ))
+        .where_clause(DomainExpression::not_exists(QueryExpression::Select(
+            Box::new(ambiguous),
+        ))))
+    .standing_at(verdict)
+    .map_err(crate::error::DelightQLError::parse_error)?;
     Ok(Obligation {
         statement: SqlStatement::Query {
             with_clause: None,
@@ -700,79 +752,30 @@ fn read_source(
     matched: DomainExpression,
     ctx: &TransformCtx,
 ) -> Result<QueryExpression> {
-    let emitting = ctx.identities.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-        None,
-    );
-    let (item, outputs) = match publishes {
+    let emitting = ctx.identities.anonymous_scope(None);
+    let item = match publishes {
         Some(column) => {
-            let output = ctx.identities.republish_column(
+            let output = ctx.identities.rebind_sql_column(
                 column,
                 emitting,
-                crate::names::Republish::BoundaryExport,
                 ctx.identities.published(column),
-                ctx.identities.addressing(column),
-                |_| {},
             );
-            (
-                SelectItem::expression_with_alias(item, output),
-                vec![output],
-            )
+            SelectItem::expression_with_alias(item, output)
         }
-        None => (SelectItem::expression(item), Vec::new()),
+        None => SelectItem::scaffolding_value(item, ctx.identities.scaffolding_slot()),
     };
-    let select = super::builder::publish_at(
-        emitting,
-        outputs,
-        SelectStatement::builder()
-            .select(item)
-            .from_tables(vec![TableExpression::Scope(source)])
-            .where_clause(matched),
-        &ctx.identities,
-    )?;
+    let select = (SelectStatement::builder()
+        .select(item)
+        .from_tables(vec![TableExpression::Scope(source)])
+        .where_clause(matched))
+    .standing_at(emitting)
+    .map_err(crate::error::DelightQLError::parse_error)?;
     Ok(QueryExpression::Select(Box::new(select)))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Whether a source occurrence IS the target's column.
-///
-/// A published NAME is not a proof of this, and matching on one is how a
-/// computed value comes to stand for the column it borrowed the spelling of:
-/// the rows that change are then chosen by comparing the target against an
-/// expression it never carried.
-///
-/// Two proofs, and both are about the value rather than the characters. The
-/// occurrences may share a republication chain — the source projected the
-/// target's column forward. Or they may be two mints of ONE catalog column:
-/// a DML target is minted beside the access its own source reads, so the
-/// legitimate case has no chain to share and only the catalog coordinate
-/// connects them. That coordinate is the physical relation and the ordinal,
-/// never the entity handle, which answers "the same lookup" rather than
-/// "the same table".
-fn is_target_column(
-    source: ColId,
-    target_column: ColId,
-    registry: &crate::names::Registry,
-) -> bool {
-    use crate::names::ColumnOrigin;
-    if registry.same_value(source, target_column) {
-        return true;
-    }
-    matches!(
-        (
-            registry.origin_of_col(registry.progenitor(source)),
-            registry.origin_of_col(registry.progenitor(target_column)),
-        ),
-        (
-            ColumnOrigin::CatalogColumn { entity: from, position: at },
-            ColumnOrigin::CatalogColumn { entity: onto, position: slot },
-        ) if registry.same_relation(from, onto) && at == slot
-    )
-}
 
 /// A column named as the reader wrote it, for a refusal to quote back.
 fn describe_column(column: ColId, ctx: &TransformCtx) -> String {
@@ -786,13 +789,33 @@ fn describe_column(column: ColId, ctx: &TransformCtx) -> String {
 
 /// Each target column paired with the one occurrence of ITSELF the source
 /// carries, or a refusal naming the column that is missing or doubled.
-fn pair_by_identity(
+fn pair_target_ports(
+    target_relation: &crate::relation::SemanticRelation,
     columns: &[ColId],
-    source_columns: &[ColumnMetadata],
+    source_relation: &crate::relation::SemanticRelation,
+    source: &dyn Qualify,
     error_category: &'static str,
     operation: &'static str,
     ctx: &TransformCtx,
 ) -> Result<Vec<(ColId, ColId)>> {
+    let target_storage = ctx.relations.storage(target_relation)?.ok_or_else(|| {
+        DelightQLError::parse_error("a DML target has no semantic storage identity")
+    })?;
+    let target_ports = ctx.relations.interface(target_relation)?;
+    let mut pending = vec![*source_relation];
+    let mut visited = std::collections::HashSet::new();
+    let mut occurrences = Vec::new();
+    while let Some(relation) = pending.pop() {
+        if !visited.insert(relation.relation()) {
+            continue;
+        }
+        let storage = ctx.relations.storage(&relation)?;
+        let inputs = ctx.relations.inputs(&relation)?;
+        if storage == Some(target_storage) {
+            occurrences.push(relation);
+        }
+        pending.extend(inputs);
+    }
     columns
         .iter()
         .map(|target_column| {
@@ -804,11 +827,34 @@ fn pair_by_identity(
             } else {
                 ("relation being mutated — the rows it changes are", "mutate")
             };
-            let matches = source_columns
+            let position = target_ports
+                .ports()
                 .iter()
-                .map(ColumnMetadata::identity)
-                .filter(|source| is_target_column(*source, *target_column, &ctx.identities))
+                .position(|port| port.column() == *target_column)
+                .ok_or_else(|| {
+                    DelightQLError::parse_error(
+                        "a DML target column is absent from its semantic interface",
+                    )
+                })?;
+            let mut matches = occurrences
+                .iter()
+                .filter_map(|occurrence| {
+                    let port = ctx
+                        .relations
+                        .interface(occurrence)
+                        .ok()?
+                        .ports()
+                        .get(position)
+                        .copied()?;
+                    let translated = ctx
+                        .relations
+                        .translated_port(source_relation, port)
+                        .ok()??;
+                    source.rebind_port(translated).ok()
+                })
                 .collect::<Vec<_>>();
+            matches.sort_unstable();
+            matches.dedup();
             match matches.as_slice() {
                 [source] => Ok((*target_column, *source)),
                 [] => Err(DelightQLError::validation_error_categorized(
@@ -839,6 +885,31 @@ fn pair_by_identity(
         .collect()
 }
 
+fn exact_republication(
+    source: ColId,
+    before: &[ColumnMetadata],
+    after: &[ColumnMetadata],
+) -> Result<ColId> {
+    let mut positions = before
+        .iter()
+        .enumerate()
+        .filter_map(|(position, column)| (column.identity() == source).then_some(position));
+    match (positions.next(), positions.next()) {
+        (Some(position), None) => after
+            .get(position)
+            .map(ColumnMetadata::identity)
+            .ok_or_else(|| {
+                DelightQLError::parse_error("a DML republication dropped a source slot")
+            }),
+        (None, _) => Err(DelightQLError::parse_error(
+            "a DML republication does not carry its exact source slot",
+        )),
+        (Some(_), Some(_)) => Err(DelightQLError::parse_error(
+            "a DML source occurrence occupies more than one slot",
+        )),
+    }
+}
+
 /// Build EXISTS subquery matching rows between target and source.
 ///
 /// Generates:
@@ -846,64 +917,58 @@ fn pair_by_identity(
 ///           WHERE target.c1 IS NOT DISTINCT FROM _del.c1 AND ...)
 fn build_exists_match(
     target: ScopeId,
-    columns: &[ColId],
+    pairs: Vec<(ColId, ColId)>,
     source_columns: Vec<ColumnMetadata>,
     mut source_query: QueryExpression,
-    error_category: &'static str,
-    operation: &'static str,
     ctx: &TransformCtx,
 ) -> Result<Option<DomainExpression>> {
-    if columns.is_empty() {
+    if pairs.is_empty() {
         return Ok(None);
     }
 
-    let source_scope = ctx.identities.mint_derived_scope(
-        crate::names::ScopeOrigin::Wrap {
-            input: ColumnMetadata::common_identity_scope(&source_columns, &ctx.identities)
-                .unwrap_or(target),
-            why: crate::names::WrapReason::Projection,
-        },
-        crate::names::Hint::None,
+    let source_scope = ctx.identities.wrap_scope(
+        ColumnMetadata::common_identity_scope(&source_columns, &ctx.identities).unwrap_or(target),
+        crate::names::WrapReason::Projection,
     );
     let active_source = super::builder::republish_under(
         &mut source_query,
         source_scope,
         &source_columns,
         &ctx.identities,
-        crate::names::Republish::BoundaryExport,
     )?;
 
-    let conditions: Vec<DomainExpression> =
-        pair_by_identity(columns, &active_source, error_category, operation, ctx)?
-            .into_iter()
-            .map(|(target_column, source)| {
-                DomainExpression::Column(target_column)
-                    .is_not_distinct_from(DomainExpression::Column(source))
-            })
-            .collect();
+    let conditions: Vec<DomainExpression> = pairs
+        .into_iter()
+        .map(|(target, source)| {
+            exact_republication(source, &source_columns, &active_source)
+                .map(|source| (target, source))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(target_column, source)| {
+            DomainExpression::Column(target_column)
+                .is_not_distinct_from(DomainExpression::Column(source))
+        })
+        .collect();
 
     let where_expr = DomainExpression::and(conditions);
 
     let from_table = TableExpression::subquery(source_query, source_scope);
-    let emitting_scope = ctx.identities.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-        None,
-    );
+    let emitting_scope = ctx.identities.anonymous_scope(None);
 
     // The match is read for existence, never for a column: the literal names
     // no occurrence and the emitting scope owns none.
-    let inner_select = super::builder::publish_at(
-        emitting_scope,
-        [],
-        SelectStatement::builder()
-            .select(SelectItem::expression(DomainExpression::literal(
-                crate::pipeline::ast_refined::LiteralValue::Number("1".to_string()),
-            )))
-            .from_tables(vec![from_table])
-            .where_clause(where_expr),
-        &ctx.identities,
-    )?;
+    let inner_select = (SelectStatement::builder()
+        .select(SelectItem::scaffolding_value(
+            DomainExpression::literal(crate::pipeline::ast_refined::LiteralValue::Number(
+                "1".to_string(),
+            )),
+            ctx.identities.scaffolding_slot(),
+        ))
+        .from_tables(vec![from_table])
+        .where_clause(where_expr))
+    .standing_at(emitting_scope)
+    .map_err(crate::error::DelightQLError::parse_error)?;
 
     let inner_query = QueryExpression::Select(Box::new(inner_select));
 

@@ -18,10 +18,14 @@ mod support;
 
 use support::refuses;
 
-/// Relational last-landing is reserved room, unbuilt: it spells with `@`.
+/// ONE GLYPH PER COMPOSITION FAMILY. The ordinary pipe lands in the final
+/// formal, so a second relational pipe has no direction left to name and a
+/// second function pipe has nothing left to say. Neither spelling derives;
+/// an exceptional non-final landing spells with `@`.
 #[test]
-fn the_relational_last_landing_pipe_is_unbuilt() {
+fn there_is_one_pipe_glyph_per_composition_family() {
     refuses("users(*) |>> (a)");
+    refuses("users(*) |> (a /->> f:(@))");
 }
 
 /// THE ONE ACCESSOR takes exactly one path, spelled with its steps: `:[1]`
@@ -166,4 +170,27 @@ fn the_two_curly_sides_do_not_accept_each_others_members() {
 #[test]
 fn the_canonical_form_requires_the_goal_marker() {
     refuses("adults(*) :- users(*)\nadults(*)");
+}
+
+/// THE SPEC IS ENCLOSED BY THE CALL IT WINDOWS: `f:(args <~ spec)`. A spec
+/// after the closing paren belongs to no call and has no derivation — in
+/// value position and in cover position alike. The group delegate's bare
+/// sigil is a different carrier and stays.
+#[test]
+fn a_window_spec_stands_inside_its_calls_parens() {
+    refuses("users(*) |> (row_number:() <~ as rn)");
+    refuses("users(*) |> (row_number:() <~ #(id) as rn)");
+    refuses("users(*) |> (sum:(total) <~ %(d), #(c) as t)");
+    refuses("users(*) |> +$(row_number:() <~ #(id) as :\"{@}_rn\")(balance)");
+    // A comma stands only BETWEEN two written spec items.
+    refuses("users(*) |> (sum:(total <~ %(d),) as t)");
+}
+
+/// NAMING IS ONE ACT: the embed-map cover names its column with the same
+/// `as` the rename cover spells before a name template. A template standing
+/// bare after the callable has no derivation.
+#[test]
+fn an_embed_map_cover_names_with_as() {
+    refuses("users(*) |> +$(upper:() :\"{@}_upper\")(first_name)");
+    refuses("users(*) |> +$(:( @ * 2) :\"{@}_x2\")(balance)");
 }

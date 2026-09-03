@@ -114,7 +114,9 @@ impl EffectExecutable for AliasPredicate {
 /// Extract a string literal from a domain expression
 fn extract_string_literal(expr: &DomainExpression, param_name: &str) -> Result<String> {
     match expr {
-        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => Ok(s.clone()),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
+            Ok(s.clone())
+        }
         _ => Err(DelightQLError::database_error(
             format!(
                 "alias!() expects '{}' to be a string literal, got: {:?}",

@@ -150,6 +150,120 @@ pub fn initialize_bootstrap_db(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A catalog with one lib namespace and one consult cartridge, for the
+    /// definition-store law tests.
+    fn definition_store() -> (Connection, i32, i64) {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_bootstrap_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO connection (id, resource_uri, mechanism, connection_type) VALUES (1, 'test://', 'in-process', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO namespace (name, fq_name, kind, provenance) VALUES ('t', 'lib::t', 'lib', 'file')",
+            [],
+        )
+        .unwrap();
+        let ns = conn.last_insert_rowid() as i32;
+        conn.execute(
+            "INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
+             VALUES (1, 1, 'file://t.dql', 'lib::t', 1, 1, 0)",
+            [],
+        )
+        .unwrap();
+        let cart = conn.last_insert_rowid();
+        (conn, ns, cart)
+    }
+
+    /// Register an entity row with one clause and activate it in the
+    /// namespace — the consult writer's exact sequence.
+    fn activate(
+        conn: &Connection,
+        ns: i32,
+        cart: i64,
+        name: &str,
+        stropped: i32,
+        kind: i32,
+        with_clause: bool,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO entity (name, name_stropped, type, cartridge_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![name, stropped, kind, cart],
+        )?;
+        let entity = conn.last_insert_rowid();
+        if with_clause {
+            conn.execute(
+                "INSERT INTO entity_clause (entity_id, ordinal, definition) VALUES (?1, 1, 'body')",
+                [entity],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![entity, ns, cart],
+        )
+    }
+
+    /// ONE CANONICAL NAME, ONE FAMILY, per namespace: the store refuses a
+    /// second authored family under a name the namespace already answers,
+    /// under the identifier law's folding.
+    #[test]
+    fn a_second_family_under_one_canonical_name_refuses_at_the_store() {
+        let (conn, ns, cart) = definition_store();
+        activate(&conn, ns, cart, "Pick", 0, 4, true).unwrap();
+        // Unstropped names fold: `pick` and `Pick` are one canonical name,
+        // and so is a stropped lowercase `pick` — same canonical bytes.
+        assert!(activate(&conn, ns, cart, "pick", 0, 4, true).is_err());
+        assert!(activate(&conn, ns, cart, "pick", 1, 4, true).is_err());
+        // A stropped case survivor keeps its bytes and IS a different name.
+        activate(&conn, ns, cart, "Pick", 1, 4, true).unwrap();
+        // Category never selects among same-named definitions: a function
+        // under the relation's name refuses too.
+        assert!(activate(&conn, ns, cart, "pick", 0, 1, true).is_err());
+    }
+
+    /// The two activation triggers apply to exactly the authored kinds the
+    /// enum names: a clauseless authored family refuses to activate, a
+    /// clauseless served row activates.
+    #[test]
+    fn the_store_triggers_and_the_enum_agree_on_authored_kinds() {
+        use crate::enums::EntityType;
+        let (conn, ns, cart) = definition_store();
+        for raw in 1..=21 {
+            let Ok(kind) = EntityType::from_i32(raw) else {
+                continue;
+            };
+            let activated = activate(&conn, ns, cart, &format!("probe_{raw}"), 0, raw, false);
+            assert_eq!(
+                activated.is_err(),
+                kind.is_authored_definition(),
+                "trigger and EntityType::is_authored_definition disagree on {kind:?} ({raw})"
+            );
+        }
+    }
+
+    /// The store keeps no revision history: no table, column, or trigger
+    /// names one.
+    #[test]
+    fn the_store_holds_no_definition_revision() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_bootstrap_db(&conn).unwrap();
+        let mut statement = conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL")
+            .unwrap();
+        let objects: Vec<(String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for (name, sql) in objects {
+            assert!(
+                !sql.to_ascii_lowercase().contains("revision"),
+                "{name} carries revision vocabulary: {sql}"
+            );
+        }
+    }
+
     #[test]
     fn test_enum_seeding_integration() {
         let conn = Connection::open_in_memory().unwrap();
@@ -343,23 +457,28 @@ pub fn setup_danger_table_on_bootstrap(conn: &rusqlite::Connection) -> crate::er
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// Create the errors table on the bootstrap connection.
+/// Create the session's finding table on the bootstrap connection,
+/// published as `sys::diagnostics.finding`.
 ///
-/// This is a per-session error log populated during pipeline execution.
-/// Each row records an error with its URI, message, and the query that caused it.
-pub fn setup_errors_table_on_bootstrap(conn: &rusqlite::Connection) -> crate::error::Result<()> {
+/// One row per refusal the compiler raised and per selftest finding:
+/// `kind` shares its domain with the client's incident table so the two
+/// project together; `uri` is the identity; `input` is the submission
+/// when there was one; `provider` says which road wrote it.
+pub fn setup_finding_table_on_bootstrap(conn: &rusqlite::Connection) -> crate::error::Result<()> {
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS errors (
-            id INTEGER PRIMARY KEY,
-            uri TEXT NOT NULL,
-            message TEXT NOT NULL,
-            query_text TEXT,
-            timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+        "CREATE TABLE IF NOT EXISTS finding (
+            id          INTEGER PRIMARY KEY,
+            occurred_at TEXT NOT NULL,
+            kind        TEXT NOT NULL CHECK (kind IN ('error', 'warning', 'info')),
+            uri         TEXT NOT NULL,
+            message     TEXT NOT NULL,
+            input       TEXT,
+            provider    TEXT NOT NULL
         )",
         [],
     )
     .map_err(|e| {
-        DelightQLError::database_error("Failed to create errors table on bootstrap", e.to_string())
+        DelightQLError::database_error("Failed to create finding table on bootstrap", e.to_string())
     })?;
 
     Ok(())

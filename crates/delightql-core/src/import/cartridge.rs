@@ -12,15 +12,17 @@ use rusqlite::Connection;
 
 /// Source type for cartridges
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SourceType {
     /// Text files containing DQL/SQL source code
+    #[allow(dead_code)]
     File = 1,
     /// Binary files (compiled/serialized definitions)
+    #[allow(dead_code)]
     FileBin = 2,
     /// Database connection (introspected tables/views)
     Db = 3,
     /// Built-in entities defined in the engine code
+    #[allow(dead_code)]
     Bin = 4,
 }
 

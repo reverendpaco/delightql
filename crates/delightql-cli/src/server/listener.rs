@@ -173,6 +173,10 @@ pub fn start_server(
 
     let _ = std::fs::remove_file(socket_path);
     eprintln!("dql server: stopped");
+    // Every worker had its own handle and core system, now gone with its
+    // thread; the server closes the client's side alone. A request's
+    // refusal is the requester's outcome, not this process's incident.
+    crate::client::exit::finish(None, 0);
 
     Ok(())
 }

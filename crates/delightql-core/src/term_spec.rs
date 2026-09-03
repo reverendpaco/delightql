@@ -101,20 +101,48 @@ pub fn canonicalize_term(source: &str) -> Result<String> {
         ));
     }
 
-    let folded = fold_unstropped_identifiers(&tree);
+    emit_canonical(&tree, unformattable)
+}
 
-    // Emit through the format engine under the frozen default style.
-    // A pass-through is a refusal, never a silent identity.
+/// THE CANONICAL SPELLING OF ONE QUERY BODY.
+///
+/// The same canonicalizer, at the other position that needs one: a consulted
+/// file's relational goal, whose ledger row names it. The term SHAPE GATE
+/// does not run here — a goal body is a whole relex, not a mention's
+/// interior — but the identity law is the same one, and it has to be, or two
+/// spellings of one goal would be one thing to the compiler and two to the
+/// ledger.
+///
+/// `refuse` builds the caller's own refusal, so a goal that cannot be
+/// canonicalized says so in the caller's vocabulary rather than a term's.
+pub(crate) fn canonicalize_query(
+    source: &str,
+    refuse: impl Fn(String) -> DelightQLError,
+) -> Result<String> {
+    let tree = crate::pipeline::parse::query_sequence(source)
+        .map_err(|e| refuse(format!("it does not parse on its own: {e}")))?;
+    emit_canonical(&tree, refuse)
+}
+
+/// Fold, then emit through the format engine under the frozen default style.
+/// A pass-through is a refusal, never a silent identity — keeping the raw
+/// bytes would be a second canonicalizer that agrees with this one only by
+/// accident.
+fn emit_canonical(
+    tree: &crate::pipeline::syntax::SyntaxTree,
+    refuse: impl Fn(String) -> DelightQLError,
+) -> Result<String> {
+    let folded = fold_unstropped_identifiers(tree);
     let config = delightql_formatter::FormatConfig::default();
     match delightql_formatter::format_outcome(&folded, &config)
-        .map_err(|e| unformattable(e.to_string()))?
+        .map_err(|e| refuse(e.to_string()))?
     {
         delightql_formatter::FormatOutcome::Formatted(text) => {
             Ok(text.strip_suffix('\n').unwrap_or(&text).to_string())
         }
-        delightql_formatter::FormatOutcome::PassedThrough { reason, .. } => Err(unformattable(
-            format!("the format engine passed it through ({reason:?})"),
-        )),
+        delightql_formatter::FormatOutcome::PassedThrough { reason, .. } => Err(refuse(format!(
+            "the format engine passed it through ({reason:?})"
+        ))),
     }
 }
 

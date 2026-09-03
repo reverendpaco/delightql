@@ -32,7 +32,7 @@ fn check_forward_references_grouped(
         // Extract all table references from all expressions in this group
         let mut all_refs = HashSet::new();
         for cte in group {
-            let refs = extract_table_references(&cte.expression);
+            let refs = extract_table_references(cte.body());
             all_refs.extend(refs);
         }
 
@@ -76,7 +76,7 @@ fn check_for_cycles_grouped(
 
         // Collect all dependencies from all expressions in this group
         for cte in group {
-            let refs = extract_table_references(&cte.expression);
+            let refs = extract_table_references(cte.body());
             for ref_name in refs {
                 // Only include references to other CTEs
                 // ALLOW self-references (recursion), but track other CTE references
@@ -179,7 +179,10 @@ impl AstVisit<Unresolved> for TableRefCollector {
             // A plan read is addressed by identity: it can neither name a
             // CTE nor be one, so it contributes no reference to order.
             Relation::Ground {
-                mention: GroundMention::Plan { .. },
+                mention:
+                    GroundMention::Scratch { .. }
+                    | GroundMention::Receipt { .. }
+                    | GroundMention::Structural { .. },
                 ..
             } => {}
             // A pseudo-predicate must have been executed and replaced during

@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::id::{ColId, EntityId, FnId, ScopeId};
-use super::origin::{Addressing, CteRole, FnOrigin, ScopeOrigin, WrapReason};
+use super::origin::{Addressing, CteRole, FnOrigin, ScopeKind, WrapReason};
 use super::policy::{Mint, NamePolicy};
 use super::registry::Registry;
 use super::sink::IdentSink;
@@ -32,10 +32,71 @@ pub struct Statement {
     pub refs: Vec<ColId>,
 }
 
+/// The open/reserved naming states a bundle passes through. Uninhabited:
+/// they select capabilities, they are never values.
+#[derive(Clone, Debug)]
+pub enum OpenNames {}
+#[derive(Clone, Debug)]
+pub enum NamesReserved {}
+
 /// Everything one compilation produces.
-#[derive(Clone, Debug, Default)]
-pub struct Bundle {
+///
+/// TYPESTATE: a bundle is gathered OPEN, must reserve its complete
+/// authored-name inventory, and only the RESERVED state reaches baptism —
+/// so no invented name can be allocated before every authored spelling
+/// owns its characters.
+#[derive(Clone, Debug)]
+pub struct Bundle<S = NamesReserved> {
     pub statements: Vec<Statement>,
+    _names: std::marker::PhantomData<S>,
+}
+
+impl Default for Bundle<OpenNames> {
+    fn default() -> Self {
+        Bundle {
+            statements: Vec::new(),
+            _names: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Bundle<OpenNames> {
+    /// Gather one compilation's statements, names still open.
+    pub fn gather(statements: Vec<Statement>) -> Self {
+        Bundle {
+            statements,
+            _names: std::marker::PhantomData,
+        }
+    }
+
+    /// Reserve the COMPLETE authored inventory this bundle publishes —
+    /// every answering scope name and every published column spelling —
+    /// with the compilation registry, sealing the bundle for baptism.
+    /// Position admission already reserved what this compilation authored;
+    /// this walk is what makes the enumeration COMPLETE for names that
+    /// arrived by other roads (consulted definitions, catalog spellings).
+    pub fn reserve_authored(self, registry: &Registry) -> Bundle<NamesReserved> {
+        for statement in &self.statements {
+            for scope in &statement.scopes {
+                if let Some(spelling) = registry.answer_spelling(*scope) {
+                    let (text, stropped) = registry.spelling_text(spelling);
+                    registry.reserve_authored(&text, stropped);
+                }
+            }
+            for heading in &statement.headings {
+                for column in heading {
+                    if let Some(spelling) = registry.published(*column) {
+                        let (text, stropped) = registry.spelling_text(spelling);
+                        registry.reserve_authored(&text, stropped);
+                    }
+                }
+            }
+        }
+        Bundle {
+            statements: self.statements,
+            _names: std::marker::PhantomData,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,7 +251,7 @@ impl Baptised<'_> {
     }
 
     pub(crate) fn is_scratch_scope(&self, s: ScopeId) -> bool {
-        matches!(self.reg.origin_of(s), ScopeOrigin::Scratch { .. })
+        matches!(self.reg.kind_of(s), ScopeKind::Scratch { .. })
     }
 
     pub fn knows_column(&self, c: ColId) -> bool {
@@ -205,25 +266,55 @@ impl Baptised<'_> {
 /// Assign emitted names to the bundle's listed scopes and output headings
 /// in one deterministic sweep, then verify that every referenced column's
 /// owner scope was listed.
-pub fn baptise<'r>(reg: &'r Registry, bundle: &Bundle) -> Result<Baptised<'r>, BaptismError> {
-    let mut mint = Mint::new(NamePolicy::from_env().map_err(|()| BaptismError::UnknownNamePolicy)?);
+///
+/// Only a RESERVED bundle enters: `baptise(&open_bundle)` is a compile
+/// error, because no entrance accepts `Bundle<OpenNames>`.
+pub fn baptise<'r>(
+    reg: &'r Registry,
+    bundle: &Bundle<NamesReserved>,
+) -> Result<Baptised<'r>, BaptismError> {
+    baptise_with_policy(
+        reg,
+        bundle,
+        NamePolicy::from_env().map_err(|()| BaptismError::UnknownNamePolicy)?,
+    )
+}
+
+/// The same, under an explicit policy — the test entrance for laws that
+/// need deterministic draws without touching process environment.
+pub(super) fn baptise_with_policy<'r>(
+    reg: &'r Registry,
+    bundle: &Bundle<NamesReserved>,
+    policy: NamePolicy,
+) -> Result<Baptised<'r>, BaptismError> {
+    let mut mint = Mint::new(policy);
+    // ALIAS ALWAYS PRE-EMPTS A MINT: every authored reservation — made at
+    // position admission and completed by the bundle seal — stands in the
+    // collision universe before the first invention is allocated.
+    let authored_reserved: HashSet<Vec<u8>> = reg
+        .authored_reserved()
+        .into_iter()
+        .map(|s| reg.canon_bytes(s))
+        .collect();
     let mut used: HashSet<Vec<u8>> = reg
         .reserved()
         .into_iter()
         .map(|s| reg.canon_bytes(s))
+        .chain(authored_reserved.iter().cloned())
         .collect();
 
     let mut scopes: HashMap<ScopeId, String> = HashMap::new();
     let mut cols: HashMap<ColId, (String, bool)> = HashMap::new();
     let mut reports: HashMap<ScopeId, String> = HashMap::new();
-    // A minted name belongs to the VALUE, not to the occurrence, and is drawn
-    // once for the whole bundle. A republication IS the value it republishes,
-    // so a boundary that carries one across — a wrapper publishing `*`, a CTE
-    // read by the statement above it — emits the name its source emitted,
-    // and the reference written outside finds it. Naming each occurrence
-    // separately worked only while the two derivations happened to produce
-    // the same characters; the reference was matching on a spelling nobody
-    // had promised.
+    // A drawn name belongs to a PORT — one output position of one emitted
+    // heading. Every port draws its own, which is what keeps two sibling
+    // publications of one value two addressable slots; no two emitted
+    // positions are ever required to share characters, because nothing
+    // the generator spells joins by name.
+    //
+    // The tempting regressions are both keys: by value progenitor, and by
+    // republication chain. Each makes siblings share characters, because
+    // siblings are related under both.
     let mut minted: HashMap<ColId, String> = HashMap::new();
     let mut drawn: HashSet<ColId> = HashSet::new();
     let mut invented = 0u32;
@@ -265,8 +356,14 @@ pub fn baptise<'r>(reg: &'r Registry, bundle: &Bundle) -> Result<Baptised<'r>, B
         // anonymous relations in one query are two answers rather than one
         // shared mark — the distinction meta-ize exists to publish.
         if authored.is_none() {
-            reported += 1;
-            reports.insert(scope, mint.spell(reported));
+            let report = loop {
+                reported += 1;
+                let candidate = mint.spell(reported);
+                if !authored_reserved.contains(&canonical_key(&candidate)) {
+                    break candidate;
+                }
+            };
+            reports.insert(scope, report);
         }
         let emission_prefix = reg.emission_prefix(scope);
         let emission_name = reg.emission_name(scope);
@@ -276,9 +373,9 @@ pub fn baptise<'r>(reg: &'r Registry, bundle: &Bundle) -> Result<Baptised<'r>, B
         // their enclosing SELECTs are distinct. Other exact compiler names
         // remain globally reserved and are uniquified as usual.
         let fixed_witness_alias = matches!(
-            (reg.origin_of(scope), emission_name),
+            (reg.kind_of(scope), emission_name),
             (
-                ScopeOrigin::Wrap {
+                ScopeKind::Wrap {
                     why: WrapReason::Witness,
                     ..
                 },
@@ -296,26 +393,26 @@ pub fn baptise<'r>(reg: &'r Registry, bundle: &Bundle) -> Result<Baptised<'r>, B
                 n += 1;
                 // Exhaustive: a new kind of invention does not compile
                 // until this match has an answer for it.
-                let prefix = match reg.origin_of(scope) {
-                    ScopeOrigin::BaseTable { .. } => "b",
-                    ScopeOrigin::UserAlias { .. } => "a",
-                    ScopeOrigin::AnonRelation => "anon",
-                    ScopeOrigin::Join { .. } => "j",
-                    ScopeOrigin::PipeStage { .. } => "t",
-                    ScopeOrigin::Wrap { .. } => "t",
-                    ScopeOrigin::Cte { role, .. } => match role {
+                let prefix = match reg.kind_of(scope) {
+                    ScopeKind::BaseTable { .. } => "b",
+                    ScopeKind::UserAlias { .. } => "a",
+                    ScopeKind::AnonRelation => "anon",
+                    ScopeKind::Join { .. } => "j",
+                    ScopeKind::PipeStage { .. } => "t",
+                    ScopeKind::Wrap { .. } => "t",
+                    ScopeKind::Cte { role, .. } => match role {
                         CteRole::TreeGroup => "tg",
                         CteRole::GroupCarrier => "gc",
                         CteRole::Recursive => "rec",
                         CteRole::Reachability => "reach",
                         CteRole::Materialize => "mat",
                     },
-                    ScopeOrigin::SetArm { .. } => "arm",
-                    ScopeOrigin::Resolution { .. } => "r",
-                    ScopeOrigin::ErHop { .. } => "hop",
-                    ScopeOrigin::HoCarrier { .. } => "ho",
-                    ScopeOrigin::Scratch { .. } => "scratch",
-                    ScopeOrigin::Interior { .. } => "int",
+                    ScopeKind::SetArm { .. } => "arm",
+                    ScopeKind::Resolution { .. } => "r",
+                    ScopeKind::ErHop { .. } => "hop",
+                    ScopeKind::HoCarrier { .. } => "ho",
+                    ScopeKind::Scratch { .. } => "scratch",
+                    ScopeKind::Interior => "int",
                 };
                 format!("{}_{}", prefix, n)
             }
@@ -392,7 +489,15 @@ pub fn baptise<'r>(reg: &'r Registry, bundle: &Bundle) -> Result<Baptised<'r>, B
                 // legible in the SQL that carries it.
                 let contested = |text: &str| {
                     reg.addressing(*c) != Addressing::Hygienic
-                        && carried.get(&canonical_key(text)).copied().unwrap_or(0) > 1
+                        && (carried.get(&canonical_key(text)).copied().unwrap_or(0) > 1
+                            // AUTHORED-NAME LOSS IS MONOTONIC. An
+                            // occurrence whose name lost an ambiguity
+                            // upstream is drawn HERE too, even where
+                            // nothing in this heading collides — otherwise
+                            // a projection that leaves one of the repeated
+                            // positions standing publishes a name the
+                            // repetition took away.
+                            || reg.name_lost(*c))
                 };
                 match published(c) {
                     Some((text, stropped)) if !contested(&text) => {
@@ -409,15 +514,22 @@ pub fn baptise<'r>(reg: &'r Registry, bundle: &Bundle) -> Result<Baptised<'r>, B
                         cols.insert(*c, (name, stropped));
                     }
                     _ => {
-                        // Drawn once per value, never suffixed: the suffix is
+                        // Drawn once per port, never suffixed: the suffix is
                         // arbitration between two spellings, and there is only
                         // ever one occurrence of one value to arbitrate for.
-                        let value = reg.progenitor(*c);
+                        let value = *c;
                         let name = match minted.get(&value) {
                             Some(drawn) => drawn.clone(),
                             None => {
-                                invented += 1;
-                                let drawn = mint.spell(invented);
+                                // A drawn spelling an authored name owns is
+                                // skipped: the author got there first.
+                                let drawn = loop {
+                                    invented += 1;
+                                    let candidate = mint.spell(invented);
+                                    if !authored_reserved.contains(&canonical_key(&candidate)) {
+                                        break candidate;
+                                    }
+                                };
                                 minted.insert(value, drawn.clone());
                                 drawn
                             }

@@ -12,7 +12,7 @@
 //!    the source library's `_internal` namespace
 //! 2. Generates CREATE TABLE SQL via the DDL pipeline
 //! 3. Executes DDL against the target data namespace's database
-//! 4. If entity has a `:=` body (CTAS), populates via INSERT INTO ... SELECT
+//! 4. If the entity has a view body (CTAS), populates via INSERT INTO ... SELECT
 //! 5. Returns the single-row receipt (success, operation,
 //!    source_namespace, target_namespace, returned ⟦entity, status⟧),
 //!    one interior row per manifest entity
@@ -195,7 +195,9 @@ fn run_imprint(
 /// Extract a string literal value from a DomainExpression
 fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<String> {
     match expr {
-        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => Ok(s.clone()),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
+            Ok(s.clone())
+        }
         _ => Err(DelightQLError::database_error(
             format!("imprint!() {} must be a string literal", arg_name),
             "Invalid argument type",

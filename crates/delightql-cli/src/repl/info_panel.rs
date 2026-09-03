@@ -35,7 +35,8 @@ pub struct SharedReplState {
     /// Primary query results from the last query
     pub last_results: Option<QueryResult>,
 
-    // Window C: query history ring
+    // Window C: query history ring — a presentation DTO projected from the
+    // repl::history.input ledger before each TUI launch, never an authority.
     pub query_history: Vec<QueryHistoryEntry>,
 
     // Cu1: process info (set once at init)
@@ -49,6 +50,7 @@ pub struct SharedReplState {
     pub config_zebra_mode: Option<usize>,
     pub config_no_headers: bool,
     pub config_multiline: bool,
+    pub config_editor_helpers: bool,
 }
 
 impl SharedReplState {
@@ -69,6 +71,7 @@ impl SharedReplState {
             config_zebra_mode: None,
             config_no_headers: false,
             config_multiline: false,
+            config_editor_helpers: false,
         }
     }
 
@@ -93,15 +96,8 @@ impl SharedReplState {
         self.last_emit_results = emit_results;
     }
 
-    /// Push a successful query + SQL pair to the history ring (capped at 50)
-    pub fn push_history(&mut self, dql: String, sql: String) {
-        self.query_history.push(QueryHistoryEntry { dql, sql });
-        if self.query_history.len() > 50 {
-            self.query_history.remove(0);
-        }
-    }
-
     /// Sync REPL configuration into the snapshot fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn sync_config(
         &mut self,
         output_format: &str,
@@ -110,6 +106,7 @@ impl SharedReplState {
         zebra_mode: Option<usize>,
         no_headers: bool,
         multiline: bool,
+        editor_helpers: bool,
     ) {
         self.config_output_format = output_format.to_string();
         self.config_target_stage = target_stage.to_string();
@@ -117,5 +114,6 @@ impl SharedReplState {
         self.config_zebra_mode = zebra_mode;
         self.config_no_headers = no_headers;
         self.config_multiline = multiline;
+        self.config_editor_helpers = editor_helpers;
     }
 }

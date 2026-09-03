@@ -3,14 +3,11 @@
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
-use crate::pipeline::asts::core::ProbeAddressing;
 use crate::pipeline::asts::core::ColumnOccurrence;
+use crate::pipeline::asts::core::ProbeAddressing;
 use crate::pipeline::asts::core::{Comparison, Existence};
 use crate::pipeline::asts::core::{NamedReference, Reference};
-use crate::pipeline::asts::ddl::{DefKind, HoParam};
-use crate::pipeline::resolver::grounding::substitute_in_truth_expr;
 use delightql_types::SqlIdentifier;
-use std::collections::HashMap;
 
 // =============================================================================
 // USING correlation synthesis for semi-joins
@@ -22,8 +19,8 @@ use std::collections::HashMap;
 pub(in crate::pipeline::resolver) fn synthesize_using_correlation(
     subquery: ast_resolved::Chain,
     using_columns: &[SqlIdentifier],
-    outer_available: &[crate::names::ColId],
-    identities: &crate::names::Registry,
+    outer_available: &[crate::relation::PortId],
+    identities: &crate::relation::Planning,
 ) -> Result<ast_resolved::Chain> {
     use crate::pipeline::asts::core::FilterOrigin;
 
@@ -31,9 +28,8 @@ pub(in crate::pipeline::resolver) fn synthesize_using_correlation(
         return Ok(subquery);
     }
 
-    let inner_schema =
-        crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(&subquery);
-    let inner = identities.known_heading(inner_schema)?;
+    let inner_schema = subquery.semantic_relation();
+    let inner = crate::relation::published_ports(identities, &inner_schema)?;
 
     // Build one comparison per USING column
     let mut comparisons: Vec<ast_resolved::TruthExpression> = Vec::new();
@@ -45,26 +41,20 @@ pub(in crate::pipeline::resolver) fn synthesize_using_correlation(
         let outer_hits: Vec<_> = outer_available
             .iter()
             .copied()
-            .filter(|column| identities.published_sym(*column) == Some(name))
+            .filter(|column| identities.published_sym(column.column()) == Some(name))
             .collect();
         let inner_hits: Vec<_> = inner
             .iter()
             .copied()
-            .filter(|column| identities.published_sym(*column) == Some(name))
+            .filter(|column| identities.published_sym(column.column()) == Some(name))
             .collect();
         let outer = unique_using_column(col_name, "outer", &outer_hits)?;
         let inner = unique_using_column(col_name, "inner", &inner_hits)?;
         let lhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-            ColumnOccurrence {
-                column: outer,
-                explicit_qualifier: false,
-            },
+            ColumnOccurrence::engine(outer),
         )));
         let rhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-            ColumnOccurrence {
-                column: inner,
-                explicit_qualifier: false,
-            },
+            ColumnOccurrence::engine(inner),
         )));
 
         comparisons.push(ast_resolved::TruthExpression::Comparison(Comparison {
@@ -82,18 +72,17 @@ pub(in crate::pipeline::resolver) fn synthesize_using_correlation(
     // this one is built in the resolved phase, so it carries that heading
     // rather than leaving a phantom for a later phase to fill: nothing runs
     // between here and the refiner that would.
-    Ok(subquery.then(ast_resolved::Continuation::Restrict {
+    Ok(subquery.transparently(ast_resolved::Transparent::Restrict {
         condition: combined,
         origin: FilterOrigin::Generated,
-        cpr_schema: inner_schema,
     }))
 }
 
 fn unique_using_column(
     name: &SqlIdentifier,
     side: &str,
-    hits: &[crate::names::ColId],
-) -> Result<crate::names::ColId> {
+    hits: &[crate::relation::PortId],
+) -> Result<crate::relation::PortId> {
     match hits {
         [column] => Ok(*column),
         [] => Err(DelightQLError::column_not_found_error(
@@ -115,13 +104,12 @@ fn unique_using_column(
 /// CDT-SJ classifier and hygienic injection mechanism expect.
 pub(in crate::pipeline::resolver) fn build_using_correlation_filters(
     using_columns: &[SqlIdentifier],
-    outer_available: &[crate::names::ColId],
+    outer_available: &[crate::relation::PortId],
     inner_expression: &ast_resolved::Chain,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<Vec<ast_resolved::TruthExpression>> {
-    let inner = identities.known_heading(
-        crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(inner_expression),
-    )?;
+    let inner_relation = inner_expression.semantic_relation();
+    let inner = crate::relation::published_ports(identities, &inner_relation)?;
 
     using_columns
         .iter()
@@ -131,26 +119,20 @@ pub(in crate::pipeline::resolver) fn build_using_correlation_filters(
             let outer: Vec<_> = outer_available
                 .iter()
                 .copied()
-                .filter(|column| identities.published_sym(*column) == Some(name))
+                .filter(|column| identities.published_sym(column.column()) == Some(name))
                 .collect();
             let inner: Vec<_> = inner
                 .iter()
                 .copied()
-                .filter(|column| identities.published_sym(*column) == Some(name))
+                .filter(|column| identities.published_sym(column.column()) == Some(name))
                 .collect();
             let outer = unique_using_column(col_name, "outer", &outer)?;
             let inner = unique_using_column(col_name, "inner", &inner)?;
             let lhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                ColumnOccurrence {
-                    column: outer,
-                    explicit_qualifier: false,
-                },
+                ColumnOccurrence::engine(outer),
             )));
             let rhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                ColumnOccurrence {
-                    column: inner,
-                    explicit_qualifier: false,
-                },
+                ColumnOccurrence::engine(inner),
             )));
 
             Ok(ast_resolved::TruthExpression::Comparison(Comparison {
@@ -168,18 +150,17 @@ pub(in crate::pipeline::resolver) fn build_using_correlation_filters(
 /// computation — so a heading pair that refuses at a join refuses here, and
 /// neither placement can quietly perform a step the other rejects.
 pub(in crate::pipeline::resolver) fn build_using_all_correlation_filters(
-    outer_available: &[crate::names::ColId],
+    outer_available: &[crate::relation::PortId],
     inner_expression: &ast_resolved::Chain,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<Vec<ast_resolved::TruthExpression>> {
-    let inner = identities.known_heading(
-        crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(inner_expression),
-    )?;
+    let inner_relation = inner_expression.semantic_relation();
+    let inner = crate::relation::published_ports(identities, &inner_relation)?;
 
     Ok(
-        crate::pipeline::resolver::join_resolver::shared_using_names(
+        crate::pipeline::resolver::lexical::shared_using_names(
             outer_available,
-            &inner.to_vec(),
+            &inner,
             identities,
         )?
         .into_iter()
@@ -187,16 +168,10 @@ pub(in crate::pipeline::resolver) fn build_using_all_correlation_filters(
             ast_resolved::TruthExpression::Comparison(Comparison {
                 operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
                 left: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
-                    NamedReference(ColumnOccurrence {
-                        column: shared.left,
-                        explicit_qualifier: false,
-                    }),
+                    NamedReference(ColumnOccurrence::engine(shared.left)),
                 ))),
                 right: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
-                    NamedReference(ColumnOccurrence {
-                        column: shared.right,
-                        explicit_qualifier: false,
-                    }),
+                    NamedReference(ColumnOccurrence::engine(shared.right)),
                 ))),
             })
         })
@@ -212,7 +187,7 @@ pub(in crate::pipeline::resolver) fn build_using_all_correlation_filters(
 ///
 /// A pattern member says what it binds; nothing here re-derives that from a
 /// value's shape, because a pattern member holds no value.
-pub(in crate::pipeline::resolver) fn extract_key_mappings_from_unresolved_pattern(
+pub(crate) fn extract_key_mappings_from_unresolved_pattern(
     pattern: &ast_unresolved::TreePattern,
 ) -> Result<Vec<(String, String)>> {
     let mut mappings = Vec::new();
@@ -428,9 +403,9 @@ pub(in crate::pipeline::resolver) fn validate_no_sibling_explosions(
 /// Bind an unresolved pattern's binders to the occurrences the destructure
 /// minted for them. Keys, reaches and iteration marks are spec material and
 /// cross unchanged.
-pub(in crate::pipeline::resolver) fn convert_destructure_pattern_to_resolved(
+pub(crate) fn convert_destructure_pattern_to_resolved(
     pattern: ast_unresolved::TreePattern,
-    columns: &std::collections::HashMap<crate::names::Sym, crate::names::ColId>,
+    columns: &std::collections::HashMap<crate::names::Sym, crate::relation::PortId>,
     identities: &crate::names::Registry,
 ) -> Result<ast_resolved::TreePattern> {
     use crate::pipeline::asts::core::{PatternTarget, RecordPatternMember, TreePattern};
@@ -482,9 +457,9 @@ pub(in crate::pipeline::resolver) fn convert_destructure_pattern_to_resolved(
 
 fn destructure_column(
     name: &str,
-    columns: &std::collections::HashMap<crate::names::Sym, crate::names::ColId>,
+    columns: &std::collections::HashMap<crate::names::Sym, crate::relation::PortId>,
     identities: &crate::names::Registry,
-) -> Result<crate::names::ColId> {
+) -> Result<crate::relation::PortId> {
     let spelling = identities.intern(name, false);
     columns
         .get(&identities.canonical(spelling))
@@ -494,74 +469,6 @@ fn destructure_column(
                 "destructuring pattern output has no structural column occurrence",
             )
         })
-}
-
-/// Expand a consulted sigma predicate into the OR'd body of its clauses.
-///
-/// The POLARITY is not applied here. It observes this body — `IS TRUE` or
-/// `IS NOT TRUE` — and that observation is a collapse with no expression in
-/// truth position, so it rides on the application until the lowering spells
-/// it. Wrapping the body in Kleene NOT here is what made `\+f(x)` and `+f(x)`
-/// both drop a row whose body is UNKNOWN.
-pub(in crate::pipeline::resolver) fn expand_consulted_sigma(
-    definition: &str,
-    functor: &str,
-    arguments: Vec<ast_unresolved::DomainExpression>,
-) -> Result<ast_unresolved::TruthExpression> {
-    let group = crate::ddl::reconstruct::group(definition).map_err(|e| {
-        DelightQLError::parse_error(format!(
-            "No definitions found for sigma predicate '{functor}': {e}"
-        ))
-    })?;
-    if group.kind() != DefKind::Sigma {
-        return Err(DelightQLError::parse_error(format!(
-            "Expected sigma predicate definition for '{}', got {:?}",
-            functor,
-            group.kind()
-        )));
-    }
-
-    let mut clause_booleans: Vec<ast_unresolved::TruthExpression> = Vec::new();
-
-    for clause in group.clauses() {
-        let params = clause.params();
-
-        // Validate arity
-        if params.len() != arguments.len() {
-            return Err(DelightQLError::validation_error(
-                format!(
-                    "Sigma predicate '{}' expects {} arguments, got {}",
-                    functor,
-                    params.len(),
-                    arguments.len()
-                ),
-                "Arity mismatch",
-            ));
-        }
-
-        // A sigma rule's body is a TRUTH, and the parse-level category says
-        // so: `p(x) :- users` never becomes one of these.
-        let body = clause.as_truth_expr().ok_or_else(|| {
-            DelightQLError::parse_error(format!(
-                "Sigma predicate '{}' clause has no truth body",
-                functor
-            ))
-        })?;
-
-        // Build param → argument substitution map
-        let param_map: HashMap<&str, &ast_unresolved::DomainExpression> = params
-            .iter()
-            .map(HoParam::name)
-            .map(delightql_types::SqlIdentifier::as_str)
-            .zip(arguments.iter())
-            .collect();
-
-        clause_booleans.push(substitute_in_truth_expr(body.clone(), &param_map));
-    }
-
-    // Every clause is an alternative: the predicate holds if any does.
-    Ok(ast_unresolved::TruthExpression::any(clause_booleans)
-        .expect("a sigma definition group has at least one clause"))
 }
 
 /// Expand a table (fact) used as a sigma predicate.
@@ -620,10 +527,8 @@ pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
                 passthrough: false,
             },
             outer: false,
-            cpr_schema: (),
         },
         ast_unresolved::Access::All,
-        (),
     );
 
     // The fact relation resolves on its own, through the ordinary
@@ -655,7 +560,7 @@ pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
     // dimension `i` of the fact relation: the correlation is positional, which
     // is what a fact's argument list means.
     let subquery =
-        synthesize_argument_correlation(*subquery, resolved_arguments, &fold.registry.identities)?;
+        synthesize_argument_correlation(*subquery, resolved_arguments, &fold.core.identities)?;
 
     Ok(ast_resolved::TruthExpression::Existence(Existence {
         polarity,
@@ -673,12 +578,12 @@ pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
 fn synthesize_argument_correlation(
     subquery: ast_resolved::Chain,
     arguments: Vec<ast_resolved::DomainExpression>,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<ast_resolved::Chain> {
     use crate::pipeline::asts::core::FilterOrigin;
 
-    let fact_scope = crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(&subquery);
-    let dimensions = identities.known_heading(fact_scope)?;
+    let fact_scope = subquery.semantic_relation();
+    let dimensions = crate::relation::published_ports(identities, &fact_scope)?;
     if dimensions.len() < arguments.len() {
         return Err(DelightQLError::validation_error(
             format!(
@@ -698,10 +603,7 @@ fn synthesize_argument_correlation(
                 operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
                 left: Box::new(argument),
                 right: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
-                    NamedReference(ColumnOccurrence {
-                        column: dimension,
-                        explicit_qualifier: true,
-                    }),
+                    NamedReference(ColumnOccurrence::engine_qualified(dimension)),
                 ))),
             })
         })
@@ -709,58 +611,63 @@ fn synthesize_argument_correlation(
     let combined = ast_resolved::TruthExpression::all(combined)
         .expect("a sigma predicate refuses an empty argument list");
 
-    Ok(subquery.then(ast_resolved::Continuation::Restrict {
+    Ok(subquery.transparently(ast_resolved::Transparent::Restrict {
         condition: combined,
         origin: FilterOrigin::Generated,
-        cpr_schema: fact_scope,
     }))
 }
 
 #[cfg(test)]
 mod sigma_argument_tests {
     use super::*;
-    use crate::names::{Addressing, ColumnOrigin, Hint, Registry, ScopeOrigin, ValueFacts};
-    use crate::pipeline::asts::core::{Access, Relation};
+    use crate::pipeline::asts::core::Access;
 
-    fn fact_scope(registry: &Registry, name: &str, columns: &[&str]) -> crate::names::ScopeId {
-        let spelling = registry.intern(name, false);
-        let scope = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::User(spelling), None);
-        for (position, column) in columns.iter().enumerate() {
-            let published = registry.intern(column, false);
-            registry.mint_column(
-                scope,
-                ColumnOrigin::Bound {
-                    position: position as u32,
-                },
-                Some(published),
-                Addressing::Published,
-                ValueFacts::default(),
-            );
-        }
-        scope
-    }
-
-    fn fact_chain(scope: crate::names::ScopeId) -> ast_resolved::Chain {
-        Relation::ground_read(Access::All, false, scope)
-    }
-
-    fn outer_column(registry: &Registry, name: &str) -> crate::names::ColId {
-        let scope = fact_scope(registry, "outer", &[name]);
+    fn fact_scope(
+        registry: &crate::relation::Planning,
+        name: &str,
+        columns: &[&str],
+    ) -> crate::relation::SemanticRelation {
+        let answer = registry.intern(name, false);
+        let entity = registry.mint_entity(answer);
+        let slots: Vec<_> = columns
+            .iter()
+            .enumerate()
+            .map(|(position, column)| crate::relation::form::SourceSlot {
+                position: position as u32,
+                named: Some(registry.intern(column, false)),
+                declared_type: None,
+            })
+            .collect();
         registry
-            .known_heading(scope)
-            .expect("a published heading")
-            .in_order()
-            .next()
-            .copied()
-            .expect("one published column")
+            .authority()
+            .derive(crate::relation::RelForm::Source(
+                crate::relation::form::SourceSpec {
+                    origin: crate::relation::form::SourceOrigin::Catalog { entity },
+                    slots: &slots,
+                    answers_to: Some(answer),
+                },
+            ))
+            .unwrap()
     }
 
-    fn argument(column: crate::names::ColId) -> ast_resolved::DomainExpression {
+    fn fact_chain(
+        registry: &crate::relation::Planning,
+        scope: crate::relation::SemanticRelation,
+    ) -> ast_resolved::Chain {
+        registry
+            .authority()
+            .ground_read(Access::All, false, scope)
+            .unwrap()
+    }
+
+    fn outer_column(registry: &crate::relation::Planning, name: &str) -> crate::relation::PortId {
+        let relation = fact_scope(registry, "outer", &[name]);
+        crate::relation::published_ports(registry, &relation).unwrap()[0]
+    }
+
+    fn argument(column: crate::relation::PortId) -> ast_resolved::DomainExpression {
         ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-            ColumnOccurrence {
-                column,
-                explicit_qualifier: false,
-            },
+            ColumnOccurrence::engine(column),
         )))
     }
 
@@ -770,24 +677,26 @@ mod sigma_argument_tests {
     /// existed to survive.
     #[test]
     fn an_argument_constrains_the_dimension_at_its_position() {
-        let registry = Registry::new(&[]);
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         let scope = fact_scope(&registry, "no_data", &["x", "y"]);
-        let dimensions: Vec<_> = registry
-            .known_heading(scope)
-            .expect("a published heading")
-            .in_order()
-            .copied()
-            .collect();
+        let dimensions = crate::relation::published_ports(&registry, &scope).unwrap();
         let outer = outer_column(&registry, "x");
 
-        let guarded =
-            synthesize_argument_correlation(fact_chain(scope), vec![argument(outer)], &registry)
-                .expect("one argument, two dimensions");
+        let guarded = synthesize_argument_correlation(
+            fact_chain(&registry, scope),
+            vec![argument(outer)],
+            &registry,
+        )
+        .expect("one argument, two dimensions");
 
         let ast_resolved::Continuation::Restrict {
             condition: predicate,
             ..
-        } = guarded.continuations.last().expect("a guard was appended")
+        } = guarded
+            .continuations()
+            .last()
+            .expect("a guard was appended")
+            .form()
         else {
             panic!("expected a restriction carrying the guard");
         };
@@ -816,13 +725,13 @@ mod sigma_argument_tests {
     /// refused, not silently truncated by the zip.
     #[test]
     fn more_arguments_than_dimensions_is_refused() {
-        let registry = Registry::new(&[]);
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         let scope = fact_scope(&registry, "no_data", &["x"]);
         let first = outer_column(&registry, "a");
         let second = outer_column(&registry, "b");
 
         assert!(synthesize_argument_correlation(
-            fact_chain(scope),
+            fact_chain(&registry, scope),
             vec![argument(first), argument(second)],
             &registry,
         )

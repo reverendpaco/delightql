@@ -39,6 +39,27 @@ fn the_functor_family_splits_by_interior() {
     assert_eq!(count::<CatalogFunctor>(&catalog), 1);
 }
 
+/// A ONE-COLUMN ANONYMOUS RELATION IS A RELATION IN ARGUMENT POSITION.
+/// `_(a @ 1)` opening a higher-order argument list shares `_(` and its name
+/// with a sparse fill opening a lifted row; the separator is ONE token for
+/// both, so the fork is settled by the token after it and the argument is
+/// an anonymous relation — not a sparse fill left standing in an error.
+/// A sparse fill inside a data row is still a sparse fill.
+#[test]
+fn a_one_column_anonymous_relation_is_an_argument() {
+    let argument = admits("wrap(_(a @ 1))(*)");
+    assert_eq!(count::<HoPart>(&argument), 1);
+    assert_eq!(count::<AnonGrelex>(&argument), 1);
+    assert_eq!(count::<SparseFill>(&argument), 0);
+
+    let dashed = admits("wrap(_(a --- 1))(*)");
+    assert_eq!(count::<AnonGrelex>(&dashed), 1);
+
+    let filled = admits("_(x, y? @ 1, _(y @ 2))");
+    assert_eq!(count::<AnonGrelex>(&filled), 1);
+    assert_eq!(count::<SparseFill>(&filled), 1);
+}
+
 /// THE IMPLICIT STAR: an interior continuation always starts realised, so the
 /// `*` in `users(*)` is the qualify postfix and `p(C) ≡ p(*) C`. There is no
 /// second glob carrier competing for it.
@@ -197,13 +218,22 @@ fn meta_stacks_rather_than_spelling_a_second_token() {
 // Value and truth position
 // ---------------------------------------------------------------------------
 
-/// CROSSING LAW, one direction: truth enters value position at an out item, and
-/// the adapter is a carrier of its own so the crossing is visible.
+/// CROSSING LAW, one direction: truth enters value position through one
+/// carrier of its own, so the crossing is visible wherever a value stands.
 #[test]
 fn truth_crosses_into_value_position_at_an_out_item() {
     let tree = admits("users(*) |> ((age > 18) as adult)");
-    assert_eq!(count::<TruthAsValue>(&tree), 1);
+    assert_eq!(count::<CrossedTruth>(&tree), 1);
     assert_eq!(count::<Comparison>(&tree), 1);
+}
+
+/// The crossing is RECURSIVE: a crossed truth is an ordinary operand, so a
+/// comparison may compare one, and the inner crossing keeps its own node.
+#[test]
+fn a_crossed_truth_is_an_operand_of_a_comparison() {
+    let tree = admits("users(*) |> (((age > 18) = true) as adult)");
+    assert_eq!(count::<CrossedTruth>(&tree), 2);
+    assert_eq!(count::<Comparison>(&tree), 2);
 }
 
 /// NO PEMDAS, structurally: an operand derives no infix form, so a chain needs
@@ -372,9 +402,31 @@ fn the_window_glyph_has_two_carriers() {
     assert_eq!(count::<GroupDelegate>(&delegate), 1);
     assert_eq!(count::<WindowSpec>(&delegate), 0);
 
-    let window = admits("users(*) |> (sum:(a) <~ %(b) #(c) rows(_, .))");
+    let window = admits("users(*) |> (sum:(a <~ %(b) #(c) rows(_, .)))");
     assert_eq!(count::<WindowSpec>(&window), 1);
     assert_eq!(count::<GroupDelegate>(&window), 0);
+}
+
+/// THE SPEC IS ENCLOSED BY THE CALL IT WINDOWS, so enclosure decides
+/// attachment: the spec belongs to the call whose parens contain it, never to
+/// an enclosing call, and a windowed call composes as a closed value.
+#[test]
+fn the_window_spec_attaches_to_the_call_that_encloses_it() {
+    let nested = admits("users(*) |> (coalesce:(lag:(balance <~ #(created_at)), 0) as prev)");
+    assert_eq!(count::<WindowApplication>(&nested), 1);
+    assert_eq!(count::<StandardApplication>(&nested), 1);
+    assert!(text_of::<WindowApplication>(&nested).starts_with("lag:("));
+
+    let composed = admits("users(*) |> (sum:(b <~ %(c)) * count:(* <~ %(c)) as w)");
+    assert_eq!(count::<WindowApplication>(&composed), 2);
+    assert_eq!(count::<WindowSpec>(&composed), 2);
+
+    let empty = admits("users(*) |> (row_number:(<~) as rn)");
+    assert_eq!(count::<WindowSpec>(&empty), 1);
+
+    let cover = admits("users(*) |> +$(ntile:(4 <~ #(@ desc)) as :\"{@}_q\")(balance)");
+    assert_eq!(count::<OpenWindowFunctor>(&cover), 1);
+    assert_eq!(count::<AsNameTemplate>(&cover), 1);
 }
 
 /// THE SINGLETON PIPE is sugar for the zero-key group, and the CST keeps the
@@ -419,13 +471,44 @@ fn effect_groups_are_read_by_position() {
     assert_eq!(count::<HoPart>(&empty), 0);
 }
 
+/// `as u` and `as u(slots)` are two productions. The argumentative stage
+/// is not a stage name followed by a paren group, a stage name never
+/// absorbs one, and the slot row is the same argumentative form a caller
+/// pattern writes — the grammar admits no other row there.
+#[test]
+fn an_argumentative_stage_is_its_own_production() {
+    let named = admits("users(*) as u");
+    assert_eq!(count::<StageName>(&named), 1);
+    assert_eq!(count::<ArgumentativeStage>(&named), 0);
+
+    let patterned = admits("users(*) as u(a, _, \"x\", t.b)");
+    assert_eq!(count::<ArgumentativeStage>(&patterned), 1);
+    assert_eq!(count::<StageName>(&patterned), 0);
+    assert_eq!(count::<ArgumentativeForm>(&patterned), 1);
+
+    // The stage attaches wherever a stage name attaches: after a pipe
+    // stage, after a member, and beside an outer-marked access's peer.
+    let staged = admits("users(*) |> (id, name) as u(a, b) |> (a)");
+    assert_eq!(count::<ArgumentativeStage>(&staged), 1);
+    let member = admits("a(*), b(*) as u(x, y)");
+    assert_eq!(count::<ArgumentativeStage>(&member), 1);
+
+    // A malformed slot row is refused where it is written, not read as a
+    // stage name with a stray group. A renamed slot is admitted only so the
+    // normalizer can teach against it, exactly as in a caller pattern.
+    refuses_query("users(*) as u()");
+    refuses_query("users(*) as u(|> (a))");
+    let renamed = admits("users(*) as u(a as b, c)");
+    assert_eq!(count::<RenamedSlot>(&renamed), 1);
+}
+
 /// The unwrap pipe is a PIPE FORM, never a boundary.
 #[test]
 fn the_unwrap_pipe_is_a_pipe_form() {
     let tree = admits("users(*) !> log!(*)");
     assert_eq!(count::<UnwrapPipeOperator>(&tree), 1);
     assert_eq!(count::<PostPipeEffrelex>(&tree), 1);
-    assert_eq!(count::<StageBoundary>(&tree), 0);
+    assert_eq!(count::<StageName>(&tree), 0);
 }
 
 /// Pure material attaches to an effect chain through the ordinary continuation
@@ -543,9 +626,7 @@ fn a_definition_documents_itself_in_its_doc_slot() {
 }
 
 /// The doc slot's OTHER inhabitants are the annotations that need no relation.
-/// An assertion's body is a continuation evaluated against the relation it
-/// stands on, and the slot precedes the body — so it has no derivation there,
-/// and the same assertion on a continuation anchor is ordinary.
+/// The retired assertion annotation has no derivation in either slot.
 #[test]
 fn a_doc_slot_takes_the_annotations_that_need_no_relation() {
     for src in [
@@ -559,12 +640,7 @@ fn a_doc_slot_takes_the_annotations_that_need_no_relation() {
     }
 
     refuses_file("v(*) :- (~~assert ~> count:(*) as c ~~) users(*)");
-    assert_eq!(
-        count::<AssertAnnotation>(&admits_file(
-            "v(*) :- users(*) (~~assert ~> count:(*) as c ~~)"
-        )),
-        1
-    );
+    refuses_file("v(*) :- users(*) (~~assert ~> count:(*) as c ~~)");
 }
 
 /// `(/* … */)` is the other documentation form and stays a different one: a
@@ -721,14 +797,11 @@ fn the_lift_and_the_anon_table_are_the_same_argument_row() {
 // Annotations and roots
 // ---------------------------------------------------------------------------
 
-/// THE SET IS CLOSED. Five lawful annotations plus the reserved room that must
+/// THE SET IS CLOSED. Four lawful annotations plus the reserved room that must
 /// parse so its refusal can teach.
 #[test]
 fn the_annotation_set_is_the_closed_one() {
-    assert_eq!(
-        count::<AssertAnnotation>(&admits("users(*) (~~assert |> (a) ~~)")),
-        1
-    );
+    support::refuses_query("users(*) (~~assert |> (a) ~~)");
     assert_eq!(
         count::<ErrorAnnotation>(&admits("users(*) (~~error://unbound/x ~~)")),
         1

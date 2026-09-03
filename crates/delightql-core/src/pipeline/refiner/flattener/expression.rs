@@ -25,32 +25,113 @@ pub(super) fn flatten_expression(
         return flatten_opaque(expr, segment, ctx);
     }
 
-    let mut expr = expr;
-    let last = expr.pop_step();
-    match last {
-        None => {
+    // The outermost step and the operand it consumes travel as ONE value,
+    // so the arms below that put the step back cannot put it anywhere else.
+    let peeled = match expr.peel() {
+        Ok(peeled) => peeled,
+        Err(expr) => {
+            // THE HEAD TRAVELS WHOLE. Taking its form out and its relation
+            // out beside it is what used to make the refined head a fresh
+            // assembly of two loose halves; the node crosses instead.
             let (head, access, _) = expr.split_head_access();
-            match head {
-                resolved::Grelex::Reference(rel) => {
-                    flatten_read(rel, access, segment, ctx)?;
-                }
-                resolved::Grelex::Literal(anon) => {
-                    flatten_anon_table(anon, segment, ctx)?;
-                }
-            }
+            flatten_head(head, access, segment, ctx)?;
+            return Ok(());
         }
+    };
 
-        // A dimension access on the relation the chain has built publishes
-        // its own heading, exactly as a pipe stage does; the rebuilder
-        // refines the stored chain.
-        Some(step @ resolved::Continuation::Access { .. }) => {
-            flatten_opaque(expr.then(step), segment, ctx)?;
+    // A ZERO-WIDTH anonymous table is still THIS segment's table. Its
+    // trailing unasked access is the read's own narrowing (RULINGS
+    // 2026-08-19: an all-consumed slot row publishes no columns and keeps
+    // its row count) — sending it down the opaque road below would hide
+    // its header constraints from this segment's analyzer, and a header
+    // term reaching a sibling table would then have no join to stand on.
+    if matches!(
+        peeled.last().form(),
+        resolved::Continuation::Access {
+            access: resolved::Access::Unasked,
+            ..
         }
+    ) && !peeled.prefix().has_steps()
+        && matches!(
+            peeled.prefix().head().form(),
+            resolved::GroundForm::Literal(_)
+        )
+    {
+        let (prefix, _last) = peeled.split();
+        let read_result = *prefix.head().result();
+        let resolved::GroundForm::Literal(anon) = prefix
+            .into_bare_head()
+            .expect("a stepless prefix is a bare head")
+            .into_form()
+        else {
+            unreachable!("the head form was just matched as a literal");
+        };
+        let resolved::AnonRelation { table, outer, .. } = anon;
+        segment.tables.push(FlatTable {
+            relation: read_result,
+            head: None,
+            position: ctx.position,
+            _scope_id: ctx.scope_id,
+            access: resolved::Access::Unasked,
+            outer,
+            anonymous_data: Some(AnonymousTableData { body: table.body }),
+            pipe_expr: None,
+            _table_filters: vec![],
+            tvf_data: None,
+            subquery_segment: None,
+        });
+        ctx.position += 1;
+        return Ok(());
+    }
 
+    // A dimension access, a pipe stage and the structural forms each
+    // publish a heading of their own, so the segment sees only the relation
+    // produced; the rebuilder refines the stored chain. The step goes back
+    // exactly where it came from.
+    if matches!(
+        peeled.last().form(),
+        resolved::Continuation::Access { .. }
+            | resolved::Continuation::Pipe { .. }
+            | resolved::Continuation::Structural(_)
+    ) {
+        return flatten_opaque(peeled.rejoin(), segment, ctx);
+    }
+
+    // A bound and a destructure must stay with their source as a UNIT.
+    // Flattening through either loses left-to-right meaning:
+    // `users(*), #<5, products(*)` bounds the users read, not the join,
+    // and a destructure's added columns belong to the relation it
+    // expanded. Both are stored whole and refined as their own stage.
+    if matches!(
+        peeled.last().form(),
+        resolved::Continuation::Bound { .. } | resolved::Continuation::Destructure { .. }
+    ) {
+        let result = peeled.last().result().to_owned();
+        segment.tables.push(FlatTable {
+            relation: result,
+            head: None,
+            position: ctx.position,
+            _scope_id: ctx.scope_id,
+            access: resolved::Access::All,
+            outer: false,
+            anonymous_data: None,
+            pipe_expr: Some(Box::new(peeled.rejoin())),
+            _table_filters: vec![],
+            tvf_data: None,
+            subquery_segment: None,
+        });
+        ctx.position += 1;
+        return Ok(());
+    }
+
+    let (expr, last) = peeled.split();
+    let result = *last.result();
+    let form = last.into_form();
+    match form {
         // A whole-heading correlation relates two ARMS of a set operation.
         // A chain standing on a bag step is opaque above, so reaching here
         // means there is no run for it to correlate.
-        Some(resolved::Continuation::Correlate { .. }) => {
+        resolved::Continuation::Correlate { .. } => {
             return Err(crate::error::DelightQLError::validation_error_categorized(
                 "resolution/setop/correlation_owner",
                 "a whole-heading correlation relates two operands of a set operation, \
@@ -60,9 +141,9 @@ pub(super) fn flatten_expression(
             ));
         }
 
-        Some(resolved::Continuation::Member {
+        resolved::Continuation::Member {
             rhs, correlation, ..
-        }) => {
+        } => {
             let left = expr;
             let right = rhs;
             // Flatten left side
@@ -78,45 +159,34 @@ pub(super) fn flatten_expression(
             // Record the join operator
             let left_tables = segment.tables[left_start..left_end]
                 .iter()
-                .map(|table| table.identity)
+                .map(|table| table.relation.scope())
                 .collect();
 
             let right_tables = segment.tables[right_start..right_end]
                 .iter()
-                .map(|table| table.identity)
+                .map(|table| table.relation.scope())
                 .collect();
 
-            // The member's correlation says which of the two it is. A
-            // correspondence belongs to the operator; a condition becomes a
-            // predicate below.
-            let correspondence = correlation
-                .as_ref()
-                .and_then(resolved::MemberCorrelation::correspondence)
-                .cloned();
-
-            // Store the join operator
+            // The member's correlation is TOTAL and belongs to the operator
+            // WHOLE — correspondence, condition, or decided Cartesian alike.
+            // Pooling the condition among the ambient predicates spent the
+            // construction's judgment and asked the classifier to buy it
+            // back out of the predicate's references.
             segment.operators.push(FlatOperator {
                 position: ctx.position,
-                kind: FlatOperatorKind::Join { correspondence },
+                kind: FlatOperatorKind::Join { correlation },
                 left_tables,
                 right_tables,
             });
 
-            // Add join condition as predicate (skips USING — already handled above)
-            add_correlation(correlation, segment, ctx);
-
             ctx.position += 1;
         }
 
-        Some(resolved::Continuation::BagOp { .. }) => {
+        resolved::Continuation::BagOp { .. } => {
             unreachable!("a chain standing on a bag step is opaque to flattening")
         }
 
-        Some(resolved::Continuation::Restrict {
-            condition,
-            origin,
-            cpr_schema,
-        }) => {
+        resolved::Continuation::Restrict { condition, origin } => {
             let source = expr;
             // HoGroundScalar filters must stay bound to their source ConsultedView.
             // Don't pool them into the segment's global predicates — that would
@@ -127,7 +197,7 @@ pub(super) fn flatten_expression(
                 // Attach the filter to the last-added table (the ConsultedView)
                 if let Some(last_table) = segment.tables.last_mut() {
                     last_table._table_filters.push((condition, origin));
-                    last_table.schema = cpr_schema;
+                    last_table.relation = result;
                 }
                 return Ok(());
             }
@@ -136,47 +206,14 @@ pub(super) fn flatten_expression(
             add_predicate(condition, origin, segment, ctx);
         }
 
-        // A bound and a destructure must stay with their source as a UNIT.
-        // Flattening through either loses left-to-right meaning:
-        // `users(*), #<5, products(*)` bounds the users read, not the join,
-        // and a destructure's added columns belong to the relation it
-        // expanded. Both are stored whole and refined as their own stage.
-        Some(
-            step @ (resolved::Continuation::Bound { .. }
-            | resolved::Continuation::Destructure { .. }),
-        ) => {
-            let cpr_schema = *step
-                .cpr_schema()
-                .expect("a bound or destructure carries its heading");
-            segment.tables.push(FlatTable {
-                identity: cpr_schema,
-                position: ctx.position,
-                _scope_id: ctx.scope_id,
-                access: resolved::Access::All,
-                schema: cpr_schema,
-                outer: false,
-                anonymous_data: None,
-                inner_relation_pattern: None,
-                preminted_scope: None,
-                pipe_expr: Some(Box::new(expr.then(step))),
-                consulted_view_query: None,
-                _table_filters: vec![],
-                tvf_data: None,
-                subquery_segment: None,
-            });
-            ctx.position += 1;
-            return Ok(());
+        resolved::Continuation::Access { .. }
+        | resolved::Continuation::Pipe { .. }
+        | resolved::Continuation::Structural(_)
+        | resolved::Continuation::Bound { .. }
+        | resolved::Continuation::Destructure { .. } => {
+            unreachable!("the opaque and unit shapes returned above")
         }
-
-        Some(
-            step @ (resolved::Continuation::Pipe { .. } | resolved::Continuation::Structural(_)),
-        ) => {
-            // A pipe stage and the structural forms each publish their own
-            // heading, so the segment sees only the relation produced. The
-            // rebuilder refines the stored chain.
-            flatten_opaque(expr.then(step), segment, ctx)?;
-        }
-        Some(resolved::Continuation::ErJoin(_)) => {
+        resolved::Continuation::ErJoin(_) => {
             unreachable!("ER-join consumed by resolver")
         }
     }
@@ -194,23 +231,16 @@ fn flatten_opaque(
     segment: &mut FlatSegment,
     ctx: &mut FlattenContext,
 ) -> Result<()> {
-    let schema = *expr
-        .continuations
-        .last()
-        .and_then(resolved::Continuation::cpr_schema)
-        .unwrap_or_else(|| panic!("an opaque chain reached flattening without a heading"));
+    let schema = expr.semantic_relation();
     segment.tables.push(FlatTable {
-        identity: schema,
+        relation: schema,
+        head: None,
         position: ctx.position,
         _scope_id: ctx.scope_id,
         access: resolved::Access::All,
-        schema,
         outer: false,
         anonymous_data: None,
-        inner_relation_pattern: None,
-        preminted_scope: None,
         pipe_expr: Some(Box::new(expr)),
-        consulted_view_query: None,
         _table_filters: vec![],
         tvf_data: None,
         subquery_segment: None,
@@ -219,30 +249,49 @@ fn flatten_opaque(
     Ok(())
 }
 
+/// Flatten a READ: the head node, and what its parens asked of it.
+///
+/// The node is what the rebuilder crosses back into the refined phase, so
+/// it is stored whole for every read kind that has one. The relation is read
+/// OUT of it here rather than carried beside it.
+pub(super) fn flatten_head(
+    head: resolved::Grelex,
+    access: Option<resolved::Access>,
+    segment: &mut FlatSegment,
+    ctx: &mut FlattenContext,
+) -> Result<()> {
+    let result = *head.result();
+    match head.form().clone() {
+        resolved::GroundForm::Literal(anon) => {
+            return flatten_anon_table(anon, result, segment, ctx);
+        }
+        resolved::GroundForm::Reference(rel) => {
+            flatten_read(rel, head, result, access, segment, ctx)
+        }
+    }
+}
+
 /// Flatten a READ: a relation, and what its parens asked of it.
-pub(super) fn flatten_read(
+fn flatten_read(
     rel: resolved::Relation,
+    head: resolved::Grelex,
+    result: crate::relation::SemanticRelation,
     access: Option<resolved::Access>,
     segment: &mut FlatSegment,
     ctx: &mut FlattenContext,
 ) -> Result<()> {
     match rel {
-        resolved::Relation::Ground {
-            cpr_schema, outer, ..
-        } => {
+        resolved::Relation::Ground { outer, .. } => {
             let access = access.unwrap_or(resolved::Access::All);
             segment.tables.push(FlatTable {
-                identity: cpr_schema,
+                relation: result,
+                head: Some(head),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
                 access: access.clone(),
-                schema: cpr_schema,
                 outer,
                 anonymous_data: None,
-                inner_relation_pattern: None,
-                preminted_scope: None,
                 pipe_expr: None,
-                consulted_view_query: None,
                 _table_filters: vec![],
                 tvf_data: None,
                 subquery_segment: None,
@@ -253,29 +302,29 @@ pub(super) fn flatten_read(
                     .tables
                     .last()
                     .expect("the ground relation was just flattened")
-                    .identity,
+                    .relation
+                    .scope(),
             );
             ctx.position += 1;
         }
 
-        resolved::Relation::FunctorCall {
-            call,
-            alias: (),
-            cpr_schema: published,
-        } => {
+        resolved::Relation::FunctorCall { call, alias: () } => {
+            let published = result;
             let function = call.call().callee;
             let arguments: Vec<Option<resolved::DomainExpression>> = match &call.call().arguments {
                 crate::pipeline::asts::core::operators::CallArguments::None => Vec::new(),
                 crate::pipeline::asts::core::operators::CallArguments::HigherOrder(part) => part
-                    .members
+                    .members()
                     .iter()
                     .map(|arg| match arg {
                         crate::pipeline::asts::core::operators::HoArgument::Value(value) => {
-                            value.domain().cloned()
+                            Some(value.value.clone())
                         }
                         crate::pipeline::asts::core::operators::HoArgument::Skip => None,
-                        crate::pipeline::asts::core::operators::HoArgument::Relation(_) => {
-                            unreachable!("a higher-order table argument survived grounding")
+                        crate::pipeline::asts::core::operators::HoArgument::Relation(_)
+                        | crate::pipeline::asts::core::operators::HoArgument::Rule(_)
+                        | crate::pipeline::asts::core::operators::HoArgument::Landed(_) => {
+                            unreachable!("a higher-order value argument survived grounding")
                         }
                         crate::pipeline::asts::core::operators::HoArgument::Landing(landing) => {
                             match *landing {}
@@ -286,7 +335,7 @@ pub(super) fn flatten_read(
                     .iter()
                     .map(|member| match member {
                         crate::pipeline::asts::core::operators::ScalarArgument::Value(value) => {
-                            value.domain().cloned()
+                            Some(value.value.clone())
                         }
                         // A callable's BODY is what the callee applies, so
                         // that is the term this position hands it.
@@ -305,19 +354,16 @@ pub(super) fn flatten_read(
                     .collect(),
             };
             let access = access.clone().unwrap_or(resolved::Access::All);
-            let cpr_schema = published;
+            let result = published;
             segment.tables.push(FlatTable {
-                identity: cpr_schema,
+                relation: result,
+                head: Some(head),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
                 access: access.clone(),
-                schema: cpr_schema,
                 outer: call.call().marks.outer(),
                 anonymous_data: None,
-                inner_relation_pattern: None,
-                preminted_scope: None,
                 pipe_expr: None,
-                consulted_view_query: None,
                 _table_filters: vec![],
                 tvf_data: Some(TvfData {
                     function,
@@ -331,43 +377,30 @@ pub(super) fn flatten_read(
 
         resolved::Relation::InnerRelation {
             pattern,
-            preminted_scope,
             alias: _,
             outer,
-            cpr_schema,
         } => {
             // This is handled in inner_relation.rs
             super::inner_relation::flatten_inner_relation(
-                pattern,
-                preminted_scope,
-                outer,
-                cpr_schema,
-                segment,
-                ctx,
+                pattern, head, outer, result, segment, ctx,
             )?;
         }
 
-        resolved::Relation::ConsultedView {
-            body,
-            scoped,
-            outer,
-        } => {
+        resolved::Relation::ConsultedView { body: _, outer } => {
+            let scoped = result;
             // Store the resolved Query as-is for the rebuilder to refine independently.
             // The body is a self-contained subquery — it doesn't participate in the
             // outer segment's FAR cycle. The rebuilder will call refine_query() on it.
             segment.tables.push(FlatTable {
-                identity: scoped,
+                relation: scoped,
+                head: Some(head),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
                 access: resolved::Access::All,
-                schema: scoped,
                 outer,
                 anonymous_data: None,
-                inner_relation_pattern: None,
-                preminted_scope: None,
                 subquery_segment: None,
                 pipe_expr: None,
-                consulted_view_query: Some(body),
                 _table_filters: vec![],
                 tvf_data: None,
             });
@@ -378,21 +411,6 @@ pub(super) fn flatten_read(
     Ok(())
 }
 
-/// Add a join condition to the segment
-pub(super) fn add_correlation(
-    correlation: Option<resolved::MemberCorrelation>,
-    segment: &mut FlatSegment,
-    ctx: &mut FlattenContext,
-) {
-    // Only a CONDITION is a predicate. A correspondence was taken by the
-    // operator above — it tests no row, so pooling it here would classify a
-    // non-predicate against the table pool.
-    if let Some(expr) = correlation.and_then(resolved::MemberCorrelation::into_condition) {
-        add_predicate(expr, resolved::FilterOrigin::UserWritten, segment, ctx);
-    }
-}
-
-/// Add a sigma condition to the segment
 /// Add a predicate to the segment
 pub(super) fn add_predicate(
     expr: resolved::TruthExpression,
@@ -414,6 +432,7 @@ pub(super) fn add_predicate(
 /// Flatten an anonymous table into the segment.
 pub(super) fn flatten_anon_table(
     anon: resolved::AnonRelation,
+    result: crate::relation::SemanticRelation,
     segment: &mut FlatSegment,
     ctx: &mut FlattenContext,
 ) -> Result<()> {
@@ -422,24 +441,20 @@ pub(super) fn flatten_anon_table(
         alias: _alias,
         outer,
     } = anon;
-    let cpr_schema = table.cpr_schema;
 
     log::debug!(
         "Flattening anonymous table with {} headers",
         table.body.header.as_ref().map_or(0, |h| h.len())
     );
     segment.tables.push(FlatTable {
-        identity: cpr_schema,
+        relation: result,
+        head: None,
         position: ctx.position,
         _scope_id: ctx.scope_id,
         access: resolved::Access::All,
-        schema: cpr_schema,
         outer,
         anonymous_data: Some(AnonymousTableData { body: table.body }),
-        inner_relation_pattern: None,
-        preminted_scope: None,
         pipe_expr: None,
-        consulted_view_query: None,
         _table_filters: vec![],
         tvf_data: None,
         subquery_segment: None,

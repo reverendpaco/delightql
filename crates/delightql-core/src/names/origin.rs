@@ -7,10 +7,10 @@
 //! exhaustively, so a new variant does not compile until the naming
 //! authority has an answer for it.
 //!
-//! An origin is not a name and never becomes one. It is what baptism reads
+//! A kind is not a name and never becomes one. It is what baptism reads
 //! when there is no user spelling to use.
 
-use super::id::{ColId, EntityId, ScopeId, Spelling, Sym};
+use super::id::{EntityId, Spelling, Sym};
 
 /// A function form chosen by the compiler rather than authored as a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -78,34 +78,34 @@ pub enum FnOrigin {
 
 /// Why a scope exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScopeOrigin {
+pub enum ScopeKind {
     /// `users(*)` — a catalog access.
     BaseTable { entity: EntityId },
     /// `... as p` — a user alias over another scope.
-    UserAlias { of: ScopeId },
+    UserAlias,
     /// `(1, 2, 3)` — an anonymous relation literal.
     AnonRelation,
     /// A join result whose heading republishes occurrences from both inputs.
-    Join { left: ScopeId, right: ScopeId },
+    Join,
     /// `|>` — a pipe stage over its input.
-    PipeStage { input: ScopeId },
+    PipeStage,
     /// A compiler wrap.
-    Wrap { input: ScopeId, why: WrapReason },
+    Wrap { why: WrapReason },
     /// A WITH binding.
-    Cte { input: ScopeId, role: CteRole },
+    Cte { role: CteRole },
     /// One operand of a set operation.
-    SetArm { of: ScopeId, arm: u16 },
+    SetArm { arm: u16 },
     /// A resolver-phase scope.
-    Resolution { of: EntityId },
+    Resolution { entity: EntityId },
     /// An entity-relationship chain hop.
-    ErHop { chain: ScopeId, hop: u16 },
+    ErHop { hop: u16 },
     /// A higher-order carrier.
     HoCarrier { role: HoRole },
     /// An effect-plan scratch table. These outlive a single statement,
     /// which is why baptism seals a whole bundle rather than a statement.
     Scratch { role: ScratchRole },
     /// A tree-group interior relation, for drill-down.
-    Interior { of: ColId },
+    Interior,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,95 +147,6 @@ pub enum ScratchRole {
     Barrier,
 }
 
-/// Why a column exists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ColumnOrigin {
-    /// From the catalog; `position` is the catalog ordinal.
-    CatalogColumn { entity: EntityId, position: u32 },
-    /// Same VALUE, new occurrence. This edge is the progenitor link and
-    /// the whole rename chain.
-    Republished { from: ColId, how: Republish },
-    /// A new value computed from zero or more inputs.
-    Computed { via: Computation },
-    /// An argumentative binding at a call-site pattern or anonymous header.
-    Bound { position: u32 },
-    /// A hygiene column the user never wrote.
-    Minted { by: MintReason },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Republish {
-    Passthrough,
-    /// The occurrence a JOIN publishes for one of its arms.
-    ///
-    /// A join is the one boundary that CONSUMES NOTHING: its arms are still
-    /// the statement's FROM entries, so the column it publishes still belongs
-    /// to the relation it came from, and `u` still names that relation. Every
-    /// other boundary ends its input's life.
-    ///
-    /// Recorded at the join rather than inferred afterwards. The inference
-    /// available later is "does a column of this name sit in one of the
-    /// arms" — and a name is not provenance: it cannot tell one arm's `id`
-    /// from the other's, and it stops working the moment the name is one the
-    /// compiler drew.
-    JoinArm,
-    /// The subquery wrap emission puts around a join operand so it can stand
-    /// as one FROM entry. Like [`Republish::JoinArm`] it consumes nothing:
-    /// the wrapped relation is the same relation, re-aliased for SQL syntax,
-    /// so an ownership walk crosses it. A semantic boundary that ends its
-    /// input's life — a projection, a set operation, a view export — must
-    /// not record this kind.
-    EmissionWrap,
-    Rename,
-    BoundaryExport,
-    ArmMerge,
-    UnionCorresponding,
-    /// A carrier minted so a condition hoisted out of a subquery still names
-    /// something the subquery publishes.
-    ///
-    /// The reason is recorded here because it is what tells this occurrence
-    /// apart from every other hygienic republication — a join's merged USING
-    /// column, a pattern's spent slot — and the readers that must find it
-    /// again would otherwise need a list kept beside the tree, which is one
-    /// fact in two places and drifts the first time a boundary republishes
-    /// one and not the other.
-    Correlation,
-}
-
-impl Republish {
-    /// Whether the boundary that recorded this edge left its input standing
-    /// as the same relation. The ownership walks cross exactly these edges;
-    /// every other kind marks a boundary that consumed what it stood over,
-    /// so the walk stops there.
-    pub fn consumes_nothing(self) -> bool {
-        matches!(self, Republish::JoinArm | Republish::EmissionWrap)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Computation {
-    Function,
-    Operator,
-    Aggregate,
-    Window,
-    Literal,
-    Subquery,
-    Case,
-    Cast,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MintReason {
-    Correlation,
-    SetOpArm,
-    RowNumber,
-    Pivot,
-    Ordinal,
-    AnonHeader,
-    /// The one occurrence an anchored case asks every arm about.
-    AnchoredCase,
-}
-
 /// What baptism should start from when it names a scope.
 ///
 /// Never the emitted name — the emitted name does not exist until baptism.
@@ -249,25 +160,47 @@ pub enum Hint {
     /// verbatim and is uniquified only when the finished bundle requires it.
     /// It never answers a user-written qualifier.
     Exact(Spelling),
-    /// No hint; baptism derives the name from the origin.
+    /// No hint; baptism derives the name from the kind.
     None,
 }
 
-/// How a column may be addressed by a reference.
+/// THE PUBLICATION ROLE of a column occurrence: how its own spelling
+/// participates in bare-name reuse and correspondence, and whether the
+/// author may see it at all.
 ///
 /// One enum rather than two coupled booleans, so every occurrence states
-/// exactly one addressing disposition. Some dispositions deliberately
-/// answer to no authored reference.
+/// exactly one role. Some roles deliberately answer to no authored
+/// reference.
+///
+/// NO VARIANT CARRIES A QUALIFIER. Which authored qualifier reaches a
+/// position is a fact about the lexical position a reference is written
+/// at, not about the column, and it is owned by the resolver's lexical
+/// frontier alone. A role that carried an answering symbol was the road by
+/// which a predecessor's qualifier outlived the PIPE FORM that consumed it:
+/// publication is not qualification, and provenance is not permission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Addressing {
     /// Answers to its own published name inside its own scope.
     Published,
-    /// Crossed an entity boundary; answers to the caller-facing name.
-    AnsweringTo(Sym),
-    /// A caller's own argumentative binding; answers to nothing else.
+    /// A caller's own argumentative binding: a bare lvar that unifies with
+    /// a same-named bare occurrence and refuses beside a second bind of
+    /// its name.
     Bare,
-    /// Bare, and also reachable under a relation alias.
-    BareAnswering(Sym),
+    /// A binding published UNDER AN AUTHORED RELATION NAME — an aliased
+    /// anonymous literal's header, an edge's endpoint column, a drilled
+    /// context. Its complete name is qualified (the qualifier is part of
+    /// the name, and unification compares the full name), so a bare header
+    /// or binder elsewhere neither unifies with it nor collides with it;
+    /// the stem still addresses it. Which name qualifies it is the lexical
+    /// frontier's fact, not this role's.
+    BareUnder,
+    /// A live bare lvar a PIPE STAGE published. Every pipe form is
+    /// scope-dequalifying, so a spelling it publishes is bare and a later
+    /// bare occurrence reuses it — but the position is a stage's
+    /// publication, not an argumentative binding: two stage-published
+    /// cells carrying one name align ranked at a set correspondence,
+    /// where two argumentative binds of one name refuse.
+    BareStage,
     /// Never addressable by the user.
     Hygienic,
     /// A dimension of a heading the caller DECLARED without naming: it holds
@@ -289,9 +222,10 @@ pub struct ValueFacts {
     /// republishes with the value, so a narrowing guard sees the same answer
     /// for a literal column, a computed projection, and an alias of either.
     pub shape: ValueShape,
-    /// The heading of an interior relation, for drill-down columns.
-    pub interior: Option<ScopeId>,
-    pub interior_conflict: bool,
+    /// The value is emitted as a nested relation payload. This is physical
+    /// value metadata only; the exact interior relation and its interface
+    /// live in the semantic relation store.
+    pub tree_valued: bool,
     /// A cover (`$$`) named this slot and gave it a different value.
     ///
     /// A cover keeps the slot's identity — downstream references were

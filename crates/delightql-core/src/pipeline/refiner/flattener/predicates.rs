@@ -2,20 +2,28 @@
 // Copyright 2026 Daniel Eklund
 //! Scope-local reference extraction for the refiner.
 
-use crate::names::ColId;
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::asts::core::RelationalMembership;
 use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::resolved;
+use crate::relation::PortId;
 use std::collections::HashSet;
 
-pub(super) fn extract_references(expr: &resolved::TruthExpression) -> HashSet<ColId> {
+pub fn extract_references(expr: &resolved::TruthExpression) -> HashSet<PortId> {
     let mut references = HashSet::new();
     extract_from_boolean(expr, &mut references);
     references
 }
 
-fn extract_from_boolean(expr: &resolved::TruthExpression, references: &mut HashSet<ColId>) {
+/// The same walk over ONE value. A comparison's cardinality context is read
+/// off its two operands, and the operands are values.
+pub fn extract_value_references(expr: &resolved::DomainExpression) -> HashSet<PortId> {
+    let mut references = HashSet::new();
+    extract_from_domain(expr, &mut references);
+    references
+}
+
+fn extract_from_boolean(expr: &resolved::TruthExpression, references: &mut HashSet<PortId>) {
     match expr {
         resolved::TruthExpression::Comparison(resolved::Comparison { left, right, .. }) => {
             extract_from_domain(left, references);
@@ -52,7 +60,7 @@ fn extract_from_boolean(expr: &resolved::TruthExpression, references: &mut HashS
 
 fn extract_from_function(
     function: &resolved::FunctionApplication,
-    references: &mut HashSet<ColId>,
+    references: &mut HashSet<PortId>,
 ) {
     match function {
         resolved::FunctionApplication::Ground(_) | resolved::FunctionApplication::Open(_) => {}
@@ -71,6 +79,9 @@ fn extract_from_function(
                 extract_from_domain(argument, references);
             }
         }
+        resolved::FunctionApplication::Crossed(crossing) => {
+            extract_from_boolean(crossing.truth(), references)
+        }
         resolved::FunctionApplication::Infix(infix) => {
             extract_from_domain(&infix.left, references);
             extract_from_domain(&infix.right, references);
@@ -87,7 +98,7 @@ fn extract_from_function(
                 if let Some(guard) = &arm.guard {
                     extract_from_boolean(guard, references);
                 }
-                extract_from_result(&arm.result, references);
+                extract_from_domain(&arm.result, references);
             }
         }
         resolved::FunctionApplication::Case(case) => {
@@ -126,7 +137,7 @@ fn extract_from_function(
 
 fn extract_from_enclyph(
     enclyph: &resolved::Enclyph,
-    references: &mut std::collections::HashSet<crate::names::ColId>,
+    references: &mut std::collections::HashSet<PortId>,
 ) {
     use crate::pipeline::asts::core::{Enclyph, NamedReference, RecordMember};
     match enclyph {
@@ -140,37 +151,42 @@ fn extract_from_enclyph(
                     }
                     // An authored spread is uninhabited after resolution.
                     RecordMember::Spread(spread) => spread.expanded(),
+                    RecordMember::Metadata { group, .. } => {
+                        extract_from_metadata_group(group, references)
+                    }
                 }
             }
         }
         Enclyph::EmptyRecord(_) => {}
         Enclyph::Tuple(tuple) => {
             for element in tuple.elements.iter() {
-                extract_from_domain(element, references);
+                extract_from_domain(element.value(), references);
             }
         }
     }
 }
 
-/// What an arm COMPUTES: a value, or the licensed crossing.
-fn extract_from_result(
-    result: &crate::pipeline::asts::core::OutValue<crate::pipeline::asts::core::Resolved>,
-    references: &mut HashSet<ColId>,
+/// A metadata level's dependencies: its key column, and its target's.
+fn extract_from_metadata_group(
+    group: &crate::pipeline::asts::core::MetadataGroup<crate::pipeline::asts::core::Resolved>,
+    references: &mut std::collections::HashSet<PortId>,
 ) {
-    use crate::pipeline::asts::core::OutValue;
-    match result {
-        OutValue::Domain(value) => extract_from_domain(value, references),
-        OutValue::Truth(crossing) => extract_from_boolean(crossing.truth(), references),
+    use crate::pipeline::asts::core::MetadataTarget;
+    references.insert(group.key.column);
+    match &group.target {
+        MetadataTarget::Enclyph(enclyph) => extract_from_enclyph(enclyph, references),
+        MetadataTarget::Group(nested) => extract_from_metadata_group(nested, references),
     }
 }
 
-fn extract_from_domain(expr: &resolved::DomainExpression, references: &mut HashSet<ColId>) {
+fn extract_from_domain(expr: &resolved::DomainExpression, references: &mut HashSet<PortId>) {
     match expr {
         resolved::DomainExpression::Reference(Reference::Named(NamedReference(
             ColumnOccurrence { column, .. },
         ))) => {
             references.insert(*column);
         }
+        resolved::DomainExpression::Reference(Reference::Physical(_)) => {}
         resolved::DomainExpression::Application(function) => {
             extract_from_function(function, references);
         }

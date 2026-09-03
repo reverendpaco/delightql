@@ -21,9 +21,7 @@
 ; ---- pipes, necks and goals -------------------------------------------------
 (pipe_operator) @operator
 (unwrap_pipe_operator) @operator
-(materialize) @operator
-(function_pipe_first) @operator
-(function_pipe_last) @operator
+(function_pipe_operator) @operator
 (definition_neck) @operator
 (goal_marker) @keyword.directive
 ; The utility file's own header — a reader directive, not DelightQL, and the

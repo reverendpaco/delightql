@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Manifest reader — reads `_internal` HO entity data from bootstrap DB.
+//! Manifest reader — reads `_internal` companion relations from bootstrap DB.
 //!
-//! `_internal` HO views (schema, constraints, defaults, imprinting) are consulted
-//! entities stored in the bootstrap DB. Their clause bodies are anonymous table
-//! facts — self-contained constants. This module extracts those facts by:
+//! `_internal` companions (schema, constraints, defaults, imprinting) are
+//! ordinary consulted relations stored in the bootstrap DB. Their clause
+//! bodies are anonymous-table facts with a ground entity key in the first
+//! head position. This module extracts those facts by:
 //!
-//! 1. Finding entity + clause via bootstrap SQL (entity, entity_clause,
-//!    ho_param, ho_param_ground_value)
+//! 1. Enumerating every active clause of the companion relation and reading
+//!    its first ground head position
 //! 2. Extracting body text from `entity_clause.definition` (text after `:-`)
 //! 3. Compiling body via `compile_source_to_sql(body, &EmptySchema)` → SQL
 //! 4. Executing SQL on bootstrap connection → get rows
@@ -219,12 +220,9 @@ pub fn read_imprinting(conn: &Connection, internal_ns_id: i32) -> Result<Vec<Imp
     Ok(rows)
 }
 
-/// Read `schema("entity_name")` from `_internal` namespace.
-///
-/// Uses HO clause matching: finds clauses where the first ground parameter
-/// matches the given entity name.
+/// Read `schema("entity_name", column, type)` from `_internal` namespace.
 pub fn read_schema(conn: &Connection, internal_ns_id: i32, entity: &str) -> Result<Vec<SchemaRow>> {
-    let clauses = read_ho_clauses_by_ground_value(conn, internal_ns_id, "schema", entity)?;
+    let clauses = read_relation_clauses_by_ground_value(conn, internal_ns_id, "schema", entity)?;
     if clauses.is_empty() {
         return Ok(Vec::new());
     }
@@ -259,13 +257,14 @@ pub fn read_schema(conn: &Connection, internal_ns_id: i32, entity: &str) -> Resu
     Ok(rows)
 }
 
-/// Read `constraints("entity_name")` from `_internal` namespace.
+/// Read `constraints("entity_name", column, constraint, name)`.
 pub fn read_constraints(
     conn: &Connection,
     internal_ns_id: i32,
     entity: &str,
 ) -> Result<Vec<ConstraintRow>> {
-    let clauses = read_ho_clauses_by_ground_value(conn, internal_ns_id, "constraints", entity)?;
+    let clauses =
+        read_relation_clauses_by_ground_value(conn, internal_ns_id, "constraints", entity)?;
     if clauses.is_empty() {
         return Ok(Vec::new());
     }
@@ -301,7 +300,7 @@ pub fn read_constraints(
     Ok(rows)
 }
 
-/// Read `defaults("entity_name")` from `_internal` namespace.
+/// Read `defaults("entity_name", column, value[, generated])`.
 ///
 /// Defaults may have 2 columns (column, default_val) or 3 columns
 /// (column, default_val, generated). We detect the column count from the SQL.
@@ -310,7 +309,7 @@ pub fn read_defaults(
     internal_ns_id: i32,
     entity: &str,
 ) -> Result<Vec<DefaultRow>> {
-    let clauses = read_ho_clauses_by_ground_value(conn, internal_ns_id, "defaults", entity)?;
+    let clauses = read_relation_clauses_by_ground_value(conn, internal_ns_id, "defaults", entity)?;
     if clauses.is_empty() {
         return Ok(Vec::new());
     }
@@ -357,48 +356,19 @@ pub fn read_defaults(
     Ok(rows)
 }
 
-/// Discover all entity names that have `schema()` entries in `_internal`.
+/// Discover all entity names that have `schema` rows in `_internal`.
 ///
 /// Used as fallback when `imprinting()` is absent — we discover entities
-/// from the ground values of `schema()` HO clauses.
+/// from the first ground head position of every active `schema` clause.
 pub fn discover_schema_entities(conn: &Connection, internal_ns_id: i32) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT hpgv.ground_value
-             FROM ho_param_ground_value hpgv
-             JOIN ho_param hp ON hpgv.ho_param_id = hp.id
-             JOIN entity e ON hp.entity_id = e.id
-             JOIN activated_entity ae ON ae.entity_id = e.id
-             WHERE ae.namespace_id = ?1
-               AND e.name = 'schema'
-               AND hp.position = 0",
-        )
-        .map_err(|e| {
-            DelightQLError::database_error("Failed to query schema entity names", e.to_string())
-        })?;
-
-    let rows = stmt
-        .query_map([internal_ns_id], |row| row.get::<_, String>(0))
-        .map_err(|e| {
-            DelightQLError::database_error("Failed to execute schema entity query", e.to_string())
-        })?;
-
-    let names: Vec<String> = rows
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            DelightQLError::database_error("Failed to read schema entity names", e.to_string())
-        })?;
-
-    // Strip DQL string literal quotes from ground values, then validate: an
-    // embedded `"` reaches the DDL generator unescaped (see validate_entity_name).
-    names
-        .into_iter()
-        .map(|s| {
-            let name = strip_dql_quotes(&s).to_string();
-            validate_entity_name(&name)?;
-            Ok(name)
-        })
-        .collect()
+    let clauses = read_entity_clauses(conn, internal_ns_id, "schema")?;
+    let mut names = std::collections::BTreeSet::new();
+    for clause in clauses {
+        let name = companion_clause_entity("schema", &clause)?;
+        validate_entity_name(&name)?;
+        names.insert(name);
+    }
+    Ok(names.into_iter().collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -457,78 +427,59 @@ fn strip_dql_quotes(s: &str) -> &str {
     }
 }
 
-/// Read entity_clause definitions for an HO entity, matched by ground value
-/// on position 0.
-///
-/// The probe is an entity NAME, so it is looked up under the one stored
-/// ground spelling a string value has — `LiteralValue::stored_ground` — and
-/// nothing else. A second accepted spelling here would be a decoder the
-/// encoder does not have.
-fn read_ho_clauses_by_ground_value(
+/// Read every active clause of an ordinary companion and retain the clauses
+/// whose first ground head position is the requested entity.
+fn read_relation_clauses_by_ground_value(
     conn: &Connection,
     namespace_id: i32,
-    ho_entity_name: &str,
+    relation_name: &str,
     ground_value: &str,
 ) -> Result<Vec<String>> {
-    let stored =
-        crate::pipeline::asts::core::LiteralValue::String(ground_value.to_string()).stored_ground();
-    read_ho_clauses_by_ground_value_exact(conn, namespace_id, ho_entity_name, &stored)
+    let clauses = read_entity_clauses(conn, namespace_id, relation_name)?;
+    let mut matching = Vec::new();
+    for clause in clauses {
+        if companion_clause_entity(relation_name, &clause)? == ground_value {
+            matching.push(clause);
+        }
+    }
+    Ok(matching)
 }
 
-fn read_ho_clauses_by_ground_value_exact(
-    conn: &Connection,
-    namespace_id: i32,
-    ho_entity_name: &str,
-    ground_value: &str,
-) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT ec.definition FROM entity_clause ec
-             JOIN entity e ON ec.entity_id = e.id
-             JOIN activated_entity ae ON ae.entity_id = e.id
-             JOIN ho_param hp ON hp.entity_id = e.id AND hp.position = 0
-             JOIN ho_param_ground_value hpgv
-               ON hpgv.ho_param_id = hp.id AND hpgv.clause_ordinal = ec.ordinal - 1
-             WHERE ae.namespace_id = ?1
-               AND e.name = ?2
-               AND hpgv.ground_value = ?3
-             ORDER BY ec.ordinal",
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
+fn companion_clause_entity(relation_name: &str, source: &str) -> Result<String> {
+    use crate::pipeline::asts::core::definitions::Supply;
+    use crate::pipeline::asts::core::LiteralValue;
+
+    let group = crate::ddl::reconstruct::group(source)?;
+    let first = group
+        .first()
+        .head
+        .items
+        .listed()
+        .and_then(|items| items.first())
+        .ok_or_else(|| {
+            DelightQLError::validation_error_categorized(
+                "imprint/manifest/companion_key",
                 format!(
-                    "Failed to query HO clauses for {}(\"{}\")",
-                    ho_entity_name, ground_value
+                    "ordinary companion '{relation_name}' has no first head position naming its entity"
                 ),
-                e.to_string(),
+                "write the companion as relation(\"entity\" as entity, ...)",
             )
         })?;
-
-    let rows = stmt
-        .query_map(
-            rusqlite::params![namespace_id, ho_entity_name, ground_value],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!(
-                    "Failed to execute HO clause query for {}(\"{}\")",
-                    ho_entity_name, ground_value
-                ),
-                e.to_string(),
-            )
-        })?;
-
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!(
-                    "Failed to read HO clauses for {}(\"{}\")",
-                    ho_entity_name, ground_value
-                ),
-                e.to_string(),
-            )
-        })
+    match &first.supply {
+        Supply::Ground(LiteralValue::String(entity)) => Ok(entity.clone()),
+        Supply::Ground(other) => Err(DelightQLError::validation_error_categorized(
+            "imprint/manifest/companion_key",
+            format!("ordinary companion '{relation_name}' uses non-string entity key {other}"),
+            "the first companion position is a string entity name",
+        )),
+        Supply::Ref(_) => Err(DelightQLError::validation_error_categorized(
+            "imprint/manifest/companion_key",
+            format!(
+                "ordinary companion '{relation_name}' leaves its manifest entity key data-dependent"
+            ),
+            "each stored companion clause grounds and labels its first entity position",
+        )),
+    }
 }
 
 /// Compile an anonymous table body to SQL via the DQL pipeline.

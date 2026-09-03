@@ -1,4 +1,4 @@
-pivot(T(*), V(v))(*) :-
+`pivot`(T(*), V(v))(*) :-
   (~~docs
     Crosstab pivot, no aggregation.
 
@@ -10,9 +10,15 @@ pivot(T(*), V(v))(*) :-
     Assumes one row per group+pivot pair.
     For duplicates, use pivot_sum, pivot_avg, etc.
 
+    THE PIVOT VALUES CLAIM THE ROW'S TAIL. They arrive as `&`-bounded
+    lifted rows, which are structurally last in an argument row, so the
+    subject cannot also be last and the pipe names its landing with `@`.
+
     Usage:
       data(subject, score, name)
-        |> pivot("Maths";"Music")(*)
+        |> pivot(@ & "Maths";"Music")(*)
+
+      pivot(data(*) & "Maths";"Music")(*)
   ~~)
   T(*), |1| in V(*)
     |> %(|3:| ~> |2| of |1|)

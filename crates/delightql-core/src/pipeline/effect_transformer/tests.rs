@@ -13,9 +13,9 @@
 
 use super::*;
 use crate::bin_cartridge::prelude::consult::execute_consult;
-use crate::pipeline::asts::core::OutValue;
 use crate::pipeline::asts::core::ProbeAddressing;
-use crate::pipeline::asts::core::{Existence, RelationalMembership};
+use crate::pipeline::asts::core::Step;
+use crate::pipeline::asts::core::{Existence, GroundForm, RelationalMembership};
 use crate::pipeline::asts::core::{Polarity, Probe};
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
@@ -131,35 +131,32 @@ fn catalogued_user_name_is_reserved_before_plan_scratch_baptism() {
                 row.get(0)
             })
             .expect("a bootstrap cartridge exists");
+        let _window = system.catalog_window();
         connection
             .execute(
-                "INSERT INTO entity (name, type, cartridge_id) VALUES (?1, 1, ?2)",
+                "INSERT INTO entity (name, type, cartridge_id) VALUES (?1, 10, ?2)",
                 rusqlite::params!["scratch_1", cartridge],
             )
             .expect("catalogue the user relation");
     }
 
     let registry = plan_registry(&system).expect("plan registry");
-    let scratch = registry.mint_scope(
-        crate::names::ScopeOrigin::Scratch {
-            role: crate::names::ScratchRole::Snapshot,
-        },
-        crate::names::Hint::None,
-        None,
-    );
+    let scratch = crate::relation::any_scratch(&registry).relation();
     let names = crate::names::baptise(
         &registry,
-        &crate::names::Bundle {
-            statements: vec![crate::names::Statement {
-                scopes: vec![scratch],
-                headings: vec![],
-                refs: vec![],
-            }],
-        },
+        &crate::names::Bundle::gather(vec![crate::names::Statement {
+            scopes: vec![scratch.scope()],
+            headings: vec![],
+            refs: vec![],
+        }])
+        .reserve_authored(&registry),
     )
     .expect("scratch baptism");
     let mut spelling = String::new();
-    names.write_scope(scratch, &mut crate::names::sink::Probe(&mut spelling));
+    names.write_scope(
+        scratch.scope(),
+        &mut crate::names::sink::Probe(&mut spelling),
+    );
     assert_ne!(
         spelling, "scratch_1",
         "plan scratch must not replace a catalogued user temp"
@@ -169,50 +166,41 @@ fn catalogued_user_name_is_reserved_before_plan_scratch_baptism() {
 #[test]
 fn scratch_placement_is_driven_by_scope_origin() {
     let system = world_system();
-    let registry = Rc::new(Registry::new(&[]));
-    let scratch = registry.mint_scope(
-        crate::names::ScopeOrigin::Scratch {
-            role: crate::names::ScratchRole::Snapshot,
-        },
-        crate::names::Hint::None,
-        None,
-    );
+    let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let scratch = crate::relation::any_scratch(&registry).relation();
     let authored_spelling = registry.intern("scratch_1", false);
-    let authored = registry.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::User(authored_spelling),
-        None,
-    );
+    let authored = registry.anonymous_scope(Some(authored_spelling));
     let inner = select_one_from(scratch, &registry).expect("scratch EXISTS source");
-    let output = registry.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-        None,
-    );
-    let select = crate::pipeline::transformer::builder::publish_at(
-        output,
-        [],
-        SelectStatement::builder()
-            .select(SelectItem::star_over_nothing())
-            .from_tables(vec![
-                TableExpression::Scope(scratch),
-                TableExpression::Scope(authored),
-            ])
-            .where_clause(SqlExpr::exists(inner)),
-        &registry,
-    )
+    let output = registry.anonymous_scope(None);
+    let select = (SelectStatement::builder()
+        .select(SelectItem::star_over_nothing())
+        .from_tables(vec![
+            TableExpression::Scope(scratch.scope()),
+            TableExpression::Scope(authored),
+        ])
+        .where_clause(SqlExpr::exists(inner)))
+    .standing_at(output)
+    .map_err(crate::error::DelightQLError::parse_error)
     .expect("placement fixture");
     let mut statement = SqlStatement::Query {
         with_clause: None,
         query: QueryExpression::Select(Box::new(select)),
     };
-    let builder = PlanBuilder::new(&system, None, Rc::clone(&registry));
+    // The capability travels INTO the builder — it is not copyable — so the
+    // names this fixture still needs come off the shared handle.
+    let names = registry.names();
+    let builder = PlanBuilder::new(
+        &system,
+        None,
+        PlanEpoch::Discovering(registry),
+        Rc::new(std::cell::RefCell::new(SemanticReplay::default())),
+    );
     builder.qualify_scratch_refs(&mut statement, "temp");
 
     let mut qualified_scratch = 0;
     let mut bare_authored = 0;
     crate::pipeline::sql_ast::walk::visit_tables_mut(&mut statement, &mut |table| match table {
-        TableExpression::QualifiedScope { schema, scope } if *scope == scratch => {
+        TableExpression::QualifiedScope { schema, scope } if *scope == scratch.scope() => {
             assert_eq!(schema, "temp");
             qualified_scratch += 1;
         }
@@ -222,21 +210,14 @@ fn scratch_placement_is_driven_by_scope_origin() {
     assert_eq!(qualified_scratch, 2, "FROM and EXISTS carry placement");
     assert_eq!(bare_authored, 1, "authored lookalikes remain untouched");
 
-    let source_scope = registry.mint_scope(
-        crate::names::ScopeOrigin::AnonRelation,
-        crate::names::Hint::None,
-        None,
-    );
-    let source = crate::pipeline::transformer::builder::publish_at(
-        source_scope,
-        [],
-        SelectStatement::builder().select(SelectItem::star_over_nothing()),
-        &registry,
-    )
-    .expect("insert source");
+    let source_scope = names.anonymous_scope(None);
+    let source = (SelectStatement::builder().select(SelectItem::star_over_nothing()))
+        .standing_at(source_scope)
+        .map_err(crate::error::DelightQLError::parse_error)
+        .expect("insert source");
     let mut insert = SqlStatement::Insert {
-        target: crate::pipeline::sql_ast::statements::RelationTarget::Scope(scratch),
-        target_scope: scratch,
+        target: crate::pipeline::sql_ast::statements::RelationTarget::Scope(scratch.scope()),
+        target_scope: scratch.scope(),
         columns: vec![],
         with_clause: None,
         source: QueryExpression::Select(Box::new(source)),
@@ -251,45 +232,48 @@ fn scratch_placement_is_driven_by_scope_origin() {
                     scope
                 },
             ..
-        } if schema == "pg_temp" && scope == scratch
+        } if schema == "pg_temp" && scope == scratch.scope()
     ));
 }
 
 #[test]
 fn star_shaped_plan_scope_keeps_its_resolved_heading() {
     let system = world_system();
-    let registry = Rc::new(Registry::new(&[]));
-    let scratch = registry.mint_scope(
-        crate::names::ScopeOrigin::Scratch {
-            role: crate::names::ScratchRole::Snapshot,
-        },
-        crate::names::Hint::None,
-        None,
-    );
+    let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
     let x = registry.intern("x", false);
-    let column = registry.mint_column(
-        scratch,
-        crate::names::ColumnOrigin::Bound { position: 0 },
-        Some(x),
-        crate::names::Addressing::Published,
-        crate::names::ValueFacts::default(),
-    );
+    let slots = [crate::relation::form::ScratchSlot {
+        position: 0,
+        named: x,
+    }];
+    let scratch = registry
+        .authority()
+        .scratch_row(crate::relation::form::ScratchSpec::stating(
+            crate::relation::form::ScratchWhy::Result,
+            None,
+            &slots,
+        ))
+        .expect("the scratch and its heading are one construction");
+    let column = crate::relation::published_ports(&registry, &scratch.relation())
+        .expect("scratch interface")[0]
+        .column();
     let query = Query::relational(Chain::read(
         Relation::Ground {
-            mention: GroundMention::Plan {
-                scope: scratch,
-                authored_name: None,
-                alias: None,
-            },
+            mention: GroundMention::Scratch { row: scratch },
             outer: false,
-            cpr_schema: (),
         },
         Access::All,
-        (),
     ));
-    let mut builder = PlanBuilder::new(&system, None, registry);
+    let mut builder = PlanBuilder::new(
+        &system,
+        None,
+        PlanEpoch::Discovering(registry),
+        Rc::new(std::cell::RefCell::new(SemanticReplay::default())),
+    );
+    let world = builder
+        .program_world()
+        .expect("the plan's own program world");
     let compiled = builder
-        .compile_statement(query)
+        .compile_statement(&top_walk_ctx(&world), query)
         .expect("direct plan-scope read");
     assert_eq!(compiled.columns, vec![column]);
 }
@@ -448,7 +432,8 @@ fn dml_marker_forbidden_refused() {
 #[test]
 fn dml_marker_mismatch_refused() {
     let err = try_plan_for(
-        "main!(*) :- customers!!(*) |> $$(\"x\" as name) |> update!(source.orders(*))(*)\n",
+        "?- enlist!(\"main\")(*)\n\
+         main!(*) :- customers!!(*) |> $$(\"x\" as name) |> update!(source.orders(*))(*)\n",
     )
     .expect_err("!! on a different table than the target must refuse");
     let msg = format!("{err}");
@@ -833,7 +818,8 @@ fn heterogeneous_clause_receipts_null_pad_the_shared_shell() {
 #[test]
 fn exit_stamps_later_dml_and_wrap_guards_shipped_selects() {
     let plan = plan_for(
-        "main!(*) :-\n\
+        "?- enlist!(\"main\")(*)\n\
+         main!(*) :-\n\
          \x20   source.orders(*) ~> count:(*) as n, n = 0, exit!(*) : x!\n\
          \x20   source.orders(*), region = \"EU\" |> insert!(warehouse.orders_eu(*))(*) : l!\n\
          \x20   x!(*) ; l!(*) |> stdout!(*) |> returning_other!(customers(*))(*)\n",
@@ -990,9 +976,9 @@ fn ho_input_materializes_when_mutation_intervenes() {
     // receipt m! joined in to sequence this after the mutation publishes
     // columns orders_us does not have.
     let plan = plan_for(
-        "sneaky!(In(*))(*) :-\n\
+        "sneaky!(SourceRows(*))(*) :-\n\
          \x20   source.orders(*), status = \"seed\" |> insert!(warehouse.orders_eu(*))(*) : m!\n\
-         \x20   m!(*), In(*)\n\
+         \x20   m!(*), SourceRows(*)\n\
          \x20     |> (order_id, customer_id, region, amount, order_date, status)\n\
          \x20     |> insert!(warehouse.orders_us(*))(*)\n\
          main!(*) :- source.orders(*), status = \"new\" |> sneaky!(*)\n",
@@ -1022,7 +1008,8 @@ fn ho_input_materializes_when_mutation_intervenes() {
 #[test]
 fn returning_other_runs_input_first_and_ships_argument() {
     let plan = plan_for(
-        "main!(*) :-\n\
+        "?- enlist!(\"main\")(*)\n\
+         main!(*) :-\n\
          \x20   source.orders(*), region = \"EU\" |> insert!(warehouse.orders_eu(*))(*) : a!\n\
          \x20   a!(*) |> returning_other!(customers(*))(*)\n",
     );
@@ -1218,7 +1205,7 @@ fn doc_in_body_refusal_does_not_cite_r9_as_prohibiting() {
     // R9 PERMITS doc! in bodies (annotation only); the refusal is honest
     // scheduling. End-to-end pin: rules--50.
     let err = try_plan_for(
-        "main!(*) :- doc!(customers, \"note\"), source.orders(*) \
+        "main!(*) :- doc!(customers, \"note\")(*), source.orders(*) \
          |> insert!(warehouse.orders_eu(*))(*)\n",
     )
     .expect_err("doc! lowering is deferred in v0.1");
@@ -1725,6 +1712,7 @@ fn sys_only_source_materializes_on_primary() {
         &system,
         &adhoc_query("sys::entities.entity(*) |> temp_table!(test(*))(*)"),
         None,
+        &[],
     )
     .expect("a sys::-only materialization source lands on primary (materialization-law §2)");
     for (i, conn) in entry_connections(&plan).iter().enumerate() {
@@ -1951,9 +1939,147 @@ fn world_system_with_engine_remote_and_id(
 /// Build the ad-hoc Query the relay entry would hand `compile_query_plan`.
 fn adhoc_query(dql: &str) -> Query {
     let tree = crate::pipeline::parse::query_sequence(dql).expect("parse");
-    let mut normalized = crate::pipeline::parse::normalize_sequence(&tree).expect("normalize");
-    assert_eq!(normalized.queries.len(), 1, "one statement expected");
-    normalized.queries.pop().unwrap().query
+    let normalized = crate::pipeline::parse::normalize_sequence(&tree).expect("normalize");
+    let mut queries = normalized.into_queries();
+    assert_eq!(queries.len(), 1, "one statement expected");
+    queries.pop().unwrap().query
+}
+
+#[test]
+fn assert_uses_configured_query_scoped_values_and_qualified_standard_identity() {
+    let system = world_system();
+    let query = adhoc_query(
+        "at_least(n, T(*))(*) : T(*) ~> count:(*) as c, c >= n\n\
+         same_bag(E(*), T(*))(*) : T(*) |> notexists(*)\n\
+         standard_equal(T(*))(*) : T(*) |> std::prelude.same_bag(_(x @ 1; 2; 3))(*)\n\
+         _(x @ 1; 2; 3) !> assert!(at_least(2), \"configured\")(*) \
+           !> assert!(standard_equal(*))(*)",
+    );
+    let plan = compile_query_plan(&system, &query, None, &[])
+        .expect("configured and lexically qualified rule values compile through one judgment");
+    let aborts = plan
+        .typed
+        .as_ref()
+        .unwrap()
+        .steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.action,
+                compiled_query::EffectAction::Terminal(
+                    compiled_query::TerminalAction::Abort { .. }
+                )
+            )
+        })
+        .count();
+    assert_eq!(aborts, 2);
+}
+
+#[test]
+fn qualified_directive_selection_preserves_the_complete_identity() {
+    let system = world_system();
+    let standard_assert = adhoc_query(
+        "nonempty(T(*))(*) : T(*)\n\
+         _(x @ 1) !> std::prelude.assert!(nonempty(*), \"standard\")(*)",
+    );
+    compile_query_plan(&system, &standard_assert, None, &[])
+        .expect("the descriptor's qualified standard identity is callable");
+
+    let standard_abort =
+        adhoc_query("_(x @ 1), x = 2 |> std::prelude.abort!(\"runtime/unreached\")(*)");
+    compile_query_plan(&system, &standard_abort, None, &[])
+        .expect("abort! uses the same population-wide identity selection");
+
+    let standard_insert = adhoc_query("customers(*) |> std::prelude.insert!(customers(*))(*)");
+    compile_query_plan(&system, &standard_insert, None, &[])
+        .expect("DML normalization and resolution preserve standard identity");
+
+    for source in [
+        "nonempty(T(*))(*) : T(*)\n_(x @ 1) !> bogus.assert!(nonempty(*))(*)",
+        "_(x @ 1) |> bogus.abort!(\"runtime/must-not-run\")(*)",
+        "customers(*) |> bogus.insert!(customers(*))(*)",
+    ] {
+        let error = compile_query_plan(&system, &adhoc_query(source), None, &[])
+            .expect_err("a wrong qualifier must not select the standard built-in");
+        assert!(
+            format!("{error}").contains("no effect rule")
+                || format!("{error}").contains("not a built-in"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn present_terminal_labels_are_validated_instead_of_becoming_omission() {
+    let system = world_system();
+    for source in [
+        "_(x @ 1) |> abort!(\"runtime/review\", 42)(*)",
+        "nonempty(T(*))(*) : T(*)\n_(x @ 1) !> assert!(nonempty(*), 42)(*)",
+    ] {
+        let error = compile_query_plan(&system, &adhoc_query(source), None, &[])
+            .expect_err("a supplied malformed label must refuse");
+        assert!(
+            error.error_uri().contains("directive/binding/value"),
+            "{error}"
+        );
+    }
+
+    compile_query_plan(
+        &system,
+        &adhoc_query("nonempty(T(*))(*) : T(*)\n_(x @ 1) !> assert!(nonempty(*), bare_label)(*)"),
+        None,
+        &[],
+    )
+    .expect("StringOrPath labels consistently admit a bare name");
+}
+
+#[test]
+fn assert_spends_a_qualified_consulted_property_value() {
+    let mut system = world_system();
+    consult_str(
+        &mut system,
+        "at_least(n, T(*))(*) :- T(*) ~> count:(*) as c, c >= n\n",
+    )
+    .expect("consult property library");
+    let query = adhoc_query("_(x @ 1; 2; 3) !> assert!(fx.at_least(3), \"consulted\")(*)");
+    compile_query_plan(&system, &query, None, &[])
+        .expect("assert! must retain a consulted rule value's lexical identity");
+}
+
+#[test]
+fn assert_refuses_wrong_residual_scalar_and_effectful_properties_normally() {
+    let system = world_system();
+    let cases = [
+        (
+            "two(E(*), T(*))(*) : T(*)\n_(x @ 1) !> assert!(two(*))(*)",
+            "semantic/resolution/ho/residual-contract",
+        ),
+        (
+            "_(x @ 1) !> assert!(length(*))(*)",
+            "semantic/resolution/ho/rule-value-missing",
+        ),
+        (
+            "bad!(T(*))(*) : T(*) |> stdout!(*)\n_(x @ 1) !> assert!(bad(*))(*)",
+            "semantic/resolution/callable_unknown",
+        ),
+    ];
+    for (source, identity) in cases {
+        let error = compile_query_plan(&system, &adhoc_query(source), None, &[])
+            .expect_err("the ordinary rule-value judgment must refuse this property");
+        assert!(error.error_uri().contains(identity), "{error}");
+    }
+}
+
+#[test]
+fn recursive_pure_cte_in_effect_body_reaches_fixpoint_authority() {
+    let system = world_system();
+    let query = adhoc_query(
+        "_(n @ 1) : r\n\
+         r(*) |> (n), n < 3 |> (n + 1 as n) : r\n\
+         r(*) |> table!(t)(*)",
+    );
+    compile_query_plan(&system, &query, None, &[])
+        .expect("a recursive pure CTE in an effect body compiles as one fixpoint");
 }
 
 /// Non-firing control 1 (T0's, kept past the strike's deletion): the
@@ -1966,6 +2092,7 @@ fn all_sqlite_anon_source_plan_keeps_compiling() {
         &system,
         &adhoc_query("_(x @ 1) |> temp_table!(t(*))(*)"),
         None,
+        &[],
     )
     .expect("an all-SQLite anon-source plan must keep compiling");
 }
@@ -2004,7 +2131,7 @@ fn entry_connections(plan: &CompiledPlan) -> Vec<Option<i64>> {
         .iter()
         .map(|e| match e {
             PlanEntry::Statement(st) | PlanEntry::ShippedStatement(st) => st.connection_id,
-            PlanEntry::Assertion { statement, .. } => statement.connection_id,
+            PlanEntry::Check { statement, .. } => statement.connection_id,
             PlanEntry::BeginTransaction { connection_id, .. }
             | PlanEntry::CommitTransaction { connection_id, .. } => *connection_id,
         })
@@ -2123,6 +2250,7 @@ fn anon_source_plan_with_fatboy_main_stamps_the_main_connection() {
         &system,
         &adhoc_query("_(x @ 1) |> temp_table!(t(*))(*)"),
         None,
+        &[],
     )
     .expect("anon-source fatboy plans compile on the production entry (strike removed, E-T5)");
     assert_plan_covers_the_entry_species(&plan);
@@ -2536,7 +2664,7 @@ fn sqlite_representative_plan_render_pinned_byte_for_byte() {
     let plan = plan_for(
         "main!(*) :- source.orders(*), region = \"EU\" |> insert!(warehouse.orders_eu(*))(*)\n",
     );
-    let expected = "-- [conn 2]\nCREATE TEMP TABLE temp.__r_main (success INTEGER, operation TEXT, target TEXT);\n\n-- [conn 2]\nBEGIN;\n\n-- [conn 2]\nINSERT INTO _imported_14.orders_eu (order_id, customer_id, region, amount, order_date, status) SELECT orders.order_id AS order_id, orders.customer_id AS customer_id, orders.region AS region, orders.amount AS amount, orders.order_date AS order_date, orders.status AS status\nFROM _imported_13.orders\nWHERE orders.region IS NOT DISTINCT FROM 'EU';\n\n-- [conn 2]\nINSERT INTO \"temp\".__r_main (success, operation, target) SELECT 1, 'insert!', 'warehouse.orders_eu'\nWHERE changes() > 0;\n\n-- [ship] [conn 2] the return value\nSELECT 1 AS success, 'main!' AS operation, t_2.returned AS returned\nFROM (\n  SELECT COALESCE(JSON('[' || GROUP_CONCAT(CASE WHEN ((__r_main.success IS NOT NULL OR __r_main.operation IS NOT NULL) OR __r_main.target IS NOT NULL) THEN JSON_OBJECT('success', __r_main.success, 'operation', __r_main.operation, 'target', __r_main.target) END, ',') || ']'), JSON('[]')) AS returned, count(*) AS __clause_count\n  FROM \"temp\".__r_main\n) AS t_2\nWHERE t_2.__clause_count > 0;\n\n-- [conn 2]\nCOMMIT;\n\n-- [conn 2] plan-scratch cleanup\nDROP TABLE IF EXISTS temp.__r_main;";
+    let expected = "-- [conn 2]\nCREATE TEMP TABLE temp.__r_main (success INTEGER, operation TEXT, target TEXT);\n\n-- [conn 2]\nBEGIN;\n\n-- [conn 2]\nINSERT INTO _imported_15.orders_eu (order_id, customer_id, region, amount, order_date, status) SELECT orders.order_id AS order_id, orders.customer_id AS customer_id, orders.region AS region, orders.amount AS amount, orders.order_date AS order_date, orders.status AS status\nFROM _imported_14.orders\nWHERE orders.region IS NOT DISTINCT FROM 'EU';\n\n-- [conn 2]\nINSERT INTO \"temp\".__r_main (success, operation, target) SELECT 1, 'insert!', 'warehouse.orders_eu'\nWHERE changes() > 0;\n\n-- [ship] [conn 2] the return value\nSELECT 1 AS success, 'main!' AS operation, t_1.returned AS returned\nFROM (\n  SELECT COALESCE(JSON('[' || GROUP_CONCAT(CASE WHEN ((__r_main.success IS NOT NULL OR __r_main.operation IS NOT NULL) OR __r_main.target IS NOT NULL) THEN JSON_OBJECT('success', __r_main.success, 'operation', __r_main.operation, 'target', __r_main.target) END, ',') || ']'), JSON('[]')) AS returned, count(*) AS __clause_count\n  FROM \"temp\".__r_main\n) AS t_1\nWHERE t_1.__clause_count > 0;\n\n-- [conn 2]\nCOMMIT;\n\n-- [conn 2] plan-scratch cleanup\nDROP TABLE IF EXISTS temp.__r_main;";
     let expected = expected.replacen(
         "-- [conn 2]\nCREATE TEMP TABLE temp.__r_main",
         "-- [conn 2] clear plan scratch from a prior run\nDROP TABLE IF EXISTS temp.__r_main;\n\n-- [conn 2]\nCREATE TEMP TABLE temp.__r_main",
@@ -3043,6 +3171,7 @@ fn anon_source_plan_with_siso_mount_elsewhere_still_compiles() {
         &system,
         &adhoc_query("_(x @ 1) |> temp_table!(t(*))(*)"),
         None,
+        &[],
     )
     .expect("anon-source plans with a siso mount elsewhere keep hub convergence");
 }
@@ -3078,12 +3207,11 @@ mod p1_closure_matrix {
     }
 
     fn join(left: Chain, right: Chain, cond: Option<TruthExpression>) -> Chain {
-        left.then(Continuation::Member {
+        left.then(Step::authored(Continuation::Member {
             rhs: right,
             correlation: cond.map(crate::pipeline::ast_unresolved::MemberCorrelation::Condition),
             join_type: None,
-            cpr_schema: (),
-        })
+        }))
     }
 
     /// One bare Ground read beneath every query-bearing edge, each uniquely
@@ -3092,23 +3220,23 @@ mod p1_closure_matrix {
     fn every_edge_fixture() -> (Chain, Vec<&'static str>) {
         // Filter.source + Filter.condition (via InRelational subquery) — the
         // P1 headline hole.
-        let filter = named_ground_read("g_filter_source").then(Continuation::Restrict {
-            condition: TruthExpression::RelationalMembership(RelationalMembership {
-                probe: Probe::Value(Box::new(DomainExpression::Application(
-                    crate::pipeline::asts::core::FunctionApplication::Open(
-                        crate::pipeline::asts::core::DomainHole::Disregarded,
-                    ),
-                ))),
-                relation: Box::new(named_ground_read("g_filter_condition")),
-                addressing: ProbeAddressing {
-                    identifier: qn("f"),
-                    using_columns: vec![],
-                },
-                negated: false,
-            }),
-            origin: FilterOrigin::UserWritten,
-            cpr_schema: (),
-        });
+        let filter =
+            named_ground_read("g_filter_source").then(Step::authored(Continuation::Restrict {
+                condition: TruthExpression::RelationalMembership(RelationalMembership {
+                    probe: Probe::Value(Box::new(DomainExpression::Application(
+                        crate::pipeline::asts::core::FunctionApplication::Open(
+                            crate::pipeline::asts::core::DomainHole::Disregarded,
+                        ),
+                    ))),
+                    relation: Box::new(named_ground_read("g_filter_condition")),
+                    addressing: ProbeAddressing {
+                        identifier: qn("f"),
+                        using_columns: vec![],
+                    },
+                    negated: false,
+                }),
+                origin: FilterOrigin::UserWritten,
+            }));
 
         // Join.left / Join.right / Join.correlation (via InnerExists).
         let join_with_cond = join(
@@ -3128,43 +3256,33 @@ mod p1_closure_matrix {
         // subquery): the edge missed by ALL relational-entry walkers today.
         let pipe = make_pipe(
             named_ground_read("g_pipe_source"),
-            PipeOp::Transform { items: crate::pipeline::asts::vocabulary::Vec1::new(crate::pipeline::asts::core::NamedOutItem {
-                    expr: OutValue::Domain(DomainExpression::Application(
+            PipeOp::Transform { items: crate::pipeline::asts::vocabulary::Vec1::new(crate::pipeline::asts::core::NamedOutItem::authored(DomainExpression::Application(
                         crate::pipeline::asts::core::FunctionApplication::Scalarized(
                             crate::pipeline::asts::core::ScalarRelation::Named {
                                 identifier: qn("s"),
-                                body: Box::new(crate::pipeline::asts::core::ScalarizedRelation {
-                                    body: named_ground_read("g_operator_arg"),
-                                    scalarization:
+                                body: Box::new(crate::pipeline::asts::core::ScalarizedRelation::authored(
+                                    named_ground_read("g_operator_arg"),
+
                                         crate::pipeline::asts::core::Scalarization::BoundToOne {
                                             ordering: Vec::new(),
                                         },
-                                    scope: (),
-                                    output: (),
-                                }),
+                                )),
                             },
                         ),
-                    )),
-                    naming: "a".into(),
-                    qualifier: None,
-                    output: (),
-                }), guard: None },
+                    ), "a".into(), None)), guard: None },
         );
 
         // SetOperation operand + an InnerRelation subquery.
         let setop = named_ground_read("g_setop_operand").bag_op(
             SetOperator::SmartUnionAll,
-            Chain::relation(Relation::InnerRelation {
+            Chain::authored(GroundForm::Reference(Relation::InnerRelation {
                 pattern: InnerRelationPattern::Indeterminate {
                     identifier: qn("i"),
                     subquery: Box::new(named_ground_read("g_inner_relation")),
                 },
-                preminted_scope: None,
                 alias: None,
                 outer: false,
-                cpr_schema: (),
-            }),
-            (),
+            })),
             (),
         );
 
@@ -3195,12 +3313,20 @@ mod p1_closure_matrix {
         }
         impl AstVisit<Unresolved> for PlanScopeCollector {
             fn enter_relation(&mut self, relation: &Relation) -> Result<Descent> {
-                if let Relation::Ground {
-                    mention: GroundMention::Plan { scope, .. },
-                    ..
-                } = relation
-                {
-                    self.scopes.insert(*scope);
+                match relation {
+                    Relation::Ground {
+                        mention: GroundMention::Scratch { row },
+                        ..
+                    } => {
+                        self.scopes.insert(row.relation().scope());
+                    }
+                    Relation::Ground {
+                        mention: GroundMention::Receipt { receipt, .. },
+                        ..
+                    } => {
+                        self.scopes.insert(receipt.row().relation().scope());
+                    }
+                    _ => {}
                 }
                 Ok(Descent::Continue)
             }
@@ -3222,14 +3348,9 @@ mod p1_closure_matrix {
         // reached that exact edge and the detector sees the substitution. That
         // the SAME name set drives both halves is the R-I6 coincidence. ---
         for n in &names {
-            let identities = crate::names::Registry::new(&[]);
-            let snap = identities.mint_derived_scope(
-                crate::names::ScopeOrigin::Scratch {
-                    role: crate::names::ScratchRole::Snapshot,
-                },
-                crate::names::Hint::None,
-            );
-            let rewritten = rename_ground_reads(fixture.clone(), n, snap);
+            let identities = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+            let snap = crate::relation::any_scratch(&identities);
+            let rewritten = rename_ground_reads(fixture.clone(), crate::relation::NamedScratch::under(snap, (*n).into(), super::ReceiptNaming(())));
             let after = collect_ground_names(&rewritten);
             assert!(
                 !after.contains(*n),
@@ -3242,19 +3363,14 @@ mod p1_closure_matrix {
             };
             walk_visit_relational(&mut scopes, &rewritten)
                 .expect("plan-scope detection is infallible");
-            assert!(scopes.scopes.contains(&snap));
+            assert!(scopes.scopes.contains(&snap.relation().scope()));
         }
     }
 
     #[test]
     fn plan_scope_rewrite_preserves_authored_access_shape() {
-        let identities = crate::names::Registry::new(&[]);
-        let snap = identities.mint_derived_scope(
-            crate::names::ScopeOrigin::Scratch {
-                role: crate::names::ScratchRole::Snapshot,
-            },
-            crate::names::Hint::None,
-        );
+        let identities = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+        let snap = crate::relation::any_scratch(&identities);
         let source = Chain::read(
             Relation::Ground {
                 mention: GroundMention::Named {
@@ -3264,32 +3380,29 @@ mod p1_closure_matrix {
                     passthrough: false,
                 },
                 outer: true,
-                cpr_schema: (),
             },
             Access::Unasked,
-            (),
         );
 
-        let rewritten = rename_ground_reads(source, "valid", snap);
+        let rewritten = rename_ground_reads(source, crate::relation::NamedScratch::under(snap, "valid".into(), super::ReceiptNaming(())));
         let access = rewritten
             .head_access()
             .cloned()
             .expect("the read carries its access");
         let Some(Relation::Ground {
-            mention:
-                GroundMention::Plan {
-                    scope,
-                    authored_name,
-                    alias,
-                },
+            mention: GroundMention::Receipt { receipt, alias },
             outer,
             ..
         }) = rewritten.as_read_relation()
         else {
-            panic!("the authored access should become an access-bearing plan scope")
+            panic!("the authored access should become an access-bearing receipt read")
         };
-        let (scope, authored_name, alias, outer) =
-            (*scope, authored_name.clone(), alias.clone(), *outer);
+        let (scope, authored_name, alias, outer) = (
+            receipt.row(),
+            Some(receipt.name().clone()),
+            alias.clone(),
+            *outer,
+        );
         assert_eq!(scope, snap);
         assert_eq!(authored_name.as_deref(), Some("valid"));
         assert!(matches!(access, Access::Unasked));
@@ -3299,13 +3412,8 @@ mod p1_closure_matrix {
 
     #[test]
     fn matched_plan_scope_still_rewrites_reads_inside_its_access() {
-        let identities = crate::names::Registry::new(&[]);
-        let snap = identities.mint_derived_scope(
-            crate::names::ScopeOrigin::Scratch {
-                role: crate::names::ScratchRole::Snapshot,
-            },
-            crate::names::Hint::None,
-        );
+        let identities = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+        let snap = crate::relation::any_scratch(&identities);
         let source = Chain::read(
             Relation::Ground {
                 mention: GroundMention::Named {
@@ -3315,33 +3423,29 @@ mod p1_closure_matrix {
                     passthrough: false,
                 },
                 outer: false,
-                cpr_schema: (),
             },
             Access::from_terms(vec![DomainExpression::Application(
                 crate::pipeline::asts::core::FunctionApplication::Scalarized(
                     crate::pipeline::asts::core::ScalarRelation::Named {
                         identifier: qn("probe"),
-                        body: Box::new(crate::pipeline::asts::core::ScalarizedRelation {
-                            body: named_ground_read("valid"),
-                            scalarization: crate::pipeline::asts::core::Scalarization::BoundToOne {
+                        body: Box::new(crate::pipeline::asts::core::ScalarizedRelation::authored(
+                            named_ground_read("valid"),
+                            crate::pipeline::asts::core::Scalarization::BoundToOne {
                                 ordering: Vec::new(),
                             },
-                            scope: (),
-                            output: (),
-                        }),
+                        )),
                     },
                 ),
             )]),
-            (),
         );
-        let rewritten = rename_ground_reads(source, "valid", snap);
+        let rewritten = rename_ground_reads(source, crate::relation::NamedScratch::under(snap, "valid".into(), super::ReceiptNaming(())));
         struct CountPlanScopes(usize);
         impl AstVisit<Unresolved> for CountPlanScopes {
             fn enter_relation(&mut self, relation: &Relation) -> Result<Descent> {
                 if matches!(
                     relation,
                     Relation::Ground {
-                        mention: GroundMention::Plan { .. },
+                        mention: GroundMention::Receipt { .. },
                         ..
                     }
                 ) {
@@ -3372,25 +3476,18 @@ mod p1_closure_matrix {
                     passthrough: false,
                 },
                 outer: false,
-                cpr_schema: (),
             },
             Access::All,
-            (),
         );
         assert!(
             collect_ground_names(&source).is_empty(),
             "hazard detection and rewrite share the unqualified-access boundary"
         );
 
-        let identities = crate::names::Registry::new(&[]);
-        let snap = identities.mint_derived_scope(
-            crate::names::ScopeOrigin::Scratch {
-                role: crate::names::ScratchRole::Snapshot,
-            },
-            crate::names::Hint::None,
-        );
+        let identities = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+        let snap = crate::relation::any_scratch(&identities);
         assert!(matches!(
-            rename_ground_reads(source, "valid", snap).as_read_relation(),
+            rename_ground_reads(source, crate::relation::NamedScratch::under(snap, "valid".into(), super::ReceiptNaming(()))).as_read_relation(),
             Some(Relation::Ground { .. })
         ));
     }
@@ -3422,41 +3519,40 @@ fn qn_red6(name: &str) -> QualifiedName {
 /// A positional access spec that hides a directive (`insert!`) in a scalar
 /// subquery — the exact shape `access_demands_directive` detects.
 fn directive_bearing_access() -> Access {
-    let inner = Chain::relation(Relation::FunctorCall {
+    let inner = Chain::authored(GroundForm::Reference(Relation::FunctorCall {
         alias: None,
         call: crate::pipeline::asts::core::FunctorCall::written(
             crate::pipeline::asts::vocabulary::Ref::synthetic_with_display(
-                &std::rc::Rc::new(crate::names::Registry::new(&[])),
+                &crate::relation::Planning::open(crate::names::Registry::new(&[])).names(),
                 crate::pipeline::asts::vocabulary::SyntheticReason::EffectReceipt,
                 "insert!",
             ),
             vec![],
         )
         .into(),
-        cpr_schema: (),
-    });
+    }));
     Access::from_terms(vec![DomainExpression::Application(
         crate::pipeline::asts::core::FunctionApplication::Scalarized(
             crate::pipeline::asts::core::ScalarRelation::Named {
                 identifier: qn_red6("s"),
-                body: Box::new(crate::pipeline::asts::core::ScalarizedRelation {
-                    body: inner,
-                    scalarization: crate::pipeline::asts::core::Scalarization::BoundToOne {
+                body: Box::new(crate::pipeline::asts::core::ScalarizedRelation::authored(
+                    inner,
+                    crate::pipeline::asts::core::Scalarization::BoundToOne {
                         ordering: Vec::new(),
                     },
-                    scope: (),
-                    output: (),
-                }),
+                )),
             },
         ),
     )])
 }
 
-fn top_walk_ctx() -> WalkCtx {
+fn top_walk_ctx(world: &EffectWorld) -> WalkCtx<'_> {
     WalkCtx {
+        world,
         guards: Vec::new(),
         sink: None,
-        ctes: Vec::new(),
+        locals: crate::pipeline::asts::core::QueryLocals::none(),
+        horizon: crate::pipeline::asts::core::LexicalHorizon::all(),
         bindings: HashMap::new(),
         receipt_name: "main".to_string(),
     }
@@ -3468,7 +3564,13 @@ fn top_walk_ctx() -> WalkCtx {
 #[test]
 fn ground_access_spec_directive_refuses_at_lowering() {
     let system = world_system();
-    let mut builder = PlanBuilder::new(&system, Some("fx"), Rc::new(Registry::new(&[])));
+    let planning = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let mut builder = PlanBuilder::new(
+        &system,
+        Some("fx"),
+        PlanEpoch::Discovering(planning),
+        Rc::new(std::cell::RefCell::new(SemanticReplay::default())),
+    );
     let ground = Relation::Ground {
         mention: GroundMention::Named {
             identifier: qn_red6("orders"),
@@ -3477,11 +3579,17 @@ fn ground_access_spec_directive_refuses_at_lowering() {
             passthrough: false,
         },
         outer: false,
-        cpr_schema: (),
     };
 
+    let world = builder
+        .program_world()
+        .expect("the plan's own program world");
     let err = builder
-        .walk_read(ground, Some(directive_bearing_access()), &top_walk_ctx())
+        .walk_read(
+            ground,
+            Some(directive_bearing_access()),
+            &top_walk_ctx(&world),
+        )
         .expect_err("a directive in a Ground access spec must refuse, not lower unprocessed");
     let msg = format!("{err}");
     assert!(
@@ -3497,7 +3605,13 @@ fn ground_access_spec_directive_refuses_at_lowering() {
 #[test]
 fn dml_access_spec_directive_refuses_at_lowering() {
     let system = world_system();
-    let mut builder = PlanBuilder::new(&system, Some("fx"), Rc::new(Registry::new(&[])));
+    let planning = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let mut builder = PlanBuilder::new(
+        &system,
+        Some("fx"),
+        PlanEpoch::Discovering(planning),
+        Rc::new(std::cell::RefCell::new(SemanticReplay::default())),
+    );
     // The walked source is immaterial: the guard fires before it is touched.
     let walked_source = Chain::read(
         Relation::Ground {
@@ -3508,12 +3622,13 @@ fn dml_access_spec_directive_refuses_at_lowering() {
                 passthrough: false,
             },
             outer: false,
-            cpr_schema: (),
         },
         Access::All,
-        (),
     );
 
+    let world = builder
+        .program_world()
+        .expect("the plan's own program world");
     let err = builder
         .handle_dml(
             walked_source,
@@ -3529,18 +3644,16 @@ fn dml_access_spec_directive_refuses_at_lowering() {
                         passthrough: false,
                     },
                     outer: false,
-                    cpr_schema: (),
                 },
                 Access::All,
-                (),
             ),
             crate::pipeline::asts::vocabulary::Ref::synthetic_with_display(
-                &std::rc::Rc::new(crate::names::Registry::new(&[])),
+                &crate::relation::Planning::open(crate::names::Registry::new(&[])).names(),
                 crate::pipeline::asts::vocabulary::SyntheticReason::EffectReceipt,
                 "insert!",
             ),
             directive_bearing_access(),
-            &top_walk_ctx(),
+            &top_walk_ctx(&world),
         )
         .expect_err("a directive in a DML access spec must refuse, not lower unprocessed");
     let msg = format!("{err}");

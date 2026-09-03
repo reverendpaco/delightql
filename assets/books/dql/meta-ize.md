@@ -23,16 +23,15 @@ This returns one row per column in `users`:
 
 : Output of `users(^)`
 
-The `^`{.delightql .sigil} operator belongs to the continuation operator family
+The `^`{.delightql .sigil} operator belongs to the unary continuation operator family
 -- unary operators that transform table access:
 
-| Operator | Meaning |
-|----------|---------|
-| `*` | Qualify column names (data access) |
-| `()` | Unqualified columns (natural join candidate) |
-| `.(cols)` | USING semantics on specific columns |
-| `^` | Column metadata as rows |
-| `^^` | Full DDL metadata as rows |
+| Operator  | Meaning                                      |
+|-----------|----------------------------------------------|
+| `*`       | Qualify column names (data access)           |
+| `.*`      | Unqualified columns (natural join candidate) |
+| `.(cols)` | USING semantics on specific columns          |
+| `^`       | Column metadata as rows                      |
 
 : Table continuation operators
 
@@ -41,7 +40,7 @@ These operators compose freely: `users(*.(id))` means "qualified + USING on id."
 
 ## Postfix Form {.dqlh}
 
-`users(^)`{.delightql} is sugar for `users(*) ^`{.delightql}. The
+`users(^)`{.delightql} is sugar for `users() ^`{.delightql}. The
 postfix form works on any relational expression, not just base tables:
 
 ```delightql
@@ -74,12 +73,8 @@ users(^), coltype = "TEXT" |> (colname)
 users_2024(^) |;| users_2023(^), x.* = y.*
 ```
 
-```delightql
--- filter schema of an optionally-joined table
-department?(^), coltype = "TEXT"
-```
 
 > The output of `^` is itself a relation with a fixed schema
-> (colname, colposition, coltype). Applying `^` to a `^` result
+> (scope, column_name, ordinal). Applying `^` to a `^` result
 > would return the schema of the metadata relation -- three rows
-> describing colname, colposition, and coltype themselves.
+> describing scope, column_name, ordinal themselves.

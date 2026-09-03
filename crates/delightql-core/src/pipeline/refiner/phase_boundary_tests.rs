@@ -146,11 +146,11 @@ fn a_tvf_access_survives_the_resolved_to_refined_boundary() {
 
     assert!(
         matches!(
-            refined.head,
-            ast_refined::Grelex::Reference(ast_refined::Relation::FunctorCall { .. })
+            refined.head().form(),
+            ast_refined::GroundForm::Reference(ast_refined::Relation::FunctorCall { .. })
         ),
         "the refined head is still the callable relation: {:?}",
-        refined.head,
+        refined.head(),
     );
     assert_eq!(
         refined.head_access().map(refined_tag),

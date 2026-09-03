@@ -6,8 +6,8 @@ employee(*), Salary > 5000
   |> ( LastName )
 ```
 
-The fundamental unary operators -- projection, distinct, group by -- have
-dedicated syntax covered in earlier sections:
+Delightql's builtin pipe unary operators -- projection, distinct, group by -- have
+dedicated syntax:
 ```delightql
 foo(*)  |>   ( LastName )
 foo(*)  |>  -( FirstName, LastName )
@@ -16,14 +16,14 @@ foo(*)  |>  %( FirstName, LastName )
 foo(*)  |>  %( FirstName, LastName ~> count:(*) )
 ```
 
-Higher-order predicates extend this pattern. A programmer-defined higher-order
-predicate can appear as the pipe target:
+Higher-order predicats are programmer-defined rules
+that can appear as the pipe target:
 ```delightql
 employee(*)
   |> summarize(*)
 ```
 
-Given this definition in assertion mode:
+Given this example definition in assertion mode:
 ```{.delightql .am}
 summarize(T(*))(*) :-
   T(*)
@@ -34,6 +34,7 @@ summarize(T(*))(*) :-
 ```
 
 the expression `employee(*) |> summarize(*)`{.delightql} expands to:
+
 ```delightql
 employee(*)
   ~> ( count:(%LastName)  as distinct_last_name_count,
@@ -62,18 +63,10 @@ and projections:
 clean_employees(batch.employee_2019(*, Salary > 50000))(*)
 ```
 
-Higher-order parameters are relational terms passed BY REFERENCE: the
-invocation preserves the written relation — filters, projections,
-qualification and all — and the receiving definition (or built-in
-rewrite) decides how and when to consume it. Constructing the
-invocation implies no early evaluation or materialization.
 
-Directive (bang) invocations share this exact shape and law: the first
-parentheses hold the parameters, the trailing parentheses access the
-return table — for a directive, its RECEIPT (`SEMANTICS/effect-algebra-law.md` §1,
-§3). The first group is never an inline input table; a relational
-input arrives through the pipe, by the same insertion law shown
-above.
+Higher-order parameters are passed by reference: their
+invocation preserves the written relation without evaluation.
+
 
 The piped form's advantage is composability with other pipe operators:
 ```delightql
@@ -84,17 +77,14 @@ batch.employee_2019(*), Salary > 50000,
 
 ## Multi-Parameter Piped Invocation {.dqlh}
 
-When the piped relation is not the first parameter, use `@` (the f-param
-placeholder) to mark where it goes — borrowing function-pipe syntax:
+When the piped relation is not the last parameter, use `@` (the f-param
+placeholder) to mark where it goes -- borrowing function-pipe syntax:
 
 ```delightql
--- Definition: scalar first, table second
-tagged(label, T(*))(*) :- T(*), ...
+-- Definition: scalar second, table first
+tagged(T(*),label)(*) :- T(*), ...
 
 -- Piped with @:
-users(*) |> tagged("young", @)(*)
+users(*) |> tagged(@,"young")(*)
 ```
 
-Without `@`, the piped relation fills the first parameter by default. When
-the first parameter is a scalar, this fails. The `@` placeholder makes the
-target position explicit.

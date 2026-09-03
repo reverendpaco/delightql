@@ -33,10 +33,15 @@ const CORRESPONDENCE: &[(&str, &str)] = &[
 /// and the disregarded anaphor.
 const PATTERN_ONLY: &[&str] = &["path_binding", "metadata_binding", "disregarded"];
 
-/// Construction-side licence: a spread expands the selected columns into
+/// Construction-side licences: a spread expands the selected columns into
 /// self-keyed members, which has no destructuring direction — a pattern binds
-/// names it was given, it does not discover them.
-const CONSTRUCTION_ONLY: &[&str] = &["spread"];
+/// names it was given, it does not discover them. A keyed metadata member
+/// (`"k": g:~> {…}`, FN.22 amended) has a destructuring direction, but it is
+/// spelled through members this table already carries — `nested_pattern`'s
+/// iteration into a `metadata_binding` (`"k": ~> g:~> {…}`), with the `~>`
+/// flip the mirror law itself prescribes — so no pattern member of its own
+/// exists to correspond with.
+const CONSTRUCTION_ONLY: &[&str] = &["spread", "keyed_metadata"];
 
 #[test]
 fn the_two_sides_differ_only_by_licensed_exceptions() {

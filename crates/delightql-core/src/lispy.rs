@@ -19,19 +19,6 @@ impl ToLispy for crate::pipeline::asts::core::provenance::CteOrigin {
     }
 }
 
-impl ToLispy for crate::pipeline::asts::core::provenance::CteResolutionOwner {
-    fn to_lispy(&self) -> String {
-        match self {
-            crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity => {
-                "entity".to_string()
-            }
-            crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller { .. } => {
-                "caller".to_string()
-            }
-        }
-    }
-}
-
 impl ToLispy for String {
     fn to_lispy(&self) -> String {
         format!("\"{}\"", self)

@@ -118,10 +118,7 @@ fn transform_query<T: QueryTransformer>(
             // Transform each CTE's query
             let transformed_ctes = ctes
                 .into_iter()
-                .map(|cte| {
-                    let transformed_query = transform_query(cte.query().clone(), transformer)?;
-                    Ok(cte.with_query(transformed_query))
-                })
+                .map(|cte| cte.rewrite_parts(|part| transform_query(part, transformer)))
                 .collect::<Result<Vec<_>>>()?;
 
             let transformed_inner = Box::new(transform_query(*query, transformer)?);

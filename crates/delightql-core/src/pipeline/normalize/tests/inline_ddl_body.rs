@@ -20,10 +20,14 @@ fn the_block(normalized: &crate::pipeline::normalize::Normalized) -> &InlineDdlS
 /// one-definition-shaped, and the clauses arrive in authored order.
 #[test]
 fn a_multi_definition_body_carries_every_clause_typed() {
-    let normalized = queries(
-        "(~~ddl v(*) :- users(*)\nw(*) :- v(*)\nf(a, b ---- 1, 2) ~~) users(*)",
-    );
-    let block = &normalized.queries[0].declared.ddl_blocks[0];
+    let normalized =
+        queries("(~~ddl v(*) :- users(*)\nw(*) :- v(*)\nf(a, b ---- 1, 2) ~~) users(*)");
+    let block = &normalized
+        .queries()
+        .nth(0)
+        .expect("a goal")
+        .declared
+        .ddl_blocks[0];
     let names: Vec<String> = block
         .body
         .definitions
@@ -91,7 +95,12 @@ fn an_empty_block_is_lawful_and_carries_an_empty_body() {
 #[test]
 fn a_named_child_namespace_travels_on_the_spec() {
     let normalized = queries("(~~ddl:\"chz\" v(*) :- users(*) ~~) users(*)");
-    let block = &normalized.queries[0].declared.ddl_blocks[0];
+    let block = &normalized
+        .queries()
+        .nth(0)
+        .expect("a goal")
+        .declared
+        .ddl_blocks[0];
     assert_eq!(block.namespace.as_deref(), Some("chz"));
 }
 
@@ -102,8 +111,7 @@ fn a_named_child_namespace_travels_on_the_spec() {
 fn block_definitions_do_not_leak_into_the_file_s_own() {
     let normalized = file("v(*) :- users(*)\n(~~ddl w(*) :- v(*) ~~)\nu(*) :- v(*)");
     let names: Vec<String> = normalized
-        .definitions
-        .iter()
+        .definitions()
         .map(|clause| clause.front.name())
         .collect();
     assert_eq!(names, ["v", "u"], "the file owns exactly its own subjects");
@@ -140,7 +148,10 @@ fn malformed_inner_syntax_is_the_submission_s_parse_defect() {
 fn a_normalization_error_inside_the_body_is_submission_owned() {
     let tree = crate::pipeline::syntax::Parser::new()
         .parse_query_sequence("(~~ddl w(a, b -> c ---- 1 -> \"x\") ~~) users(*)");
-    assert!(!tree.has_defects(), "the width defect is semantic, not syntax");
+    assert!(
+        !tree.has_defects(),
+        "the width defect is semantic, not syntax"
+    );
     let error = crate::pipeline::normalize::query_sequence(
         &tree,
         std::rc::Rc::new(crate::names::Registry::new(&[])),
@@ -158,7 +169,12 @@ fn a_normalization_error_inside_the_body_is_submission_owned() {
 #[test]
 fn sibling_agreement_is_not_judged_at_normalization() {
     let normalized = queries("(~~ddl q(a) :- _(a @ 1)\nq(a, b) :- _(a, b @ 1, 2) ~~) users(*)");
-    let block = &normalized.queries[0].declared.ddl_blocks[0];
+    let block = &normalized
+        .queries()
+        .nth(0)
+        .expect("a goal")
+        .declared
+        .ddl_blocks[0];
     assert_eq!(block.body.definitions.len(), 2, "both clauses travel");
 }
 
@@ -167,10 +183,9 @@ fn sibling_agreement_is_not_judged_at_normalization() {
 /// the enclosing submission.
 #[test]
 fn a_doc_slot_block_inside_a_body_lands_in_that_body() {
-    let normalized = queries(
-        "(~~ddl v(*) :-\n  (~~ddl:\"aside\" w(*) :- _(x @ 1) ~~)\n  users(*) ~~) users(*)",
-    );
-    let goal = &normalized.queries[0];
+    let normalized =
+        queries("(~~ddl v(*) :-\n  (~~ddl:\"aside\" w(*) :- _(x @ 1) ~~)\n  users(*) ~~) users(*)");
+    let goal = &normalized.queries().nth(0).expect("a goal");
     assert_eq!(
         goal.declared.ddl_blocks.len(),
         1,
@@ -178,7 +193,11 @@ fn a_doc_slot_block_inside_a_body_lands_in_that_body() {
     );
     let outer = &goal.declared.ddl_blocks[0];
     assert_eq!(outer.body.definitions.len(), 1);
-    assert_eq!(outer.body.ddl_blocks.len(), 1, "the doc-slot block is the body's");
+    assert_eq!(
+        outer.body.ddl_blocks.len(),
+        1,
+        "the doc-slot block is the body's"
+    );
     assert_eq!(outer.body.ddl_blocks[0].namespace.as_deref(), Some("aside"));
 }
 
@@ -188,13 +207,37 @@ fn a_doc_slot_block_inside_a_body_lands_in_that_body() {
 fn inner_declarations_do_not_reach_the_enclosing_goal() {
     let plain = queries("users(*)");
     let with_block = queries("(~~ddl v(*) :- users(*), age > 3 ~~) users(*)");
-    assert!(plain.queries[0].declared.is_empty());
+    assert!(plain.queries().nth(0).expect("a goal").declared.is_empty());
     assert!(
-        with_block.queries[0].declared.ddl_blocks.len() == 1
-            && with_block.queries[0].declared.assertions.is_empty()
-            && with_block.queries[0].declared.dangers.is_empty()
-            && with_block.queries[0].declared.options.is_empty(),
+        with_block
+            .queries()
+            .nth(0)
+            .expect("a goal")
+            .declared
+            .ddl_blocks
+            .len()
+            == 1
+            && with_block
+                .queries()
+                .nth(0)
+                .expect("a goal")
+                .declared
+                .dangers
+                .is_empty()
+            && with_block
+                .queries()
+                .nth(0)
+                .expect("a goal")
+                .declared
+                .options
+                .is_empty(),
         "the goal declares its own block and nothing of the block's interior"
     );
-    assert!(with_block.queries[0].declared.expected_error.is_none());
+    assert!(with_block
+        .queries()
+        .nth(0)
+        .expect("a goal")
+        .declared
+        .expected_error
+        .is_none());
 }

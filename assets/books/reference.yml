@@ -6,9 +6,22 @@ frontmatter: |
   ---
 spine:
   - introduction.md:
-      - typesetting.md
+    - terminology.md:
+       - terminology/logic-and-sql.md
+       - terminology/_index.md:
+          - terminology/domain.md
+          - terminology/functor.md
+          - terminology/predicate-vs-relation.md
+          - terminology/sigilization.md
   - dql/_index.md:
-      - dql/from.md
+      - dql/identifier_rules.md
+      - dql/from/_index.md:
+        - dql/from/qualified_access.md
+        - dql/from/argumentative_access.md
+        - dql/from/aliasing_a_table.md
+        - dql/from/table_namespacing.md
+        - dql/from/anon_table.md
+        - dql/from/higher_order.md
       - dql/order-by.md
       - dql/limit.md
       - dql/projection/_index.md:
@@ -37,51 +50,136 @@ spine:
           - dql/functions/case-simple.md
           - dql/functions/case-search.md
           - dql/functions/format.md
+          - dql/functions/citations-and-symbols.md
           - dql/functions/window.md
           - dql/functions/scalar-subquery.md
           - dql/functions/context-aware.md
           - dql/functions/sigma-as-column.md
           - dql/functions/interior-tuples.md
-      - dql/path-addressing.md
+          - dql/functions/path-addressing.md
       - dql/index-addressing.md
       - dql/common-expressions.md:
         - dql/common-table-expressions.md
         - dql/common-function-expressions.md
         - dql/recursive-common-table-expressions.md
-      - dql/where.md
-      - dql/join.md
-      - dql/lvars.md
-      - dql/set-operators.md
+        - dql/common-ho-table-expressions.md
+      - dql/where/_index.md:
+        - dql/where/domain_predicates.md
+        - dql/where/argumentative_grounding.md
+        - dql/where/semi_joins_and_anti_joins.md
+        - dql/where/the_in_predicate.md
+        - dql/where/relational_IN.md
+        - dql/where/inverted_in.md
+        - dql/where/sigma-predicates.md
+      - dql/join/_index.md:
+        - dql/join/cross-join.md
+        - dql/join/inner-join.md
+        - dql/join/using.md
+        - dql/join/on-vs-where.md
+        - dql/join/multi-table.md
+        - dql/join/self-join.md
+        - dql/join/argumentative.md
+        - dql/join/outer.md
+        - dql/join/lateral.md
+        - dql/join/er-context.md
+      - dql/tree_groups/_index.md:
+          - dql/tree_groups/data-oriented-tree-groups.md
+          - dql/tree_groups/metadata-oriented-tree-groups.md
+          - dql/tree_groups/tree-distinction.md
+          - dql/tree_groups/tree-destructuring.md
+          - dql/tree_groups/tree-pathing.md
+          - dql/tree_groups/interior-drill.md
+          - dql/tree_groups/narrowing.md
+          - dql/tree_groups/null-elision-tgs.md
+      - dql/set-operators/_index.md:
+        - dql/set-operators/union-all-corresponding.md
+        - dql/set-operators/smart-union-all.md
+        - dql/set-operators/traditional-union-all.md
+        - dql/set-operators/set-vs-multiset.md
+        - dql/set-operators/intersects-as-correlation.md
+        - dql/set-operators/minus.md
       - dql/interior-relations.md
       - dql/higher-order.md
       - dql/pivot.md
-      - dql/tree-groups.md
       - dql/meta-ize.md
+  - dql/fundamentals/_index.md:
+    - dql/fundamentals/lvars.md
+    - dql/fundamentals/identifier-syntax-mirrors-call.md
+    - dql/fundamentals/null-semantics.md
+    - dql/fundamentals/the-meaning-is-sql.md
+    - dql/fundamentals/the-meaning-is-not-sql.md
+    - dql/fundamentals/default-transpilation-strategy.md
+    - dql/fundamentals/scoping/_index.md:
+      - dql/fundamentals/scoping/relational-continuation.md
+      - dql/fundamentals/scoping/left-to-right.md
+      - dql/fundamentals/scoping/interior-relations.md
+    - dql/fundamentals/nominalization/_index.md:
+      - dql/fundamentals/nominalization/functor_rules.md
+      - dql/fundamentals/nominalization/minting.md
+      - dql/fundamentals/nominalization/the-postfix-operators.md
+    - dql/fundamentals/moding-and-currying.md:
+      - dql/fundamentals/modes/functions-mode.md
+      - dql/fundamentals/modes/table-mode.md
+      - dql/fundamentals/modes/sigma-predicates-mode.md
+      - dql/fundamentals/modes/function-facts-mode.md
+      - dql/fundamentals/modes/higher-order-rules-mode.md
+    - dql/fundamentals/grounding-higher-order-literals.md
   - ddl/_index.md:
       - ddl/necks.md
       - ddl/entity-types/_index.md
       - ddl/head-semantics.md
-      - ddl/advanced/higher-order.md
+      - ddl/higher-order/_index.md:
+        - ddl/higher-order/syntax.md
+        - ddl/higher-order/invocation.md
+        - ddl/higher-order/parameters/_index.md:
+          - ddl/higher-order/parameters/scalar-parameters.md
+          - ddl/higher-order/parameters/glob-functor-parameters.md
+          - ddl/higher-order/parameters/arugmentative-functor-parameters.md
+          - ddl/higher-order/parameters/parameter-chart.md
       - ddl/entity-types/sigma-predicates.md
       - ddl/advanced/er-context-rules.md
       - ddl/advanced/recursive.md
-      - ddl/entity-types/functions.md
       - ddl/facts.md
+      - ddl/citations.md
+      - ddl/entity-types/functions/_index.md:
+        - ddl/entity-types/functions/stacked-named-case.md
+        - ddl/entity-types/functions/rule-function.md
+        - ddl/entity-types/functions/higher-order-functions.md
+        - ddl/entity-types/functions/context-aware-functions.md
+        - ddl/entity-types/functions/fact-form.md
       - ddl/namespaces.md
-  - dml/_index.md
+  - dml/_index.md:
+    - dml/insert.md
+    - dml/update.md
+    - dml/delete.md
+  - effects/_index.md:
+      - effects/receipts.md
+      - effects/effect-rules.md
+      - effects/returning-pipe.md
+      - effects/scripting.md
+      - effects/built-ins.md:
+          - effects/built-ins/assert.md
+          - effects/built-ins/consult.md
+          - effects/built-ins/mount.md
+          - effects/built-ins/ddl.md
+  - runtime/_index.md:
+      - runtime/namespaces/_index.md:
+        - runtime/namespaces/builtin.md
+        - runtime/namespaces/metadata.md
+        - runtime/namespaces/auto-enlist.md
+        - runtime/namespaces/protected.md
+      - runtime/repl-vs-cli-vs-core.md
+      - runtime/system-tables/_index.md:
+        - runtime/system-tables/information-schema-namespaces.md
+        - runtime/system-tables/transpilation-rules.md
+      - runtime/override-tables.md
   - annotations/_index.md:
-      - annotations/assertions.md
+      # - annotations/assertions.md
       - annotations/errors.md
       - annotations/danger.md
-      - annotations/options.md
+      # - annotations/options.md
       - annotations/docs.md
-  # - normative/EFFECT-ALGEBRA.md:
-  #     - normative/EQUALITY.md
-  #     - normative/GROUNDING-AND-MENTION.md
-  #     - normative/GROUNDING-AND-MENTION-READING.md
-  #     - normative/HEADS.md
-  #     - normative/JSON-SUBSTRATE.md
   - appendices/tree-normal-form.md
-  - appendices/error-uris.md
-  - appendices/danger-uris.md
-  - appendices/namespace-directives.md
+  # - appendices/error-uris.md
+  # - appendices/danger-uris.md
+  # - appendices/namespace-directives.md

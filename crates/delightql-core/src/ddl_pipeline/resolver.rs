@@ -24,12 +24,9 @@ use crate::pipeline::asts::core::{Probe, ValueRow};
 /// - Validates composite PK/UNIQUE column names exist in the table's column list.
 pub fn resolve(
     def: CreateTableDef<Unresolved>,
-) -> Result<(
-    CreateTableDef<Resolved>,
-    std::rc::Rc<crate::names::Registry>,
-)> {
-    let identities = std::rc::Rc::new(crate::names::Registry::new(&[]));
-    let (table, available) = build_available(&def.columns, &def.name, &identities);
+) -> Result<(CreateTableDef<Resolved>, crate::relation::Planning)> {
+    let identities = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let (table, available) = build_available(&def.columns, &def.name, &identities)?;
 
     let mut resolved_columns = Vec::with_capacity(def.columns.len());
     for (col, metadata) in def.columns.into_iter().zip(&available) {
@@ -64,31 +61,33 @@ pub fn resolve(
 fn build_available(
     columns: &[ColumnDef<Unresolved>],
     table_name: &str,
-    identities: &std::rc::Rc<crate::names::Registry>,
-) -> (crate::names::ScopeId, Vec<ast_resolved::ColumnMetadata>) {
+    identities: &crate::relation::Planning,
+) -> Result<(crate::names::ScopeId, Vec<ast_resolved::ColumnMetadata>)> {
     let table_spelling = identities.intern(table_name, false);
     let entity = identities.mint_entity(table_spelling);
-    let scope = identities.mint_scope(
-        crate::names::ScopeOrigin::Resolution { of: entity },
-        crate::names::Hint::User(table_spelling),
-        None,
-    );
-    let available = columns
+    let slots = columns
         .iter()
         .enumerate()
-        .map(|(i, col)| {
-            let published = identities.intern(col.name.as_str(), false);
-            let identity = identities.mint_column(
-                scope,
-                crate::names::ColumnOrigin::Bound { position: i as u32 },
-                Some(published),
-                crate::names::Addressing::Published,
-                crate::names::ValueFacts::default(),
-            );
-            ast_resolved::ColumnMetadata::new(identity)
+        .map(|(position, column)| crate::relation::form::SourceSlot {
+            position: position as u32,
+            named: Some(identities.intern(column.name.as_str(), false)),
+            declared_type: Some(column.col_type.clone()),
         })
+        .collect::<Vec<_>>();
+    let relation = identities
+        .authority()
+        .derive(crate::relation::RelForm::Source(
+            crate::relation::form::SourceSpec {
+                origin: crate::relation::form::SourceOrigin::Catalog { entity },
+                slots: &slots,
+                answers_to: Some(table_spelling),
+            },
+        ))?;
+    let available = crate::relation::published_ports(identities, &relation)?
+        .into_iter()
+        .map(|port| ast_resolved::ColumnMetadata::new(port.column()))
         .collect();
-    (scope, available)
+    Ok((relation.scope(), available))
 }
 
 /// Empty schema — DDL expressions don't reference external tables.
@@ -110,7 +109,7 @@ impl DatabaseSchema for EmptySchema {
 fn resolve_constraints(
     constraints: Vec<DdlConstraint<Unresolved>>,
     available: &[ast_resolved::ColumnMetadata],
-    identities: &std::rc::Rc<crate::names::Registry>,
+    identities: &crate::relation::Planning,
     table_level: bool,
     subject: Option<&str>,
 ) -> Result<Vec<DdlConstraint<Resolved>>> {
@@ -146,24 +145,16 @@ fn resolve_constraints(
                 }
                 let table_spelling = identities.intern(&table, false);
                 let entity = identities.mint_entity(table_spelling);
-                let ref_table = identities.mint_scope(
-                    crate::names::ScopeOrigin::Resolution { of: entity },
-                    crate::names::Hint::User(table_spelling),
-                    None,
-                );
+                let ref_table = identities.resolved_access_scope(entity, table_spelling);
                 let columns = columns
                     .into_iter()
                     .enumerate()
-                    .map(|(position, name)| {
+                    .map(|(_position, name)| {
                         let spelling = identities.intern(&name, false);
-                        identities.mint_column(
+                        identities.sql_column(
                             ref_table,
-                            crate::names::ColumnOrigin::Bound {
-                                position: position as u32,
-                            },
                             Some(spelling),
                             crate::names::Addressing::Published,
-                            crate::names::ValueFacts::default(),
                         )
                     })
                     .collect();
@@ -189,7 +180,7 @@ fn resolve_constraints(
 fn resolve_local_columns(
     names: Vec<String>,
     available: &[ast_resolved::ColumnMetadata],
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Result<Vec<crate::names::ColId>> {
     names
         .into_iter()
@@ -219,7 +210,7 @@ fn resolve_local_columns(
 fn resolve_default(
     default: Option<DdlDefault<Unresolved>>,
     available: &[ast_resolved::ColumnMetadata],
-    identities: &std::rc::Rc<crate::names::Registry>,
+    identities: &crate::relation::Planning,
     subject: Option<&str>,
 ) -> Result<Option<DdlDefault<Resolved>>> {
     match default {
@@ -286,7 +277,11 @@ impl crate::pipeline::ast_transform::AstTransform<Unresolved, Unresolved> for Na
         expression: DomainExpression<Unresolved>,
     ) -> Result<DomainExpression<Unresolved>> {
         match expression {
-            DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Open(crate::pipeline::asts::core::DomainHole::CompositionInput)) => {
+            DomainExpression::Application(
+                crate::pipeline::asts::core::FunctionApplication::Open(
+                    crate::pipeline::asts::core::DomainHole::CompositionInput,
+                ),
+            ) => {
                 let Some(subject) = self.subject else {
                     return Err(crate::DelightQLError::transpilation_error(
                         "A table-level DDL expression cannot use the value placeholder",
@@ -309,13 +304,12 @@ impl crate::pipeline::ast_transform::AstTransform<Unresolved, Unresolved> for Na
 fn resolve_expr(
     expr: DomainExpression<Unresolved>,
     available: &[ast_resolved::ColumnMetadata],
-    identities: &std::rc::Rc<crate::names::Registry>,
+    identities: &crate::relation::Planning,
     subject: Option<&str>,
 ) -> Result<DomainExpression<Resolved>> {
     let expr = name_the_subject(expr, subject)?;
     let schema = EmptySchema;
-    let mut registry =
-        crate::resolution::EntityRegistry::new(&schema, std::rc::Rc::clone(identities));
+    let mut registry = crate::resolution::ResolverCore::new(&schema, &identities);
     resolve_domain_expr_via_registry(expr, &mut registry, available, false)
 }
 
@@ -328,7 +322,7 @@ fn resolve_expr(
 fn resolve_truth(
     expr: TruthExpression<Unresolved>,
     available: &[ast_resolved::ColumnMetadata],
-    identities: &std::rc::Rc<crate::names::Registry>,
+    identities: &crate::relation::Planning,
     subject: Option<&str>,
 ) -> Result<TruthExpression<Resolved>> {
     let expr = name_the_subject_in_truth(expr, subject)?;
@@ -361,8 +355,7 @@ fn resolve_truth(
     }
 
     let schema = EmptySchema;
-    let mut registry =
-        crate::resolution::EntityRegistry::new(&schema, std::rc::Rc::clone(identities));
+    let mut registry = crate::resolution::ResolverCore::new(&schema, &identities);
     resolve_truth_via_registry(expr, &mut registry, available)
 }
 
@@ -372,8 +365,9 @@ fn resolve_truth(
 ///   `Comparison { operator: "null_safe_ne", left: @, right: Literal(Null) }`
 /// for `@ != null`.
 ///
-/// SQL inequality (`@ !== null`) must remain a CHECK: its unknown result admits
-/// null, unlike the null-safe comparison.
+/// SQL inequality (`+sql_ne(@, null)`) is a sigma application, not this
+/// comparison, and stays a CHECK: it is the null-safe operator alone that
+/// promotes.
 fn is_not_null_pattern(expr: &TruthExpression<Unresolved>) -> bool {
     match expr {
         TruthExpression::Comparison(Comparison {
@@ -381,7 +375,8 @@ fn is_not_null_pattern(expr: &TruthExpression<Unresolved>) -> bool {
             left,
             right,
         }) => {
-            let null_safe_ne = *operator == crate::pipeline::asts::vocabulary::CmpOp::NullSafeNotEqual;
+            let null_safe_ne =
+                *operator == crate::pipeline::asts::vocabulary::CmpOp::NullSafeNotEqual;
             if null_safe_ne && is_value_placeholder(left) && is_null_literal(right) {
                 return true;
             }
@@ -395,13 +390,20 @@ fn is_not_null_pattern(expr: &TruthExpression<Unresolved>) -> bool {
 }
 
 fn is_value_placeholder(expr: &DomainExpression<Unresolved>) -> bool {
-    matches!(expr, DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Open(crate::pipeline::asts::core::DomainHole::CompositionInput)))
+    matches!(
+        expr,
+        DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Open(
+            crate::pipeline::asts::core::DomainHole::CompositionInput
+        ))
+    )
 }
 
 fn is_null_literal(expr: &DomainExpression<Unresolved>) -> bool {
     matches!(
         expr,
-        DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::Null))
+        DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(
+            LiteralValue::Null
+        ))
     )
 }
 

@@ -15,8 +15,14 @@ use super::asts::core::{OptionSpec, OptionState};
 
 /// Known option URIs and their default states.
 const KNOWN_OPTIONS: &[(&str, OptionState)] = &[
-    ("delightql-config://generation/rule/inlining/view", OptionState::Off),
-    ("delightql-config://generation/rule/inlining/fact", OptionState::Off),
+    (
+        "delightql-config://generation/rule/inlining/view",
+        OptionState::Off,
+    ),
+    (
+        "delightql-config://generation/rule/inlining/fact",
+        OptionState::Off,
+    ),
 ];
 
 /// The config badge scheme.

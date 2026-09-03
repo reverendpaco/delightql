@@ -1,14 +1,26 @@
-then(met) :- _(met@1)
+`then`(met) :- _(met@1)
 
 // The existence views. A row answers YES to the proposition; absence
 // answers NO — there is no `met = 0` row, because a false receipt that
 // still occupies a row would survive every conjunction it joins.
 // The witness produces a row either way, so the filter is what turns
 // its 0 into an absence.
-exists(T(*))(*) :- T(+), met = 1
+`exists`(T(*))(*) :- T(+), met = 1
 notexists(T(*))(*) :- T(\+), met = 1
+count_is(n, T(*))(*) :- T(*) ~> count:(*) as c, c = n |> exists(*)
+at_least(n, T(*))(*) :- T(*) ~> count:(*) as c, c >= n |> exists(*)
 
-// `equals` is deliberately NOT here. A view built on the relational
-// minus pairs columns by name; the comparison `equals` lowers to pairs
-// them by position, and the two disagree wherever a heading repeats or
-// reorders names. It lands as a native binary predicate instead.
+// Positional bag equality first makes each row a tuple, orders those tuples,
+// and collects the ordered bag as one interior value. Tuple construction
+// preserves duplicate headings, NULL positions, and multiplicity; comparing
+// the two one-row values is therefore the positional bag judgment.
+bag_tuple(T(*))(*) :-
+  T(*) |> ([*] as tuple_value) |> #(tuple_value)
+       ~> [tuple_value] as bag
+same_bag(E(*), T(*))(*) :-
+  bag_tuple(T(*))(*) as actual,
+  bag_tuple(E(*))(*) as expected,
+  actual.bag = expected.bag
+
+iota(end)(value) :- _(value@1)
+iota(end)(value) :- iota(end)(*),value<end |> (value + 1 as value)

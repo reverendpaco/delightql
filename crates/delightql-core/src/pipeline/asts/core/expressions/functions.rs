@@ -6,8 +6,8 @@
 
 use super::super::{LiteralValue, Phase, Unresolved};
 use super::domain::DomainExpression;
-use super::truth::{OutValue, TruthExpression};
-use crate::{lispy::ToLispy, ToLispy};
+use super::truth::TruthExpression;
+use crate::{enums::EntityType, lispy::ToLispy, ToLispy};
 use std::ops::Deref;
 
 /// The one callable payload used by relational, scalar, higher-order, sigma,
@@ -326,11 +326,21 @@ pub enum ScalarRelation<P: Phase = Unresolved> {
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("scalarized_relation")]
 pub struct ScalarizedRelation<P: Phase = Unresolved> {
-    pub body: super::chain::Chain<P>,
-    pub scalarization: Scalarization<P>,
-    /// The relation the compression publishes. A step publishes one, and
-    /// this step is no exception for having been lifted out of the chain.
-    pub scope: P::Scope,
+    /// THE COMPRESSED BODY. Private beside the compression, and for the
+    /// same reason: the steps that came off this chain answer about THIS
+    /// body, so a road that swaps the body out leaves a compression
+    /// answering for a relation that is no longer under it.
+    #[lispy("body")]
+    body: super::chain::Chain<P>,
+    /// THE COMPRESSION, RIDING AS THE STEPS IT CAME OFF AS.
+    ///
+    /// Not a plan to rebuild from: these are the exact steps the chain
+    /// carried, relation included, so putting the compression back on is a
+    /// move rather than a construction and nothing here can pair a step
+    /// with a relation it did not publish.
+    #[lispy("compression")]
+    compression: Vec<super::chain::Step<P>>,
+    #[lispy("output")]
     pub output: P::ScalarOutput,
 }
 
@@ -349,6 +359,54 @@ impl<P: Phase> ScalarRelation<P> {
     }
 }
 
+impl<P: Phase<Scope = (), ScalarOutput = ()>> ScalarizedRelation<P> {
+    /// The authored compression: the steps it is are built here, because
+    /// the authored phase has no relation for them to be paired with.
+    pub fn authored(body: super::chain::Chain<P>, scalarization: Scalarization<P>) -> Self {
+        use super::super::operators::PipeOp;
+        use super::super::specs::GroupSpec;
+        use super::chain::{Continuation, Step};
+        use crate::pipeline::asts::core::specs::{TupleOrdinalClause, TupleOrdinalOperator};
+        let compression = match scalarization {
+            Scalarization::ZeroKeyReduction(items) => vec![Step::authored(Continuation::Pipe {
+                operator: PipeOp::Group(GroupSpec::Reduce {
+                    keys: Vec::new(),
+                    reductions: items,
+                    plan: crate::pipeline::asts::core::ReductionPlan::empty(),
+                }),
+                named: Default::default(),
+            })],
+            // THE BOUND-TO-ONE IS ONE STEP: the ordering it consumes and the
+            // `#<1` are one membership act, so an ordered compression is the
+            // ordering's node carrying its bound, and an unordered one is
+            // the arbitrary bound alone.
+            Scalarization::BoundToOne { ordering } => {
+                let bound = TupleOrdinalClause {
+                    operator: TupleOrdinalOperator::LessThan,
+                    value: 1,
+                    offset: None,
+                };
+                vec![Step::authored(if ordering.is_empty() {
+                    Continuation::Bound { bound }
+                } else {
+                    Continuation::Structural(super::chain::StructuralStep {
+                        form: super::chain::StructuralForm::Ordering {
+                            specs: ordering,
+                            bound: Some(bound),
+                        },
+                        named: Default::default(),
+                    })
+                })]
+            }
+        };
+        ScalarizedRelation {
+            body,
+            compression,
+            output: (),
+        }
+    }
+}
+
 impl<P: Phase> ScalarizedRelation<P> {
     /// THE COMPRESSION, PUT BACK ON THE CHAIN IT CLOSES.
     ///
@@ -359,45 +417,59 @@ impl<P: Phase> ScalarizedRelation<P> {
     /// from how a chain happened to end, which is the inference this carrier
     /// exists to make unnecessary.
     pub fn attached(self) -> super::chain::Chain<P> {
+        let Self {
+            body, compression, ..
+        } = self;
+        body.rejoin(compression)
+    }
+
+    /// The body alone, borrowed. What it publishes is NOT what the
+    /// carrier publishes: the compression stands over it.
+    pub fn body(&self) -> &super::chain::Chain<P> {
+        &self.body
+    }
+
+    /// What the compression IS, read off the steps it rides as.
+    pub fn scalarization(&self) -> Scalarization<P> {
         use super::super::operators::PipeOp;
         use super::super::specs::GroupSpec;
         use super::chain::Continuation;
-        use crate::pipeline::asts::core::specs::{TupleOrdinalClause, TupleOrdinalOperator};
-
-        let Self {
-            mut body,
-            scalarization,
-            scope,
-            ..
-        } = self;
-        match scalarization {
-            Scalarization::ZeroKeyReduction(items) => body.then(Continuation::Pipe {
-                operator: PipeOp::Group(GroupSpec::Reduce {
-                    keys: Vec::new(),
-                    reductions: items,
-                    plan: crate::pipeline::asts::core::ReductionPlan::empty(),
-                }),
-                named: Default::default(),
-                cpr_schema: scope,
-            }),
-            Scalarization::BoundToOne { ordering } => {
-                if !ordering.is_empty() {
-                    body = body.then(Continuation::Structural(super::chain::StructuralStep {
-                        form: super::chain::StructuralForm::Ordering { specs: ordering },
-                        named: Default::default(),
-                        cpr_schema: scope.clone(),
-                    }));
+        for step in &self.compression {
+            match step.form() {
+                Continuation::Pipe {
+                    operator: PipeOp::Group(GroupSpec::Reduce { reductions, .. }),
+                    ..
+                } => return Scalarization::ZeroKeyReduction(reductions.clone()),
+                Continuation::Bound { .. } => {
+                    return Scalarization::BoundToOne {
+                        ordering: Vec::new(),
+                    };
                 }
-                body.then(Continuation::Bound {
-                    bound: TupleOrdinalClause {
-                        operator: TupleOrdinalOperator::LessThan,
-                        value: 1,
-                        offset: None,
-                    },
-                    cpr_schema: scope,
-                })
+                Continuation::Structural(super::chain::StructuralStep {
+                    form:
+                        super::chain::StructuralForm::Ordering {
+                            specs,
+                            bound: Some(_),
+                        },
+                    ..
+                }) => {
+                    return Scalarization::BoundToOne {
+                        ordering: specs.clone(),
+                    };
+                }
+                _ => {}
             }
         }
+        unreachable!("a scalarized relation is built from one of the two compressions")
+    }
+
+    /// The relation the compression publishes. A step publishes one, and
+    /// this step is no exception for having been lifted out of the chain.
+    pub fn scope(&self) -> &P::Scope {
+        self.compression
+            .last()
+            .expect("a scalarized relation carries its compression")
+            .result()
     }
 
     /// The inverse, over a chain THIS carrier built: the compression comes
@@ -416,34 +488,23 @@ impl<P: Phase> ScalarizedRelation<P> {
                 "scalarization",
             )
         };
-        let (scalarization, scope) = match chain.continuations.pop().ok_or_else(missing)? {
+        let closing = chain.steps_mut().pop().ok_or_else(missing)?;
+        let compression = vec![closing];
+        match compression[0].form() {
             Continuation::Pipe {
-                operator: PipeOp::Group(GroupSpec::Reduce { reductions, .. }),
-                cpr_schema,
+                operator: PipeOp::Group(GroupSpec::Reduce { .. }),
                 ..
-            } => (Scalarization::ZeroKeyReduction(reductions), cpr_schema),
-            Continuation::Bound { cpr_schema, .. } => {
-                let ordering = match chain.continuations.last() {
-                    Some(Continuation::Structural(super::chain::StructuralStep {
-                        form: super::chain::StructuralForm::Ordering { .. },
-                        ..
-                    })) => match chain.continuations.pop() {
-                        Some(Continuation::Structural(super::chain::StructuralStep {
-                            form: super::chain::StructuralForm::Ordering { specs },
-                            ..
-                        })) => specs,
-                        _ => unreachable!("the peek and the pop read the same step"),
-                    },
-                    _ => Vec::new(),
-                };
-                (Scalarization::BoundToOne { ordering }, cpr_schema)
             }
+            | Continuation::Bound { .. }
+            | Continuation::Structural(super::chain::StructuralStep {
+                form: super::chain::StructuralForm::Ordering { bound: Some(_), .. },
+                ..
+            }) => {}
             _ => return Err(missing()),
-        };
+        }
         Ok(Self {
             body: chain,
-            scalarization,
-            scope,
+            compression,
             output,
         })
     }
@@ -459,7 +520,9 @@ impl<P: Phase> ScalarizedRelation<P> {
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum Scalarization<P: Phase = Unresolved> {
     #[lispy("scalarization:zero_key_reduction")]
-    ZeroKeyReduction(crate::pipeline::asts::vocabulary::Vec1<super::super::specs::ReductionItem<P>>),
+    ZeroKeyReduction(
+        crate::pipeline::asts::vocabulary::Vec1<super::super::specs::ReductionItem<P>>,
+    ),
     #[lispy("scalarization:bound_to_one")]
     BoundToOne {
         ordering: Vec<super::super::specs::OrderingSpec<P>>,
@@ -500,11 +563,14 @@ pub struct Lambda<P: Phase = Unresolved> {
     pub body: Box<DomainExpression<P>>,
 }
 
-/// THE CLOSED VALUE APPLICATION FAMILY.
+/// THE CLOSED NON-REFERENCE VALUE FAMILY.
 ///
 /// A value is a reference or ONE of these. The member says what KIND of
-/// application it is, so no consumer rediscovers the kind from a broad
-/// enum's contents.
+/// value it is, so no consumer rediscovers the kind from a broad enum's
+/// contents. Not every member applies a callable: a ground literal, a
+/// synthesized selection and a crossed truth are computed values that are
+/// not calls, and they live here because this is the one closed family of
+/// values that are not references.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum FunctionApplication<P: Phase = Unresolved> {
     /// THE SELF-DENOTING NULLARIES — a literal or a mention. `LiteralValue`
@@ -557,6 +623,82 @@ pub enum FunctionApplication<P: Phase = Unresolved> {
     /// The reach is a typed `Path`, so no consumer re-validates it.
     #[lispy("domain_expression:function:json_access")]
     JsonAccess(super::paths::JsonAccess<P>),
+    /// THE CROSSING — a truth read as a value. One directed edge: once
+    /// crossed, the truth is an ordinary value and composes wherever a value
+    /// composes; nothing crosses back.
+    #[lispy("domain_expression:crossed")]
+    Crossed(Crossing<P>),
+}
+
+/// A TRUTH READ AS A VALUE.
+///
+/// The one truth-to-value carrier, in every phase. Its answer is the
+/// truth's own — TRUE, FALSE, or UNKNOWN carried as NULL — read in value
+/// position instead of collapsed by a truth position. A comparison of a
+/// null is UNKNOWN and REJECTS the row in truth position; crossed, it
+/// CARRIES the NULL. Null-safe `=` answers false on a null and carries
+/// false.
+///
+/// THE FIELD IS PRIVATE and there are two doors. [`Crossing::originate`]
+/// makes an authored crossing and takes normalization's permit, so only the
+/// authority that reads the surface can decide a truth stands in value
+/// position. [`Crossing::folded`] carries an EXISTING crossing across a
+/// phase boundary by handing its own truth to the fold's truth road. No
+/// operation takes a truth and answers with a crossing except the mint, and
+/// no operation replaces the truth an authored crossing holds: a crossing
+/// that reaches a later phase is the one that was authored, transformed by
+/// the same authority that transforms every truth in that phase.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Crossing<P: Phase = Unresolved>(Box<TruthExpression<P>>);
+
+impl Crossing<Unresolved> {
+    /// THE ONE MINT. Normalization's permit is unforgeable outside the
+    /// normalization module.
+    pub fn originate(
+        _permit: crate::pipeline::normalize::CrossingPermit,
+        truth: TruthExpression<Unresolved>,
+    ) -> Self {
+        Crossing(Box::new(truth))
+    }
+}
+
+impl<P: Phase> Crossing<P> {
+    /// The truth this crossing reads.
+    pub fn truth(&self) -> &TruthExpression<P> {
+        &self.0
+    }
+
+    /// THE VALUES THE TRUTH READS AT ITS OWN SCOPE, writable in place. A
+    /// walk that rewrites occurrences reaches a crossed truth's operands
+    /// here exactly as it reaches an arithmetic operand. The truth itself —
+    /// that THIS truth stands as a value — is not for it to replace.
+    pub fn scalar_operands_mut(&mut self) -> Vec<&mut DomainExpression<P>> {
+        self.0.scalar_operands_mut()
+    }
+
+    /// The truth, by value. Lowering spends the crossing here; a phase fold
+    /// uses [`Self::folded`] instead, so the crossing survives the fold.
+    pub fn into_truth(self) -> TruthExpression<P> {
+        *self.0
+    }
+
+    /// THE ONE PHASE ROAD. The crossing hands its OWN truth to the fold's
+    /// truth road and comes back as the same crossing in the next phase. A
+    /// walk is never handed the truth and asked for the crossing back, so it
+    /// cannot pair an existing crossing with a truth of its choosing; what
+    /// it transforms is what was authored.
+    pub fn folded<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
+        self,
+        walk: &mut F,
+    ) -> crate::error::Result<Crossing<Q>> {
+        Ok(Crossing(Box::new(walk.transform_boolean(*self.0)?)))
+    }
+}
+
+impl<P: Phase> crate::lispy::ToLispy for Crossing<P> {
+    fn to_lispy(&self) -> String {
+        format!("(crossed {})", self.0.to_lispy())
+    }
 }
 
 /// THE ARITHMETIC INFIX.
@@ -633,11 +775,9 @@ pub enum ValueTemplatePart<P: Phase = Unresolved> {
 /// anchor is where that value lands.
 ///
 /// AN AUTHORED CASE RESULT IS A DOMAIN EXPRESSION, by the grammar
-/// (`match_arm`, `searched_arm`, `default_arm` all end in one) and by the
-/// crossing law: the adapter's positions are enumerated and a case result is
-/// not among them. A multi-clause value rule's guarded selection is a
-/// different shape with a different carrier — see `ClauseSelection` — so
-/// nothing widens this one to make room for it.
+/// (`match_arm`, `searched_arm`, `default_arm` all end in one); a crossed
+/// truth is one such value. A multi-clause value rule's guarded selection is
+/// a different shape with a different carrier — see `ClauseSelection`.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum CaseExpression<P: Phase = Unresolved> {
     /// `_:(subject @ term -> result; …)`
@@ -673,16 +813,13 @@ pub struct SearchedArm<P: Phase = Unresolved> {
 
 /// ONE CLAUSE of a multi-clause value rule, as the group assembles.
 ///
-/// A clause's result is its BODY, and a value rule's body is one of the
-/// crossing's licensed positions — so this arm carries `OutValue` because
-/// of the position it holds, not because a shared carrier was widened to
-/// fit it. The guard is the clause's own, absent on the one clause that is
-/// the group's default.
+/// A clause's result is its BODY, an ordinary value. The guard is the
+/// clause's own, absent on the one clause that is the group's default.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("clause_arm")]
 pub struct ClauseArm<P: Phase = Unresolved> {
     pub guard: Option<TruthExpression<P>>,
-    pub result: OutValue<P>,
+    pub result: DomainExpression<P>,
 }
 
 /// The SELECTION a multi-clause value rule assembles into.
@@ -705,12 +842,11 @@ pub struct ClauseSelection<P: Phase = Unresolved> {
 /// declaration is itself the one-row compression, so nothing here is a
 /// desugaring into some other shape that happens to be one row at width one.
 ///
-/// The same carrier answers both of the entity's faces. Relationally it is a
-/// fact whose heading is the declared inputs followed by the declared outputs
-/// and whose rows are the explicit arms; callably it is the case law those
-/// arms spell, asked null-safely of the supplied input row. The DEFAULT
-/// belongs to the callable face alone: it is fallback behavior, not an
-/// additional finite row.
+/// Callably this is the case law the arms spell, asked null-safely of the
+/// supplied input row. Without a default it also has a finite fact face whose
+/// heading is the inputs followed by the outputs and whose rows are the arms.
+/// A default denotes the complement of those inputs over an unbounded domain,
+/// so its family is callable-only.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("fact_function_mode")]
 pub struct FactFunctionMode<P: Phase = Unresolved> {
@@ -720,8 +856,8 @@ pub struct FactFunctionMode<P: Phase = Unresolved> {
     /// The declared output attributes, in order. Their count is the width of
     /// the row a call compresses to, and a `field_select` names one of them.
     pub outputs: crate::pipeline::asts::vocabulary::Vec1<delightql_types::SqlIdentifier>,
-    /// The explicit arms — the finite rows of the relational face and the
-    /// match arms of the callable one.
+    /// The explicit match arms. When there is no default they also comprise
+    /// the finite relational face.
     pub arms: crate::pipeline::asts::vocabulary::Vec1<FactFunctionArm<P>>,
     /// `_ -> …`: the output row a call answers with when no arm matched.
     /// Callable fallback behavior only — it publishes no relational row.
@@ -741,10 +877,58 @@ pub struct FactFunctionArm<P: Phase = Unresolved> {
     pub outputs: crate::pipeline::asts::vocabulary::Vec1<DomainExpression<P>>,
 }
 
+/// A complete fact-function definition with its available face fixed once.
+///
+/// The classification is private and minted from the complete declared mode.
+/// Catalog registration and body opening consume it; neither re-scans arms or
+/// asks independently whether a default was present.
+#[derive(Debug, Clone)]
+pub struct FactFunctionDefinition {
+    mode: FactFunctionMode<Unresolved>,
+    face: FactFunctionFace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactFunctionFace {
+    FiniteRelation,
+    CallableOnly,
+}
+
+impl FactFunctionDefinition {
+    pub fn assemble(mode: FactFunctionMode<Unresolved>) -> Self {
+        let face = if mode.default.is_some() {
+            FactFunctionFace::CallableOnly
+        } else {
+            FactFunctionFace::FiniteRelation
+        };
+        FactFunctionDefinition { mode, face }
+    }
+
+    pub fn mode(&self) -> &FactFunctionMode<Unresolved> {
+        &self.mode
+    }
+
+    pub(in crate::pipeline::asts) fn entity_type(&self) -> EntityType {
+        match self.face {
+            FactFunctionFace::FiniteRelation => EntityType::DqlFactExpression,
+            FactFunctionFace::CallableOnly => EntityType::DqlDefaultFactFunctionExpression,
+        }
+    }
+
+    pub(in crate::pipeline::asts) fn relational_body(
+        &self,
+    ) -> Option<super::super::queries::Query<Unresolved>> {
+        match self.face {
+            FactFunctionFace::FiniteRelation => Some(self.mode.finite_relational_body()),
+            FactFunctionFace::CallableOnly => None,
+        }
+    }
+}
+
 /// Substitute the declared inputs' values into an authored output cell.
 ///
-/// The relational face has no row, so a reference to a declared input is
-/// answered by the arm's own match value. Only a BARE name binds — a
+/// In a finite relational face, a reference to a declared input is answered
+/// by the arm's own match value. Only a BARE name binds — a
 /// qualifier addresses somebody else's relation, and normalization refused
 /// one here.
 fn spend_inputs(
@@ -790,13 +974,14 @@ fn spend_inputs(
 }
 
 impl FactFunctionMode<Unresolved> {
-    /// FACT ELABORATION, for the face that is a fact.
+    /// FACT ELABORATION, after absence of a default has proved this mode has
+    /// a finite relational face.
     ///
     /// The heading is the declared inputs followed by the declared outputs,
     /// and the rows are the explicit arms. The DEFAULT is absent by
     /// construction: it is what a CALL answers with when no arm matched, and
     /// a relation has no such row to publish.
-    pub fn relation(&self) -> super::chain::AnonTable<Unresolved> {
+    fn finite_relation(&self) -> super::chain::AnonTable<Unresolved> {
         let header = self
             .inputs
             .iter()
@@ -835,20 +1020,20 @@ impl FactFunctionMode<Unresolved> {
                     .collect()
             })
             .collect();
-        super::chain::AnonTable::from_values(Some(header), rows, ())
+        super::chain::AnonTable::from_values(Some(header), rows)
             .expect("a declared mode has a nonempty heading and at least one arm")
     }
 
     /// The same, as the chain a relational body is.
-    pub fn relational_chain(&self) -> super::chain::Chain<Unresolved> {
-        super::chain::Chain::ground(super::chain::Grelex::Literal(
-            super::chain::AnonRelation::plain(self.relation()),
+    fn finite_relational_chain(&self) -> super::chain::Chain<Unresolved> {
+        super::chain::Chain::authored(super::chain::GroundForm::Literal(
+            super::chain::AnonRelation::plain(self.finite_relation()),
         ))
     }
 
-    /// The same, as the relational body a definition's clause carries.
-    pub fn relational_body(&self) -> super::super::queries::Query<Unresolved> {
-        super::super::queries::Query::relational(self.relational_chain())
+    /// Build the body for the closed definition's finite face.
+    fn finite_relational_body(&self) -> super::super::queries::Query<Unresolved> {
+        super::super::queries::Query::relational(self.finite_relational_chain())
     }
 }
 
@@ -860,7 +1045,8 @@ impl<P: Phase> FactFunctionMode<P> {
         self.outputs.iter().position(|declared| declared == name)
     }
 
-    /// The declared heading of the relational face: inputs, then outputs.
+    /// The declared input/output heading. It is callable metadata for every
+    /// mode and the relational heading only when no default is present.
     pub fn heading(&self) -> Vec<delightql_types::SqlIdentifier> {
         self.inputs
             .iter()
@@ -907,7 +1093,7 @@ pub struct ModeWitness<P: Phase = Unresolved> {
     /// that reads an input reads one of these, and the callable face spends
     /// them by substituting the call's arguments at lowering. Empty before
     /// resolution, where no occurrence exists to name.
-    pub inputs: Vec<crate::names::ColId>,
+    pub inputs: Vec<P::ScalarOutput>,
     /// Which declared output the field named.
     pub selected: usize,
 }

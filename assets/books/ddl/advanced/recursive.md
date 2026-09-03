@@ -70,7 +70,7 @@ SQL's recursive CTEs evaluate using a **working table** algorithm:
 4. Repeat until the working table is empty
 5. Return the union of all iterations
 
-This is **bottom-up** or **co-recursive** evaluation: starting from known facts, derive new facts, repeat until fixed point. It resembles dynamic programming more than classical recursion.
+This is **bottom-up** or **co-recursive** evaluation: starting from known facts it derives new facts and repeats until a fixed point is reached. It resembles dynamic programming more than classical recursion.
 
 The critical implication: **the recursive clause sees only the previous iteration's rows, not the full accumulated result**. This is why certain operations are prohibited -- they would require access to rows that haven't been computed yet or have already been consumed.
 
@@ -210,17 +210,64 @@ tree(*) as t, node(*) as n, n.parent = t.id, # < 100
 ```
 
 
-## UNION vs UNION ALL {.dqlh}
+## UNION Badge {.dqlh}
 
 By default, delightql emits `UNION ALL` -- duplicates across iterations are preserved. This is efficient and correct for most traversals.
 
-For graph traversal where the same node may be reached via multiple paths, duplicates accumulate. To deduplicate the final result:
+For graph traversals that require the usage of `UNION` over `UNION ALL` for correctness use
+the **UNION-BADGE**  where the badge `%` is postfixed to the name of the rule.
 
 ```delightql
-edge(*) |> (origin, dest) : reachable
-edge(*) as e, reachable(*) as r, r.dest = e.origin
-    |> (r.origin, e.dest) : reachable
-reachable(*) |> %(*)  // deduplicate at the end
+category_edge(*) :-
+  categories(*), parent_id != null
+    |> (id as src, parent_id as dst)
+
+category_edge(*) :-
+  categories(*), parent_id != null
+    |> (parent_id as src, id as dst)
+
+connected%(*) :-
+  categories(*), name = "Electronics"
+    |> (id as category_id)
+
+connected%(*) :-
+  connected(*) as c,
+    category_edge(*) as e,
+    c.category_id = e.src
+    |> (e.dst as category_id)
+```
+
+This applies to CTEs as well:
+
+```delightql
+// Construct an undirected category graph.
+categories(*), parent_id != null
+  |> (id as src, parent_id as dst)
+  : edge
+
+categories(*), parent_id != null
+  |> (parent_id as src, id as dst)
+  : edge
+
+// Begin at Electronics.
+categories(*), name = "Electronics"
+  |> (id as category_id)
+  : connected%
+
+// Follow every edge. UNION prevents previously reached categories
+// from returning to the top of the stack
+connected(*) as c,
+  edge(*) as e,
+  c.category_id = e.src
+  |> (e.dst as category_id)
+  : connected%
+
+// Display the connected component.
+connected(*) as c,
+  categories(*) as k,
+  c.category_id = k.id
+  |> (k.id, k.name)
+  |> #(id)
 ```
 
 
@@ -289,7 +336,7 @@ The query generates a coordinate grid, runs the escape-time algorithm via
 recursive iteration, then aggregates the results into ASCII art -- all in a
 single delightql expression.
 
-## Delightql Recursive Apology {.dqlh}
+## Delightql Recursive Limits {.dqlh}
 
 
 A true fixed-point engine -- like those in Datalog systems -- would maintain the full set of derived facts and allow each iteration to query against it. SQL chose a simpler model. The restrictions on aggregation, subqueries, and mutual recursion all follow from this choice.

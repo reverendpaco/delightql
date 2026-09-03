@@ -15,29 +15,28 @@
 //
 // Input shape (resolved phase):
 //
-//   Filter(condition=TupleOrdinal(LessThan, N),
-//     source=Pipe(operator=TupleOrdering[specs],
-//       source=...inner correlation+filter+relation...))
+//   Ordering { specs, bound: Some(#<N) }          — the ordered bound, ONE node
+//     over ...inner correlation+filter+relation...
+//   or Bound(#<N) over the same                    — the arbitrary bound
 //
 // Output shape:
 //
 //   Filter(condition=Predicate(__dql_rn <= N),
 //     source=Pipe(operator=General[Glob, Window(row_number, partition, order_by, alias=__dql_rn)],
-//       source=...inner with TupleOrdering removed...))
+//       source=...inner with the bounding step removed...))
 //
-// The TupleOrdering pipe is consumed into the window's ORDER BY.
-// The TupleOrdinal filter is consumed into the rn comparison.
+// The ordered bound's specs become the window's ORDER BY and its N the rn
+// comparison — both read off the one node, so the window cannot rank by an
+// ordering the bound did not consume. An arbitrary bound orders nothing.
 
 use crate::error::Result;
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::asts::core::Comparison;
-use crate::pipeline::asts::core::OutValue;
 use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::resolved::{
-    self, Chain, DomainExpression, FilterOrigin, FunctionApplication, LiteralValue, PipeOp,
+    self, Chain, DomainExpression, FilterOrigin, FunctionApplication, LiteralValue,
     TruthExpression, TupleOrdinalClause, TupleOrdinalOperator,
 };
-use std::rc::Rc;
 
 type OrderingSpec = crate::pipeline::asts::core::OrderingSpec<resolved::Resolved>;
 
@@ -116,9 +115,9 @@ fn prove_equality_conjunction(f: &TruthExpression, out: &mut Vec<TruthExpression
 pub fn rewrite_window_join_subquery(
     subquery: Chain,
     correlation_filters: &[TruthExpression],
-    identities: &Rc<crate::names::Registry>,
+    identities: &crate::relation::Planning,
 ) -> Result<Chain> {
-    let inner_scope = super::pattern_classifier::relational_scope(&subquery)?;
+    let inner = subquery.semantic_relation();
     // This lowering pre-ranks per correlation-key group and joins AFTER —
     // sound only when the correlation is a CONJUNCTION OF EQUALITIES,
     // because then each outer row sees exactly one child group and
@@ -143,16 +142,11 @@ pub fn rewrite_window_join_subquery(
     // family the flattening guard above closes.
     let original_partition_columns = correlation_filters
         .iter()
-        .map(|filter| {
-            super::correlation_analyzer::prove_partition_key(filter, inner_scope, identities)
-        })
-        .collect::<Result<Vec<crate::names::ColId>>>()?;
+        .map(|filter| super::correlation_analyzer::prove_partition_key(filter, inner, identities))
+        .collect::<Result<Vec<crate::relation::PortId>>>()?;
 
-    // Capture limit value and the inner expression (without the TupleOrdinal filter).
-    let (subquery_no_limit, limit_value) = strip_limit(subquery)?;
-
-    // Capture order_by specs and the deeper expression (without the TupleOrdering pipe).
-    let (subquery_no_order, order_specs) = strip_order_by(subquery_no_limit);
+    // The bounding step comes off whole: its cap and the ordering it consumed.
+    let (subquery_no_order, limit_value, order_specs) = take_bound(subquery)?;
 
     // If the user's projection strips correlation columns, hygienic-inject
     // them so the window function (placed above the projection) can still
@@ -168,88 +162,64 @@ pub fn rewrite_window_join_subquery(
     // original name (because no projection stripped it). The carriers are
     // read back off the subquery that now publishes them — the same question
     // the flattener asks later, answered the same way.
-    let injection_lookup: std::collections::HashMap<crate::names::ColId, crate::names::ColId> =
-        super::pattern_classifier::correlation_carriers(&injected_subquery, identities)?
-            .into_iter()
-            .collect();
+    let injection_lookup: std::collections::HashMap<
+        crate::relation::PortId,
+        crate::relation::PortId,
+    > = super::pattern_classifier::correlation_carriers(&injected_subquery, identities)?
+        .into_iter()
+        .collect();
 
     let partition_by: Vec<DomainExpression> = original_partition_columns
         .iter()
         .map(|column| {
-            DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
-                column: injection_lookup.get(column).copied().unwrap_or(*column),
-                explicit_qualifier: false,
-            })))
+            DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence::engine(
+                injection_lookup.get(column).copied().unwrap_or(*column),
+            ))))
         })
         .collect();
 
-    let row_number_scope = match injected_subquery.continuations.last() {
-        Some(resolved::Continuation::Pipe { cpr_schema, .. }) => Some(*cpr_schema),
-        _ => None,
-    }
-    .unwrap_or_else(|| {
-        identities.mint_scope(
-            crate::names::ScopeOrigin::AnonRelation,
-            crate::names::Hint::None,
-            None,
-        )
-    });
-    let row_number_column = identities.mint_column(
-        row_number_scope,
-        crate::names::ColumnOrigin::Minted {
-            by: crate::names::MintReason::RowNumber,
-        },
-        None,
-        crate::names::Addressing::Hygienic,
-        crate::names::ValueFacts::default(),
-    );
-    let window_item = resolved::OutItem::One(resolved::OneOut {
-        expr: OutValue::Domain(DomainExpression::Application(
-            FunctionApplication::Standard(crate::pipeline::asts::core::StandardApplication {
-                call: crate::pipeline::asts::core::PureCall::from_inner(
-                    crate::pipeline::asts::core::FunctorCall::<resolved::Resolved> {
-                        callee: identities
-                            .mint_function(identities.intern("row_number", false), Vec::new()),
-                        arguments: crate::pipeline::asts::core::operators::CallArguments::Scalar(
-                            Vec::new(),
-                        ),
-                        marks: Default::default(),
-                    },
-                ),
-                guard: None,
-                window: Some(crate::pipeline::asts::core::WindowSpec {
-                    partition: partition_by,
-                    ordering: order_specs,
-                    frame: None,
-                }),
-            }),
-        )),
-        // A compiler-minted witness answers to no authored name.
-        naming: None,
-        output: Some(row_number_column),
-    });
-
-    // Wrap with a General projection: (*, row_number(...) as __dql_rn).
-    let projected = wrap_with_projection(injected_subquery, window_item);
+    // Wrap with the embed: the operand's whole heading, then the row-number
+    // witness standing at the port that same derivation minted for it.
+    let authority = identities.authority();
+    let (staged, published) = authority.bind(crate::relation::pending::Pending::WindowWitness {
+        input: injected_subquery.semantic_relation(),
+        partition: partition_by,
+        ordering: order_specs,
+    })?;
+    let row_number_port = *published
+        .last()
+        .expect("the window projection appends one row-number port");
+    let projected = authority.reland(injected_subquery, staged)?;
 
     // Wrap with WHERE __dql_rn <= N.
-    let limited = wrap_with_rn_filter(projected, row_number_column, limit_value);
+    let limited = wrap_with_rn_filter(projected, row_number_port, limit_value, identities)?;
 
     Ok(limited)
 }
 
-/// Walk the expression to find the (single) TupleOrdinal limit filter,
-/// return (expression with that filter removed, captured limit value).
-fn strip_limit(expr: Chain) -> Result<(Chain, i64)> {
+/// TAKE THE BOUND OFF THE SHAPING RUN, WITH THE ORDERING IT CONSUMED.
+///
+/// Returns the chain, the cap, and the ordering that cap consumed — read
+/// off ONE node. An ordering carrying its bound is the membership act: the
+/// window now performs it, ranking by exactly the specs that bound
+/// consumed. The ordering's node STAYS and surrenders the bound: it
+/// republishes its operand through the stage export, and everything above
+/// it stands on the ports that export minted; the ORDER BY it still emits
+/// is inert, the rank filter owns the selection. An arbitrary bound comes
+/// out alone and the window orders nothing: `row_number()` with no ORDER
+/// BY is legal SQL and ranks arbitrarily within each partition, exactly
+/// the members the law lets an unordered bound choose. A loose ordering
+/// standing elsewhere in the run is not this bound's and is left alone.
+///
+/// The scan covers the shaping run above the relation and DELIBERATELY
+/// does not descend a member's chain, a bag arm, or a condition's subquery
+/// — the boundary is where the shaping stops.
+fn take_bound(expr: Chain) -> Result<(Chain, i64, Vec<OrderingSpec>)> {
     use crate::error::DelightQLError;
 
-    // The bound lives in the shaping run above the relation: this scans that
-    // run and DELIBERATELY does not descend a member's chain, a bag arm, or a
-    // condition's subquery — the boundary is where the shaping stops.
-    let mut stripped = expr;
-    let mut found = None;
-    for index in (0..stripped.continuations.len()).rev() {
-        match &stripped.continuations[index] {
+    let mut chain = expr;
+    for index in (0..chain.continuations().len()).rev() {
+        match chain.continuations()[index].form() {
             resolved::Continuation::Bound {
                 bound:
                     TupleOrdinalClause {
@@ -259,85 +229,52 @@ fn strip_limit(expr: Chain) -> Result<(Chain, i64)> {
                     },
                 ..
             } => {
-                found = Some(*value);
-                stripped.continuations.remove(index);
-                break;
+                let value = *value;
+                return Ok((chain.without(index)?, value, Vec::new()));
+            }
+            resolved::Continuation::Structural(resolved::StructuralStep {
+                form:
+                    resolved::StructuralForm::Ordering {
+                        specs,
+                        bound:
+                            Some(TupleOrdinalClause {
+                                operator: TupleOrdinalOperator::LessThan,
+                                ..
+                            }),
+                    },
+                ..
+            }) => {
+                let specs = specs.clone();
+                let bound = chain
+                    .surrender_bound(index)
+                    .expect("the ordering just matched carries its bound");
+                return Ok((chain, bound.value, specs));
             }
             resolved::Continuation::Restrict { .. }
             | resolved::Continuation::Bound { .. }
-            | resolved::Continuation::Pipe { .. } => {}
-            _ => break,
-        }
-    }
-
-    let value = found.ok_or_else(|| DelightQLError::ParseError {
-        message: "rewrite_window_join_subquery: expected a row bound but found none".to_string(),
-        source: None,
-        subcategory: None,
-    })?;
-    Ok((stripped, value))
-}
-
-/// Walk the expression to find the (first) TupleOrdering pipe, return
-/// (expression with that pipe removed, captured specs). If no order_by
-/// is present, returns the expression unchanged with an empty spec list —
-/// row_number() with no ORDER BY is legal SQL though deterministic only
-/// per-partition, mirroring DQL's "limit without order" semantics.
-fn strip_order_by(expr: Chain) -> (Chain, Vec<OrderingSpec>) {
-    let mut stripped = expr;
-    let mut found: Option<Vec<OrderingSpec>> = None;
-    for index in (0..stripped.continuations.len()).rev() {
-        match &stripped.continuations[index] {
-            resolved::Continuation::Structural(resolved::StructuralStep {
-                form: resolved::StructuralForm::Ordering { specs },
-                ..
-            }) => {
-                found = Some(specs.clone());
-                stripped.continuations.remove(index);
-                break;
-            }
-            resolved::Continuation::Restrict { .. }
             | resolved::Continuation::Pipe { .. }
             | resolved::Continuation::Structural(_) => {}
             _ => break,
         }
     }
-    (stripped, found.unwrap_or_default())
-}
 
-/// Wrap an expression with a General projection carrying the whole operand
-/// and then the window item.
-///
-/// A RESOLVED PROJECTION HOLDS NO AUTHORED SPREAD. What this needs is not
-/// the expansion of a glob but the operand ITSELF: the subquery's hygienic
-/// columns have to ride through, and a column named in a select list
-/// cannot be hygienic. `Whole` is that meaning, and it is also why the
-/// schema below can stay the placeholder the FAR cycle recomputes — there
-/// is no heading to read here.
-fn wrap_with_projection(source: Chain, window_item: resolved::OutItem) -> Chain {
-    // Carry the source's cpr_schema as the operator's schema. The FAR cycle
-    // recomputes schemas during rebuild, so this is a placeholder.
-    let source_schema = crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(&source);
-
-    source.then(resolved::Continuation::Pipe {
-        operator: PipeOp::Project(
-            crate::pipeline::asts::vocabulary::Vec1::try_from_vec(vec![
-                resolved::OutItem::Whole,
-                window_item,
-            ])
-            .expect("the window projection carries the whole and the window item"),
-        ),
-        named: (),
-        cpr_schema: source_schema,
+    Err(DelightQLError::ParseError {
+        message: "rewrite_window_join_subquery: expected a row bound but found none".to_string(),
+        source: None,
+        subcategory: None,
     })
 }
 
 /// Wrap an expression with a filter over the generated row-number occurrence.
-fn wrap_with_rn_filter(source: Chain, row_number_column: crate::names::ColId, limit: i64) -> Chain {
-    let rn_lvar = DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
-        column: row_number_column,
-        explicit_qualifier: false,
-    })));
+fn wrap_with_rn_filter(
+    source: Chain,
+    row_number_column: crate::relation::PortId,
+    limit: i64,
+    _identities: &crate::relation::Planning,
+) -> Result<Chain> {
+    let rn_lvar = DomainExpression::Reference(Reference::Named(NamedReference(
+        ColumnOccurrence::engine(row_number_column),
+    )));
     let limit_literal = DomainExpression::Application(FunctionApplication::Ground(
         LiteralValue::Number(limit.to_string()),
     ));
@@ -348,11 +285,8 @@ fn wrap_with_rn_filter(source: Chain, row_number_column: crate::names::ColId, li
         right: Box::new(limit_literal),
     });
 
-    let source_schema = crate::pipeline::resolver::helpers::extraction::extract_cpr_schema(&source);
-
-    source.then(resolved::Continuation::Restrict {
+    Ok(source.transparently(resolved::Transparent::Restrict {
         condition: comparison,
         origin: FilterOrigin::Generated,
-        cpr_schema: source_schema,
-    })
+    }))
 }

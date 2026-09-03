@@ -17,7 +17,7 @@
 //! boundaries do not become the accidental diagnostic; the probe feature is
 //! never enabled by ordinary builds or doctests.
 
-use crate::names::{CallableId, Registry, ScopeId, Spelling};
+use crate::names::{CallableId, Registry, Spelling};
 use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
@@ -212,6 +212,12 @@ impl<T> Vec2<T> {
         std::iter::once(&self.first)
             .chain(std::iter::once(&self.second))
             .chain(self.rest.iter())
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        std::iter::once(&mut self.first)
+            .chain(std::iter::once(&mut self.second))
+            .chain(self.rest.iter_mut())
     }
 
     pub fn into_vec(self) -> Vec<T> {
@@ -524,29 +530,12 @@ impl Ref {
     }
 }
 
-/// The resolver's one-time recursion decision, stored by its decider, never
-/// re-derived. A `ScopeId` is not a decision, which is why this is its own
-/// payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecursionState {
-    NonRecursive,
-    Recursive { self_scope: ScopeId },
-}
-
-impl RecursionState {
-    pub fn is_recursive(&self) -> bool {
-        matches!(self, RecursionState::Recursive { .. })
-    }
-}
-
-impl crate::lispy::ToLispy for RecursionState {
-    fn to_lispy(&self) -> String {
-        match self {
-            RecursionState::NonRecursive => "non_recursive".to_string(),
-            RecursionState::Recursive { .. } => "recursive".to_string(),
-        }
-    }
-}
+/// The authored badge lives with THE BINDING AUTHORITY, which owns the walk
+/// that judges it, the binding it decides, and the mint of the deduplicating
+/// outcome's evidence. It is named here because a head carries it as
+/// `CteAuthority::fixpoint`; it is not defined here, because a second place
+/// able to construct the decision would be a second authority.
+pub use crate::pipeline::bindings::Fixpoint;
 
 // ---------------------------------------------------------------------------
 // Call-site and step evidence
@@ -684,18 +673,6 @@ impl CmpOp {
     }
 }
 
-/// The necks, typed. `Local` (`:`) is the CTE neck. Serializable because a
-/// parsed definition travels to the catalog as data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Neck {
-    /// `:-` — session rule.
-    Bind,
-    /// `:=` — materialized/data.
-    Assign,
-    /// `:` — the label/CTE neck.
-    Local,
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -781,7 +758,8 @@ mod tests {
     /// rather than as a module that quietly regrows.
     #[test]
     fn generated_type_and_variant_inventory_is_current() {
-        let file = syn::parse_file(include_str!("vocabulary.rs")).expect("the vocabulary module parses");
+        let file =
+            syn::parse_file(include_str!("vocabulary.rs")).expect("the vocabulary module parses");
         let mut types = Vec::new();
         let mut variants = Vec::new();
         let mut public_fields = Vec::new();
@@ -795,9 +773,7 @@ mod tests {
             "enum CmpOp",
             "enum Mark",
             "enum Namespace",
-            "enum Neck",
             "enum Never",
-            "enum RecursionState",
             "enum RefOrigin",
             "enum ResolutionMode",
             "enum SyntheticReason",
@@ -827,11 +803,6 @@ mod tests {
             "Mark::Plain",
             "Namespace::Ambient",
             "Namespace::Path",
-            "Neck::Assign",
-            "Neck::Bind",
-            "Neck::Local",
-            "RecursionState::NonRecursive",
-            "RecursionState::Recursive",
             "RefOrigin::Authored",
             "RefOrigin::Synthetic",
             "ResolutionMode::Normal",

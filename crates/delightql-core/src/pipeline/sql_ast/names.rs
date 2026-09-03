@@ -3,8 +3,8 @@
 //! Exhaustive identity enumeration for late SQL naming.
 
 use super::{
-    DomainExpression, JoinCondition, QueryExpression, SelectItem, SqlFrameBound, SqlStatement,
-    TableExpression, TvfArgument,
+    DomainExpression, JoinCondition, QueryExpression, SqlFrameBound, SqlStatement, TableExpression,
+    TvfArgument,
 };
 use crate::names::{ColId, Registry, ScopeId};
 
@@ -133,12 +133,13 @@ impl<'a> NameCollector<'a> {
                 self.table(right);
                 match join_condition {
                     JoinCondition::On(expression) => self.expression(expression),
-                    JoinCondition::Using(columns) => {
-                        for column in columns {
-                            self.column(*column);
+                    JoinCondition::Merge(pairs) => {
+                        for pair in pairs {
+                            self.column(pair.left);
+                            self.column(pair.right);
                         }
                     }
-                    JoinCondition::Natural => {}
+                    JoinCondition::Cartesian => {}
                 }
             }
             TableExpression::TVF {
@@ -160,14 +161,11 @@ impl<'a> NameCollector<'a> {
         match query {
             QueryExpression::Select(select) => {
                 for item in select.select_list() {
-                    match item {
-                        SelectItem::Star { .. } => {}
-                        SelectItem::Expression { expr, alias } => {
-                            self.expression(expr);
-                            if let Some(alias) = alias {
-                                self.column(*alias);
-                            }
-                        }
+                    if let Some(expr) = item.expr() {
+                        self.expression(expr);
+                    }
+                    if let Some(alias) = item.printed_alias() {
+                        self.column(alias);
                     }
                 }
                 if let Some(tables) = select.from() {
@@ -206,7 +204,9 @@ impl<'a> NameCollector<'a> {
             QueryExpression::WithCte { ctes, query } => {
                 for cte in ctes {
                     self.scope(cte.scope());
-                    self.query(cte.query());
+                    for part in cte.body().parts() {
+                        self.query(part);
+                    }
                 }
                 self.query(query);
             }
@@ -217,7 +217,7 @@ impl<'a> NameCollector<'a> {
         let headings = self
             .scopes
             .iter()
-            .map(|scope| self.identities.heading(*scope).columns_seen())
+            .map(|scope| self.identities.late_naming_columns(*scope))
             .filter(|heading| !heading.is_empty())
             .collect();
         crate::names::Statement {
@@ -237,7 +237,9 @@ pub fn statement_names(statement: &SqlStatement, identities: &Registry) -> crate
             if let Some(ctes) = with_clause {
                 for cte in ctes {
                     names.scope(cte.scope());
-                    names.query(cte.query());
+                    for part in cte.body().parts() {
+                        names.query(part);
+                    }
                 }
             }
             names.query(query);
@@ -256,7 +258,9 @@ pub fn statement_names(statement: &SqlStatement, identities: &Registry) -> crate
             if let Some(ctes) = with_clause {
                 for cte in ctes {
                     names.scope(cte.scope());
-                    names.query(cte.query());
+                    for part in cte.body().parts() {
+                        names.query(part);
+                    }
                 }
             }
             names.query(query);
@@ -315,7 +319,9 @@ fn cte_names(ctes: &Option<Vec<super::Cte>>, names: &mut NameCollector<'_>) {
     if let Some(ctes) = ctes {
         for cte in ctes {
             names.scope(cte.scope());
-            names.query(cte.query());
+            for part in cte.body().parts() {
+                names.query(part);
+            }
         }
     }
 }

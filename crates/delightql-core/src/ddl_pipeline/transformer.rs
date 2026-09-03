@@ -5,6 +5,7 @@ use crate::pipeline::asts::core::expressions::functions::FunctionApplication;
 use crate::pipeline::asts::core::expressions::truth::TruthExpression;
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::asts::core::Resolved;
+use crate::pipeline::asts::core::TruthConsumer;
 #[cfg(test)]
 use crate::pipeline::asts::vocabulary::Vec1;
 use crate::pipeline::sql_ast::BinaryOperator;
@@ -84,11 +85,7 @@ fn transform_column(
                 not_null = true;
             }
             DdlConstraint::Check { expr } => {
-                checks.push(transform_ddl_predicate(
-                    expr.clone(),
-                    Some(col.name),
-                    identities,
-                )?);
+                checks.push(transform_check(expr.clone(), Some(col.name), identities)?);
             }
             DdlConstraint::ForeignKey { table, columns } => {
                 extra_constraints.push(SqlTableConstraint::ForeignKey {
@@ -168,7 +165,7 @@ fn transform_table_constraint(
             "use \"%(column, ...)\" on the \"_\" constraint row",
         )),
         DdlConstraint::Check { expr } => {
-            let sql_expr = transform_ddl_predicate(expr.clone(), None, identities)?;
+            let sql_expr = transform_check(expr.clone(), None, identities)?;
             Ok(SqlTableConstraint::Check { expr: sql_expr })
         }
         DdlConstraint::NotNull => {
@@ -182,15 +179,11 @@ fn transform_table_constraint(
             let ref_columns = columns
                 .iter()
                 .enumerate()
-                .map(|(position, column)| {
-                    identities.mint_column(
+                .map(|(_position, column)| {
+                    identities.sql_column(
                         *table,
-                        crate::names::ColumnOrigin::Bound {
-                            position: position as u32,
-                        },
                         identities.published(*column),
                         crate::names::Addressing::Published,
-                        crate::names::ValueFacts::default(),
                     )
                 })
                 .collect();
@@ -214,14 +207,15 @@ fn n_ary_ddl_predicate(
     op: BinaryOperator,
     column: Option<crate::names::ColId>,
     identities: &crate::names::Registry,
+    consumer: TruthConsumer,
 ) -> Result<SqlExpression> {
     let (first, rest) = parts.into_head_tail();
-    let mut combined = transform_ddl_predicate(first, column, identities)?;
+    let mut combined = transform_ddl_predicate(first, column, identities, consumer)?;
     for part in rest {
         combined = SqlExpression::Binary {
             left: Box::new(combined),
             op: op.clone(),
-            right: Box::new(transform_ddl_predicate(part, column, identities)?),
+            right: Box::new(transform_ddl_predicate(part, column, identities, consumer)?),
         };
     }
     Ok(combined)
@@ -243,7 +237,7 @@ fn transform_ddl_expression(
         DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
             column,
             ..
-        }))) => Ok(SqlExpression::Column(column)),
+        }))) => Ok(SqlExpression::Column(column.column())),
         DomainExpression::Application(
             crate::pipeline::asts::core::FunctionApplication::Ground(value),
         ) => Ok(SqlExpression::Literal(value)),
@@ -258,21 +252,14 @@ fn transform_ddl_expression(
     }
 }
 
-/// A DDL argument's value, lowered from the EXACT carrier it stands in. A
-/// crossed argument is a truth read as a value, and it is spelled as the
-/// predicate it is rather than converted back into a value that holds one.
+/// A DDL argument's value. DISTINCT is the argument's own data and is not a
+/// DDL concern; the value lowers through the ordinary scalar road.
 fn transform_ddl_argument(
     value: crate::pipeline::asts::core::ArgumentValue<Resolved>,
     column: Option<crate::names::ColId>,
     identities: &crate::names::Registry,
 ) -> Result<SqlExpression> {
-    use crate::pipeline::asts::core::ArgumentValue;
-    match value {
-        ArgumentValue::Domain { value, .. } => transform_ddl_expression(value, column, identities),
-        ArgumentValue::Truth(crossing) => {
-            transform_ddl_predicate(crossing.into_truth(), column, identities)
-        }
-    }
+    transform_ddl_expression(value.value, column, identities)
 }
 
 fn transform_ddl_function(
@@ -350,50 +337,67 @@ fn transform_ddl_function(
                 right: Box::new(right_sql),
             })
         }
-        crate::pipeline::asts::core::FunctionApplication::Case(case) => {
-            let mut when_clauses = Vec::new();
-            let mut else_clause = None;
-            let mut case_expr = None;
-
-            let default = match case {
-                crate::pipeline::asts::core::CaseExpression::Anchored {
-                    anchor,
-                    arms,
-                    default,
-                } => {
-                    case_expr = Some(Box::new(transform_ddl_expression(
-                        *anchor, column, identities,
-                    )?));
-                    for arm in arms.into_vec() {
-                        when_clauses.push(WhenClause::new(
-                            SqlExpression::Literal(arm.term),
+        crate::pipeline::asts::core::FunctionApplication::Case(case) => match case {
+            // THE SAME MATCH LAW AS EVERY OTHER ROAD. A null arm is not dead
+            // code in DelightQL, so the shape the target can express is
+            // decided by the arms and by one lowering, not once per road.
+            crate::pipeline::asts::core::CaseExpression::Anchored {
+                anchor,
+                arms,
+                default,
+            } => {
+                let subject = transform_ddl_expression(*anchor, column, identities)?;
+                let asked = arms
+                    .into_vec()
+                    .into_iter()
+                    .map(|arm| {
+                        Ok((
+                            arm.term,
                             transform_ddl_expression(*arm.result, column, identities)?,
-                        ));
-                    }
-                    default
-                }
-                crate::pipeline::asts::core::CaseExpression::Searched { arms, default } => {
-                    for arm in arms.into_vec() {
-                        when_clauses.push(WhenClause::new(
-                            transform_ddl_predicate(*arm.condition, column, identities)?,
-                            transform_ddl_expression(*arm.result, column, identities)?,
-                        ));
-                    }
-                    default
-                }
-            };
-            if let Some(result) = default {
-                else_clause = Some(Box::new(transform_ddl_expression(
-                    *result, column, identities,
-                )?));
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let else_expr = default
+                    .map(|result| transform_ddl_expression(*result, column, identities))
+                    .transpose()?;
+                SqlExpression::anchored_case(subject, asked, else_expr)
             }
-
-            Ok(SqlExpression::Case {
-                expr: case_expr,
-                when_clauses,
-                else_clause,
-            })
-        }
+            crate::pipeline::asts::core::CaseExpression::Searched { arms, default } => {
+                let mut when_clauses = Vec::new();
+                for arm in arms.into_vec() {
+                    when_clauses.push(WhenClause::new(
+                        // A CASE ARM'S GUARD IS A FILTER: it fires exactly
+                        // where its truth is TRUE, whatever consumes the
+                        // value the arm produces.
+                        transform_ddl_predicate(
+                            *arm.condition,
+                            column,
+                            identities,
+                            TruthConsumer::Filter,
+                        )?,
+                        transform_ddl_expression(*arm.result, column, identities)?,
+                    ));
+                }
+                let else_clause = default
+                    .map(|result| transform_ddl_expression(*result, column, identities))
+                    .transpose()?
+                    .map(Box::new);
+                Ok(SqlExpression::Case {
+                    expr: None,
+                    when_clauses,
+                    else_clause,
+                })
+            }
+        },
+        // THE CROSSING lowers as the truth it is, READ AS A VALUE: the DDL
+        // predicate road spells it, told that nothing observes it here, and
+        // nothing converts it back.
+        FunctionApplication::Crossed(crossing) => transform_ddl_predicate(
+            crossing.into_truth(),
+            column,
+            identities,
+            TruthConsumer::Value,
+        ),
         other => Err(crate::DelightQLError::transpilation_error(
             format!(
                 "Unsupported DDL function variant: {:?}",
@@ -404,10 +408,23 @@ fn transform_ddl_function(
     }
 }
 
+/// A CHECK's body, lowered for the consumer a database CHECK is: the row is
+/// refused exactly when the constrained truth is FALSE, so TRUE and UNKNOWN
+/// alike satisfy it. This is the ONE entrance a column or table constraint
+/// takes; the consumer is named here and never rediscovered downstream.
+fn transform_check(
+    pred: TruthExpression<Resolved>,
+    column: Option<crate::names::ColId>,
+    identities: &crate::names::Registry,
+) -> Result<SqlExpression> {
+    transform_ddl_predicate(pred, column, identities, TruthConsumer::Constraint)
+}
+
 fn transform_ddl_predicate(
     pred: TruthExpression<Resolved>,
     column: Option<crate::names::ColId>,
     identities: &crate::names::Registry,
+    consumer: TruthConsumer,
 ) -> Result<SqlExpression> {
     match pred {
         TruthExpression::Comparison(Comparison {
@@ -419,12 +436,20 @@ fn transform_ddl_predicate(
             let right_sql = transform_ddl_expression(*right, column, identities)?;
             let op = match operator {
                 crate::pipeline::asts::vocabulary::CmpOp::Equal => BinaryOperator::Equal,
-                crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual => BinaryOperator::IsNotDistinctFrom,
+                crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual => {
+                    BinaryOperator::IsNotDistinctFrom
+                }
                 crate::pipeline::asts::vocabulary::CmpOp::NotEqual => BinaryOperator::NotEqual,
-                crate::pipeline::asts::vocabulary::CmpOp::NullSafeNotEqual => BinaryOperator::IsDistinctFrom,
+                crate::pipeline::asts::vocabulary::CmpOp::NullSafeNotEqual => {
+                    BinaryOperator::IsDistinctFrom
+                }
                 crate::pipeline::asts::vocabulary::CmpOp::LessThan => BinaryOperator::LessThan,
-                crate::pipeline::asts::vocabulary::CmpOp::GreaterThan => BinaryOperator::GreaterThan,
-                crate::pipeline::asts::vocabulary::CmpOp::LessThanOrEqual => BinaryOperator::LessThanOrEqual,
+                crate::pipeline::asts::vocabulary::CmpOp::GreaterThan => {
+                    BinaryOperator::GreaterThan
+                }
+                crate::pipeline::asts::vocabulary::CmpOp::LessThanOrEqual => {
+                    BinaryOperator::LessThanOrEqual
+                }
                 crate::pipeline::asts::vocabulary::CmpOp::GreaterThanOrEqual => {
                     BinaryOperator::GreaterThanOrEqual
                 }
@@ -436,13 +461,13 @@ fn transform_ddl_predicate(
             })
         }
         TruthExpression::Conjunction(parts) => {
-            n_ary_ddl_predicate(*parts, BinaryOperator::And, column, identities)
+            n_ary_ddl_predicate(*parts, BinaryOperator::And, column, identities, consumer)
         }
         TruthExpression::Disjunction(parts) => {
-            n_ary_ddl_predicate(*parts, BinaryOperator::Or, column, identities)
+            n_ary_ddl_predicate(*parts, BinaryOperator::Or, column, identities, consumer)
         }
         TruthExpression::Not { expr } => {
-            let inner = transform_ddl_predicate(*expr, column, identities)?;
+            let inner = transform_ddl_predicate(*expr, column, identities, consumer)?;
             Ok(SqlExpression::Unary {
                 op: crate::pipeline::sql_ast::UnaryOperator::Not,
                 expr: Box::new(inner),
@@ -522,6 +547,14 @@ fn transform_ddl_predicate(
              lowering here",
             "ddl_pipeline::transformer",
         )),
+        // THE SAME PREDICATE IDENTITY AS THE QUERY ROAD: the call lowers to
+        // the predicate rewrite the generator resolves through the bin
+        // registry, so `like`, `sql_eq` and `sql_ne` have one lowering. The
+        // atom is lowered UNOBSERVED and the CONSUMER decides whether the
+        // positive proof is collapsed: only a filter partitions its input,
+        // and a CHECK refuses exactly what it can call FALSE. Negative
+        // polarity is already the two-valued "not proven TRUE" and is spelled
+        // `IS NOT TRUE` for every consumer — never the target's own `NOT`.
         TruthExpression::Sigma(SigmaApplication {
             proof: crate::pipeline::asts::core::NamedProof::Call(call),
             polarity,
@@ -539,62 +572,46 @@ fn transform_ddl_predicate(
                     })?;
                 name
             };
-            let arguments: Vec<_> = match call.arguments {
+            let namespace = identities
+                .function_namespace(call.callee)
+                .into_iter()
+                .map(|part| {
+                    let mut text = String::new();
+                    identities.write(part, &mut crate::names::sink::Teaching(&mut text));
+                    text
+                })
+                .collect::<Vec<_>>();
+            let args = match call.arguments {
                 crate::pipeline::asts::core::operators::CallArguments::Scalar(members) => members
                     .into_iter()
                     .filter_map(|member| match member {
                         crate::pipeline::asts::core::operators::ScalarArgument::Value(
                             expression,
-                        ) => Some(expression),
+                        ) => Some(transform_ddl_argument(expression, column, identities)),
                         _ => None,
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
                 crate::pipeline::asts::core::operators::CallArguments::None
                 | crate::pipeline::asts::core::operators::CallArguments::HigherOrder(_) => {
                     Vec::new()
                 }
             };
-            match name.as_str() {
-                "like" => {
-                    if arguments.len() != 2 {
-                        return Err(crate::DelightQLError::transpilation_error(
-                            format!(
-                                "DDL LIKE requires exactly 2 arguments, got {}",
-                                arguments.len()
-                            ),
-                            "ddl_pipeline::transformer",
-                        ));
-                    }
-                    let mut args = arguments.into_iter();
-                    let value = transform_ddl_argument(
-                        args.next().expect("two arguments, counted above"),
-                        column,
-                        identities,
-                    )?;
-                    let pattern = transform_ddl_argument(
-                        args.next().expect("two arguments, counted above"),
-                        column,
-                        identities,
-                    )?;
-                    // The atom is lowered UNOBSERVED and the polarity wraps
-                    // it, exactly as on the query road. `NOT LIKE` is Kleene
-                    // negation: on a null operand it is UNKNOWN, which a SQL
-                    // CHECK accepts — so both polarities would admit the same
-                    // row instead of equipartitioning it.
-                    Ok(SqlExpression::Observation {
-                        expr: Box::new(SqlExpression::Binary {
-                            left: Box::new(value),
-                            op: BinaryOperator::Like,
-                            right: Box::new(pattern),
-                        }),
+            let proof = SqlExpression::PredicateRewrite {
+                name,
+                namespace,
+                args,
+                negated: false,
+            };
+            Ok(
+                if polarity.is_positive() && !consumer.observes_positive_proof() {
+                    proof
+                } else {
+                    SqlExpression::Observation {
+                        expr: Box::new(proof),
                         positive: polarity.is_positive(),
-                    })
-                }
-                other => Err(crate::DelightQLError::transpilation_error(
-                    format!("Unsupported sigma predicate in DDL: {other}"),
-                    "ddl_pipeline::transformer",
-                )),
-            }
+                    }
+                },
+            )
         }
         other => Err(crate::DelightQLError::transpilation_error(
             format!(
@@ -931,24 +948,85 @@ mod tests {
                 ),
             ),
         });
-        // THE ATOM IS OBSERVED, not negated. A CHECK accepts UNKNOWN, so a
-        // bare `LIKE` would admit the null this positive observation must
-        // refuse — the collapse is the whole difference.
+        // A CHECK CARRIES THE POSITIVE PROOF UNOBSERVED. The constraint
+        // refuses exactly what it can call FALSE, and an UNKNOWN `LIKE`
+        // against a null is not FALSE — collapsing it with `IS TRUE` would
+        // make the constraint refuse a row SQL's own CHECK rule admits, and
+        // would silently imply the NOT NULL nobody wrote. The atom itself is
+        // the predicate identity the query road carries: the generator
+        // renders it through the selected bin entity, not a DDL-local arm.
         let result = transform_check(expr, "name");
-        let SqlExpression::Observation { expr, positive } = result else {
-            panic!("Expected an observation, got: {result:?}");
-        };
-        assert!(positive);
-        match *expr {
-            SqlExpression::Binary { left, op, right } => {
-                assert_eq!(op, BinaryOperator::Like);
-                assert!(matches!(*left, SqlExpression::Column(_)));
+        match result {
+            SqlExpression::PredicateRewrite {
+                name,
+                namespace,
+                args,
+                negated,
+            } => {
+                assert_eq!(name, "like");
+                assert!(namespace.is_empty());
+                assert!(!negated);
+                assert!(matches!(args[0], SqlExpression::Column(_)));
                 assert!(
-                    matches!(*right, SqlExpression::Literal(LiteralValue::String(ref s)) if s == "%abc")
+                    matches!(args[1], SqlExpression::Literal(LiteralValue::String(ref s)) if s == "%abc")
                 );
             }
-            other => panic!("Expected Binary LIKE, got: {:?}", other),
+            other => panic!("Expected the bare like predicate rewrite, got: {:?}", other),
         }
+    }
+
+    /// THE CONSUMER, NOT THE PREDICATE, DECIDES. The same positive proof in
+    /// a filtering position IS collapsed: a filter admits only TRUE, which is
+    /// what makes the two polarities equipartition its input. Nothing about
+    /// `like` changed between the two — only who consumed it.
+    #[test]
+    fn a_filter_observes_the_positive_proof_the_check_carries() {
+        let expr = TruthExpression::Sigma(SigmaApplication {
+            polarity: Polarity::Positive,
+            proof: crate::pipeline::asts::core::NamedProof::Call(
+                crate::pipeline::asts::core::PureCall::from_inner(
+                    crate::pipeline::asts::core::FunctorCall::scalar(
+                        crate::pipeline::asts::vocabulary::Ref::synthetic_with_display(
+                            &std::rc::Rc::new(crate::names::Registry::new(&[])),
+                            crate::pipeline::asts::vocabulary::SyntheticReason::EffectReceipt,
+                            "like",
+                        ),
+                        vec![value_placeholder(), lit_str("%abc")],
+                    ),
+                ),
+            ),
+        });
+        let identities = crate::names::Registry::new(&[]);
+        let (resolved, identities) = crate::ddl_pipeline::resolver::resolve(CreateTableDef {
+            name: "t".to_string(),
+            temp: false,
+            columns: vec![ColumnDef {
+                name: "name".to_string(),
+                col_type: "TEXT".to_string(),
+                constraints: vec![DdlConstraint::Check { expr }],
+                default: None,
+            }],
+            table_constraints: vec![],
+        })
+        .map(|(resolved, minted)| {
+            let _ = &identities;
+            (resolved, minted)
+        })
+        .unwrap();
+        let DdlConstraint::Check { expr } = resolved.columns[0].constraints[0].clone() else {
+            panic!("the fixture writes one check")
+        };
+        let observed = transform_ddl_predicate(
+            expr,
+            Some(resolved.columns[0].name),
+            &identities,
+            TruthConsumer::Filter,
+        )
+        .unwrap();
+        assert!(
+            matches!(observed, SqlExpression::Observation { positive: true, .. }),
+            "a filtering position collapses the proof it admits: {observed:?}"
+        );
     }
 
     #[test]
@@ -968,17 +1046,54 @@ mod tests {
                 ),
             ),
         });
-        // And the negative one observes the SAME atom. `NOT LIKE` is Kleene
-        // negation: it keeps UNKNOWN, so both polarities would admit a null
-        // row instead of one of them claiming it.
+        // NEGATIVE POLARITY IS ALREADY TWO-VALUED — "not proven TRUE" — so
+        // every consumer spells it the same way, `IS NOT TRUE`. It is not the
+        // target's `NOT`: `NOT LIKE` is Kleene negation and keeps UNKNOWN,
+        // which would answer the wrong question about a null row.
         let result = transform_check(expr, "name");
         let SqlExpression::Observation { expr, positive } = result else {
             panic!("Expected an observation, got: {result:?}");
         };
         assert!(!positive);
         match *expr {
-            SqlExpression::Binary { op, .. } => assert_eq!(op, BinaryOperator::Like),
-            other => panic!("Expected Binary NotLike, got: {:?}", other),
+            SqlExpression::PredicateRewrite { name, negated, .. } => {
+                assert_eq!(name, "like");
+                assert!(!negated);
+            }
+            other => panic!("Expected the like predicate rewrite, got: {:?}", other),
+        }
+    }
+
+    /// The SQL comparison predicates take the same road as `like`: one
+    /// predicate rewrite carrying the selected identity, its qualifier
+    /// included, and — in a CHECK — carried without an observation. The
+    /// CHECK law is GENERIC: nothing here reads the callee's name.
+    #[test]
+    fn test_sql_eq_sigma_keeps_its_qualified_identity() {
+        let registry = std::rc::Rc::new(crate::names::Registry::new(&[]));
+        let callee = crate::pipeline::asts::vocabulary::Ref::synthetic_with_display(
+            &registry,
+            crate::pipeline::asts::vocabulary::SyntheticReason::EffectReceipt,
+            "sql_eq",
+        );
+        let expr = TruthExpression::Sigma(SigmaApplication {
+            polarity: Polarity::Positive,
+            proof: crate::pipeline::asts::core::NamedProof::Call(
+                crate::pipeline::asts::core::PureCall::from_inner(
+                    crate::pipeline::asts::core::FunctorCall::scalar(
+                        callee,
+                        vec![value_placeholder(), lit_num("5")],
+                    ),
+                ),
+            ),
+        });
+        let result = transform_check(expr, "state");
+        match result {
+            SqlExpression::PredicateRewrite { name, args, .. } => {
+                assert_eq!(name, "sql_eq");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("Expected the sql_eq predicate rewrite, got: {:?}", other),
         }
     }
 
@@ -1049,5 +1164,45 @@ mod tests {
             }
             other => panic!("Expected Case, got: {:?}", other),
         }
+    }
+
+    /// A null match arm makes anchored matching observably different from
+    /// SQL simple CASE. DQL null matches null, so lowering must switch to a
+    /// searched case whose arm uses null-safe equality.
+    #[test]
+    fn an_anchored_null_arm_uses_null_safe_matching() {
+        let case_expr =
+            DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Case(
+                crate::pipeline::asts::core::CaseExpression::Anchored {
+                    anchor: Box::new(value_placeholder()),
+                    arms: crate::pipeline::asts::vocabulary::Vec1::new(
+                        crate::pipeline::asts::core::MatchArm {
+                            term: LiteralValue::Null,
+                            result: Box::new(lit_str("null-arm")),
+                        },
+                    ),
+                    default: Some(Box::new(lit_str("other"))),
+                },
+            ));
+
+        let result = transform_expr(case_expr, "code");
+        let SqlExpression::Case {
+            expr,
+            when_clauses,
+            else_clause,
+        } = result
+        else {
+            panic!("expected an anchored match to remain a case")
+        };
+        assert!(expr.is_none(), "a null arm cannot use SQL simple CASE");
+        assert_eq!(when_clauses.len(), 1);
+        assert!(else_clause.is_some());
+        assert!(matches!(
+            when_clauses[0].when(),
+            SqlExpression::Binary {
+                op: BinaryOperator::IsNotDistinctFrom,
+                ..
+            }
+        ));
     }
 }

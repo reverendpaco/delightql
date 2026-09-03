@@ -25,7 +25,6 @@ use crate::{
 
 /// Buffered eager results for non-streaming connections (bootstrap, imported).
 struct EagerBuffer {
-    #[allow(dead_code)]
     dimensions: Vec<Dimension>,
     rows: Vec<Vec<Cell>>,
     cursor: usize,
@@ -107,16 +106,6 @@ fn cell_count(row: Option<&Vec<Cell>>) -> Option<i64> {
     std::str::from_utf8(bytes).ok()?.trim().parse::<i64>().ok()
 }
 
-/// How a failing assertion names itself. The author's name is the point
-/// of naming one; the ordinal is what to say when there is no name, not
-/// the answer to prefer.
-fn assertion_label(name: &Option<String>, index: usize) -> String {
-    match name {
-        Some(n) => format!("'{}'", n),
-        None => format!("{}", index + 1),
-    }
-}
-
 impl Default for RelayHooks {
     fn default() -> Self {
         Self {
@@ -137,7 +126,14 @@ pub struct RelayParty<'a, T: Transport> {
     /// What a live result still owes: the compiler-created relations its
     /// statement staged, waiting for the rows to be done with.
     staged_by_handle: HashMap<Handle, Staged>,
+    /// The submission each live handle came from, so an error reported at
+    /// fetch or close names the input that caused it.
+    text_by_handle: HashMap<Handle, String>,
+    /// The submission being handled right now; `next_handle` binds it to
+    /// the handle it mints.
+    current_text: Option<String>,
     next_handle_id: u64,
+    next_effect_run_id: u64,
     danger_overrides: Vec<pipeline::ast_unresolved::DangerSpec>,
     option_overrides: Vec<pipeline::ast_unresolved::OptionSpec>,
     sql_optimization_level: pipeline::sql_optimizer::OptimizationLevel,
@@ -200,7 +196,10 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             handles: HashMap::new(),
             eager_buffers: HashMap::new(),
             staged_by_handle: HashMap::new(),
+            text_by_handle: HashMap::new(),
+            current_text: None,
             next_handle_id: 1,
+            next_effect_run_id: 1,
             danger_overrides: Vec::new(),
             option_overrides: Vec::new(),
             sql_optimization_level: pipeline::sql_optimizer::OptimizationLevel::Basic,
@@ -326,8 +325,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // classification and the compilation all ask questions about the same
         // goal, and asking the parser three times is how they come to
         // disagree.
-        let registry = std::rc::Rc::new(crate::names::Registry::new(&[]));
-        let goal = match self.read_one_goal(&dql, &registry) {
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+        let goal = match self.read_one_goal(&dql, registry.shared()) {
             Ok(goal) => goal,
             Err(GoalRefusal::Reported(term)) => return term,
             Err(GoalRefusal::AsDeclared { declared, detail }) => {
@@ -413,7 +412,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         &mut self,
         compiled: crate::pipeline::compiled_query::CompiledQuery,
     ) -> (ServerTerm, Staged) {
-        let assertion_sqls = compiled.assertion_sqls;
         let obligations = compiled.obligations;
         let prepare_sqls = compiled.prepare_sqls;
         let connection_id = compiled.connection_id;
@@ -423,67 +421,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             drops: Vec::new(),
             connection_id,
         };
-
-        // Evaluate assertions on the routed connection
-        for (i, assertion) in assertion_sqls.iter().enumerate() {
-            let assertion_sql = &assertion.sql;
-            match self.execute_sql_routed(assertion_sql, connection_id) {
-                Ok((_cols, rows)) => {
-                    let passed = cell_says_yes(rows.first());
-
-                    if let Some(ref mut hook) = self.hooks.on_verdict {
-                        let v = verdict::Verdict {
-                            outcome: if passed {
-                                verdict::VerdictOutcome::Pass
-                            } else {
-                                verdict::VerdictOutcome::Fail
-                            },
-                            identity: verdict::VerdictIdentity {
-                                name: assertion.name.clone(),
-                                body_text: assertion_sql.clone(),
-                            },
-                            detail: if passed {
-                                None
-                            } else {
-                                Some(format!(
-                                    "Assertion {} failed\n  SQL: {}",
-                                    assertion_label(&assertion.name, i),
-                                    assertion_sql
-                                ))
-                            },
-                        };
-                        hook(&v);
-                    }
-
-                    if !passed {
-                        return (
-                            ServerTerm::Error {
-                                kind: ErrorKind::Permission,
-                                identity: b"delightql-error://runtime/assertion".to_vec(),
-                                message: format!(
-                                    "Assertion {} failed\n  SQL: {}",
-                                    assertion_label(&assertion.name, i),
-                                    assertion_sql
-                                )
-                                .into_bytes(),
-                            },
-                            staged,
-                        );
-                    }
-                }
-                Err(msg) => {
-                    return (
-                        ServerTerm::Error {
-                            kind: ErrorKind::Permission,
-                            identity: b"delightql-error://runtime/assertion".to_vec(),
-                            message: format!("Assertion {} execution error: {}", i + 1, msg)
-                                .into_bytes(),
-                        },
-                        staged,
-                    );
-                }
-            }
-        }
 
         // Only now is the source evaluated: staged once, so the check and
         // the statement read one relation. Two evaluations of one source are
@@ -794,7 +731,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         dql: &str,
         goal: crate::pipeline::normalize::Goal,
         expected: verdict::ExpectedError,
-        registry: std::rc::Rc<crate::names::Registry>,
+        registry: crate::relation::Planning,
     ) -> ServerTerm {
         let identity = verdict::VerdictIdentity {
             name: None,
@@ -1059,7 +996,37 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     fn next_handle(&mut self) -> Handle {
         let id = self.next_handle_id;
         self.next_handle_id += 1;
-        format!("h{}", id).into_bytes()
+        let handle: Handle = format!("h{}", id).into_bytes();
+        if let Some(text) = &self.current_text {
+            self.text_by_handle.insert(handle.clone(), text.clone());
+        }
+        handle
+    }
+
+    /// The session boundary is where every error a client sees crosses,
+    /// and the ONE place a reported error becomes a
+    /// `sys::diagnostics.finding` row: an error a hook consumed is data,
+    /// not a finding; an error the client is about to receive is.
+    fn record_reported_error(&self, term: &ServerTerm, input: Option<&str>) {
+        let ServerTerm::Error {
+            identity, message, ..
+        } = term
+        else {
+            return;
+        };
+        let uri = String::from_utf8_lossy(identity);
+        let uri: &str = if uri.is_empty() {
+            crate::uri_registry::INTERNAL_UNBADGED
+        } else {
+            &uri
+        };
+        self.system.record_finding(
+            crate::diagnostics::Severity::Error,
+            uri,
+            &String::from_utf8_lossy(message),
+            input,
+            "session",
+        );
     }
 
     /// Return the appropriate protocol response for an error hook verdict.
@@ -1287,18 +1254,34 @@ impl<'a, T: Transport> Handler for RelayParty<'a, T> {
                 }
             }
 
-            ClientTerm::Query { text } => self.handle_query(text),
+            ClientTerm::Query { text } => {
+                self.current_text = Some(String::from_utf8_lossy(&text).into_owned());
+                let term = self.handle_query(text);
+                let input = self.current_text.take();
+                self.record_reported_error(&term, input.as_deref());
+                term
+            }
 
             ClientTerm::Fetch {
                 handle,
                 projection,
                 count,
                 orientation,
-            } => self.handle_fetch(handle, projection, count, orientation),
+            } => {
+                let input = self.text_by_handle.get(&handle).cloned();
+                let term = self.handle_fetch(handle, projection, count, orientation);
+                self.record_reported_error(&term, input.as_deref());
+                term
+            }
 
             ClientTerm::Stat { handle } => self.handle_stat(handle),
 
-            ClientTerm::Close { handle } => self.handle_close(handle),
+            ClientTerm::Close { handle } => {
+                let input = self.text_by_handle.remove(&handle);
+                let term = self.handle_close(handle);
+                self.record_reported_error(&term, input.as_deref());
+                term
+            }
 
             ClientTerm::Prepare { .. } => ServerTerm::Error {
                 kind: ErrorKind::Permission,

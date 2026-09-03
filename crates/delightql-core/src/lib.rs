@@ -3,11 +3,10 @@
 pub mod api;
 pub(crate) mod bin_cartridge;
 pub(crate) mod compiler_limits;
-#[cfg(test)]
-mod construction_fence;
 pub(crate) mod ddl;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod ddl_pipeline;
+pub(crate) mod defuse;
 pub mod diagnostics;
 pub(crate) mod enums;
 #[cfg(not(target_arch = "wasm32"))]
@@ -18,10 +17,12 @@ pub(crate) mod namespace;
 pub(crate) mod pipeline;
 pub(crate) mod probe;
 pub(crate) mod refinement_budget;
+pub(crate) mod relation;
 pub(crate) mod resolution;
 pub(crate) mod seed_manifest;
 pub mod session_cwd;
 pub(crate) mod sexp_formatter;
+pub(crate) mod sql_binding;
 pub(crate) mod stdlib_manifest;
 pub mod term_spec;
 pub mod uri_registry;

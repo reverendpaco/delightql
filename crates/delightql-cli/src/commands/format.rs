@@ -143,7 +143,7 @@ fn format_with_library(
         apply_style_bundle(&mut config, style_name)?;
     }
     for warning in delightql_formatter::apply_config_file(&mut config, None) {
-        eprintln!("warning: {warning}");
+        crate::client::incident::warning("format", crate::client::incident::hierarchy::FORMAT, warning.to_string());
     }
     let outcome = delightql_formatter::format_outcome(&input, &config)?;
 
@@ -155,15 +155,22 @@ fn format_with_library(
         use delightql_formatter::PassReason;
         match reason {
             PassReason::DefinitionFile => {
-                eprintln!(
-                    "warning: this is a definition library — `dql format` \
-                     speaks the query grammar only and cannot format rule \
-                     definitions yet; returned unchanged"
+                crate::client::incident::warning(
+                    "format",
+                    crate::client::incident::hierarchy::FORMAT,
+                    "this is a definition library — `dql format` speaks the \
+                     query grammar only and cannot format rule definitions \
+                     yet; returned unchanged"
+                        .to_string(),
                 );
                 if !fail_if_not_formatted {
                     print!("{}", outcome.text());
                 }
+                {
+                crate::client::exit::finish(None, 2);
+                crate::client::exit::announce();
                 std::process::exit(2);
+            }
             }
             PassReason::ParseError => {
                 // THE TOOL'S ACCOMMODATION, not a second semantics. `dql
@@ -176,32 +183,48 @@ fn format_with_library(
                     .parse_definition_file(&input)
                     .has_defects();
                 if is_definition_file {
-                    eprintln!(
-                        "warning: this is a definition library — `dql format` \
-                         speaks the query grammar only and cannot format rule \
-                         definitions yet; returned unchanged"
+                    crate::client::incident::warning(
+                        "format",
+                        crate::client::incident::hierarchy::FORMAT,
+                        "this is a definition library — `dql format` speaks the \
+                         query grammar only and cannot format rule definitions \
+                         yet; returned unchanged"
+                            .to_string(),
                     );
                 } else {
-                    eprintln!("warning: input does not parse; returned unchanged");
+                    crate::client::incident::warning("format", crate::client::incident::hierarchy::FORMAT, "input does not parse; returned unchanged".to_string());
                 }
                 // A parse error is "cannot determine" in BOTH modes —
                 // there is no formatted form of unparseable input.
                 if !fail_if_not_formatted {
                     print!("{}", outcome.text());
                 }
+                {
+                crate::client::exit::finish(None, 2);
+                crate::client::exit::announce();
                 std::process::exit(2);
             }
-            PassReason::UnhandledNode(kind) => eprintln!(
-                "warning: formatter does not yet handle node '{kind}'; \
-                 input returned unchanged"
+            }
+            PassReason::UnhandledNode(kind) => crate::client::incident::warning(
+                "format",
+                crate::client::incident::hierarchy::FORMAT,
+                format!("formatter does not yet handle node '{kind}'; input returned unchanged"),
             ),
-            PassReason::TokenStreamChanged(detail) => eprintln!(
-                "warning: formatting would have changed the token stream \
-                 ({detail}); input returned unchanged"
+            PassReason::TokenStreamChanged(detail) => crate::client::incident::warning(
+                "format",
+                crate::client::incident::hierarchy::FORMAT,
+                format!(
+                    "formatting would have changed the token stream ({detail}); \
+                     input returned unchanged"
+                ),
             ),
         }
         if fail_if_not_formatted {
-            std::process::exit(2);
+            {
+                crate::client::exit::finish(None, 2);
+                crate::client::exit::announce();
+                std::process::exit(2);
+            }
         }
     }
     let formatted = outcome.text().to_string();
@@ -211,7 +234,11 @@ fn format_with_library(
     // command-line string, which naturally has none.
     if fail_if_not_formatted {
         if input != formatted && format!("{input}\n") != formatted {
-            std::process::exit(1);
+            {
+                crate::client::exit::finish(None, 1);
+                crate::client::exit::announce();
+                std::process::exit(1);
+            }
         }
         return Ok(());
     }

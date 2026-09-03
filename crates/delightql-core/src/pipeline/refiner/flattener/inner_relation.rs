@@ -12,9 +12,9 @@ use crate::pipeline::asts::resolved::{self, InnerRelationPattern};
 /// Flatten an INNER-RELATION (correlated subquery)
 pub(super) fn flatten_inner_relation(
     pattern: InnerRelationPattern<resolved::Resolved>,
-    preminted_scope: Option<crate::names::ScopeId>,
+    head: resolved::Grelex,
     outer: bool,
-    cpr_schema: crate::names::ScopeId,
+    result: crate::relation::SemanticRelation,
     segment: &mut FlatSegment,
     ctx: &mut FlattenContext,
 ) -> Result<()> {
@@ -102,8 +102,8 @@ pub(super) fn flatten_inner_relation(
                 correlation_filters,
             );
 
-            let flattened_subquery =
-                super::flatten(cleaned_subquery, std::rc::Rc::clone(&ctx.identities))?;
+            let operand = cleaned_subquery.semantic_relation();
+            let flattened_subquery = super::flatten(cleaned_subquery, operand, ctx.identities)?;
 
             // Extract correlation filters and add to PARENT segment predicates
             // This hoists them out of the subquery so they become JOIN ON clauses
@@ -122,48 +122,19 @@ pub(super) fn flatten_inner_relation(
                 );
             }
 
-            let identity = cpr_schema;
-            // An injected carrier RIDES this table's boundary: the hoisted
-            // filter above references the injection's occurrence, the
-            // rebuilder's join republishes THIS scope's heading, and the
-            // reference re-anchors along the republish chain — a carrier
-            // present only inside the subquery leaves the hoisted condition
-            // holding an occurrence no FROM entry publishes. The boundary
-            // was registered before the injection existed, so it is
-            // extended here, once (a reflatten finds the occurrence already
-            // riding).
-            for (_, carrier) in &carriers {
-                let riding = ctx
-                    .identities
-                    .known_heading(identity)?
-                    .iter()
-                    .any(|column| ctx.identities.republishes(*column, *carrier));
-                if !riding {
-                    ctx.identities.republish_column(
-                        *carrier,
-                        identity,
-                        crate::names::Republish::Correlation,
-                        None,
-                        crate::names::Addressing::Hygienic,
-                        |_| {},
-                    );
-                }
-            }
+            let identity = result;
             // Add the table with BOTH the pattern AND the flattened subquery
             // The pattern is kept for metadata, the flattened subquery is used by rebuilder
             segment.tables.push(FlatTable {
-                identity,
+                relation: identity,
+                head: Some(head),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
                 access: resolved::Access::All,
-                schema: cpr_schema,
                 outer,
                 anonymous_data: None,
-                inner_relation_pattern: Some(pattern.clone()),
-                preminted_scope,
                 subquery_segment: Some(Box::new(flattened_subquery)), // PHASE 3: Store flattened subquery
                 pipe_expr: None,
-                consulted_view_query: None,
                 _table_filters: vec![],
                 tvf_data: None,
             });
@@ -189,27 +160,23 @@ pub(super) fn flatten_inner_relation(
 
             // Recursively flatten subquery if present, passing through inherited scope
             let flattened_subquery_opt = if let Some(subquery) = subquery_opt {
-                Some(Box::new(super::flatten(
-                    (**subquery).clone(),
-                    std::rc::Rc::clone(&ctx.identities),
-                )?))
+                let subquery = (**subquery).clone();
+                let operand = subquery.semantic_relation();
+                Some(Box::new(super::flatten(subquery, operand, ctx.identities)?))
             } else {
                 None
             };
 
             segment.tables.push(FlatTable {
-                identity: cpr_schema,
+                relation: result,
+                head: Some(head),
                 position: ctx.position,
                 _scope_id: ctx.scope_id,
                 access: resolved::Access::All,
-                schema: cpr_schema,
                 outer,
                 anonymous_data: None,
-                inner_relation_pattern: Some(pattern.clone()),
-                preminted_scope,
                 subquery_segment: flattened_subquery_opt,
                 pipe_expr: None,
-                consulted_view_query: None,
                 _table_filters: vec![],
                 tvf_data: None,
             });

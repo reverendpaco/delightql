@@ -169,6 +169,38 @@ impl<'t> Normalizer<'t> {
         })
     }
 
+    /// A relation-position predicate name whose leaf has passed authored
+    /// identifier admission before any definition, catalog or target lookup.
+    pub(crate) fn qualified_reference_name(
+        &self,
+        node: cst::PredicateIdentifier<'t>,
+    ) -> Result<QualifiedName> {
+        let name = self.require(node.name(), "a predicate identifier has a name")?;
+        let name = self.admit_reference(self.identifier(name))?;
+        let namespace_path = match node.namespace() {
+            None => NamespacePath::empty(),
+            Some(qual) => {
+                let path = self.require(qual.child(), "a namespace qualifier has a namespace")?;
+                NamespacePath::from_parts(
+                    self.namespace_segments(path)
+                        .into_iter()
+                        .map(|segment| self.admit_reference(segment))
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .map(|segment| segment.as_str().to_string())
+                        .collect(),
+                )
+                .map_err(|error| {
+                    DelightQLError::parse_error(format!("invalid namespace path: {error:?}"))
+                })?
+            }
+        };
+        Ok(QualifiedName {
+            namespace_path,
+            name,
+        })
+    }
+
     pub(crate) fn namespace_path(
         &self,
         qual: Option<cst::NamespaceQual<'t>>,
@@ -230,13 +262,9 @@ impl<'t> Normalizer<'t> {
         {
             return supplied.clone();
         }
-        match bindings.table_params.get(formal) {
-            Some(supplied) => SqlIdentifier::new(supplied.clone()),
-            // A relation EXPRESSION has no spelling to substitute, and an
-            // ordinary alias is not a formal at all: both keep what was
-            // written.
-            None => written,
-        }
+        // A relation EXPRESSION has no spelling to substitute, and an
+        // ordinary alias is not a formal at all: both keep what was written.
+        written
     }
 }
 
@@ -331,7 +359,7 @@ impl<'t> Normalizer<'t> {
     /// a name with no binding is a refusal here rather than a bind parameter
     /// carried forward.
     fn substituted_integer(&self, name: SqlIdentifier, position: &'static str) -> Result<i64> {
-        use crate::pipeline::asts::core::{DomainExpression, LiteralValue};
+        use crate::pipeline::asts::core::LiteralValue;
 
         // No fabricated stand-in: a bound with nothing to substitute is not a
         // bound of zero. A definition body that cannot be read until its
@@ -347,12 +375,8 @@ impl<'t> Normalizer<'t> {
                 "a scalar parameter is code: it is substituted before resolution",
             ));
         };
-        match bindings.scalar_params.get(name.as_str()) {
-            Some(DomainExpression::Application(
-                crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::Number(
-                    number,
-                )),
-            )) => number.replace('_', "").parse::<i64>().map_err(|_| {
+        match bindings.scalar_literals.get(name.as_str()) {
+            Some(LiteralValue::Number(number)) => number.replace('_', "").parse::<i64>().map_err(|_| {
                 DelightQLError::validation_error_categorized(
                     crate::uri_registry::subcat::LIMIT_VALUE,
                     format!("{position} takes a whole number; '{name}' is bound to {number}"),

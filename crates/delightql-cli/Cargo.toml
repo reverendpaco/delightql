@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = ["repl", "prettify", "formatter"]
-repl = ["dep:rustyline", "dep:ratatui", "dep:crossterm", "dep:ctrlc"]
+repl = ["dep:rustyline", "dep:ratatui", "dep:crossterm", "dep:ctrlc", "dep:rexpect"]
 prettify = ["dep:tree-sitter-highlight"]
 formatter = ["dep:delightql-formatter"]
 recursion_stats = ["delightql-core/recursion_stats"]
@@ -60,6 +60,7 @@ rustyline = { path = "../rustyline", optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 ctrlc = { version = "3.4", optional = true }
+rexpect = { version = "0.7", optional = true }
 
 [build-dependencies]
 chrono.workspace = true

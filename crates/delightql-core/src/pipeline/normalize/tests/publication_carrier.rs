@@ -27,9 +27,9 @@ fn chain(source: &str) -> Chain<Unresolved> {
 fn operator(source: &str) -> PipeOp<Unresolved> {
     let chain = chain(source);
     chain
-        .continuations
+        .continuations()
         .iter()
-        .find_map(|continuation| match continuation {
+        .find_map(|continuation| match continuation.form() {
             Continuation::Pipe { operator, .. } => Some(operator.clone()),
             _ => None,
         })
@@ -39,8 +39,7 @@ fn operator(source: &str) -> PipeOp<Unresolved> {
 /// The publication items a projection or an embed publishes.
 fn items(source: &str) -> Vec<OutItem<Unresolved>> {
     match operator(source) {
-        PipeOp::Project(items)
-        | PipeOp::Embed(items) => items.into_vec(),
+        PipeOp::Project(items) | PipeOp::Embed(items) => items.into_vec(),
         other => panic!("expected a projection or embed, got {other:?}"),
     }
 }
@@ -210,7 +209,10 @@ fn the_embed_carries_only_its_added_items() {
 /// diagnosed — and the projection beside it keeps its optional naming.
 #[test]
 fn transform_naming_is_mandatory_and_projection_naming_is_optional() {
-    let PipeOp::Transform { items: transformations, .. } = operator("users(*) |> $$(upper:(name) as name)")
+    let PipeOp::Transform {
+        items: transformations,
+        ..
+    } = operator("users(*) |> $$(upper:(name) as name)")
     else {
         panic!("expected a transform");
     };
@@ -230,7 +232,10 @@ fn transform_naming_is_mandatory_and_projection_naming_is_optional() {
 /// says which live scope holds the column being redefined.
 #[test]
 fn a_transform_target_keeps_its_qualifier_and_its_strop() {
-    let PipeOp::Transform { items: transformations, .. } = operator("users(*) |> $$(upper:(u.name) as u.`Name`)")
+    let PipeOp::Transform {
+        items: transformations,
+        ..
+    } = operator("users(*) |> $$(upper:(u.name) as u.`Name`)")
     else {
         panic!("expected a transform");
     };
@@ -296,10 +301,8 @@ fn every_publication_position_holds_publication_items() {
 #[test]
 fn the_singleton_reduction_publishes_through_the_same_carrier() {
     let PipeOp::Group(GroupSpec::Reduce {
-                keys,
-                reductions,
-                ..
-            }) = operator("users(*) ~> count:(*) as n")
+        keys, reductions, ..
+    }) = operator("users(*) ~> count:(*) as n")
     else {
         panic!("expected a zero-key reduction");
     };
@@ -324,5 +327,5 @@ fn the_authored_output_stamp_is_phantom() {
         panic!("expected one one-value item");
     };
     // Written, and the only value the type admits.
-    assert_eq!(one.output, ());
+    assert_eq!(*one.output(), ());
 }

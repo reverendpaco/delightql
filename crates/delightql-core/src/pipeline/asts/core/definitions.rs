@@ -1,30 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Definitions — one head, typed necks, one fallible assembler.
+//! Definitions — one head, one fallible assembler.
 //!
-//! A definition is a subject and its clauses; a clause
-//! is a head, a neck, and a body. The head is the SAME type under every
-//! neck — `:-`, `:=`, and `:` alike — so head-`as`, ground supply, and the
-//! naming algebra mean one thing wherever they are written.
+//! A definition is a subject and its clauses; a clause is a head and a
+//! body. The head is the SAME type under the defining neck `:-` and the
+//! label neck `:`, so head-`as`, ground supply, and the naming algebra mean
+//! one thing wherever they are written.
 //!
 //! The head is a heading, not a computation: an item SUPPLIES a value (a
 //! reference into the body, or a ground constant) and OFFERS a name. What
 //! the offers make of each other is the assembler's business, and it is the
 //! only place that business happens.
 
-use super::expressions::chain::{Continuation, Grelex, StructuralForm};
+use super::expressions::chain::{Continuation, StructuralForm};
 use super::literals::LiteralValue;
 use super::operators::PipeOp;
 use super::phases::{Phase, Unresolved};
 use super::queries::ContextMode;
 use super::specs::GroupSpec;
-use super::{Chain, DomainExpression, TruthExpression};
+use super::{Chain, DomainExpression, GroundForm, TruthExpression};
 use crate::error::{DelightQLError, Result};
 use delightql_types::SqlIdentifier;
 
-/// The neck, typed: `:-`, `:=`, `:`. There is no source text to search for
-/// a neck in — a definition carries the one it was written with.
-pub use crate::pipeline::asts::vocabulary::Neck;
+/// The fixpoint flavor a head authors, typed. THE BADGE CHOOSES THE UNION.
+pub use crate::pipeline::asts::vocabulary::Fixpoint;
 
 /// What KIND of entity a definition declares. Declared by the head form at
 /// build time; never re-derived downstream from the Rust type of a body
@@ -42,8 +41,8 @@ pub enum DefKind {
     /// `name(data)` — inline data, no neck.
     Fact,
     /// `name(inputs -> outputs ---- arms)` — inline data whose `->` declares
-    /// a functional mode. A fact by its relational face and a callable by the
-    /// declaration, from ONE carrier.
+    /// a functional mode. It is always callable; assembly grants the ordinary
+    /// fact face only when no `_ -> outputs` default is present.
     FactFunction,
     /// `name!(…) neck body` — a user directive.
     Effect,
@@ -120,6 +119,79 @@ pub enum HeadItems {
     Listed(Vec<HeadItem>),
 }
 
+/// One still-unbound position in a closed residual rule value.
+///
+/// Names inside this contract explain positions to the author but do not bind
+/// names in the enclosing definition. Admission compares the ordered role and
+/// structural heading; the residual itself owns the selected declaration's
+/// actual formal identities.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResidualMode {
+    Relation {
+        name: SqlIdentifier,
+        cols: HeadItems,
+    },
+    Scalar {
+        name: SqlIdentifier,
+    },
+}
+
+impl ResidualMode {
+    pub fn name(&self) -> &SqlIdentifier {
+        match self {
+            ResidualMode::Relation { name, .. } | ResidualMode::Scalar { name } => name,
+        }
+    }
+}
+
+/// The surface contract of a rule-valued formal. The sealed-prefix count is
+/// intentionally absent: `...` promises that construction already sealed one
+/// lawful complete prefix, while consumers depend only on what remains and on
+/// the published heading.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResidualSignature {
+    pub remaining: Vec<ResidualMode>,
+    pub output: HeadItems,
+}
+
+impl ResidualSignature {
+    /// Whether two declarations promise the same ordered structural
+    /// contract. Parameter names explain positions but do not participate;
+    /// relation headings and the published heading do.
+    pub(crate) fn same_shape(&self, other: &Self) -> bool {
+        fn same_heading(left: &HeadItems, right: &HeadItems) -> bool {
+            match (left, right) {
+                (HeadItems::Glob, HeadItems::Glob) => true,
+                (HeadItems::Listed(left), HeadItems::Listed(right)) => {
+                    left.len() == right.len()
+                        && left
+                            .iter()
+                            .zip(right)
+                            .all(|(left, right)| left.offered_name() == right.offered_name())
+                }
+                (HeadItems::Glob, HeadItems::Listed(_))
+                | (HeadItems::Listed(_), HeadItems::Glob) => false,
+            }
+        }
+
+        self.remaining.len() == other.remaining.len()
+            && self
+                .remaining
+                .iter()
+                .zip(&other.remaining)
+                .all(|(left, right)| match (left, right) {
+                    (
+                        ResidualMode::Relation { cols: left, .. },
+                        ResidualMode::Relation { cols: right, .. },
+                    ) => same_heading(left, right),
+                    (ResidualMode::Scalar { .. }, ResidualMode::Scalar { .. }) => true,
+                    (ResidualMode::Relation { .. }, ResidualMode::Scalar { .. })
+                    | (ResidualMode::Scalar { .. }, ResidualMode::Relation { .. }) => false,
+                })
+            && same_heading(&self.output, &other.output)
+    }
+}
+
 impl HeadItems {
     pub fn listed(&self) -> Option<&[HeadItem]> {
         match self {
@@ -148,6 +220,13 @@ pub enum HoParam {
         guard: Option<TruthExpression<Unresolved>>,
         callable: bool,
     },
+    /// `P(... T(*))(*)` — a pure relational rule value whose already-bound
+    /// prefix is hidden and whose remaining ordered mode and result heading
+    /// are structural admission facts.
+    Rule {
+        name: SqlIdentifier,
+        signature: ResidualSignature,
+    },
     /// `"value"` or `42` — a ground constant fixing this position in THIS
     /// clause. Sibling clauses may bind the same position freely.
     ///
@@ -163,6 +242,7 @@ impl HoParam {
         match self {
             HoParam::Relation { name, .. }
             | HoParam::Scalar { name, .. }
+            | HoParam::Rule { name, .. }
             | HoParam::Ground { name, .. } => name,
         }
     }
@@ -518,7 +598,7 @@ pub fn assemble(
 
 /// A clause the desugar law can be applied to. The law needs exactly this
 /// much of a clause — its head, and a way to push that head's projection
-/// onto whatever body shape the clause carries — so the consulted `:-`/`:=`
+/// onto whatever body shape the clause carries — so the consulted `:-`
 /// road and the local `:` road share one implementation instead of two
 /// loops that agree by inspection.
 pub trait HeadedClause: Sized {
@@ -557,11 +637,11 @@ pub trait HeadedClause: Sized {
 /// the language allows.
 #[stacksafe::stacksafe]
 pub fn chain_publishes_names<P: Phase>(chain: &Chain<P>) -> bool {
-    let mut publishes = match &chain.head {
-        Grelex::Literal(table) => table.table.body.header.is_some(),
-        Grelex::Reference(_) => true,
+    let mut publishes = match chain.head().form() {
+        GroundForm::Literal(table) => table.table.body.header.is_some(),
+        GroundForm::Reference(_) => true,
     };
-    for continuation in &chain.continuations {
+    for continuation in chain.forms() {
         publishes = match continuation {
             // An access asks a relation for dimensions it already has. It
             // narrows, activates, or merges a heading; it cannot put a name
@@ -710,11 +790,10 @@ fn named_out(
     expr: DomainExpression<Unresolved>,
     naming: delightql_types::SqlIdentifier,
 ) -> crate::pipeline::asts::core::OutItem<Unresolved> {
-    crate::pipeline::asts::core::OutItem::One(crate::pipeline::asts::core::OneOut {
-        expr: crate::pipeline::asts::core::OutValue::Domain(expr),
-        naming: Some(naming),
-        output: (),
-    })
+    crate::pipeline::asts::core::OutItem::One(crate::pipeline::asts::core::OneOut::authored(
+        expr,
+        Some(naming),
+    ))
 }
 
 pub fn project_body_through_head(
@@ -726,9 +805,11 @@ pub fn project_body_through_head(
         .iter()
         .zip(canonical_names.iter())
         .map(|(item, canonical)| match &item.supply {
-            Supply::Ref(name) if name == canonical => crate::pipeline::asts::core::OutItem::plain(
-                DomainExpression::lvar_builder(name.clone()).build(),
-                (),
+            Supply::Ref(name) if name == canonical => crate::pipeline::asts::core::OutItem::one(
+                crate::pipeline::asts::core::OneOut::authored(
+                    DomainExpression::lvar_builder(name.clone()).build(),
+                    None,
+                ),
             ),
             Supply::Ref(name) => named_out(
                 DomainExpression::lvar_builder(name.clone()).build(),
@@ -746,7 +827,12 @@ pub fn project_body_through_head(
     let Some(items) = crate::pipeline::asts::vocabulary::Vec1::try_from_vec(items) else {
         return body;
     };
-    Chain::pipe_builder(body, ()).with_projection(items).build()
+    body.then(crate::pipeline::asts::core::Step::authored(
+        Continuation::Pipe {
+            operator: crate::pipeline::asts::core::PipeOp::Project(items),
+            named: Default::default(),
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -809,6 +895,23 @@ impl HoParam {
                 Some(_) => format!("(scalar \"{name}\" guarded)"),
                 None => format!("(scalar \"{name}\")"),
             },
+            HoParam::Rule { name, signature } => {
+                let remaining = signature
+                    .remaining
+                    .iter()
+                    .map(|mode| match mode {
+                        ResidualMode::Relation { name, cols } => {
+                            format!("(relation \"{name}\" {})", cols.render())
+                        }
+                        ResidualMode::Scalar { name } => format!("(scalar \"{name}\")"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!(
+                    "(rule \"{name}\" (remaining {remaining}) (output {}))",
+                    signature.output.render()
+                )
+            }
             HoParam::Ground { text, .. } => format!("(ground \"{text}\")"),
         }
     }
@@ -846,7 +949,8 @@ mod tests {
     #[test]
     fn a_glob_group_declares_no_heading() {
         let head = Head::glob();
-        let assembly = assemble("g", &[&head, &head], GroundNaming::Refuse).expect("glob group assembles");
+        let assembly =
+            assemble("g", &[&head, &head], GroundNaming::Refuse).expect("glob group assembles");
         assert_eq!(assembly.canonical_names, None);
     }
 
@@ -887,7 +991,8 @@ mod tests {
             Supply::Ref(SqlIdentifier::new("age")),
             Some("id"),
         )]);
-        let assembly = assemble("q", &[&left, &right], GroundNaming::Refuse).expect("the label conforms");
+        let assembly =
+            assemble("q", &[&left, &right], GroundNaming::Refuse).expect("the label conforms");
         assert_eq!(names(&assembly), vec!["id"]);
     }
 
@@ -907,7 +1012,8 @@ mod tests {
             item(ground("VIP"), Some("tag")),
             HeadItem::plumb("id"),
         ]);
-        let assembly = assemble("b", &[&head], GroundNaming::Refuse).expect("the label names the position");
+        let assembly =
+            assemble("b", &[&head], GroundNaming::Refuse).expect("the label names the position");
         assert_eq!(names(&assembly), vec!["tag", "id"]);
     }
 
@@ -917,7 +1023,8 @@ mod tests {
         // lvar's offer names it, and clause 1's literal still supplies.
         let grounded = listed(vec![item(ground("VIP"), None)]);
         let named = listed(vec![HeadItem::plumb("tag")]);
-        let assembly = assemble("b", &[&grounded, &named], GroundNaming::Refuse).expect("one offer suffices");
+        let assembly =
+            assemble("b", &[&grounded, &named], GroundNaming::Refuse).expect("one offer suffices");
         assert_eq!(names(&assembly), vec!["tag"]);
     }
 
@@ -929,7 +1036,8 @@ mod tests {
             HeadItem::plumb("last"),
         ]);
         let bare = listed(vec![item(ground("y"), None), HeadItem::plumb("last")]);
-        let assembly = assemble("t", &[&labelled, &bare], GroundNaming::Refuse).expect("one offer suffices");
+        let assembly =
+            assemble("t", &[&labelled, &bare], GroundNaming::Refuse).expect("one offer suffices");
         assert_eq!(names(&assembly), vec!["tag", "last"]);
     }
 
@@ -939,7 +1047,8 @@ mod tests {
         // Unanimous, so no contest.
         let plumbed = listed(vec![HeadItem::plumb("country")]);
         let laundered = listed(vec![item(ground("x"), Some("country"))]);
-        let assembly = assemble("c", &[&plumbed, &laundered], GroundNaming::Refuse).expect("agreement is not conflict");
+        let assembly = assemble("c", &[&plumbed, &laundered], GroundNaming::Refuse)
+            .expect("agreement is not conflict");
         assert_eq!(names(&assembly), vec!["country"]);
     }
 

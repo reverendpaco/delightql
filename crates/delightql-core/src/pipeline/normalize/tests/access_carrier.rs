@@ -8,7 +8,7 @@
 //! under a different name, which is the one thing these exist to catch.
 
 use super::support::*;
-use crate::pipeline::asts::core::operators::{HoArgument, PipeOp};
+use crate::pipeline::asts::core::operators::PipeOp;
 use crate::pipeline::asts::core::*;
 
 /// The chain a query is, when it is one relational expression.
@@ -24,9 +24,9 @@ fn chain(source: &str) -> Chain<Unresolved> {
 /// never off a spelling.
 fn accesses(chain: &Chain<Unresolved>) -> Vec<&Access<Unresolved>> {
     chain
-        .continuations
+        .continuations()
         .iter()
-        .filter_map(|continuation| match continuation {
+        .filter_map(|continuation| match continuation.form() {
             Continuation::Access { access, .. } => Some(access),
             _ => None,
         })
@@ -96,12 +96,12 @@ fn a_ground_read_and_a_callable_relation_share_the_shape() {
     let ground = chain("users(*)");
     let callable = chain("wrap(users(*))(*)");
     assert!(matches!(
-        ground.head,
-        Grelex::Reference(Relation::Ground { .. })
+        ground.head().form(),
+        GroundForm::Reference(Relation::Ground { .. })
     ));
     assert!(matches!(
-        callable.head,
-        Grelex::Reference(Relation::FunctorCall { .. })
+        callable.head().form(),
+        GroundForm::Reference(Relation::FunctorCall { .. })
     ));
     for read in [&ground, &callable] {
         assert_eq!(read.head_span(), 1);
@@ -124,7 +124,10 @@ fn a_step_access_stands_past_the_read() {
     );
     assert_eq!(stepped.head_span(), 1, "the pattern is the read's");
     assert!(
-        matches!(stepped.steps(), [Continuation::Access { .. }]),
+        matches!(
+            stepped.step_forms().as_slice(),
+            [Continuation::Access { .. }]
+        ),
         "the run is one step on the read's result: {:?}",
         stepped.steps()
     );
@@ -135,9 +138,12 @@ fn a_step_access_stands_past_the_read() {
 #[test]
 fn a_literal_head_takes_no_access_of_its_own() {
     let melted = chain("_(1; 2)*");
-    assert!(matches!(melted.head, Grelex::Literal(_)));
+    assert!(matches!(melted.head().form(), GroundForm::Literal(_)));
     assert_eq!(melted.head_span(), 0);
-    assert!(matches!(melted.steps(), [Continuation::Access { .. }]));
+    assert!(matches!(
+        melted.step_forms().as_slice(),
+        [Continuation::Access { .. }]
+    ));
 }
 
 // ---------------------------------------------------------------------
@@ -171,7 +177,7 @@ fn a_restriction_stops_the_run_from_reaching_the_read() {
     assert_ne!(lispy_chain(&direct), lispy_chain(&separated));
     assert!(
         matches!(
-            separated.steps(),
+            separated.step_forms().as_slice(),
             [Continuation::Restrict { .. }, Continuation::Access { .. }]
         ),
         "the restriction stands between the read and the step: {:?}",
@@ -197,8 +203,8 @@ fn direct_and_piped_receipts_reach_one_carrier() {
     let piped = chain("users(*) |> doc!(\"main.users\", \"d\")(*)");
     for read in [&direct, &piped] {
         assert!(matches!(
-            read.head,
-            Grelex::Reference(Relation::FunctorCall { .. })
+            read.head().form(),
+            GroundForm::Reference(Relation::FunctorCall { .. })
         ));
         assert_eq!(
             accesses(read).into_iter().map(tag).collect::<Vec<_>>(),
@@ -279,7 +285,7 @@ fn an_access_beside_a_destructure_stays_one_run() {
     let both = chain("users(*) |> (id), payload ~= {.a} .(a)");
     assert!(
         matches!(
-            both.steps(),
+            both.step_forms().as_slice(),
             [
                 Continuation::Pipe { .. },
                 Continuation::Destructure { .. },
@@ -302,11 +308,10 @@ fn an_access_beside_a_destructure_stays_one_run() {
 #[test]
 fn a_ground_relation_has_no_access_field() {
     let read = chain("users(*)");
-    let Grelex::Reference(Relation::Ground {
+    let GroundForm::Reference(Relation::Ground {
         mention: _,
         outer: _,
-        cpr_schema: _,
-    }) = &read.head
+    }) = read.head().form()
     else {
         panic!("expected a ground read");
     };
@@ -345,7 +350,7 @@ fn no_unary_operator_carries_an_access() {
     }
 
     let piped = chain("users(*) |> (id) .(id)");
-    for continuation in &piped.continuations {
+    for continuation in piped.forms() {
         if let Continuation::Pipe { operator, .. } = continuation {
             assert!(operator_is_not_an_access(operator));
         }
@@ -371,8 +376,8 @@ fn only_a_mention_takes_a_leading_access() {
 // ---------------------------------------------------------------------
 
 fn call_of(chain: &Chain<Unresolved>) -> &FunctorCall<Unresolved> {
-    match &chain.head {
-        Grelex::Reference(Relation::FunctorCall { call, .. }) => call.call(),
+    match chain.head().form() {
+        GroundForm::Reference(Relation::FunctorCall { call, .. }) => call.call(),
         other => panic!("expected a callable head, got {other:?}"),
     }
 }

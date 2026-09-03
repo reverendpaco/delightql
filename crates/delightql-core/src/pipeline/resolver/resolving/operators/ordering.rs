@@ -11,8 +11,11 @@ use crate::pipeline::{ast_resolved, ast_unresolved};
 pub(in crate::pipeline::resolver) fn resolve_tuple_ordering_via_fold(
     fold: &mut ResolverFold,
     specs: Vec<ast_unresolved::OrderingSpec>,
-    available: &[crate::names::ColId],
-) -> Result<(Vec<ast_resolved::OrderingSpec>, Vec<crate::names::ColId>)> {
+    available: &[crate::relation::PortId],
+) -> Result<(
+    Vec<ast_resolved::OrderingSpec>,
+    Vec<crate::relation::PortId>,
+)> {
     // Resolve ORDER BY specs
     let resolved_specs = specs
         .into_iter()

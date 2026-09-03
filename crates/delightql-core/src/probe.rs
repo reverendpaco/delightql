@@ -104,13 +104,7 @@ pub(crate) fn chain(
     identities: &crate::names::Registry,
     column: crate::names::ColId,
 ) -> Vec<String> {
-    let mut out = vec![format!("{column:?}@{:?}", identities.scope_of(column))];
-    let mut cur = column;
-    while let crate::names::ColumnOrigin::Republished { from, .. } = identities.origin_of_col(cur) {
-        out.push(format!("{from:?}@{:?}", identities.scope_of(from)));
-        cur = from;
-    }
-    out
+    vec![format!("{column:?}@{:?}", identities.scope_of(column))]
 }
 
 /// The input chain of a scope, oldest last, with each hop's origin and the
@@ -124,26 +118,11 @@ pub(crate) fn scope_chain(
     identities: &crate::names::Registry,
     scope: crate::names::ScopeId,
 ) -> Vec<String> {
-    use crate::names::ScopeOrigin as O;
-    let mut out = Vec::new();
-    let mut cur = scope;
-    loop {
-        let answers = identities.answers_to(cur);
-        let origin = identities.origin_of(cur);
-        out.push(format!("{cur:?}(answers {answers:?}) {origin:?}"));
-        cur = match origin {
-            O::UserAlias { of }
-            | O::PipeStage { input: of }
-            | O::Wrap { input: of, .. }
-            | O::Cte { input: of, .. }
-            | O::SetArm { of, .. }
-            | O::ErHop { chain: of, .. } => of,
-            _ => return out,
-        };
-        if out.len() > 32 {
-            return out;
-        }
-    }
+    let answers = identities.answers_to(scope);
+    vec![format!(
+        "{scope:?}(answers {answers:?}) {:?}",
+        identities.kind_of(scope)
+    )]
 }
 
 #[cfg(test)]

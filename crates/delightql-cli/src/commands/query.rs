@@ -117,6 +117,29 @@ fn run_query(
     Ok(())
 }
 
+/// The road a `query` invocation is on: the prompt when there is no query,
+/// no file, and a terminal on stdin; one-shot otherwise. The ONE place
+/// that decides it — the process database and the dispatch both ask here.
+pub fn mode_of(command: &Command) -> crate::client::context::Mode {
+    use crate::client::context::Mode;
+    match command {
+        // The replay driver is neither prompt nor one-shot: it types into
+        // a child that is the prompt.
+        #[cfg(feature = "repl")]
+        Command::Query {
+            replay_repl: Some(_),
+            ..
+        } => Mode::Other,
+        Command::Query { query, file, .. }
+            if query.is_none() && file.is_none() && io::stdin().is_terminal() =>
+        {
+            Mode::Repl
+        }
+        Command::Query { .. } => Mode::Query,
+        _ => Mode::Other,
+    }
+}
+
 /// Handle query subcommand
 pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result<()> {
     let Command::Query {
@@ -133,11 +156,25 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         quiet,
         #[cfg(feature = "repl")]
         highlights,
+        #[cfg(feature = "repl")]
+        replay_repl,
         ..
     } = command
     else {
         unreachable!("handle_query_subcommand called with non-Query command")
     };
+
+    // The replay driver: no connection, no handle of its own — it spawns
+    // this executable on a pty and types the recorded session into it.
+    #[cfg(feature = "repl")]
+    if let Some(source) = replay_repl {
+        let argv: Vec<String> = std::env::args().collect();
+        let fallback = crate::client::replay::arguments_without_replay(&argv);
+        let code = crate::client::replay::run(source, &fallback)?;
+        crate::client::exit::finish(None, code);
+        crate::client::exit::announce();
+        std::process::exit(code);
+    }
 
     let output_format = OutputFormat::resolve(format.clone());
     let db_path = base_args
@@ -146,7 +183,7 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         .map(|p| p.to_string_lossy().to_string());
 
     if *no_sanitize {
-        eprintln!("warning: output sanitization disabled, terminal injection possible");
+        crate::client::incident::warning("argument", crate::client::incident::hierarchy::SANITIZE_DISABLED, "output sanitization disabled, terminal injection possible".to_string());
     }
 
     // Build the connection manager. For a fatboy target this classifies the
@@ -168,7 +205,7 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
     // backend-opener on its path — one child, mirroring the one-shot mount!
     // (pinned indirectly by the
     // REPL smoke path — no ball coverage).
-    if query.is_none() && file.is_none() && io::stdin().is_terminal() {
+    if mode_of(command) == crate::client::context::Mode::Repl {
         #[cfg(feature = "repl")]
         {
             return crate::repl::run_interactive_with_connection(
@@ -215,17 +252,45 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         crate::attach::process_attach_flags(&mut *handle, attach)?;
     }
 
-    if let Some(ref q) = query {
+    // Run, then close the session while the handle — and core's findings
+    // in it — are alive, then answer. `?` would skip the close on error,
+    // which is the case the session files exist for.
+    let result = run_one_shot(
+        query.as_deref(),
+        file.as_deref(),
+        &mut *handle,
+        to.clone(),
+        output_format,
+        *no_headers,
+        *no_sanitize,
+        *sequential,
+    );
+    crate::client::exit::finish(Some(&mut *handle), if result.is_ok() { 0 } else { 1 });
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_one_shot(
+    query: Option<&str>,
+    file: Option<&std::path::Path>,
+    handle: &mut dyn delightql_core::api::DqlHandle,
+    to: Option<crate::args::Stage>,
+    output_format: OutputFormat,
+    no_headers: bool,
+    no_sanitize: bool,
+    sequential: bool,
+) -> Result<()> {
+    if let Some(q) = query {
         run_query(
             q,
-            &mut *handle,
-            to.clone(),
+            handle,
+            to,
             output_format,
-            *no_headers,
-            *no_sanitize,
-            *sequential,
+            no_headers,
+            no_sanitize,
+            sequential,
         )
-    } else if let Some(ref f) = file {
+    } else if let Some(f) = file {
         // `--file -` means stdin, per convention (R2.4) — otherwise the
         // OS goes looking for a file literally named "-".
         let source_code = if f.as_os_str() == "-" {
@@ -237,12 +302,12 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         };
         run_query(
             &source_code,
-            &mut *handle,
-            to.clone(),
+            handle,
+            to,
             output_format,
-            *no_headers,
-            *no_sanitize,
-            *sequential,
+            no_headers,
+            no_sanitize,
+            sequential,
         )
     } else {
         // No query, no file, and (per the interactive check above) stdin is
@@ -263,12 +328,12 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         }
         run_query(
             &buffer,
-            &mut *handle,
-            to.clone(),
+            handle,
+            to,
             output_format,
-            *no_headers,
-            *no_sanitize,
-            *sequential,
+            no_headers,
+            no_sanitize,
+            sequential,
         )
     }
 }

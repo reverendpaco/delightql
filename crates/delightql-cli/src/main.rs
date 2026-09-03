@@ -82,21 +82,44 @@ fn main() {
         } else {
             "panic with non-string payload".to_string()
         };
-        let at = info
+        let location = info
             .location()
-            .map(|l| format!(" (at {}:{})", l.file(), l.line()))
+            .map(|l| format!("{}:{}", l.file(), l.line()));
+        // The worker forwards its panic as an answer; the parent records
+        // it and says it once. Anything else is this process's own: say
+        // it, and queue it for the incident table — the hook cannot insert
+        // (the panicking thread may hold the connection lock), the next
+        // prompt or the exit drains the queue.
+        #[cfg(feature = "repl")]
+        if delightql_cli::client::context::current_mode()
+            == Some(delightql_cli::client::context::Mode::Worker)
+        {
+            delightql_cli::repl::worker::stash_panic(msg, location);
+            return;
+        }
+        let at = location
+            .as_deref()
+            .map(|l| format!(" (at {l})"))
             .unwrap_or_default();
         let prefix = CLI_FLAGS
             .with(|f| f.borrow().as_ref().map(|fl| fl.error_prefix.clone()))
             .unwrap_or_else(|| "\x1E".to_string());
         emit_error_record(
             &prefix,
-            Some("delightql-error://internal/panic"),
+            Some(delightql_cli::client::incident::PANIC_URI),
             &format!(
                 "{msg}{at} — this is a dql bug, please report it \
                  (`dql explain internal/panic`; RUST_BACKTRACE=1 for a backtrace)"
             ),
         );
+        delightql_cli::client::incident::queue_panic(delightql_cli::client::incident::PanicRecord {
+            message: msg,
+            location,
+            thread: std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_string(),
+        });
         if std::env::var_os("RUST_BACKTRACE").is_some() {
             default_hook(info);
         }
@@ -104,7 +127,14 @@ fn main() {
 
     let result = match std::panic::catch_unwind(run) {
         Ok(r) => r,
-        Err(_) => std::process::exit(1), // record already emitted by the hook
+        Err(_) => {
+            // The record is already on stderr and in the panic queue; the
+            // session files carry it out (client side only: the handle
+            // unwound with the panic).
+            delightql_cli::client::exit::finish(None, 1);
+            delightql_cli::client::exit::announce();
+            std::process::exit(1)
+        }
     };
 
     if let Err(e) = result {
@@ -115,6 +145,10 @@ fn main() {
             .unwrap_or_else(|| "\x1E".to_string());
 
         let error_display = format!("{}", e);
+        // Core's errors are core's rows (sys::diagnostics.finding, written
+        // where they were raised). Everything else reaching this boundary
+        // is the client's, badged or not, and is recorded as such.
+        use delightql_cli::client::incident::{hierarchy, Incident, IncidentKind};
         if let Some(dql_err) = e.downcast_ref::<delightql_core::error::DelightQLError>() {
             emit_error_record(&prefix, Some(&dql_err.error_uri()), &error_display);
         } else if let Some(rest) = error_display
@@ -123,11 +157,35 @@ fn main() {
         {
             // Identity prefix from protocol error: "[dql/parse/general] Syntax: ..."
             emit_error_record(&prefix, Some(rest.0), rest.1);
+            if let Some(db) = delightql_cli::client::context::process_database() {
+                let mut incident = Incident::plain(
+                    IncidentKind::Error,
+                    "main",
+                    hierarchy::UNBADGED,
+                    rest.1.to_string(),
+                );
+                incident.uri = rest.0.to_string();
+                db.record_incident(incident);
+            }
         } else {
             emit_error_record(&prefix, None, &error_display);
+            if let Some(db) = delightql_cli::client::context::process_database() {
+                db.record_incident(Incident::plain(
+                    IncidentKind::Error,
+                    "main",
+                    hierarchy::UNBADGED,
+                    error_display.clone(),
+                ));
+            }
         }
+        delightql_cli::client::exit::finish(None, 1);
+        delightql_cli::client::exit::announce();
         std::process::exit(1);
     }
+    // The ordinary end: a road that owned a handle already closed the
+    // session with it; this is the fallback for every other command.
+    delightql_cli::client::exit::finish(None, 0);
+    delightql_cli::client::exit::announce();
 }
 
 #[stacksafe::stacksafe]
@@ -144,6 +202,24 @@ fn run() -> Result<()> {
         args.error_format == args::ErrorFormat::Json,
         std::sync::atomic::Ordering::Relaxed,
     );
+
+    // The process's one client database opens on its road before any
+    // handle: the session, argv and environment rows exist from here on,
+    // whichever command runs and however it ends.
+    {
+        use delightql_cli::args::Command;
+        use delightql_cli::client::context::Mode;
+        let mode = match args.command {
+            Some(ref command @ Command::Query { .. }) => {
+                delightql_cli::commands::query::mode_of(command)
+            }
+            Some(Command::Server { .. }) => Mode::Server,
+            #[cfg(feature = "repl")]
+            Some(Command::ReplParserWorker { .. }) => Mode::Worker,
+            _ => Mode::Other,
+        };
+        delightql_cli::client::context::open_process_database(mode);
+    }
 
     // Test hook for the panic catch itself: the bin test pins the
     // contract (a panic exits 1 with a structured internal/panic
@@ -176,6 +252,8 @@ fn run() -> Result<()> {
             Command::Help { .. } => ("help", false, false, false),
             Command::Completions { .. } => ("completions", false, false, false),
             Command::Selftest { .. } => ("selftest", false, false, false),
+            #[cfg(feature = "repl")]
+            Command::ReplParserWorker { .. } => ("__repl-parser-worker", false, false, false),
         };
         // --make-new-db-if-missing is --db's companion knob, but only
         // query creates databases (server's --db must already exist).
@@ -258,6 +336,11 @@ fn run() -> Result<()> {
             Command::Query { .. } => {
                 delightql_cli::commands::query::handle_query_subcommand(command, &args)
             }
+            #[cfg(feature = "repl")]
+            Command::ReplParserWorker {
+                generation,
+                highlights,
+            } => delightql_cli::repl::worker::run_worker(*generation, highlights.clone()),
             Command::Explain { identifier } => {
                 delightql_cli::commands::explain::handle_explain(identifier)
             }
@@ -755,7 +838,7 @@ mod tests {
                 "-n",
                 "-f",
                 "jsonl",
-                "cli::surface.option(*) |> (command, long)",
+                "cli::surface.`option`(*) |> (command, long)",
             ])
             .output()
             .unwrap();
@@ -1459,6 +1542,33 @@ mod tests {
         assert_eq!(v[0]["x"], serde_json::json!(1));
         assert_eq!(v[1]["x"], serde_json::json!("abc"));
         assert_eq!(v[2]["x"], serde_json::json!(2));
+    }
+
+    /// RED: a relation of width two must remain an object with two members.
+    /// Repeated publications may carry equal values, but their emitted names
+    /// are distinct output-port identities; otherwise JSON's duplicate-member
+    /// interoperability collapses the row when a consumer parses it.
+    #[test]
+    fn repeated_publications_remain_distinct_json_members() {
+        let cli_path = get_cli_path();
+        let out = std::process::Command::new(&cli_path)
+            .args(["query", "-n", "-f", "json", "_(2) as q |> (q.*, q.*)"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("-f json must emit valid JSON");
+        let row = parsed[0]
+            .as_object()
+            .expect("a result row is a JSON object");
+        assert_eq!(
+            row.len(),
+            2,
+            "relation width and parsed JSON member count must agree: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(row.values().all(|value| value == &serde_json::json!(2)));
     }
 
     /// Bare `dql` is sugar for `dql query` with no arguments — one

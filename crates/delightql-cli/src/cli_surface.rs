@@ -3,6 +3,11 @@
 //! The running CLI's live command surface, materialized as a CLI-owned
 //! SQLite database and mounted at `cli::surface`.
 //!
+//! Dot commands are NOT here: the interactive client's accepted commands
+//! live in `repl::surface.dot_command`, projected from the same registry the
+//! dispatcher is welded to. This database describes the executable's
+//! NON-INTERACTIVE surface only.
+//!
 //! Commands and options are introspected from the LIVE clap tree —
 //! they structurally cannot drift from what the binary accepts. Two
 //! kinds of rows are enriched by hand, each from the same source its
@@ -41,7 +46,6 @@ struct Surface {
         Option<String>,
         Option<String>,
     )>,
-    dot_commands: Vec<(String, String)>,
     envs: Vec<(String, String, Option<String>)>,
     exit_codes: Vec<(i64, String, String, Option<String>, Option<String>)>,
 }
@@ -65,7 +69,6 @@ fn build() -> Surface {
     enrich_option_values(&mut surface);
     seed_envs(&mut surface);
     seed_exit_codes(&mut surface);
-    seed_dot_commands(&mut surface);
     surface
 }
 
@@ -125,7 +128,9 @@ fn walk_command(cmd: &clap::Command, parent: Option<&str>, surface: &mut Surface
     }
 
     for sub in cmd.get_subcommands() {
-        if sub.get_name() == "help" {
+        // Hidden commands are implementation channels (the REPL's parser
+        // worker), not CLI surface.
+        if sub.get_name() == "help" || sub.is_hide_set() {
             continue;
         }
         walk_command(sub, Some(&name), surface);
@@ -266,33 +271,6 @@ fn seed_exit_codes(surface: &mut Surface) {
     }
 }
 
-#[cfg(feature = "repl")]
-fn seed_dot_commands(surface: &mut Surface) {
-    // Projection of the REPL's dot-command registry — the same table the
-    // dispatcher is welded to (registry_and_dispatch_agree), so these
-    // rows structurally cannot drift from what the REPL accepts. One row
-    // per accepted SPELLING: aliases get their own row naming the
-    // canonical form.
-    for cmd in crate::repl::commands::DOT_COMMANDS {
-        surface
-            .dot_commands
-            .push((cmd.name.to_string(), cmd.summary.to_string()));
-        for alias in cmd.aliases {
-            surface.dot_commands.push((
-                alias.to_string(),
-                format!("{} (alias of {})", cmd.summary, cmd.name),
-            ));
-        }
-    }
-}
-
-#[cfg(not(feature = "repl"))]
-fn seed_dot_commands(surface: &mut Surface) {
-    // No REPL in this build → honestly empty rows, same contract as
-    // headless HelpSurface tables.
-    let _ = surface;
-}
-
 /// Build the live surface as a serialized in-memory SQLite image — no
 /// tempfile, no disk. The image is bound as owned bytes and mounted via
 /// `delightql-bytes://surface`, so the catalog records honest provenance
@@ -305,8 +283,8 @@ fn serialize_surface() -> Result<Vec<u8>> {
         crate::embedded_db::SCHEMA_VERSION
     ))?;
     (move |conn: &mut rusqlite::Connection| -> Result<()> {
-            conn.execute_batch(
-                "CREATE TABLE command (
+        conn.execute_batch(
+            "CREATE TABLE command (
                      name TEXT NOT NULL,
                      parent TEXT,
                      alias TEXT,
@@ -333,10 +311,6 @@ fn serialize_surface() -> Result<Vec<u8>> {
                      grade TEXT,
                      PRIMARY KEY (command, option, value)
                  );
-                 CREATE TABLE dot_command (
-                     name TEXT PRIMARY KEY,
-                     summary TEXT NOT NULL
-                 );
                  CREATE TABLE env (
                      name TEXT PRIMARY KEY,
                      effect TEXT NOT NULL,
@@ -350,55 +324,49 @@ fn serialize_surface() -> Result<Vec<u8>> {
                      grade TEXT,
                      PRIMARY KEY (code, context)
                  );",
+        )?;
+        let tx = conn.transaction()?;
+        for (name, parent, alias, summary) in surface.commands {
+            tx.execute(
+                "INSERT INTO command VALUES (?1, ?2, ?3, ?4)",
+                params![name, parent, alias, summary],
             )?;
-            let tx = conn.transaction()?;
-            for (name, parent, alias, summary) in surface.commands {
-                tx.execute(
-                    "INSERT INTO command VALUES (?1, ?2, ?3, ?4)",
-                    params![name, parent, alias, summary],
-                )?;
-            }
-            for option in surface.options {
-                tx.execute(
-                    "INSERT INTO option VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        option.command,
-                        option.long,
-                        option.short,
-                        option.value_name,
-                        option.default_value,
-                        option.global,
-                        option.repeatable,
-                        option.summary
-                    ],
-                )?;
-            }
-            for (command, option, value, summary, class, grade) in surface.option_values {
-                tx.execute(
-                    "INSERT INTO option_value VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![command, option, value, summary, class, grade],
-                )?;
-            }
-            for (name, summary) in surface.dot_commands {
-                tx.execute(
-                    "INSERT INTO dot_command VALUES (?1, ?2)",
-                    params![name, summary],
-                )?;
-            }
-            for (name, effect, flag) in surface.envs {
-                tx.execute(
-                    "INSERT INTO env VALUES (?1, ?2, ?3)",
-                    params![name, effect, flag],
-                )?;
-            }
-            for (code, context, meaning, class, grade) in surface.exit_codes {
-                tx.execute(
-                    "INSERT INTO exit_code VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![code, context, meaning, class, grade],
-                )?;
-            }
-            tx.commit()?;
-            Ok(())
+        }
+        for option in surface.options {
+            tx.execute(
+                "INSERT INTO option VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    option.command,
+                    option.long,
+                    option.short,
+                    option.value_name,
+                    option.default_value,
+                    option.global,
+                    option.repeatable,
+                    option.summary
+                ],
+            )?;
+        }
+        for (command, option, value, summary, class, grade) in surface.option_values {
+            tx.execute(
+                "INSERT INTO option_value VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![command, option, value, summary, class, grade],
+            )?;
+        }
+        for (name, effect, flag) in surface.envs {
+            tx.execute(
+                "INSERT INTO env VALUES (?1, ?2, ?3)",
+                params![name, effect, flag],
+            )?;
+        }
+        for (code, context, meaning, class, grade) in surface.exit_codes {
+            tx.execute(
+                "INSERT INTO exit_code VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![code, context, meaning, class, grade],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     })(&mut conn)?;
     let data = conn.serialize("main")?;
     Ok(data.to_vec())

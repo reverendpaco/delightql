@@ -106,10 +106,14 @@ pub fn handle_target_install(profile: &str, from: Option<&std::path::Path>) -> R
             true
         }
         None => {
-            eprintln!(
-                "warning: this dql is a {} build and carries no adapter \
-                 digests — installing UNVERIFIED",
-                delightql_buildinfo::profile()
+            crate::client::incident::warning(
+                "argument",
+                crate::client::incident::hierarchy::ARGUMENT,
+                format!(
+                    "this dql is a {} build and carries no adapter digests — \
+                     installing UNVERIFIED",
+                    delightql_buildinfo::profile()
+                ),
             );
             false
         }

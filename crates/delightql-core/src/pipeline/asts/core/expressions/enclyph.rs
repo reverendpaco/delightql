@@ -41,11 +41,54 @@ pub struct Record<P: Phase = Unresolved> {
     pub members: Vec1<RecordMember<P>>,
 }
 
-/// `[ … ]` — by position. Nonempty by construction: `domain_expression+`.
+/// `[ … ]` — by position. Nonempty by construction.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("tuple")]
 pub struct Tuple<P: Phase = Unresolved> {
-    pub elements: Vec1<DomainExpression<P>>,
+    pub elements: Vec1<TupleElement<P>>,
+}
+
+/// One position of a tuple: a value, or a spread standing for the several
+/// positions it covers. The spread spellings are the record's (FN.28),
+/// expanding as FN.35 states; resolution spends them, so a resolved tuple
+/// holds values only.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum TupleElement<P: Phase = Unresolved> {
+    #[lispy("tuple_element:value")]
+    Value(DomainExpression<P>),
+    #[lispy("tuple_element:spread")]
+    Spread(Spread<P>),
+}
+
+impl<P: Phase> TupleElement<P> {
+    /// The value standing at this position, where the phase has spent its
+    /// enumerations.
+    pub fn value(&self) -> &DomainExpression<P>
+    where
+        P: Phase<
+            Enumeration = crate::pipeline::asts::vocabulary::Never,
+            ColumnRange = crate::pipeline::asts::vocabulary::Never,
+        >,
+    {
+        match self {
+            Self::Value(value) => value,
+            Self::Spread(spread) => spread.expanded(),
+        }
+    }
+
+    /// The same, by value.
+    pub fn into_value(self) -> DomainExpression<P>
+    where
+        P: Phase<
+            Enumeration = crate::pipeline::asts::vocabulary::Never,
+            ColumnRange = crate::pipeline::asts::vocabulary::Never,
+        >,
+    {
+        match self {
+            Self::Value(value) => value,
+            Self::Spread(spread) => spread.expanded(),
+        }
+    }
 }
 
 /// The four things a record constructor may hold, and nothing else.
@@ -70,6 +113,15 @@ pub enum RecordMember<P: Phase = Unresolved> {
     /// key. Only references qualify: nothing else has a name to donate.
     #[lispy("record_member:self_keyed")]
     SelfKeyed(NamedReference<P>),
+    /// `"k": g:~> {…}` — a metadata group standing as an induced member's
+    /// body, under a fixed key (FN.22, amended). OUTWARD-ACTING: it
+    /// summarizes the group of rows its record stands for, so it may stand
+    /// only in a record that stands for a group.
+    #[lispy("record_member:metadata")]
+    Metadata {
+        key: String,
+        group: Box<super::MetadataGroup<P>>,
+    },
 }
 
 impl<P: Phase> Record<P> {

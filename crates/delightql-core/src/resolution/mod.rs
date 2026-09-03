@@ -2,14 +2,12 @@
 // Copyright 2026 Daniel Eklund
 //! Resolution subsystem for DelightQL
 //!
-//! This module provides entity tracking and resolution services to the pipeline.
-//! EntityRegistry consolidates schema lookups, CTEs, and namespace resolution
-//! into a single registry.
+//! The durable resolver core: catalog readers, the built-in vocabulary, and
+//! the relation authority's planning capability. Lexical bindings live in the
+//! one lexical world the resolver stands in (`crate::defuse::environment`).
 
 pub mod entity;
 pub mod registry;
-pub mod resolver;
 
 pub use entity::*;
 pub use registry::*;
-pub use resolver::*;

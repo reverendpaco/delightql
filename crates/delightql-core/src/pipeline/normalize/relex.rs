@@ -23,16 +23,15 @@ use crate::pipeline::asts::core::definitions::Head;
 use crate::pipeline::asts::core::expressions::pipes::DestructureMode;
 use crate::pipeline::asts::core::expressions::InnerRelationPattern;
 use crate::pipeline::asts::core::operators::JoinType;
-use crate::pipeline::asts::core::provenance::{CteOrigin, CteResolutionOwner};
+use crate::pipeline::asts::core::provenance::CteOrigin;
 use crate::pipeline::asts::core::Existence;
-use crate::pipeline::asts::core::SlotConstraint;
 use crate::pipeline::asts::core::{
-    Access, AnonRelation, AnonTable, ArrayPattern, ArrayPatternMember, AssertionSpec, Chain,
-    Continuation, CteBinding, DangerSpec, DangerState, Datum, DomainExpression, ErJoinStep,
-    FilterOrigin, Grelex, GroundMention, HeaderItem, InlineDdlSpec, LiteralValue, Membership,
-    NamespacePath, OptionSpec, OptionState, PathBinding, PatternTarget, PipeOp, Probe,
-    QualifiedName, Query, RecordPattern, RecordPatternMember, Relation, SetOperator, Slot,
-    TabularBody, TabularRow, TreePattern, Unresolved, ValueRow,
+    Access, AnonRelation, AnonTable, ArrayPattern, ArrayPatternMember, Chain, Continuation,
+    CteBinding, DangerSpec, DangerState, Datum, DomainExpression, ErJoinStep, FilterOrigin, Grelex,
+    GroundForm, GroundMention, HeaderItem, InlineDdlSpec, LiteralValue, Membership, NamespacePath,
+    OptionSpec, OptionState, PathBinding, PatternTarget, PipeOp, Probe, QualifiedName, Query,
+    RecordPattern, RecordPatternMember, Relation, SetOperator, Slot, Step, TabularBody, TabularRow,
+    TreePattern, Unresolved, ValueRow,
 };
 use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::vocabulary::FunctorMarks;
@@ -70,11 +69,32 @@ impl<'t> From<cst::FoRuleHead<'t>> for HeadingPayload<'t> {
     }
 }
 
-/// What a heading says: the output head, and whether the subject wore the
-/// deduplicating fixpoint badge.
+/// One let-block binding as read: a relation binding (CTE, labelled or
+/// effect-marked), or one clause of a common higher-order expression, which
+/// waits for its siblings before it is a definition.
+pub(crate) enum LetBinding {
+    Relation(CteBinding<Unresolved>),
+    HigherOrder {
+        name: SqlIdentifier,
+        effect: crate::pipeline::asts::core::CteEffectDeclaration,
+        decl: crate::pipeline::asts::ddl::ClauseDecl,
+    },
+}
+
+fn nested_preamble_refusal() -> DelightQLError {
+    DelightQLError::validation_error_categorized(
+        "cte/nested_preamble",
+        "only a relation binding may stand in a source's own preamble".to_string(),
+        "declare the function, the common higher-order expression, or the DDL block \
+         on the statement itself",
+    )
+}
+
+/// What a heading says: the output head, and the fixpoint flavor the subject
+/// badged.
 pub(crate) struct Heading {
     pub head: Head,
-    pub badged: bool,
+    pub fixpoint: crate::pipeline::asts::vocabulary::Fixpoint,
 }
 
 impl<'t> Normalizer<'t> {
@@ -88,18 +108,30 @@ impl<'t> Normalizer<'t> {
         self.wrap_let_block(node.let_block(), chain)
     }
 
-    /// The let block is ONE block: ctes, cfes, effect ctes and inline DDL
-    /// intermixed. Which binding collection each kind lands in is decided
-    /// here, once, in authored order.
+    /// The let block is ONE block: ctes, cfes, choes, effect ctes and inline
+    /// DDL intermixed. Which binding collection each kind lands in is decided
+    /// here, once, in authored order — and so is each CHOE's LEXICAL
+    /// HORIZON: a body sees the bindings declared before it, and the block
+    /// is the only place that order is written.
     pub(crate) fn wrap_let_block(
         &mut self,
         block: Option<cst::LetBlock<'t>>,
         chain: Chain<Unresolved>,
     ) -> Result<Query<Unresolved>> {
+        use crate::pipeline::asts::core::QueryLocalBlock;
+
+        let mut read = QueryLocalBlock::default();
+        let admit = |read: &mut QueryLocalBlock, binding: LetBinding| match binding {
+            LetBinding::Relation(binding) => read.admit_relation(binding),
+            LetBinding::HigherOrder { name, effect, decl } => {
+                read.admit_ho_clause(name, effect, decl)
+            }
+        };
         // A nested preamble's bindings belong to THIS query: the source that
         // declared them built a chain, and a chain holds no let block.
-        let mut ctes = std::mem::take(&mut self.hoisted_ctes);
-        let mut cfes = Vec::new();
+        for hoisted in std::mem::take(&mut self.hoisted_ctes) {
+            admit(&mut read, hoisted)?;
+        }
         if let Some(block) = block {
             for child in block.children() {
                 match child {
@@ -111,15 +143,22 @@ impl<'t> Normalizer<'t> {
                     // member that carried them, which is where they were written.
                     cst::LetBlockChild::Cte(cte) => {
                         let binding = self.cte(cte)?;
-                        ctes.append(&mut self.hoisted_ctes);
-                        ctes.push(binding);
+                        for hoisted in std::mem::take(&mut self.hoisted_ctes) {
+                            admit(&mut read, hoisted)?;
+                        }
+                        admit(&mut read, binding)?;
                     }
                     cst::LetBlockChild::EffectCte(cte) => {
                         let binding = self.effect_cte(cte)?;
-                        ctes.append(&mut self.hoisted_ctes);
-                        ctes.push(binding);
+                        for hoisted in std::mem::take(&mut self.hoisted_ctes) {
+                            admit(&mut read, hoisted)?;
+                        }
+                        admit(&mut read, binding)?;
                     }
-                    cst::LetBlockChild::Cfe(cfe) => cfes.push(self.cfe(cfe)?),
+                    cst::LetBlockChild::Cfe(cfe) => {
+                        let cfe = self.cfe(cfe)?;
+                        read.admit_cfe(cfe)?;
+                    }
                     cst::LetBlockChild::DdlAnnotation(ddl) => {
                         let spec = self.ddl_annotation(ddl)?;
                         self.features().add_ddl_block(spec);
@@ -127,15 +166,7 @@ impl<'t> Normalizer<'t> {
                 }
             }
         }
-        if !ctes.is_empty() {
-        }
-        if !cfes.is_empty() {
-        }
-        Ok(Query {
-            cfes,
-            ctes,
-            body: chain,
-        })
+        Ok(Query::binding(read.seal()?, chain))
     }
 
     /// A preamble declared where only a CHAIN can be built. Its bindings wait
@@ -146,23 +177,14 @@ impl<'t> Normalizer<'t> {
             return Ok(());
         };
         for child in block.children() {
-            match child {
-                cst::LetBlockChild::Cte(cte) => {
-                    let binding = self.cte(cte)?;
-                    self.hoisted_ctes.push(binding);
-                }
-                cst::LetBlockChild::EffectCte(cte) => {
-                    let binding = self.effect_cte(cte)?;
-                    self.hoisted_ctes.push(binding);
-                }
+            let binding = match child {
+                cst::LetBlockChild::Cte(cte) => self.cte(cte)?,
+                cst::LetBlockChild::EffectCte(cte) => self.effect_cte(cte)?,
                 cst::LetBlockChild::Cfe(_) | cst::LetBlockChild::DdlAnnotation(_) => {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "cte/nested_preamble",
-                        "only a binding may stand in a source's own preamble".to_string(),
-                        "declare the function or the DDL block on the statement itself",
-                    ))
+                    return Err(nested_preamble_refusal())
                 }
-            }
+            };
+            self.hoisted_ctes.push(binding);
         }
         Ok(())
     }
@@ -197,12 +219,11 @@ impl<'t> Normalizer<'t> {
                 } else {
                     JoinType::RightOuter
                 };
-                left.then(Continuation::Member {
+                left.then(Step::authored(Continuation::Member {
                     rhs: right,
                     correlation: None,
                     join_type: Some(join_type),
-                    cpr_schema: (),
-                })
+                }))
             }
             _ => {
                 let grelex = self.require(node.grelex(), "a relex begins with a grelex")?;
@@ -232,7 +253,7 @@ impl<'t> Normalizer<'t> {
             cst::LeadingOuterGrelexChild::OuterAnonGrelex(outer) => {
                 let body = self.require(outer.child(), "an anonymous table has a body")?;
                 let table = self.anon_body(body)?;
-                Ok(Chain::ground(Grelex::Literal(AnonRelation {
+                Ok(Chain::authored(GroundForm::Literal(AnonRelation {
                     table,
                     alias: None,
                     outer: true,
@@ -250,7 +271,7 @@ impl<'t> Normalizer<'t> {
             cst::Grelex::NamedGrelex(named) => self.named_grelex(named),
             cst::Grelex::AnonGrelex(anon) => {
                 let body = self.require(anon.child(), "an anonymous table has a body")?;
-                Ok(Chain::ground(Grelex::Literal(AnonRelation::plain(
+                Ok(Chain::authored(GroundForm::Literal(AnonRelation::plain(
                     self.anon_body(body)?,
                 ))))
             }
@@ -265,7 +286,7 @@ impl<'t> Normalizer<'t> {
     pub(crate) fn named_read(&mut self, node: cst::NamedGrelex<'t>) -> Result<Chain<Unresolved>> {
         let text = self.text(node).to_string();
         let read = self.named_grelex(node)?;
-        if read.has_steps() || !matches!(read.head, Grelex::Reference(_)) {
+        if read.has_steps() || !matches!(read.head().form(), GroundForm::Reference(_)) {
             return Err(DelightQLError::validation_error_categorized(
                 "grounding/er/endpoint",
                 format!("'{text}' shapes its interior, so it names no single term"),
@@ -279,13 +300,11 @@ impl<'t> Normalizer<'t> {
         self.last_term = Some(self.text(node).to_string());
         Ok(match node {
             cst::GrelexLikeMember::Grelex(grelex) => self.grelex(grelex)?,
-            cst::GrelexLikeMember::OuterGrelex(outer) => {
-                self.outer_grelex(outer)?
-            }
+            cst::GrelexLikeMember::OuterGrelex(outer) => self.outer_grelex(outer)?,
             cst::GrelexLikeMember::OuterAnonGrelex(outer) => {
                 let body = self.require(outer.child(), "an anonymous table has a body")?;
                 let table = self.anon_body(body)?;
-                Chain::ground(Grelex::Literal(AnonRelation {
+                Chain::authored(GroundForm::Literal(AnonRelation {
                     table,
                     alias: None,
                     outer: true,
@@ -471,24 +490,7 @@ impl<'t> Normalizer<'t> {
         if let Some(chain) = bindings.table_scope_relation(formal, access.clone(), None, outer) {
             return Some(chain);
         }
-        if let Some(supplied) = bindings.table_expr_params.get(formal) {
-            return Some(supplied.clone());
-        }
-        bindings.table_params.get(formal).map(|actual| {
-            ground_read(
-                GroundMention::Named {
-                    identifier: QualifiedName {
-                        namespace_path: NamespacePath::empty(),
-                        name: SqlIdentifier::new(actual.clone()),
-                    },
-                    alias: None,
-                    mutation_target: false,
-                    passthrough: false,
-                },
-                access,
-                outer,
-            )
-        })
+        bindings.table_expr_params.get(formal).cloned()
     }
 
     fn interior_read(
@@ -526,16 +528,16 @@ impl<'t> Normalizer<'t> {
         for continuation in rest {
             subquery = self.continuation(continuation, subquery)?;
         }
-        Ok(Chain::relation(Relation::InnerRelation {
-            pattern: InnerRelationPattern::Indeterminate {
-                identifier,
-                subquery: Box::new(subquery),
+        Ok(Chain::authored(GroundForm::Reference(
+            Relation::InnerRelation {
+                pattern: InnerRelationPattern::Indeterminate {
+                    identifier,
+                    subquery: Box::new(subquery),
+                },
+                alias: None,
+                outer,
             },
-            preminted_scope: None,
-            alias: None,
-            outer,
-            cpr_schema: (),
-        }))
+        )))
     }
 
     /// The interior's LEADING dequalifying run, folded into the access it
@@ -666,6 +668,19 @@ impl<'t> Normalizer<'t> {
         marks: FunctorMarks,
     ) -> Result<Chain<Unresolved>> {
         let ho_arguments = self.ho_arguments(part)?;
+        self.higher_order_call_with(reference, ho_arguments, access, shaping, marks)
+    }
+
+    /// The same call, its arguments already built — the road a call group
+    /// takes wherever it opens without a `ho_part` node of its own.
+    pub(crate) fn higher_order_call_with(
+        &mut self,
+        reference: crate::pipeline::asts::vocabulary::Ref,
+        ho_arguments: Vec<crate::pipeline::asts::core::operators::HoArgument<Unresolved>>,
+        access: Access<Unresolved>,
+        shaping: Vec<cst::Continuation<'t>>,
+        marks: FunctorMarks,
+    ) -> Result<Chain<Unresolved>> {
         let mut call = crate::pipeline::asts::core::FunctorCall::written(reference, ho_arguments);
         call.marks = marks;
         // THE ACCESS GROUP STANDS WHERE AN ACCESS STANDS. `f(x)(*)` asks the
@@ -676,10 +691,8 @@ impl<'t> Normalizer<'t> {
             Relation::FunctorCall {
                 alias: None,
                 call: crate::pipeline::asts::core::SealedCall::authored(call),
-                cpr_schema: (),
             },
             access,
-            (),
         );
         for continuation in shaping {
             chain = self.continuation(continuation, chain)?;
@@ -693,7 +706,7 @@ impl<'t> Normalizer<'t> {
     ) -> Result<(QualifiedName, bool)> {
         match self.require(node.child(), "a relation name has a spelling")? {
             cst::RelationNameChild::PredicateIdentifier(name) => {
-                Ok((self.qualified_name(name)?, false))
+                Ok((self.qualified_reference_name(name)?, false))
             }
             // THE ENGINE'S CATALOG IS THE ENGINE'S: the slash routes past
             // DQL's catalog, so the engine segment travels as the namespace
@@ -732,10 +745,12 @@ impl<'t> Normalizer<'t> {
         for slot in self.slot_nodes(node) {
             slots.push(self.slot(slot)?);
         }
-        Ok(match crate::pipeline::asts::vocabulary::Vec1::try_from_vec(slots) {
-            Some(slots) => Access::Slots(slots),
-            None => Access::Unasked,
-        })
+        Ok(
+            match crate::pipeline::asts::vocabulary::Vec1::try_from_vec(slots) {
+                Some(slots) => Access::Slots(slots),
+                None => Access::Unasked,
+            },
+        )
     }
 
     pub(crate) fn slot_nodes(&self, node: cst::ArgumentativeForm<'t>) -> Vec<cst::Slot<'t>> {
@@ -750,27 +765,38 @@ impl<'t> Normalizer<'t> {
     /// ONE slot, read as the slot it is.
     ///
     /// A bare name binds, a qualified name REUSES the enclosing value, `_`
-    /// disregards, and a term or the licensed crossing CONSTRAINS. Each is
-    /// its own alternative, so no consumer recovers the distinction from a
-    /// value it was handed.
+    /// disregards, and a term CONSTRAINS. Each is its own alternative, so no
+    /// consumer recovers the distinction from a value it was handed.
     pub(crate) fn slot(&mut self, node: cst::Slot<'t>) -> Result<Slot<Unresolved>> {
         Ok(match node {
-            // The crossing is a VALUE the column unifies with, never a
-            // predicate over the row.
-            cst::Slot::ConstraintTerm(cst::ConstraintTerm::TruthAsValue(truth)) => {
-                Slot::Constraint(SlotConstraint::truth(self.truth_as_value_truth(truth)?))
-            }
-            // The pre-carved existence spelling is the same crossing wearing
-            // its own surface, and a slot is one of its three homes.
-            cst::Slot::ConstraintTerm(cst::ConstraintTerm::FunctionApplication(application))
-                if super::value::pre_carved_existence(application).is_some() =>
+            // A SCALAR FORMAL IS CODE, NOT DATA, in a slot as in any other
+            // value position: the slot CONSTRAINS the position with the
+            // value the caller resolved for the formal, and the body's
+            // formal frame answers the reference at resolution. Binding it
+            // as a fresh column would publish the parameter's own name.
+            cst::Slot::NamedReference(reference)
+                if self.is_scalar_formal(&self.authored_column(reference.clone())?) =>
             {
-                let existence = super::value::pre_carved_existence(application)
-                    .expect("the guard just read one");
-                Slot::Constraint(SlotConstraint::truth(self.exists_as_column(existence)?))
+                let column = self.authored_column(reference)?;
+                Slot::Constraint(Box::new(DomainExpression::Reference(Reference::Named(
+                    NamedReference(column),
+                ))))
             }
             other => Slot::classify(self.slot_term(other)?),
         })
+    }
+
+    /// Whether an unqualified authored name is a scalar formal of the
+    /// definition being normalized with bindings in hand.
+    pub(crate) fn is_scalar_formal(
+        &self,
+        column: &crate::pipeline::asts::core::AuthoredColumn,
+    ) -> bool {
+        column.qualifier.is_none()
+            && column.namespace_path.is_empty()
+            && self
+                .bindings()
+                .is_some_and(|bindings| bindings.scalar_formals.contains(column.name.as_str()))
     }
 
     pub(crate) fn slot_term(
@@ -780,20 +806,6 @@ impl<'t> Normalizer<'t> {
         match node {
             cst::Slot::NamedReference(reference) => {
                 let column = self.authored_column(reference)?;
-                // A SCALAR FORMAL IS CODE, NOT DATA, in a slot as in any other
-                // value position: the supplied value stands where the formal
-                // was written, so the slot CONSTRAINS the position instead of
-                // binding a fresh column the body would then publish under
-                // the parameter's own name. A qualified name addresses
-                // somebody else's column and is never a formal.
-                if column.qualifier.is_none() {
-                    if let Some(supplied) = self
-                        .bindings()
-                        .and_then(|bindings| bindings.scalar_params.get(column.name.as_str()))
-                    {
-                        return Ok(supplied.clone());
-                    }
-                }
                 Ok(DomainExpression::Reference(Reference::Named(
                     NamedReference(column),
                 )))
@@ -805,16 +817,6 @@ impl<'t> Normalizer<'t> {
             )),
             cst::Slot::ConstraintTerm(cst::ConstraintTerm::FunctionApplication(application)) => {
                 self.function_application_expression(application)
-            }
-            // A HEADER ITEM NAMES A COLUMN, and a crossing names none. The
-            // slot road never reaches here with one — `slot` reads the
-            // crossing in its own carrier — so this arm is the header's.
-            cst::Slot::ConstraintTerm(cst::ConstraintTerm::TruthAsValue(_)) => {
-                Err(DelightQLError::validation_error_categorized(
-                    "anon/header_crossing",
-                    "a header item names a column, and a truth read as a value names none",
-                    "write the column's name in the header and the crossing in a row",
-                ))
             }
             cst::Slot::RenamedSlot(renamed) => Err(self.renamed_slot_refusal(renamed)),
         }
@@ -858,6 +860,16 @@ impl<'t> Normalizer<'t> {
         // own cells before handing them here.
         let mut rows = Vec::new();
         let (column_headers, sparse) = self.tabular_heading(node.header())?;
+        // An anonymous-header binder uses the same position-valid name
+        // admission as every other publication: a bare reserved word
+        // requires stropping.
+        if let Some(row) = &column_headers {
+            for item in row.iter() {
+                if let Slot::Bind(binder) = &item.slot {
+                    self.admit_published(binder.name.clone())?;
+                }
+            }
+        }
         for child in node.children() {
             if let cst::AnonBodyChild::DataRow(row) = child {
                 let (positional, fills) = self.row_parts(row)?;
@@ -870,7 +882,6 @@ impl<'t> Normalizer<'t> {
                 header: column_headers,
                 rows,
             },
-            cpr_schema: (),
         })
     }
 
@@ -1005,6 +1016,18 @@ impl<'t> Normalizer<'t> {
         let headers = Vec1::try_from_vec(headers)
             .map(|row| TabularRow(Box::new(row)))
             .ok_or_else(|| DelightQLError::parse_error("a tabular header names a column"))?;
+        // SPARSE COLUMNS FORM A SUFFIX: positional omission is unambiguous
+        // only when the omittable columns come last.
+        if let Some(&(first_sparse, _)) = sparse.first() {
+            if (first_sparse..headers.len()).any(|at| !sparse.iter().any(|(p, _)| *p == at)) {
+                return Err(DelightQLError::validation_error_categorized(
+                    "anon/sparse_suffix",
+                    "a required column cannot follow a sparse column".to_string(),
+                    "move the sparse columns to the end of the heading, or mark \
+                     the trailing columns sparse too",
+                ));
+            }
+        }
         Ok((headers, sparse))
     }
 
@@ -1026,6 +1049,17 @@ impl<'t> Normalizer<'t> {
             };
             match datum {
                 cst::Datum::DomainExpression(expression) => {
+                    // A ROW IS A POSITIONAL PREFIX, THEN NAMED FILLS. A
+                    // value standing after a fill would leave the written
+                    // order no longer saying which position got which value.
+                    if !fills.is_empty() {
+                        return Err(DelightQLError::validation_error_categorized(
+                            "anon/sparse_fill_position",
+                            "a sparse fill must follow every positional value in its row"
+                                .to_string(),
+                            "write the positional values first, then the named fills",
+                        ));
+                    }
                     values.push(self.domain_expression(expression)?)
                 }
                 cst::Datum::SparseFill(fill) => fills.extend(self.sparse_fill_parts(fill)?),
@@ -1109,31 +1143,33 @@ impl<'t> Normalizer<'t> {
                     return Ok(apply_access_run(chain, step));
                 }
                 let step = self.postfix_operator(postfix)?;
-                Ok(chain.then(step))
+                Ok(chain.then(Step::authored(step)))
             }
-            cst::OperatorContinuation::StageBoundary(boundary) => match boundary {
-                // `|*>` is the materialization boundary: the stage's whole
-                // heading, marked so the lowering plants it.
-                cst::StageBoundary::Materialize(_) => {
-                    Ok(
-                        chain.pipe(PipeOp::Project(crate::pipeline::asts::vocabulary::Vec1::new(
-                            crate::pipeline::asts::core::OutItem::Many(
-                                crate::pipeline::asts::core::Spread::Glob(
-                                    crate::pipeline::asts::core::Glob::whole(),
-                                ),
-                            ),
-                        ))),
-                    )
-                }
-                // `as f` names a stage's output and removes it from `_`'s
-                // deictic domain. On a bare head there is no stage yet, so
-                // the name is the mention's alias.
-                cst::StageBoundary::StageName(stage) => {
-                    let name = self.require(stage.name(), "a stage name carries a name")?;
-                    let name = self.identifier(name);
-                    name_the_stage(chain, name)
-                }
-            },
+            // `as f` names a stage's output and removes it from `_`'s deictic
+            // domain. On a bare head there is no stage yet, so the name is
+            // the mention's alias.
+            cst::OperatorContinuation::StageName(stage) => {
+                let name = self.require(stage.name(), "a stage name carries a name")?;
+                let name = self.identifier(name);
+                // Admission, not decoration: the spelling becomes an
+                // answering name only through the position law (exact `_`
+                // and bare reserved words refuse; a strop stays an exact
+                // name), and admission reserves it against the compilation's
+                // invented names.
+                let name = self.admit_stage(name)?;
+                name_the_stage(chain, name)
+            }
+            // `as f(slots)` names AND patterns: one act at the one occurrence
+            // plain `as f` would name.
+            cst::OperatorContinuation::ArgumentativeStage(stage) => {
+                let name = self.require(stage.name(), "an argumentative stage carries a name")?;
+                let name = self.identifier(name);
+                let name = self.admit_stage(name)?;
+                let slots =
+                    self.require(stage.slots(), "an argumentative stage carries a slot row")?;
+                let access = self.slot_access(slots)?;
+                pattern_the_stage(chain, name, access)
+            }
             // THE SINGLETON PIPE — sugar for the zero-key group. ONE road:
             // it builds the same group operator `%( ~> item)` builds, so the
             // two spellings cannot drift apart.
@@ -1159,11 +1195,7 @@ impl<'t> Normalizer<'t> {
                 cst::SingletonReductionChild::MetadataGroup(group) => {
                     let (group, naming) = self.metadata_group(group)?;
                     reductions.push(ReductionItem::Metadata(
-                        crate::pipeline::asts::core::MetadataOut {
-                            group,
-                            naming,
-                            output: (),
-                        },
+                        crate::pipeline::asts::core::MetadataOut::authored(group, naming),
                     ))
                 }
                 cst::SingletonReductionChild::ReductionSigil(_) => {}
@@ -1192,12 +1224,12 @@ impl<'t> Normalizer<'t> {
             cst::PostPipeForm::PipeStructural(structural) => {
                 let mut chain = chain;
                 for step in self.pipe_structural(structural)? {
-                    chain = chain.then(step);
+                    chain = chain.then(Step::authored(step));
                 }
                 Ok(chain)
             }
             // Substitution, not combination: the piped source becomes the
-            // call's first argument, and the landing is SPENT here — piped
+            // call's final argument, and the landing is SPENT here — piped
             // and direct spellings are indistinguishable afterwards.
             cst::PostPipeForm::PureInvocation(invocation) => {
                 self.pure_invocation(invocation, chain)
@@ -1205,34 +1237,24 @@ impl<'t> Normalizer<'t> {
         }
     }
 
-    /// ONE SUBSTITUTION LAW: the flowing operand lands in the FIRST argument
-    /// by default and a written `@` overrides it. Two landings refuse.
+    /// ONE SUBSTITUTION LAW: the authored arguments bind a complete left
+    /// prefix and the flowing operand lands in the FINAL place after them;
+    /// a written `@` names an exceptional non-final one. The act is the
+    /// landing authority's — this position supplies the relation, not the
+    /// place it goes.
     ///
     /// The call HEADS the chain it publishes. A source kept as an operand
     /// beside a call that already holds it is the same relation named twice,
     /// and only whichever consumer collapses the pair first decides which one
-    /// counts — a body no collapser walks (an assertion's, an `equals`
-    /// operand's) reaches lowering with a call still standing in operator
+    /// counts — a body no collapser walks reaches lowering with a call still standing in operator
     /// position.
     pub(crate) fn pure_invocation(
         &mut self,
         node: cst::PureInvocation<'t>,
         source: Chain<Unresolved>,
     ) -> Result<Chain<Unresolved>> {
-        use crate::pipeline::asts::core::operators::HoArgument;
-
         let callee = self.require(node.callee(), "an invocation names a relation")?;
         let reference = self.relation_reference(callee)?;
-        // `equals` is assertion SYNTAX, not a view: the assertion reads its
-        // operand as metadata. Building it anywhere else would silently
-        // discard the comparison, so the position refuses instead.
-        if reference.name_text() == "equals" && !self.in_assertion {
-            return Err(DelightQLError::validation_error_categorized(
-                "assertion/equals_context",
-                "equals(...) is only valid inside an assertion",
-                "write `(~~assert |> equals(target(*))(*) ~~)`",
-            ));
-        }
         let access = self.require(node.access(), "an invocation has an access group")?;
         let (access, shaping) = self.access_of(access)?;
 
@@ -1240,35 +1262,14 @@ impl<'t> Normalizer<'t> {
             Some(part) => self.ho_arguments(part)?,
             None => Vec::new(),
         };
-        let landings: Vec<usize> = arguments
-            .iter()
-            .enumerate()
-            .filter(|(_, argument)| matches!(argument, HoArgument::Landing(_)))
-            .map(|(index, _)| index)
-            .collect();
-        let landed_at = match landings.len() {
-            0 => {
-                arguments.insert(0, HoArgument::Relation(source));
-                0
-            }
-            1 => {
-                arguments[landings[0]] = HoArgument::Relation(source);
-                landings[0]
-            }
-            count => return Err(two_landings(count)),
-        };
-        let mut call = crate::pipeline::asts::core::FunctorCall::written(reference, arguments);
-        if let Some(part) = call.arguments.ho_mut() {
-            part.landing = Some(landed_at);
-        }
+        super::landing::land_relation(&mut arguments, source)?;
+        let call = crate::pipeline::asts::core::FunctorCall::written(reference, arguments);
         let mut chain = Chain::read(
             Relation::FunctorCall {
                 alias: None,
                 call: crate::pipeline::asts::core::SealedCall::authored(call),
-                cpr_schema: (),
             },
             access,
-            (),
         );
         // The group's shaping belongs to what the call PUBLISHES, exactly as
         // it does when the same call is read directly.
@@ -1308,6 +1309,52 @@ impl<'t> Normalizer<'t> {
         Ok((access, rest))
     }
 
+    /// ONE argument of a call group, wherever the group opens.
+    pub(crate) fn one_ho_argument(
+        &mut self,
+        argument: cst::HoArgument<'t>,
+    ) -> Result<crate::pipeline::asts::core::operators::HoArgument<Unresolved>> {
+        use crate::pipeline::asts::core::operators::HoArgument;
+        Ok(match argument {
+            cst::HoArgument::ResidualDesignator(designator) => {
+                let name =
+                    self.require(designator.relation(), "a residual designator names a rule")?;
+                let part = self.require(
+                    designator.ho_part(),
+                    "a configured residual carries its prefix row",
+                )?;
+                HoArgument::Rule(self.higher_order_read(name, part, Access::Unasked, Vec::new())?)
+            }
+            // ONE relation carrier among ho_arguments: whether a grelex
+            // binds a relation parameter or stands in a scalar slot is
+            // judged against the callee's descriptor at resolution, never
+            // here.
+            cst::HoArgument::Grelex(grelex) => HoArgument::Relation(self.grelex(grelex)?),
+            cst::HoArgument::Ground(ground) => HoArgument::Value(
+                crate::pipeline::asts::core::ArgumentValue::plain(self.ground_expression(ground)?),
+            ),
+            // AN ARGUMENT THAT ADDRESSES A COLUMN REACHES AS FAR AS ANY
+            // REFERENCE — by name or by position.
+            cst::HoArgument::HoArgumentReference(reference) => {
+                let reference =
+                    self.require(reference.child(), "an argument addresses a column")?;
+                HoArgument::Value(crate::pipeline::asts::core::ArgumentValue::plain(
+                    self.reference_expression(reference)?,
+                ))
+            }
+            // THE RELATION HOLES ARE ROW STRUCTURE, not values: the landing
+            // is the formal a piped relation fills, and the skip is a
+            // position the descriptor judges. Neither can stand where a
+            // value stands.
+            cst::HoArgument::RelationHole(hole) => match hole {
+                cst::RelationHole::Landing(_) => {
+                    HoArgument::Landing(crate::pipeline::asts::core::AtSign)
+                }
+                cst::RelationHole::Skipped(_) => HoArgument::Skip,
+            },
+        })
+    }
+
     pub(crate) fn ho_arguments(
         &mut self,
         node: cst::HoPart<'t>,
@@ -1317,59 +1364,36 @@ impl<'t> Normalizer<'t> {
         let mut arguments = Vec::new();
         for child in node.children() {
             match child {
-                cst::HoPartChild::HoArgument(argument) => arguments.push(match argument {
-                    // ONE relation carrier among ho_arguments: whether a
-                    // grelex binds a relation parameter or stands in a
-                    // scalar slot is judged against the callee's descriptor
-                    // at resolution, never here.
-                    cst::HoArgument::Grelex(grelex) => HoArgument::Relation(self.grelex(grelex)?),
-                    cst::HoArgument::Ground(ground) => {
-                        HoArgument::Value(crate::pipeline::asts::core::ArgumentValue::plain(
-                            self.ground_expression(ground)?,
-                        ))
-                    }
-                    // AN ARGUMENT THAT ADDRESSES A COLUMN REACHES AS FAR AS
-                    // ANY REFERENCE — by name or by position.
-                    cst::HoArgument::HoArgumentReference(reference) => {
-                        let reference =
-                            self.require(reference.child(), "an argument addresses a column")?;
-                        HoArgument::Value(crate::pipeline::asts::core::ArgumentValue::plain(
-                            self.reference_expression(reference)?,
-                        ))
-                    }
-                    // THE RELATION HOLES ARE ROW STRUCTURE, not values: the
-                    // landing is the formal a piped relation fills, and the
-                    // skip is a position the descriptor judges. Neither can
-                    // stand where a value stands.
-                    cst::HoArgument::RelationHole(hole) => match hole {
-                        cst::RelationHole::Landing(_) => {
-                            HoArgument::Landing(crate::pipeline::asts::core::AtSign)
-                        }
-                        cst::RelationHole::Skipped(_) => HoArgument::Skip,
-                    },
-                }),
+                cst::HoPartChild::HoArgument(argument) => {
+                    arguments.push(self.one_ho_argument(argument)?)
+                }
                 // THE LIFT'S COST: `&` bounds arguments and `;` separates
                 // lifted rows. Both glyphs are CST-only — the lifted rows
                 // dissolve into one anonymous-table argument.
                 cst::HoPartChild::LiftSigil(_) | cst::HoPartChild::CommaSigil(_) => {}
             }
         }
+        let lift = |rows: Vec<TabularRow<Datum<Unresolved>>>,
+                    arguments: &mut Vec<HoArgument<Unresolved>>| {
+            if let Some(rows) = Vec1::try_from_vec(rows) {
+                arguments.push(HoArgument::Relation(Chain::authored(GroundForm::Literal(
+                    AnonRelation::plain(AnonTable {
+                        body: TabularBody { header: None, rows },
+                    }),
+                ))));
+            }
+        };
         let lifted: Vec<TabularRow<Datum<Unresolved>>> = node
             .lifted()
             .map(|row| self.data_row(row))
             .collect::<Result<_>>()?;
-        if !lifted.is_empty() {
-            arguments.push(HoArgument::Relation(Chain::ground(Grelex::Literal(
-                AnonRelation::plain(AnonTable {
-                    body: TabularBody {
-                        header: None,
-                        rows: Vec1::try_from_vec(lifted)
-                            .expect("the lifted table was checked nonempty"),
-                    },
-                    cpr_schema: (),
-                }),
-            ))));
-        }
+        lift(lifted, &mut arguments);
+        // Rows right of `&` after a row-set are the SECOND lifted relation.
+        let second: Vec<TabularRow<Datum<Unresolved>>> = node
+            .second()
+            .map(|row| self.data_row(row))
+            .collect::<Result<_>>()?;
+        lift(second, &mut arguments);
         Ok(arguments)
     }
 
@@ -1411,7 +1435,7 @@ impl<'t> Normalizer<'t> {
                 };
                 let arm = self.require(arm, "a union has an arm")?;
                 let arm = self.grelex(arm)?;
-                Ok(chain.bag_op(operator, arm, (), ()))
+                Ok(chain.bag_op(operator, arm, ()))
             }
             cst::BinaryContinuation::MinusContinuation(minus) => {
                 let arm = minus.children().find_map(|child| match child {
@@ -1420,7 +1444,7 @@ impl<'t> Normalizer<'t> {
                 });
                 let arm = self.require(arm, "a minus has an arm")?;
                 let arm = self.grelex(arm)?;
-                Ok(chain.bag_op(SetOperator::MinusCorresponding, arm, (), ()))
+                Ok(chain.bag_op(SetOperator::MinusCorresponding, arm, ()))
             }
             cst::BinaryContinuation::EdgeContinuation(edge) => self.edge(edge, chain),
         }
@@ -1476,7 +1500,7 @@ impl<'t> Normalizer<'t> {
                     .body
                     .rows
                     .map(|row| ValueRow((*row.0).map(Datum::into_value)));
-                Ok(chain.then(Continuation::Restrict {
+                Ok(chain.then(Step::authored(Continuation::Restrict {
                     condition: crate::pipeline::asts::core::TruthExpression::Membership(
                         Membership {
                             probe,
@@ -1486,8 +1510,7 @@ impl<'t> Normalizer<'t> {
                         },
                     ),
                     origin: FilterOrigin::UserWritten,
-                    cpr_schema: (),
-                }))
+                })))
             }
             cst::CommaContinuationMember::GrelexLikeMember(member) => {
                 let outer = matches!(
@@ -1496,12 +1519,11 @@ impl<'t> Normalizer<'t> {
                         | cst::GrelexLikeMember::OuterAnonGrelex(_)
                 );
                 let rhs = self.grelex_like_member(member)?;
-                Ok(chain.then(Continuation::Member {
+                Ok(chain.then(Step::authored(Continuation::Member {
                     rhs,
                     correlation: None,
                     join_type: outer.then_some(JoinType::LeftOuter),
-                    cpr_schema: (),
-                }))
+                })))
             }
             // In comma position a truth RESTRICTS the current relation.
             // Existence is a truth like any other here: semi/antijoin is a
@@ -1514,39 +1536,39 @@ impl<'t> Normalizer<'t> {
                 let (wholes, condition) = self.comma_truth(truth)?;
                 let mut chain = chain;
                 for whole in wholes {
-                    chain = chain.then(Continuation::Correlate {
-                        whole,
-                        cpr_schema: (),
-                    });
+                    chain = chain.then(Step::authored(Continuation::Correlate { whole }));
                 }
                 if let Some(condition) = condition {
-                    chain = chain.then(Continuation::Restrict {
+                    chain = chain.then(Step::authored(Continuation::Restrict {
                         condition,
                         origin: FilterOrigin::UserWritten,
-                        cpr_schema: (),
-                    });
+                    }));
                 }
                 Ok(chain)
             }
             cst::CommaContinuationMember::DestructureRelex(destructure) => {
-                Ok(chain.then(self.destructure(destructure)?))
+                Ok(chain.then(Step::authored(self.destructure(destructure)?)))
             }
             // ORDER IS CONSUMED: the AST stores an Ordering, not the
             // comma-versus-pipe origin it was written with.
             cst::CommaContinuationMember::Ordering(ordering) => {
                 let specs = self.ordering_specs(ordering)?;
-                Ok(chain.then(Continuation::Structural(
+                Ok(chain.then(Step::authored(Continuation::Structural(
                     crate::pipeline::asts::core::StructuralStep {
-                        form: crate::pipeline::asts::core::StructuralForm::Ordering { specs },
+                        form: crate::pipeline::asts::core::StructuralForm::Ordering {
+                            specs,
+                            bound: None,
+                        },
                         named: Default::default(),
-                        cpr_schema: (),
                     },
-                )))
+                ))))
             }
-            cst::CommaContinuationMember::RowBound(bound) => Ok(chain.then(Continuation::Bound {
-                bound: self.row_bound(bound)?,
-                cpr_schema: (),
-            })),
+            // A BOUND CONSUMES THE ORDERING IT STANDS BESIDE: the chain folds
+            // it into that ordering's node, and only a bound no ordering
+            // precedes stands as a step of its own.
+            cst::CommaContinuationMember::RowBound(bound) => {
+                Ok(chain.bounding(self.row_bound(bound)?))
+            }
         }
     }
 
@@ -1579,7 +1601,6 @@ impl<'t> Normalizer<'t> {
                 DestructureMode::Scalar
             },
             schema: (),
-            cpr_schema: (),
         })
     }
 
@@ -1604,23 +1625,56 @@ impl<'t> Normalizer<'t> {
             None => None,
         };
         let term = self.require(node.term(), "an edge names a term")?;
+        // THE OUTER MARK IS ON THE ACCESS, NOT IN THE TERM: `orders_t?(*)`
+        // selects the same declared edge as `orders_t(*)` and keeps every
+        // left row. The selection key is therefore the UNMARKED spelling.
+        let (term_text, rhs) = match term {
+            cst::EdgeContinuationTerm::NamedGrelex(named) => {
+                (self.text(named).to_string(), self.named_read(named)?)
+            }
+            cst::EdgeContinuationTerm::OuterGrelex(outer) => {
+                if transitive {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "grounding/er/transitive_outer",
+                        format!(
+                            "'{}' marks a composed walk's peer outer; the walk \
+                             cannot yet compose an outer step",
+                            self.text(outer)
+                        ),
+                        "mark a direct edge peer, or compose the walk and join \
+                         the marked access separately",
+                    ));
+                }
+                let name = self.require(outer.relation(), "an outer access names a relation")?;
+                let interior = self.require(outer.interior(), "an outer access has an interior")?;
+                let text = format!("{}({})", self.text(name), self.text(interior));
+                let read = self.outer_grelex(outer)?;
+                if read.has_steps() || !matches!(read.head().form(), GroundForm::Reference(_)) {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "grounding/er/endpoint",
+                        format!("'{text}' shapes its interior, so it names no single term"),
+                        "an edge selects by the term's exact canonical spelling",
+                    ));
+                }
+                (text, read)
+            }
+        };
         // IDENTITY IS THE CANONICAL SPELLING: the selection keys are the
         // terms' canonical bytes, produced by the one canonicalizer. The LEFT
         // key is the chain's own endpoint, which is why the walk carries the
         // authored spelling forward — canonicalization never normalizes
         // semantics, so `people(, 18 <= age)` is a DIFFERENT term from
         // `people(, age >= 18)` and only the bytes can say which was written.
-        let right_spelling = crate::term_spec::canonicalize_term(self.text(term))?;
+        let right_spelling = crate::term_spec::canonicalize_term(&term_text)?;
         let left_spelling = self.edge_endpoint()?;
-        let rhs = self.named_read(term)?;
-        self.last_term = Some(self.text(term).to_string());
-        Ok(chain.then(Continuation::ErJoin(ErJoinStep {
+        self.last_term = Some(term_text);
+        Ok(chain.then(Step::authored(Continuation::ErJoin(ErJoinStep {
             transitive,
             context,
             left_spelling,
             right_spelling,
             rhs,
-        })))
+        }))))
     }
 
     /// The endpoint of the chain-so-far, as its canonical spelling. A
@@ -1682,7 +1736,9 @@ impl<'t> Normalizer<'t> {
                             // binding does; a bare index keeps whatever the
                             // array member was already called.
                             let naming = match (binding.alias(), binding.reach()) {
-                                (Some(alias), _) => Some(self.identifier(alias)),
+                                (Some(alias), _) => {
+                                    Some(self.admit_published(self.identifier(alias))?)
+                                }
                                 (None, Some(reach)) => Some(SqlIdentifier::new(format!(
                                     "{text}_{}",
                                     self.flattened_path(reach)?
@@ -1743,18 +1799,33 @@ impl<'t> Normalizer<'t> {
             // cardinalities.
             cst::PatternMember::NestedPattern(nested) => {
                 let mut key = None;
-                let mut inner = None;
+                let mut inner: Option<TreePattern<Unresolved>> = None;
                 let mut iteration = false;
                 for child in nested.children() {
                     match child {
                         cst::NestedPatternChild::Key(node) => key = Some(node),
-                        cst::NestedPatternChild::TreePattern(pattern) => inner = Some(pattern),
+                        cst::NestedPatternChild::TreePattern(pattern) => {
+                            inner = Some(self.tree_pattern(pattern)?)
+                        }
                         cst::NestedPatternChild::Iteration(node) => {
                             iteration = true;
                             for part in node.children() {
                                 match part {
                                     cst::IterationChild::TreePattern(pattern) => {
-                                        inner = Some(pattern)
+                                        inner = Some(self.tree_pattern(pattern)?)
+                                    }
+                                    // FN.22 (amended): a metadata group may
+                                    // stand as an induced member's body —
+                                    // `"k": ~> g:~> {…}` is the braced
+                                    // nesting `"k": {g:~> {…}}`. The `~>` is
+                                    // the induction's own spelling; the
+                                    // binding iterates the keyed OBJECT, so
+                                    // no array iteration stands between.
+                                    cst::IterationChild::MetadataBinding(binding) => {
+                                        iteration = false;
+                                        inner = Some(TreePattern::Record(RecordPattern {
+                                            members: Vec1::new(self.metadata_binding(binding)?),
+                                        }))
                                     }
                                     cst::IterationChild::ReductionSigil(_) => {}
                                 }
@@ -1767,7 +1838,7 @@ impl<'t> Normalizer<'t> {
                 Ok(RecordPatternMember::Nested {
                     key: self.pattern_key(key)?,
                     iteration,
-                    pattern: Box::new(self.tree_pattern(inner)?),
+                    pattern: Box::new(inner),
                 })
             }
             // Reach without matching. A path binding publishes the
@@ -1782,7 +1853,7 @@ impl<'t> Normalizer<'t> {
                 }
                 let path = self.require(path, "a path binding has a path")?;
                 let naming = match binding.alias() {
-                    Some(alias) => Some(self.identifier(alias)),
+                    Some(alias) => Some(self.admit_published(self.identifier(alias))?),
                     None => Some(SqlIdentifier::new(self.flattened_path(path)?)),
                 };
                 Ok(RecordPatternMember::Path(PathBinding {
@@ -1867,8 +1938,9 @@ impl<'t> Normalizer<'t> {
     // Let-block bindings
     // -----------------------------------------------------------------
 
-    fn cte(&mut self, node: cst::Cte<'t>) -> Result<CteBinding<Unresolved>> {
-        match node {
+    fn cte(&mut self, node: cst::Cte<'t>) -> Result<LetBinding> {
+        Ok(LetBinding::Relation(match node {
+            cst::Cte::HoCte(ho) => return self.ho_cte(ho),
             // A query-scoped label is a BARE name, and `body : name` IS
             // `name(*) : body` — one glob head, so the shorthand and a
             // compiler-built binding say the same thing.
@@ -1884,13 +1956,15 @@ impl<'t> Normalizer<'t> {
                         self.dml_form(cst::DmlForm::MutationSource(source))?
                     }
                 };
-                self.fixpoint_badge(label.child().is_some())?;
-                Ok(self.binding(
+                self.binding(
                     expression,
                     self.identifier(name),
                     Head::glob(),
+                    crate::pipeline::asts::vocabulary::Fixpoint::from_badge(
+                        label.child().is_some(),
+                    ),
                     crate::pipeline::asts::core::CteEffectDeclaration::Pure,
-                ))
+                )?
             }
             cst::Cte::StandardCte(standard) => {
                 let name = self.require(standard.name(), "a binding names its subject")?;
@@ -1898,16 +1972,76 @@ impl<'t> Normalizer<'t> {
                 let head = self.require(standard.head(), "a binding has a head")?;
                 let body = self.require(standard.body(), "a binding has a body")?;
                 let expression = self.let_free_relex(body)?;
-                let Heading { head, badged } = self.heading(head.into())?;
-                self.fixpoint_badge(badged)?;
-                Ok(self.binding(
+                let Heading { head, fixpoint } = self.heading(head.into())?;
+                self.binding(
                     expression,
                     self.identifier(name),
                     head,
+                    fixpoint,
                     crate::pipeline::asts::core::CteEffectDeclaration::Pure,
-                ))
+                )?
+            }
+        }))
+    }
+
+    /// `name(params)(head) : body` — one clause of a COMMON HIGHER-ORDER
+    /// EXPRESSION. The head is read exactly as the consulted `ho_rule`'s is
+    /// (the same `ho_param` and `head_term` readers), and the body is HELD
+    /// AS AUTHORED: a parameterized body is normalized at each use, with
+    /// that use's bindings in hand, because substitution is a CST-to-AST
+    /// judgment — a formal in relation position becomes the supplied
+    /// relation, a formal in a bound becomes the supplied integer — and the
+    /// bindings are not here yet. The clauses meet at the assembler once the
+    /// block has been read.
+    fn ho_cte(&mut self, node: cst::HoCte<'t>) -> Result<LetBinding> {
+        use crate::pipeline::asts::core::definitions::{HeadItems, HoParam};
+        use crate::pipeline::asts::ddl::{DdlBody, DefKind, DefSubject};
+
+        let name = self.require(node.name(), "a binding names its subject")?;
+        let name = self.require(name.name(), "a subject has a name")?;
+        let body = self.require(node.body(), "a binding has a body")?;
+        let name = self.admit_cte(self.identifier(name))?;
+        let params: Vec<HoParam> = node
+            .children()
+            .filter_map(|child| match child {
+                cst::HoCteChild::HoParam(param) => Some(param),
+                cst::HoCteChild::CommaSigil(_) => None,
+            })
+            .map(|param| self.ho_param(param))
+            .collect::<Result<_>>()?;
+        let mut items = Vec::new();
+        let mut glob = false;
+        for item in node.head() {
+            match item {
+                cst::HoCteHead::HeadTerm(term) => items.push(self.head_term(term)?),
+                cst::HoCteHead::Glob(_) => glob = true,
+                cst::HoCteHead::CommaSigil(_) => {}
             }
         }
+        let head = Head::higher_order(
+            params,
+            if glob {
+                HeadItems::Glob
+            } else {
+                HeadItems::Listed(items)
+            },
+        );
+        let decl = self.clause(
+            DefKind::HoView,
+            DefSubject::Named(name.clone()),
+            head,
+            crate::pipeline::asts::vocabulary::Fixpoint::Bag,
+            DdlBody::Deferred {
+                source: self.text(body).to_string(),
+            },
+            self.text(node),
+            None,
+        );
+        Ok(LetBinding::HigherOrder {
+            name,
+            effect: crate::pipeline::asts::core::CteEffectDeclaration::Pure,
+            decl,
+        })
     }
 
     /// The heading payload's reading. ONE decoder: a rule's head and a
@@ -1915,9 +2049,9 @@ impl<'t> Normalizer<'t> {
     /// and the badge are read in one place — and the SUBJECT is not read here
     /// at all, because it stands on the form that owns the heading.
     ///
-    /// The badge travels out rather than being acted on: a badged binding
-    /// marks the CTE feature, and a badged rule head means something else
-    /// entirely (THE BADGE CHOOSES THE UNION).
+    /// The badge travels out rather than being acted on: whether the subject
+    /// is a fixpoint at all is not knowable here, so the flavor rides the
+    /// binding to the one recursion decision (THE BADGE CHOOSES THE UNION).
     pub(crate) fn heading(&mut self, node: HeadingPayload<'t>) -> Result<Heading> {
         match node {
             HeadingPayload::Glob(head) => {
@@ -1926,7 +2060,7 @@ impl<'t> Normalizer<'t> {
                     .any(|child| matches!(child, cst::GlobHeadingChild::FixpointBadge(_)));
                 Ok(Heading {
                     head: Head::glob(),
-                    badged,
+                    fixpoint: crate::pipeline::asts::vocabulary::Fixpoint::from_badge(badged),
                 })
             }
             HeadingPayload::Argumentative(head) => {
@@ -1943,7 +2077,7 @@ impl<'t> Normalizer<'t> {
                 }
                 Ok(Heading {
                     head: Head::listed(items),
-                    badged,
+                    fixpoint: crate::pipeline::asts::vocabulary::Fixpoint::from_badge(badged),
                 })
             }
         }
@@ -1972,27 +2106,11 @@ impl<'t> Normalizer<'t> {
         }
         Ok(HeadItem {
             supply: self.require(supply, "a head term supplies a value")?,
-            label: node.alias().map(|alias| self.identifier(alias)),
+            label: node
+                .alias()
+                .map(|alias| self.admit_published(self.identifier(alias)))
+                .transpose()?,
         })
-    }
-
-    /// The deduplicating fixpoint badge (`c%`), under EVERY neck. THE BADGE
-    /// CHOOSES THE UNION is ruled, but its UNION lowering, its
-    /// recursive-target legality check, and the lying-badge refusals are not
-    /// built — and an authored badge must not silently read as its unbadged
-    /// twin (UNION ALL) while they are missing. The refusal retires with the
-    /// lowering.
-    pub(crate) fn fixpoint_badge(&mut self, badged: bool) -> Result<()> {
-        if badged {
-            return Err(DelightQLError::validation_error_categorized(
-                "recursion/fixpoint_badge",
-                "the deduplicating fixpoint badge (`%`) is not lowered yet: a badged \
-                 head would silently deduplicate nothing. Remove the badge — unbadged \
-                 recursion combines clauses with UNION ALL",
-                "the fixpoint badge's UNION lowering is unbuilt",
-            ));
-        }
-        Ok(())
     }
 
     pub(crate) fn binding(
@@ -2000,18 +2118,22 @@ impl<'t> Normalizer<'t> {
         expression: Chain<Unresolved>,
         name: SqlIdentifier,
         head: Head,
+        fixpoint: crate::pipeline::asts::vocabulary::Fixpoint,
         effect: crate::pipeline::asts::core::CteEffectDeclaration,
-    ) -> CteBinding<Unresolved> {
-        CteBinding {
+    ) -> Result<CteBinding<Unresolved>> {
+        // A binding name is a naming position: the admission law runs, and
+        // the spelling is reserved against the compilation's invented names.
+        let name = self.admit_cte(name)?;
+        Ok(CteBinding::authored(
             expression,
-            subject: crate::pipeline::asts::core::CteSubject::Authored { name, effect },
-            authority: crate::pipeline::asts::core::CteAuthority {
+            crate::pipeline::asts::core::AuthoredCteSubject::Authored { name, effect },
+            crate::pipeline::asts::core::CteAuthority {
+                horizon: crate::pipeline::asts::core::LexicalHorizon::all(),
                 head,
                 origin: CteOrigin::UserDefined,
-                resolution_owner: CteResolutionOwner::Entity,
+                fixpoint,
             },
-            recursion: (),
-        }
+        ))
     }
 
     /// One list is a query-scoped function; two make an HO-CFE, and the
@@ -2124,7 +2246,7 @@ impl<'t> Normalizer<'t> {
         // identifier law's: an unstropped spelling folds, a stropped one
         // keeps its authored bytes. The declared captures share the frame,
         // so they enter the same judgment.
-        let name = self.identifier(name);
+        let name = self.admit_definition(self.identifier(name))?;
         let mut declared_names: Vec<&SqlIdentifier> =
             formals.iter().map(|formal| &formal.name).collect();
         if let ContextMode::Explicit(captures) = &context_mode {
@@ -2144,13 +2266,12 @@ impl<'t> Normalizer<'t> {
             }
         }
 
-        Ok(CfeDefinition {
+        Ok(CfeDefinition::unbounded(
             name,
             formals,
             context_mode,
-            body: self.computed_value(body)?,
-            source_namespace: None,
-        })
+            self.domain_expression(body)?,
+        ))
     }
 
     // -----------------------------------------------------------------
@@ -2160,20 +2281,12 @@ impl<'t> Normalizer<'t> {
     /// THE SET IS CLOSED. Each member has its own carrier and its own
     /// collector; a generic `(~~name …~~)` has no derivation at all.
     ///
-    /// `anchor` is the relation the annotation stands beside. An ASSERTION is
-    /// the only member that needs one — its body is a continuation evaluated
-    /// against that relation — which is what puts it outside
-    /// `definition_annotation` and out of a definition's doc slot.
     pub(crate) fn annotation(
         &mut self,
         node: cst::Annotation<'t>,
-        anchor: &Chain<Unresolved>,
+        _anchor: &Chain<Unresolved>,
     ) -> Result<()> {
         match node {
-            cst::Annotation::AssertAnnotation(assertion) => {
-                let spec = self.assertion(assertion, anchor)?;
-                self.features().add_assertion(spec);
-            }
             // Reserved room, recognized so the refusal can teach rather than
             // read as a typo.
             cst::Annotation::ReservedAnnotation(_) => {
@@ -2245,10 +2358,7 @@ impl<'t> Normalizer<'t> {
                     None => OptionState::On,
                     Some(ground) => option_state(self.ground(ground)?)?,
                 };
-                let spec = OptionSpec {
-                    uri,
-                    state,
-                };
+                let spec = OptionSpec { uri, state };
                 self.features().add_option(spec);
             }
             cst::DefinitionAnnotation::DdlAnnotation(ddl) => {
@@ -2288,122 +2398,6 @@ impl<'t> Normalizer<'t> {
             .join("/")
     }
 
-    /// An assertion FORKS the chain at its anchor: the body is the relation
-    /// so far plus the annotation's own continuations, built by the ordinary
-    /// road with nothing stripped from it.
-    fn assertion(
-        &mut self,
-        node: cst::AssertAnnotation<'t>,
-        anchor: &Chain<Unresolved>,
-    ) -> Result<AssertionSpec> {
-        let mut body = anchor.clone();
-        let mut right_operand = None;
-        let carried = std::mem::replace(&mut self.in_assertion, true);
-        for continuation in node.body() {
-            // `equals` is assertion SYNTAX. Its operand is metadata the
-            // annotation tests against, and the body keeps the relation the
-            // assertion is about — so the invocation contributes an operand
-            // and NOT a step.
-            match self.equals_operand(continuation)? {
-                Some(operand) if right_operand.is_none() => right_operand = Some(operand),
-                Some(_) => {
-                    self.in_assertion = carried;
-                    return Err(DelightQLError::validation_error_categorized(
-                        "assertion/equals_arity",
-                        "one assertion compares against one relation; this one names two",
-                        "supply the second relation once: `|> equals(target(*))(*)`",
-                    ));
-                }
-                None => body = self.continuation(continuation, body)?,
-            }
-        }
-        self.in_assertion = carried;
-        let name = node
-            .name()
-            .map(|name| super::ground::string_interior(self.text(name)).to_string());
-        Ok(AssertionSpec {
-            body,
-            name,
-            right_operand,
-            source_location: self.span(node),
-        })
-    }
-
-    /// `equals` compares POSITIONALLY and lowers to `EXCEPT`, which the
-    /// relational minus is not. Until that is ruled, its right operand
-    /// travels beside the body.
-    fn equals_operand(&mut self, node: cst::Continuation<'t>) -> Result<Option<Chain<Unresolved>>> {
-        let cst::Continuation::OperatorContinuation(cst::OperatorContinuation::PipeContinuation(
-            pipe,
-        )) = node
-        else {
-            return Ok(None);
-        };
-        let Some(cst::PostPipeForm::PureInvocation(invocation)) =
-            pipe.children().find_map(|child| match child {
-                cst::PipeContinuationChild::PostPipeForm(form) => Some(form),
-                cst::PipeContinuationChild::PipeOperator(_) => None,
-            })
-        else {
-            return Ok(None);
-        };
-        let Some(callee) = invocation.callee() else {
-            return Ok(None);
-        };
-        let reference = self.relation_reference(callee)?;
-        if reference.name_text() != "equals" {
-            return Ok(None);
-        }
-
-        let arity_fault = || {
-            DelightQLError::validation_error_categorized(
-                "assertion/equals_arity",
-                "equals(...) is binary and was given no relation to compare against",
-                "supply the second relation: `|> equals(target(*))(*)`",
-            )
-        };
-        let two_operands_fault = || {
-            DelightQLError::validation_error_categorized(
-                "assertion/equals_arity",
-                "one assertion compares against one relation; this one names two",
-                "supply the second relation once: `|> equals(target(*))(*)`",
-            )
-        };
-        use crate::pipeline::asts::core::operators::HoArgument;
-        let part = invocation.ho_part().ok_or_else(arity_fault)?;
-        // SCALAR LIFTING: `15` is `_(15)` — a one-row relation — so equals
-        // compares against it like any other. A value row beside a relation
-        // operand is a SECOND operand and refuses; a landing or skip marks a
-        // formal equals does not have.
-        let mut relation: Option<Chain<Unresolved>> = None;
-        let mut lifted: Vec<Datum<Unresolved>> = Vec::new();
-        for argument in self.ho_arguments(part)? {
-            match argument {
-                HoArgument::Relation(chain) if relation.is_none() && lifted.is_empty() => {
-                    relation = Some(chain)
-                }
-                HoArgument::Value(value) => match (&relation, value.into_domain()) {
-                    (None, Some(domain)) => lifted.push(Datum::Value(domain)),
-                    _ => return Err(two_operands_fault()),
-                },
-                HoArgument::Relation(_) => return Err(two_operands_fault()),
-                HoArgument::Landing(_) | HoArgument::Skip => return Err(arity_fault()),
-            }
-        }
-        let operand = match (relation, Vec1::try_from_vec(lifted)) {
-            (Some(chain), None) => chain,
-            (None, Some(row)) => Chain::ground(Grelex::Literal(AnonRelation::plain(AnonTable {
-                body: TabularBody {
-                    header: None,
-                    rows: Vec1::new(TabularRow(Box::new(row))),
-                },
-                cpr_schema: (),
-            }))),
-            _ => return Err(arity_fault()),
-        };
-        Ok(Some(operand))
-    }
-
     pub(crate) fn ddl_annotation(&mut self, node: cst::DdlAnnotation<'t>) -> Result<InlineDdlSpec> {
         let namespace = node
             .namespace()
@@ -2426,6 +2420,12 @@ impl<'t> Normalizer<'t> {
                     }
                     None => Normalizer::new(self.tree, Rc::clone(&self.registry)),
                 };
+                // A block addressed to a system-owned `_` child carries the
+                // companion vocabulary: its subjects are operations, not
+                // authored names, and the admission law does not judge them.
+                inner.system_child_block = namespace
+                    .as_deref()
+                    .is_some_and(|child| child.starts_with('_'));
                 inner.ddl_content(content)?
             }
         };
@@ -2458,20 +2458,6 @@ impl<'t> Normalizer<'t> {
         }
         Ok(body)
     }
-}
-
-/// ONE pipe, ONE landing. The teaching is the law's own words, and the
-/// identity is one for every position that can hold a landing — a pure
-/// invocation and a directive break the same rule.
-pub(crate) fn two_landings(count: usize) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "resolution/ho/pipe_landing",
-        format!(
-            "one pipe, one landing — this call writes {count} placeholders; \
-             exactly one @ names the parameter that receives the pipe"
-        ),
-        "R8: exactly one explicit @",
-    )
 }
 
 /// The leading dequalifying run's steps. Anything else ends the run.
@@ -2565,7 +2551,11 @@ fn absorbs_run(access: &Access<Unresolved>) -> bool {
 /// the access the mention already carries.
 #[stacksafe::stacksafe]
 fn apply_access_run(mut chain: Chain<Unresolved>, step: AccessRunStep) -> Chain<Unresolved> {
-    if let Some(Continuation::Member { rhs, .. }) = chain.continuations.last_mut() {
+    if let Some(Continuation::Member { rhs, .. }) = chain
+        .continuations_mut()
+        .last_mut()
+        .map(|step| step.form_mut())
+    {
         *rhs = apply_access_run(rhs.clone(), step);
         return chain;
     }
@@ -2578,18 +2568,27 @@ fn apply_access_run(mut chain: Chain<Unresolved>, step: AccessRunStep) -> Chain<
     // the step stands on the mention's RESULT — but it is the same value of
     // the same type in the same carrier, so one authority answers for both
     // positions and nothing downstream re-derives which spelling was written.
-    chain.then(Continuation::Access {
+    chain.then(Step::authored(Continuation::Access {
         access: fold_access(None, step),
-        cpr_schema: (),
-    })
+        named: None,
+    }))
 }
 
 /// The mention's own access, when the chain is still just that read.
 fn bare_access(chain: &mut Chain<Unresolved>) -> Option<&mut Access<Unresolved>> {
-    if chain.has_steps() || !matches!(chain.head, Grelex::Reference(Relation::Ground { .. })) {
+    if chain.has_steps()
+        || !matches!(
+            chain.head().form(),
+            GroundForm::Reference(Relation::Ground { .. })
+        )
+    {
         return None;
     }
-    match chain.continuations.first_mut() {
+    match chain
+        .continuations_mut()
+        .first_mut()
+        .map(|step| step.form_mut())
+    {
         Some(Continuation::Access { access, .. }) => Some(access),
         _ => None,
     }
@@ -2602,15 +2601,7 @@ fn ground_read(
     access: Access<Unresolved>,
     outer: bool,
 ) -> Chain<Unresolved> {
-    Chain::read(
-        Relation::Ground {
-            mention,
-            outer,
-            cpr_schema: (),
-        },
-        access,
-        (),
-    )
+    Chain::read(Relation::Ground { mention, outer }, access)
 }
 
 /// `a?(*), b?(*)` is FULL outer: both marked. The completing member's own
@@ -2620,9 +2611,9 @@ fn right_is_outer(chain: &Chain<Unresolved>) -> bool {
         Some(Relation::Ground { outer, .. })
         | Some(Relation::InnerRelation { outer, .. })
         | Some(Relation::ConsultedView { outer, .. }) => *outer,
-        Some(Relation::FunctorCall { .. }) | None => match &chain.head {
-            Grelex::Literal(table) => table.outer,
-            Grelex::Reference(_) => false,
+        Some(Relation::FunctorCall { .. }) | None => match chain.head().form() {
+            GroundForm::Literal(table) => table.outer,
+            GroundForm::Reference(_) => false,
         },
     }
 }
@@ -2640,35 +2631,41 @@ fn right_is_outer(chain: &Chain<Unresolved>) -> bool {
 /// its own gave the two spellings two different answers — the absorbed one
 /// named the mention, the postfix one named a stage.
 #[stacksafe::stacksafe]
+/// `as f` NAMES THE OCCURRENCE STANDING HERE — the one latest nameable
+/// occurrence, whatever produced it: the stage a pipe or structural step
+/// published, the relation an access published, the member or arm to the
+/// right, the relation an existence probe reads, or the bare head. ONE
+/// judgment: the argumentative stage patterns and names the same
+/// occurrence through it.
 fn name_the_stage(mut chain: Chain<Unresolved>, alias: SqlIdentifier) -> Result<Chain<Unresolved>> {
-    if matches!(
-        chain.continuations.last(),
-        Some(Continuation::Access { .. })
-    ) {
-        let step = chain.continuations.pop().expect("just matched an access");
-        let mut named = name_the_stage(chain, alias)?;
-        named.continuations.push(step);
-        return Ok(named);
+    // A head's own access IS the read, and the read's name is the
+    // mention's: `users(*) as u` names the occurrence `users(*)` reads.
+    if chain.head_span() == 1 && chain.continuations().len() == 1 {
+        return Ok(alias_head(chain, alias));
     }
-    match chain.continuations.last_mut() {
-        Some(Continuation::Access { .. }) => {
-            unreachable!("a trailing access was taken off above")
-        }
-        Some(Continuation::Pipe { named, .. }) => {
+    match chain
+        .continuations_mut()
+        .last_mut()
+        .map(|step| step.form_mut())
+    {
+        // An access past the head's own read publishes an occurrence of its
+        // own, and the name is that occurrence's — never the operand's.
+        Some(Continuation::Access { named, .. }) | Some(Continuation::Pipe { named, .. }) => {
             *named = Some(alias);
             Ok(chain)
         }
         Some(Continuation::Member { rhs, .. }) => {
-            *rhs = alias_head(rhs.clone(), alias);
+            *rhs = name_the_stage(rhs.clone(), alias)?;
             Ok(chain)
         }
         Some(Continuation::BagOp { arm, .. }) => {
-            *arm = alias_head(arm.clone(), alias);
+            *arm = name_the_stage(arm.clone(), alias)?;
             Ok(chain)
         }
         // An existence probe DOES publish something to name: the relation it
         // probes, which a correlation in the same chain then addresses. The
-        // name lands on the probe and on the relation it stands for.
+        // name lands on the relation the probe reads — its head, whatever
+        // restrictions the probe states over it.
         Some(Continuation::Restrict {
             condition:
                 crate::pipeline::asts::core::TruthExpression::Existence(Existence {
@@ -2696,11 +2693,7 @@ fn name_the_stage(mut chain: Chain<Unresolved>, alias: SqlIdentifier) -> Result<
                     ..
                 }),
             ..
-        }) => Err(DelightQLError::validation_error_categorized(
-            "resolution/anon/membership_alias",
-            "a witness anonymous table (+_ or \\+_) is a membership test and exports no columns",
-            "drop the alias; predicates may refer to columns from the outer relation",
-        )),
+        }) => Err(witness_alias_refusal()),
         // A structural form is a run step and publishes a stage exactly as
         // a pipe operator does; its name slot is the same slot.
         Some(Continuation::Structural(step)) => {
@@ -2715,25 +2708,106 @@ fn name_the_stage(mut chain: Chain<Unresolved>, alias: SqlIdentifier) -> Result<
             | Continuation::Correlate { .. }
             | Continuation::Bound { .. }
             | Continuation::Destructure { .. },
-        ) => Err(DelightQLError::validation_error_categorized(
-            "resolution/pipe/no_unnamed_pipe",
-            format!("`as {alias}` here names nothing: this operator publishes no pipe stage"),
-            "naming a pipe",
-        )),
+        ) => Err(names_no_stage(&alias)),
         None => Ok(alias_head(chain, alias)),
     }
+}
+
+/// `as f(slots)` PATTERNS AND NAMES THE OCCURRENCE STANDING HERE in one
+/// act, at exactly the occurrence `as f` would name: the slot row is an
+/// access step over that occurrence and the name is that step's. Nothing
+/// here selects a relation beside the row — the step stands on whatever the
+/// chain publishes where it is placed.
+fn pattern_the_stage(
+    mut chain: Chain<Unresolved>,
+    alias: SqlIdentifier,
+    access: Access<Unresolved>,
+) -> Result<Chain<Unresolved>> {
+    match chain
+        .continuations_mut()
+        .last_mut()
+        .map(|step| step.form_mut())
+    {
+        Some(Continuation::Member { rhs, .. }) => {
+            *rhs = pattern_the_stage(rhs.clone(), alias, access)?;
+            Ok(chain)
+        }
+        Some(Continuation::BagOp { arm, .. }) => {
+            *arm = pattern_the_stage(arm.clone(), alias, access)?;
+            Ok(chain)
+        }
+        Some(Continuation::Restrict {
+            condition:
+                crate::pipeline::asts::core::TruthExpression::Existence(Existence {
+                    relation: subquery,
+                    ..
+                }),
+            ..
+        }) => {
+            **subquery = pattern_the_stage((**subquery).clone(), alias, access)?;
+            Ok(chain)
+        }
+        // An edge composes its endpoints by their catalog headings; a slot
+        // row over an endpoint would compose a relation the edge does not
+        // name. The boundary the edge publishes is the occurrence to pattern.
+        Some(Continuation::ErJoin(_)) => Err(DelightQLError::validation_error_categorized(
+            "resolution/pipe/no_unnamed_pipe",
+            format!(
+                "`as {alias}(…)` here patterns an edge endpoint, which is read whole by the edge"
+            ),
+            "pattern the relation the edge publishes: `… && … as x |> … as u(…)`",
+        )),
+        Some(Continuation::Restrict {
+            condition:
+                crate::pipeline::asts::core::TruthExpression::Membership(Membership {
+                    source: crate::pipeline::asts::core::MembershipSource::WitnessAnon,
+                    ..
+                }),
+            ..
+        }) => Err(witness_alias_refusal()),
+        Some(
+            Continuation::Restrict { .. }
+            | Continuation::Correlate { .. }
+            | Continuation::Bound { .. }
+            | Continuation::Destructure { .. },
+        ) => Err(names_no_stage(&alias)),
+        Some(
+            Continuation::Access { .. } | Continuation::Pipe { .. } | Continuation::Structural(_),
+        )
+        | None => Ok(chain.then(Step::authored(Continuation::Access {
+            access,
+            named: Some(alias),
+        }))),
+    }
+}
+
+fn witness_alias_refusal() -> DelightQLError {
+    DelightQLError::validation_error_categorized(
+        "resolution/anon/membership_alias",
+        "a witness anonymous table (+_ or \\+_) is a membership test and exports no columns",
+        "drop the alias; predicates may refer to columns from the outer relation",
+    )
+}
+
+fn names_no_stage(alias: &SqlIdentifier) -> DelightQLError {
+    DelightQLError::validation_error_categorized(
+        "resolution/pipe/no_unnamed_pipe",
+        format!("`as {alias}` here names nothing: this operator publishes no pipe stage"),
+        "naming a pipe",
+    )
 }
 
 /// The alias a bare head carries. A head is not a stage — there is none yet
 /// for the name to replace — so the name lands on the mention.
 fn alias_head(mut chain: Chain<Unresolved>, alias: SqlIdentifier) -> Chain<Unresolved> {
-    match chain.head {
-        Grelex::Reference(relation) => {
-            chain.head = Grelex::Reference(alias_relation(relation, alias))
+    match chain.head().clone().into_form() {
+        GroundForm::Reference(relation) => {
+            *chain.head_mut() =
+                Grelex::authored(GroundForm::Reference(alias_relation(relation, alias)))
         }
-        Grelex::Literal(mut occurrence) => {
+        GroundForm::Literal(mut occurrence) => {
             occurrence.alias = Some(alias);
-            chain.head = Grelex::Literal(occurrence);
+            *chain.head_mut() = Grelex::authored(GroundForm::Literal(occurrence));
         }
     }
     chain
@@ -2745,10 +2819,10 @@ fn alias_head(mut chain: Chain<Unresolved>, alias: SqlIdentifier) -> Chain<Unres
 /// own name, so the rename follows the head rather than every mention the
 /// interior happens to hold.
 fn name_interior_read(subquery: &mut Chain<Unresolved>, alias: &SqlIdentifier) {
-    if let Grelex::Reference(Relation::Ground {
+    if let GroundForm::Reference(Relation::Ground {
         mention: GroundMention::Named { alias: slot, .. },
         ..
-    }) = &mut subquery.head
+    }) = subquery.head_mut().form_mut()
     {
         if slot.is_none() {
             *slot = Some(alias.clone());
@@ -2768,7 +2842,13 @@ fn alias_relation(
         // scope nothing opened.
         Relation::Ground { mention, .. } => match mention {
             GroundMention::Named { alias: slot, .. } => *slot = Some(alias),
-            GroundMention::Plan { alias: slot, .. } => *slot = Some(alias),
+            GroundMention::Receipt { alias: slot, .. } => *slot = Some(alias),
+            // A scratch read is compiler-built after normalization; no
+            // authored text carries one, so none is here to alias.
+            GroundMention::Scratch { .. } => {
+                unreachable!("a scratch read is compiler-built and never aliased in authored text")
+            }
+            GroundMention::Structural { alias: slot, .. } => *slot = Some(alias),
         },
         // THE NAME IS THE RELATION'S, NOT THE WRAPPER'S. Sneaky parentheses
         // make a derived table out of the mention the interior reads, and
@@ -2851,14 +2931,20 @@ pub(crate) fn tabular_row(
             .ok_or_else(|| DelightQLError::parse_error("a tabular row has a datum"));
     }
     let dense = width - sparse.len();
-    if positional.len() != dense {
+    // A POSITIONAL VALUE MAY FILL A SPARSE COLUMN: optional means the
+    // column may be omitted, never that it cannot be supplied. Positions
+    // fill left to right — the dense prefix first, then as far into the
+    // sparse suffix as the row wrote.
+    if positional.len() < dense || positional.len() > width {
         return Err(DelightQLError::validation_error_categorized(
             "anon/sparse_arity",
             format!(
-                "a row of this table writes {} dense cell(s); the heading has {dense}",
+                "a row of this table writes {} positional cell(s); the heading \
+                 takes {dense} required and up to {width}",
                 positional.len()
             ),
-            "every column without `?` is written in every row",
+            "every column without `?` is written in every row; positions fill \
+             left to right",
         ));
     }
     for (name, _) in &fills {
@@ -2870,6 +2956,7 @@ pub(crate) fn tabular_row(
             ));
         }
     }
+    let filled_by_position = positional.len();
     let mut positional = positional.into_iter();
     let mut values = Vec::with_capacity(width);
     for position in 0..width {
@@ -2881,6 +2968,26 @@ pub(crate) fn tabular_row(
             ));
             continue;
         };
+        // ONE COLUMN, ONE SUPPLY. A position the row already filled cannot
+        // also be filled by name: two values and no choosing rule.
+        if position < filled_by_position {
+            if fills.iter().any(|(name, _)| name == column) {
+                return Err(DelightQLError::validation_error_categorized(
+                    "anon/sparse_duplicate",
+                    format!(
+                        "Duplicate sparse fill for column '{column}': a column filled \
+                         twice in one row has two values and no rule for choosing"
+                    ),
+                    "each sparse column takes at most one fill per row",
+                ));
+            }
+            values.push(Datum::Value(
+                positional
+                    .next()
+                    .expect("the positional count was checked against the width"),
+            ));
+            continue;
+        }
         // TWO FILLS FOR ONE COLUMN CONTRADICT. A first-match reader would drop
         // the later value in silence, so the row refuses instead.
         let mut found = fills.iter().filter(|(name, _)| name == column);

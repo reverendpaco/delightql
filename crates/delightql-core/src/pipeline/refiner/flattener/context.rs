@@ -5,8 +5,8 @@
 use std::collections::HashSet;
 
 /// Context maintained during flattening
-pub(super) struct FlattenContext {
-    pub identities: std::rc::Rc<crate::names::Registry>,
+pub(super) struct FlattenContext<'a> {
+    pub identities: &'a crate::relation::Planning,
     pub position: usize,
     pub scope_id: usize,
     pub tables_in_scope: HashSet<crate::names::ScopeId>,

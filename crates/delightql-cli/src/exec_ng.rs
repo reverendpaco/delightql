@@ -35,6 +35,62 @@ pub(crate) fn cells_to_display(row: &[Option<Vec<u8>>]) -> Vec<String> {
         .collect()
 }
 
+/// A relation with its cells still nullable and its columns' type
+/// descriptors: the shape a file with readers needs (`json_object_row`
+/// renders NULL as null and numbers unquoted), as opposed to the console
+/// display road, where a missing cell becomes the text `NULL`.
+pub struct TypedRows {
+    pub columns: Vec<String>,
+    pub descriptors: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+}
+
+impl TypedRows {
+    /// One JSON object per row, one line each.
+    pub fn to_jsonl(&self) -> String {
+        let mut out = String::new();
+        for row in &self.rows {
+            out.push_str(&crate::output_format::json_object_row(
+                &self.columns,
+                &self.descriptors,
+                row,
+            ));
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Fetch ALL rows of a DQL query with their nullability and descriptors
+/// intact.
+pub fn fetch_all_typed(session: &mut dyn DqlSession, dql: &str) -> Result<TypedRows> {
+    let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
+    let descriptors: Vec<String> = qr.columns.iter().map(|c| c.descriptor.clone()).collect();
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    loop {
+        let fr = session
+            .fetch(&qr.handle, u64::MAX)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        if fr.finished {
+            break;
+        }
+        for row in &fr.rows {
+            rows.push(
+                row.iter()
+                    .map(|cell| cell.as_ref().map(|b| String::from_utf8_lossy(b).to_string()))
+                    .collect(),
+            );
+        }
+    }
+    let _ = session.close(qr.handle);
+    Ok(TypedRows {
+        columns,
+        descriptors,
+        rows,
+    })
+}
+
 /// Fetch ALL rows from a DQL session into QueryResults.
 pub(crate) fn fetch_all(session: &mut dyn DqlSession, dql: &str) -> Result<QueryResults> {
     let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -275,9 +331,12 @@ fn display_results_raw(session: &mut dyn DqlSession, dql: &str) -> Result<Result
         // The poweruser sharp edge, --no-sanitize style: verbatim bytes
         // to a terminal are an injection surface. Warn, never block;
         // silent when piped (the intended use).
-        eprintln!(
-            "warning: -f raw writes verbatim bytes (terminal control \
-             sequences included); intended for pipes and files"
+        crate::client::incident::warning(
+            "argument",
+            crate::client::incident::hierarchy::SANITIZE_DISABLED,
+            "-f raw writes verbatim bytes (terminal control sequences \
+             included); intended for pipes and files"
+                .to_string(),
         );
     }
     let mut stdout = std::io::stdout().lock();

@@ -127,10 +127,14 @@ pub enum DomainExpression {
         frame: Option<SqlWindowFrame>,
     },
 
-    /// Predicate-position rewrite call (sigma predicates like +like, +between).
-    /// The generator consults the bin_registry to render this.
+    /// Predicate-position rewrite call (sigma predicates like +like, +between,
+    /// +sql_eq). The generator consults the bin_registry to render this. The
+    /// SELECTED entity is the identity carried — its namespace when the
+    /// author qualified it, else the universal bare name — so every SQL-AST
+    /// pass moves the call whole and none reads it as a comparison.
     PredicateRewrite {
         name: String,
+        namespace: Vec<String>,
         args: Vec<DomainExpression>,
         negated: bool,
     },
@@ -214,10 +218,12 @@ impl DomainExpression {
             },
             E::PredicateRewrite {
                 name,
+                namespace,
                 args,
                 negated,
             } => E::PredicateRewrite {
                 name,
+                namespace,
                 args: re_vec(args),
                 negated,
             },
@@ -247,22 +253,12 @@ mod map_columns_tests {
     //! the subquery is the opposite case: it reads at this layer.
 
     use super::DomainExpression as E;
-    use crate::names::{Addressing, ColId, ColumnOrigin, Computation, Hint, Registry, ScopeOrigin};
+    use crate::names::{Addressing, ColId, Registry};
 
     fn two_columns() -> (ColId, ColId) {
         let registry = Registry::new(&[]);
-        let scope = registry.mint_scope(ScopeOrigin::AnonRelation, Hint::None, None);
-        let mint = || {
-            registry.mint_column(
-                scope,
-                ColumnOrigin::Computed {
-                    via: Computation::Operator,
-                },
-                None,
-                Addressing::Published,
-                Default::default(),
-            )
-        };
+        let scope = registry.anonymous_scope(None);
+        let mint = || registry.sql_column(scope, None, Addressing::Published);
         (mint(), mint())
     }
 
@@ -362,6 +358,7 @@ pub enum SqlPredicate {
     /// The generator consults the bin_registry to render this.
     RewriteCall {
         name: String,
+        namespace: Vec<String>,
         args: Vec<DomainExpression>,
         negated: bool,
     },
@@ -376,11 +373,13 @@ impl SqlPredicate {
     /// Wrap a rewrite-rule predicate.
     pub(crate) fn rewrite_call(
         name: impl Into<String>,
+        namespace: Vec<String>,
         args: Vec<DomainExpression>,
         negated: bool,
     ) -> Self {
         Self::RewriteCall {
             name: name.into(),
+            namespace,
             args,
             negated,
         }
@@ -393,10 +392,12 @@ impl SqlPredicate {
             Self::Expr(e) => e,
             Self::RewriteCall {
                 name,
+                namespace,
                 args,
                 negated,
             } => DomainExpression::PredicateRewrite {
                 name,
+                namespace,
                 args,
                 negated,
             },
@@ -582,6 +583,88 @@ impl DomainExpression {
             op: BinaryOperator::GreaterThan,
             right: Box::new(other),
         }
+    }
+
+    /// AN ANCHORED MATCH, in the shape the target can actually express.
+    ///
+    /// THE ANCHOR IS ONE VALUE, so it is evaluated once. A match arm is a
+    /// null-safe question — `WHEN anchor IS NOT DISTINCT FROM term` — and
+    /// asking it per arm means writing the anchor per arm, which for a
+    /// volatile anchor asks about a DIFFERENT value each time and can reach
+    /// an arm no single value could.
+    ///
+    /// Where no term is null, THE EQUALITY LAW makes the target's own simple
+    /// `CASE anchor WHEN term` equivalent: a null anchor answers UNKNOWN to
+    /// `=` and FALSE to `IS NOT DISTINCT FROM`, and neither fires, so both
+    /// fall to the same default. That form names the anchor once and is what
+    /// this emits.
+    ///
+    /// Where a term IS null the two disagree — SQL's simple CASE makes a null
+    /// arm dead code and the language's does not — so the null-safe spelling
+    /// stays, and with it the per-arm occurrence. A computed anchor cannot be
+    /// repeated, so it must be published by the row that owns the case; one
+    /// standing where no row publishes it REFUSES rather than being asked
+    /// twice.
+    ///
+    /// ONE LOWERING FOR ONE LAW: the query road and the DDL road ask the same
+    /// question of the same arms, and a second copy would answer it once.
+    pub fn anchored_case(
+        anchor: DomainExpression,
+        arms: Vec<(LiteralValue, DomainExpression)>,
+        default: Option<DomainExpression>,
+    ) -> crate::Result<Self> {
+        if !arms
+            .iter()
+            .any(|(term, _)| matches!(term, LiteralValue::Null))
+        {
+            return Ok(DomainExpression::Case {
+                expr: Some(Box::new(anchor)),
+                when_clauses: arms
+                    .into_iter()
+                    .map(|(term, then)| WhenClause::new(DomainExpression::Literal(term), then))
+                    .collect(),
+                else_clause: default.map(Box::new),
+            });
+        }
+        let anchor = anchor.bound_where_it_stands()?;
+        Ok(DomainExpression::Case {
+            expr: None,
+            when_clauses: arms
+                .into_iter()
+                .map(|(term, then)| {
+                    WhenClause::new(
+                        anchor
+                            .clone()
+                            .is_not_distinct_from(DomainExpression::Literal(term)),
+                        then,
+                    )
+                })
+                .collect(),
+            else_clause: default.map(Box::new),
+        })
+    }
+
+    /// THE VALUE WHERE IT STANDS, when no row published it.
+    ///
+    /// A column reference IS one occurrence and so is a literal: naming
+    /// either twice names the same value. Anything else must have been
+    /// published by the row that owns it, and a position with no row to
+    /// publish it — a predicate, an ordering, a context that never reached a
+    /// projection — has nowhere to put it. Repeating it there would ask a
+    /// volatile value twice and answer for neither, so this refuses instead.
+    pub fn bound_where_it_stands(self) -> crate::Result<Self> {
+        if matches!(
+            self,
+            DomainExpression::Column(_) | DomainExpression::Literal(_)
+        ) {
+            return Ok(self);
+        }
+        Err(crate::error::DelightQLError::transformation_error(
+            "case/anchor_needs_a_row",
+            "a match arm spelling `null` asks its question of the anchor itself, \
+             so a computed anchor must be published by the row that owns the \
+             case; this one stands where no row publishes it",
+        ))
     }
 
     /// IS NOT DISTINCT FROM (NULL-safe equality)

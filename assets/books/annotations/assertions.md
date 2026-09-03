@@ -1,177 +1,82 @@
 # Assertions {.dqlh}
 
-Assertions verify properties of a relation at a given point in a
-pipeline. They are annotations whose body is parsed
-as DQL, using interior relation semantics to scope the current
-relation.
+Assertions are ordinary effects. They apply a pure property rule to the
+relation at the authored point, abort the current run when the property
+answers NO, and otherwise release the exact relation that was checked.
 
 ```delightql
-users(*), age > 30
-  (~~assert , age > 30 |> forall(*) ~~)
-  |> (first_name, email)
+at_least(n, T(*))(*) : T(*) ~> count:(*) as count, count >= n
+
+users(*), age < 20
+  !> assert!(at_least(2), "at least two young users")(*)
+  |> (id, email)
 ```
 
-The assertion above verifies that every row has `age > 30` at that
-point in the pipeline. The main pipeline is unaffected -- the
-relation after the assertion is the same as before it.
+The property argument is a closed rule value with exactly one relation input
+left. Configuration such as `at_least(2)` is resolved when the value is
+closed. Query-scoped and consulted properties retain their lexical identity;
+`assert!` does not look their authored spelling up again.
 
-## Assertion Syntax {.dqlh}
-
-An assertion uses the annotation syntax with the reserved name `assert`:
+The label is optional:
 
 ```delightql
-(~~assert <continuation> ~~)
+has_rows(T(*))(*) : T(*) |> `exists`(*)
+users(*) !> assert!(has_rows(*))(*)
 ```
 
-The body after `assert` is parsed as a DQL continuation -- the same
-syntax used inside functor parentheses for interior relations (see
-**Interior Relations**). The `(~~assert` delimiter scopes a sub-query
-on the current relation. The leading `,`{.delightql .sigil} or
-`|>`{.delightql .sigil} is a continuation on the implicit relation,
-exactly like `users(, age > 20)`.
-
-The sub-query inside the assertion is a **fork**: it branches from the
-main pipeline, evaluates independently, and the main pipeline
-continues with the original relation regardless of the assertion's
-outcome.
-
-The assertion body is pure DQL. It may terminate with an assertion
-view that produces a single-column, single-row boolean relation (see
-**Assertion Views** below). If no assertion view is specified,
-`exists(*)` is implied -- the assertion passes if at least one row
-survives the body's filters:
+An omitted label receives a stable synthetic occurrence label. A direct call
+places the checked relation last, because a pipe fills the final formal:
 
 ```delightql
--- these are equivalent
-users(*) (~~assert , age > 0 ~~)
-users(*) (~~assert , age > 0 |> exists(*) ~~)
+assert!(has_rows(*), "users exist", users(*))(*)
 ```
 
-The bare form is the common case. An explicit view is only needed
-for `notexists(*)`, `forall(*)`, or `equals(*)`.
+## Result and failure {.dqlh}
 
-## Named Assertions {.dqlh}
+A nonempty property result is a witness and passes. An empty property result
+reaches the fundamental `abort!` effect with the identity
+`runtime/assertion`. Failure stops later effects in that run and rolls the
+current transaction back; work committed by an earlier `;` run remains.
+Errors evaluating either the checked relation or its property keep their
+original identities and are not relabelled as assertion failures.
 
-Assertions may carry a name. The name appears after `assert` as a colon-delimited string:
+On success the receipt has:
+
+| column | meaning |
+|---|---|
+| `success` | `1` |
+| `operation` | `"assert!"` |
+| `label` | authored or synthetic label |
+| `witnesses` | the exact property-result occurrence used for the verdict |
+| `returned` | the exact checked input occurrence |
+
+The unwrap pipe `!>` releases `returned`. The implementation establishes the
+input once and the witness once, so volatile inputs cannot be checked as one
+occurrence and returned as another.
+
+## Common properties {.dqlh}
+
+The standard prelude includes pure property rules such as `exists`,
+`notexists`, `count_is(n)`, `at_least(n)`, and `same_bag(expected)`.
 
 ```delightql
-(~~assert:"age is positive" , age > 0 |> forall(*) ~~)
-(~~assert:"has email" , email != null |> forall(*) ~~)
-(~~assert:"at least 3 rows" ~> count:(*) as n, n >= 3 |> exists(*) ~~)
+orders(*) !> assert!(count_is(3), "three orders")(*)
+
+actual(*)
+  !> assert!(same_bag(expected(*)), "expected rows")(*)
 ```
 
-The name should be an author-supplied label that serves as the primary key when
-recording assertion outcomes. Unnamed assertions still work. They will receive
-a synthetic key (derived from source location and body hash) but lose cross-run
-trackability.
+User properties can express filters, aggregates, schema meta-relations, or
+other pure relational checks. Effectful rules, scalar callables, unknown
+target callables, extra holes, and incompatible residual headings refuse at
+the ordinary rule-value boundary.
 
-## Data Assertions {.dqlh}
+## Observability {.dqlh}
 
-Data assertions check properties of the rows at a point in the
-pipeline. They end with an assertion view that reduces the relation
-to a boolean:
+Passing and failing verdicts reach host assertion hooks and `sys.assertions`.
+The failure row is recorded outside the target transaction so it remains
+queryable after rollback and the session can continue.
 
-```delightql
--- at least one row with age > 20 exists
-users(*) (~~assert , age > 20 |> exists(*) ~~)
-
--- every row has age > 20
-users(*) (~~assert , age > 20 |> forall(*) ~~)
-
--- no nulls in email
-users(*) (~~assert , email is null |> notexists(*) ~~)
-
--- exactly 3 rows
-users(*) (~~assert ~> count:(*) as cnt, cnt == 3 |> exists(*) ~~)
-
--- id is unique (no duplicates)
-users(*) (~~assert ~> %(id ~> count:(*) as n), n > 1 |> notexists(*) ~~)
-
--- age is always positive
-users(*) (~~assert , age > 0 |> forall(*) ~~)
-```
-
-The assertion body is any valid DQL.
-
-## Schema Assertions {.dqlh}
-
-Schema assertions check structural properties of the relation. They
-use the meta-ize operator `^`{.delightql .sigil} (see **Meta-ize
-Operator**) to convert the schema to a queryable relation, then apply
-standard assertions:
-
-```delightql
--- column "age" exists
-users(*) |> (name, age)
-  (~~assert ^, colname = "age" |> exists(*) ~~)
-
--- exactly 3 columns
-users(*) |> (a, b, c)
-  (~~assert ^ ~> count:(*) as n, n == 3 |> exists(*) ~~)
-
--- no TEXT columns
-users(*)
-  (~~assert ^, coltype = "TEXT" |> notexists(*) ~~)
-```
-
-For exact schema matching, use `equals(*)`{.delightql} with the
-reverse pipe `<|`{.delightql .sigil} (see **Reverse Pipe**) to
-compare against an expected schema:
-
-```delightql
-users(*)
-  (~~assert ^ |> equals(*) <| _(colname, colpos
-                                  ------
-                                  "age", 1;
-                                  "last_name", 2;
-                                  "first_name", 3) ~~)
-```
-
-## Relational Equality {.dqlh}
-
-The `equals(*)`{.delightql} view checks bag equality between two
-relations via the reverse pipe. Bag equality means: same column names
-in the same order, and the same bag of rows with duplicates and
-multiplicities preserved.
-
-```delightql
--- assert query result matches expected rows
-users(*), age > 50
-  (~~assert |> equals(*) <| _(first_name, age
-                                ------
-                                "Alice", 55;
-                                "Bob", 62) ~~)
-```
-
-The right operand of `<|`{.delightql .sigil} can be any relational
-expression -- a CTE, a table access, or an anonymous table literal.
-
-## Assertion Views {.dqlh}
-
-Assertion bodies end with a view from `std::prelude` that reduces a
-relation to a single-row, single-column table. The column is named
-`bool` and contains `true` or `false`. Every assertion view has this
-same output shape -- the runner reads the `bool` column to determine
-the verdict.
-
-```
-┌───────┐
-│ bool  │
-├───────┤
-│ true  │
-└───────┘
-```
-
-| View           | Semantics                         | SQL pattern                                    |
-|----------------|-----------------------------------|------------------------------------------------|
-| `exists(*)`    | At least one row in the input     | `SELECT EXISTS(...)  AS bool`                  |
-| `notexists(*)` | No rows in the input              | `SELECT NOT EXISTS(...) AS bool`               |
-| `forall(*)`    | All input rows survived filtering | `SELECT NOT EXISTS(... WHERE NOT ...) AS bool` |
-| `equals(*)`    | Bag equality of two relations     |                                                |
-
-: Assertion views (auto-imported from std::prelude)
-
-All four views produce the same relation: one row, one column named
-`bool`. This uniformity means the assertion mechanism needs no
-special dispatch -- the pipeline compiles the body, executes it, and
-reads `bool` from the single result row.
+The former `(~~assert … ~~)` annotation has been removed. It now receives a
+retirement diagnostic directing programs to a property rule and `assert!`;
+there is no compatibility sidecar or separately executed assertion SQL.

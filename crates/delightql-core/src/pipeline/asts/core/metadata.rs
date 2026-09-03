@@ -310,32 +310,6 @@ impl ToLispy for NamespaceItem {
 // Grounding Infrastructure
 // ============================================================================
 
-/// Grounded namespace path: data_ns^lib_ns for binding data to groundable definitions
-///
-/// In `data::test^lib::math.users(*)`:
-/// - `data_ns` = NamespacePath for "data::test" (where tables live)
-/// - `grounded_ns` = vec of NamespacePaths for libraries being grounded (e.g., "lib::math")
-///
-/// Multiple groundings are supported: `data::test^lib::math^lib::extra`
-#[derive(Debug, Clone, PartialEq)]
-pub struct GroundedPath {
-    /// The data namespace (provides concrete tables)
-    pub data_ns: NamespacePath,
-    /// The grounded namespaces (provide definitions with unresolved table references)
-    pub grounded_ns: Vec<NamespacePath>,
-}
-
-impl ToLispy for GroundedPath {
-    fn to_lispy(&self) -> String {
-        let ns_parts: Vec<String> = self.grounded_ns.iter().map(|ns| ns.to_lispy()).collect();
-        format!(
-            "(grounding :data {} :libs [{}])",
-            self.data_ns.to_lispy(),
-            ns_parts.join(" ")
-        )
-    }
-}
-
 // ============================================================================
 // Metadata Structures (from resolver phase onward)
 // ============================================================================

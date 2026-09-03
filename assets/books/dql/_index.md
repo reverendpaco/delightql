@@ -13,6 +13,5 @@ to understanding DDL and DML.
 A query's meaning is identical to the table it produces. This substitutability
 is key to composability: through subqueries and CTEs, query expressions become
 recursively inductive to any depth. Delightql encourages a particular style of
-composition that will become evident within a few pages -- pipelining a relation
-through transformations, left to right, with consistent associativity and
-scoping.
+composition -- pipelining a relation through transformations, left to right,
+with consistent associativity and scoping.

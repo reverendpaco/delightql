@@ -9,11 +9,12 @@
 //! operator, or the wrong ending. The corpus does not pin these directly —
 //! a walk that over-reaches still compiles and usually still produces SQL.
 
+use super::Step;
 use super::*;
 use crate::pipeline::asts::core::expressions::metadata_types::{FilterOrigin, SetOperator};
 use crate::pipeline::asts::core::metadata::NamespacePath;
 use crate::pipeline::asts::core::{
-    Access, FunctorCall, GroundMention, PipeOp, QualifiedName, Relation, TruthExpression,
+    Access, FunctorCall, GroundForm, GroundMention, QualifiedName, Relation, TruthExpression,
     Unresolved,
 };
 
@@ -21,7 +22,7 @@ use crate::pipeline::asts::core::{
 
 /// A recognizable head: a functor call whose name is the tag.
 fn sentinel(tag: &str) -> Chain<Unresolved> {
-    Chain::relation(Relation::FunctorCall {
+    Chain::authored(GroundForm::Reference(Relation::FunctorCall {
         alias: None,
         call: FunctorCall::written(
             crate::pipeline::asts::vocabulary::Ref::synthetic_with_display(
@@ -32,12 +33,11 @@ fn sentinel(tag: &str) -> Chain<Unresolved> {
             vec![],
         )
         .into(),
-        cpr_schema: (),
-    })
+    }))
 }
 
 fn restrict(chain: Chain<Unresolved>) -> Chain<Unresolved> {
-    chain.then(Continuation::Restrict {
+    chain.then(Step::authored(Continuation::Restrict {
         // A restriction whose CONTENT is irrelevant to the spine walk —
         // only that one stands here. There is no synthetic truth leaf to
         // reach for, so it is a real comparison.
@@ -55,39 +55,29 @@ fn restrict(chain: Chain<Unresolved>) -> Chain<Unresolved> {
             )),
         }),
         origin: FilterOrigin::UserWritten,
-        cpr_schema: (),
-    })
-}
-
-fn pipe(chain: Chain<Unresolved>, operator: PipeOp<Unresolved>) -> Chain<Unresolved> {
-    chain.then(Continuation::Pipe {
-        operator,
-        named: None,
-        cpr_schema: (),
-    })
+    }))
 }
 
 fn access(chain: Chain<Unresolved>, access: Access<Unresolved>) -> Chain<Unresolved> {
-    chain.then(Continuation::Access {
+    chain.then(Step::authored(Continuation::Access {
         access,
-        cpr_schema: (),
-    })
+        named: None,
+    }))
 }
 
 fn member(left: Chain<Unresolved>, right: Chain<Unresolved>) -> Chain<Unresolved> {
-    left.then(Continuation::Member {
+    left.then(Step::authored(Continuation::Member {
         rhs: right,
         correlation: None,
         join_type: None,
-        cpr_schema: (),
-    })
+    }))
 }
 
 fn bag(operands: Vec<Chain<Unresolved>>) -> Chain<Unresolved> {
     let mut operands = operands.into_iter();
     let mut accumulated = operands.next().expect("a bag operation has a left operand");
     for arm in operands {
-        accumulated = accumulated.bag_op(SetOperator::UnionCorresponding, arm, (), ());
+        accumulated = accumulated.bag_op(SetOperator::UnionCorresponding, arm, ());
     }
     accumulated
 }
@@ -107,13 +97,12 @@ fn source_spine_reads_restrictions_and_pipes_outermost_first() {
     // `sentinel * ^ , ` — two pipes then a restriction. The run is
     // deliberately ASYMMETRIC: a palindromic one reads the same in either
     // direction and would pin nothing about order.
-    let chain = restrict(
-        access(sentinel("term"), Access::All).then(Continuation::Structural(StructuralStep {
+    let chain = restrict(access(sentinel("term"), Access::All).then(Step::authored(
+        Continuation::Structural(StructuralStep {
             form: StructuralForm::Meta,
             named: None,
-            cpr_schema: (),
-        })),
-    );
+        }),
+    )));
 
     // Read from the OUTSIDE in: the last continuation written is the first
     // step seen, which is what makes "the top-level operator" answerable.
@@ -167,24 +156,24 @@ fn source_spine_stops_at_a_bag_operation_and_at_an_edge() {
     let over_bag = restrict(bag(vec![sentinel("a"), sentinel("b")]));
     assert_eq!(over_bag.source_spine().count(), 1);
 
-    let over_edge = restrict(sentinel("a").then(Continuation::ErJoin(ErJoinStep {
-        transitive: false,
-        context: Some("ctx".to_string()),
-        left_spelling: "a".to_string(),
-        right_spelling: "b".to_string(),
-        rhs: Chain::read(
-            Relation::Ground {
-                mention: GroundMention::named(QualifiedName {
-                    namespace_path: NamespacePath::empty(),
-                    name: "b".into(),
-                }),
-                outer: false,
-                cpr_schema: (),
-            },
-            Access::All,
-            (),
-        ),
-    })));
+    let over_edge = restrict(sentinel("a").then(Step::authored(Continuation::ErJoin(
+        ErJoinStep {
+            transitive: false,
+            context: Some("ctx".to_string()),
+            left_spelling: "a".to_string(),
+            right_spelling: "b".to_string(),
+            rhs: Chain::read(
+                Relation::Ground {
+                    mention: GroundMention::named(QualifiedName {
+                        namespace_path: NamespacePath::empty(),
+                        name: "b".into(),
+                    }),
+                    outer: false,
+                },
+                Access::All,
+            ),
+        },
+    ))));
     assert_eq!(over_edge.source_spine().count(), 1);
 }
 
@@ -260,7 +249,7 @@ fn fold_tail_hands_the_leaf_the_whole_chain() {
     let saw_operator = chain.fold_tail(
         &|leaf: &Chain<Unresolved>| {
             matches!(
-                leaf.continuations.last(),
+                leaf.continuations.last().map(|step| step.form()),
                 Some(Continuation::Access {
                     access: Access::All,
                     ..
@@ -316,15 +305,17 @@ fn a_spent_phase_refuses_an_authored_stage_name_rather_than_dropping_it() {
 /// beside it, and there is no second answer to disagree with.
 #[test]
 fn the_run_partition_is_one_operation() {
-    use crate::pipeline::asts::core::expressions::chain::RunStep;
-    let mut running = sentinel("base").then(Continuation::Structural(StructuralStep {
-        form: StructuralForm::Ordering { specs: vec![] },
-        named: None,
-        cpr_schema: (),
-    }));
+    let mut running =
+        sentinel("base").then(Step::authored(Continuation::Structural(StructuralStep {
+            form: StructuralForm::Ordering {
+                specs: vec![],
+                bound: None,
+            },
+            named: None,
+        })));
     assert!(matches!(
-        running.pop_run_step(),
-        Some(RunStep::Structural(StructuralStep {
+        running.pop_run_step().map(|step| step.into_form()),
+        Some(RunForm::Structural(StructuralStep {
             form: StructuralForm::Ordering { .. },
             ..
         }))
@@ -333,18 +324,17 @@ fn the_run_partition_is_one_operation() {
     // The base has no further run step, and nothing was taken.
     assert!(running.pop_run_step().is_none());
 
-    let mut bounded = sentinel("base").then(Continuation::Bound {
+    let mut bounded = sentinel("base").then(Step::authored(Continuation::Bound {
         bound: crate::pipeline::asts::core::specs::TupleOrdinalClause {
             operator: crate::pipeline::asts::core::specs::TupleOrdinalOperator::LessThan,
             value: 2,
             offset: None,
         },
-        cpr_schema: (),
-    });
+    }));
     // A nonmember is RESTORED, not consumed: the chain is unchanged.
     assert!(bounded.pop_run_step().is_none());
     assert!(matches!(
-        bounded.continuations.last(),
+        bounded.continuations.last().map(|step| step.form()),
         Some(Continuation::Bound { .. })
     ));
 }

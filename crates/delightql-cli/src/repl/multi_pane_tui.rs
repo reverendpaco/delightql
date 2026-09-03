@@ -406,7 +406,7 @@ pub fn run_multi_pane_tui(
     terminal.show_cursor()?;
 
     if let Err(err) = res {
-        eprintln!("Error in multi-pane TUI: {}", err);
+        crate::client::incident::error("terminal", crate::client::incident::hierarchy::TERMINAL, format!("error in the multi-pane TUI: {err}"));
     }
 
     // Return the final window position
@@ -1321,6 +1321,10 @@ fn create_window_cd1_content(tui: &MultiPaneTui) -> Vec<Line<'_>> {
     lines.push(Line::from(vec![
         Span::styled("Multiline:        ", label_style),
         fmt_on_off(tui.repl_state.config_multiline),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Parser helpers:   ", label_style),
+        fmt_on_off(tui.repl_state.config_editor_helpers),
     ]));
 
     lines

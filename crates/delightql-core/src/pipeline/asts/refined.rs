@@ -14,11 +14,17 @@
 pub type Query = crate::pipeline::asts::core::Query<crate::pipeline::asts::core::Refined>;
 pub type CteBinding = crate::pipeline::asts::core::CteBinding<crate::pipeline::asts::core::Refined>;
 pub type Chain = crate::pipeline::asts::core::Chain<crate::pipeline::asts::core::Refined>;
-pub type Grelex = crate::pipeline::asts::core::Grelex<crate::pipeline::asts::core::Refined>;
+pub type GroundForm = crate::pipeline::asts::core::GroundForm<crate::pipeline::asts::core::Refined>;
+#[allow(dead_code)]
+pub type Step = crate::pipeline::asts::core::Step<crate::pipeline::asts::core::Refined>;
+#[allow(dead_code)]
+pub type Peel = crate::pipeline::asts::core::Peel<crate::pipeline::asts::core::Refined>;
+#[allow(dead_code)]
+#[allow(dead_code)]
+pub type Transparent =
+    crate::pipeline::asts::core::Transparent<crate::pipeline::asts::core::Refined>;
 pub type Continuation =
     crate::pipeline::asts::core::Continuation<crate::pipeline::asts::core::Refined>;
-pub type StructuralStep =
-    crate::pipeline::asts::core::StructuralStep<crate::pipeline::asts::core::Refined>;
 pub type StructuralForm =
     crate::pipeline::asts::core::StructuralForm<crate::pipeline::asts::core::Refined>;
 pub type AnonTable = crate::pipeline::asts::core::AnonTable<crate::pipeline::asts::core::Refined>;
@@ -54,7 +60,6 @@ pub type TruthExpression =
     crate::pipeline::asts::core::TruthExpression<crate::pipeline::asts::core::Refined>;
 pub type ArgumentValue =
     crate::pipeline::asts::core::ArgumentValue<crate::pipeline::asts::core::Refined>;
-pub type OutValue = crate::pipeline::asts::core::OutValue<crate::pipeline::asts::core::Refined>;
 pub type OrderingSpec =
     crate::pipeline::asts::core::OrderingSpec<crate::pipeline::asts::core::Refined>;
 pub type WindowFrame =

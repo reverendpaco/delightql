@@ -10,7 +10,7 @@
 //! for the same kind under a different spelling.
 
 use super::support::*;
-use crate::pipeline::asts::core::operators::{HoArgument, PipeOp};
+use crate::pipeline::asts::core::operators::PipeOp;
 use crate::pipeline::asts::core::*;
 
 fn chain(source: &str) -> Chain<Unresolved> {
@@ -24,9 +24,9 @@ fn chain(source: &str) -> Chain<Unresolved> {
 /// Every pipe operator a query carries, in order.
 fn operators(source: &str) -> Vec<PipeOp<Unresolved>> {
     chain(source)
-        .continuations
+        .continuations()
         .iter()
-        .filter_map(|continuation| match continuation {
+        .filter_map(|continuation| match continuation.form() {
             Continuation::Pipe { operator, .. } => Some(operator.clone()),
             _ => None,
         })
@@ -110,7 +110,7 @@ fn every_enumerating_position_admits_the_same_carrier() {
     };
     let DomainExpression::Application(FunctionApplication::Enclyph(
         crate::pipeline::asts::core::Enclyph::Record(record),
-    )) = one.expr.domain().expect("a domain value")
+    )) = &one.expr
     else {
         panic!("expected a record, got {:?}", one.expr);
     };
@@ -138,8 +138,7 @@ fn every_enumerating_position_admits_the_same_carrier() {
     let [OutItem::One(one)] = counted.as_slice() else {
         panic!("expected one item, got {counted:?}");
     };
-    let DomainExpression::Application(FunctionApplication::Standard(application)) =
-        one.expr.domain().expect("a domain value")
+    let DomainExpression::Application(FunctionApplication::Standard(application)) = &one.expr
     else {
         panic!("expected an application, got {:?}", one.expr);
     };
@@ -242,8 +241,8 @@ fn a_name_and_a_position_are_two_arms_of_one_reference() {
             panic!("expected one item in {source:?}, got {found:?}");
         };
         match &one.expr {
-            OutValue::Domain(DomainExpression::Reference(Reference::Named(_))) => "named",
-            OutValue::Domain(DomainExpression::Reference(Reference::Ordinal(_))) => "ordinal",
+            DomainExpression::Reference(Reference::Named(_)) => "named",
+            DomainExpression::Reference(Reference::Ordinal(_)) => "ordinal",
             other => panic!("expected a reference, got {other:?}"),
         }
     };
@@ -261,9 +260,9 @@ fn a_reposition_addresses_by_the_one_reference_carrier() {
     let addressed = |source: &str| {
         let chain = chain(source);
         let moves = chain
-            .continuations
+            .continuations()
             .iter()
-            .find_map(|continuation| match continuation {
+            .find_map(|continuation| match continuation.form() {
                 Continuation::Structural(crate::pipeline::asts::core::StructuralStep {
                     form: crate::pipeline::asts::core::StructuralForm::Reposition { moves },
                     ..
@@ -277,6 +276,7 @@ fn a_reposition_addresses_by_the_one_reference_carrier() {
         match &spec.column {
             Reference::Named(_) => "named",
             Reference::Ordinal(_) => "ordinal",
+            Reference::Physical(never) => match *never {},
         }
     };
     assert_eq!(addressed("t(*) |> *[a as 1]"), "named");
@@ -299,9 +299,7 @@ fn json_access_and_a_path_binding_share_the_path_and_not_the_parent() {
     let [OutItem::One(one)] = found.as_slice() else {
         panic!("expected one item, got {found:?}");
     };
-    let DomainExpression::Application(FunctionApplication::JsonAccess(access)) =
-        one.expr.domain().expect("a domain value")
-    else {
+    let DomainExpression::Application(FunctionApplication::JsonAccess(access)) = &one.expr else {
         panic!("expected a json access, got {:?}", one.expr);
     };
 
@@ -309,9 +307,9 @@ fn json_access_and_a_path_binding_share_the_path_and_not_the_parent() {
     // destructure continuation — a different parent kind entirely.
     let destructured = chain("t(*), d ~= {.a.b}");
     let pattern = destructured
-        .continuations
+        .continuations()
         .iter()
-        .find_map(|continuation| match continuation {
+        .find_map(|continuation| match continuation.form() {
             Continuation::Destructure { pattern, .. } => Some(pattern.clone()),
             _ => None,
         })
@@ -351,9 +349,9 @@ fn json_access_and_a_path_binding_share_the_path_and_not_the_parent() {
 fn a_narrowing_carries_its_reach_as_a_path() {
     let narrowed = chain("t(*) |> .d{.a.b}");
     let (nest, pattern) = narrowed
-        .continuations
+        .continuations()
         .iter()
-        .find_map(|continuation| match continuation {
+        .find_map(|continuation| match continuation.form() {
             Continuation::Structural(crate::pipeline::asts::core::StructuralStep {
                 form: crate::pipeline::asts::core::StructuralForm::Narrow { nest, pattern, .. },
                 ..
@@ -390,9 +388,9 @@ fn a_narrowing_carries_its_reach_as_a_path() {
 fn a_narrowing_reaches_an_index_by_index() {
     let narrowed = chain("t(*) |> .d{.bye.1}");
     let pattern = narrowed
-        .continuations
+        .continuations()
         .iter()
-        .find_map(|continuation| match continuation {
+        .find_map(|continuation| match continuation.form() {
             Continuation::Structural(crate::pipeline::asts::core::StructuralStep {
                 form: crate::pipeline::asts::core::StructuralForm::Narrow { pattern, .. },
                 ..
@@ -421,8 +419,7 @@ fn a_path_step_is_a_key_or_an_index() {
         let [OutItem::One(one)] = found.as_slice() else {
             panic!("expected one item in {source:?}, got {found:?}");
         };
-        let DomainExpression::Application(FunctionApplication::JsonAccess(access)) =
-            one.expr.domain().expect("a domain value")
+        let DomainExpression::Application(FunctionApplication::JsonAccess(access)) = &one.expr
         else {
             panic!("expected a json access, got {:?}", one.expr);
         };
@@ -459,7 +456,6 @@ fn no_authored_publication_list_holds_a_whole_operand_item() {
         "t(*) |> (e.*)",
         "t(*) |> +(a)",
         "t(*) |> %(*)",
-        "t(*) |*>",
     ] {
         for operator in operators(source) {
             let published: Vec<OutItem<Unresolved>> = match operator {

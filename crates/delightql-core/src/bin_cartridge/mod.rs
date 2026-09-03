@@ -54,7 +54,7 @@ pub mod registry;
 
 use crate::enums::{EntityType, Language};
 use crate::error::Result;
-use crate::pipeline::asts::unresolved::{DomainExpression, Grelex};
+use crate::pipeline::asts::unresolved::{DomainExpression, GroundForm};
 use crate::system::DelightQLSystem;
 use std::sync::Arc;
 
@@ -88,7 +88,6 @@ pub struct BinCartridgeMetadata {
 ///
 /// Cartridges are registered during system initialization and provide
 /// entities that are compiled into the DelightQL engine.
-#[allow(dead_code)]
 pub trait BinCartridge: Send + Sync {
     /// Get cartridge metadata
     ///
@@ -107,6 +106,7 @@ pub trait BinCartridge: Send + Sync {
     /// to be fully bootstrapped (e.g., registering callback hooks).
     ///
     /// Default implementation does nothing.
+    #[allow(dead_code)]
     fn on_registered(&self, _system: &DelightQLSystem) -> Result<()> {
         Ok(())
     }
@@ -116,6 +116,7 @@ pub trait BinCartridge: Send + Sync {
     /// Use this to clean up any resources (e.g., close connections, free memory).
     ///
     /// Default implementation does nothing.
+    #[allow(dead_code)]
     fn on_shutdown(&self) -> Result<()> {
         Ok(())
     }
@@ -160,7 +161,6 @@ pub struct EntitySignature {
 /// Provides metadata about the entity (name, type, signature) without
 /// defining how it executes. Execution semantics are defined by extension
 /// traits (e.g., EffectExecutable for pseudo-predicates).
-#[allow(dead_code)]
 pub trait BinEntity: Send + Sync {
     /// LOCAL entity name (e.g., "mount!", "concat", "upper") — never a
     /// namespace-qualified string. Identity is (namespace, name); see
@@ -186,6 +186,7 @@ pub trait BinEntity: Send + Sync {
     ///
     /// Side-effecting entities (pseudo-predicates) must be executed during
     /// the effect executor rather than deferred to a later stage.
+    #[allow(dead_code)]
     fn has_side_effects(&self) -> bool {
         false // Most entities don't have side effects
     }
@@ -220,7 +221,7 @@ pub enum EntityResult {
     /// Entity returned a relation: the chain HEAD it answers with — a
     /// written-out table for most receipts, a named form where the entity
     /// builds one.
-    Relation(Grelex),
+    Relation(GroundForm),
 }
 
 /// Effect Executable - Entities that execute in the effect executor

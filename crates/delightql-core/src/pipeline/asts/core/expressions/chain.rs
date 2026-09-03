@@ -27,13 +27,19 @@ use delightql_types::SqlIdentifier;
 
 /// §2.2 — the chain: a ground relational expression and the continuations
 /// applied to it, in authored order.
+///
+/// PRIVATE FIELDS. A bound step's relation is its prefix's answer, so a
+/// vector anyone can push into or assign through is the attachment road the
+/// step's own privacy closed: `chain.continuations[0] = other_step` relates
+/// two valid objects wrongly without naming a single private field. The
+/// authored phase has nothing to mispair and keeps ordinary mutation.
 #[derive(Debug, PartialEq, ToLispy)]
 #[lispy("chain")]
 pub struct Chain<P: Phase = Unresolved> {
     #[lispy("head")]
-    pub head: Grelex<P>,
+    head: Grelex<P>,
     #[lispy("continuations")]
-    pub continuations: Vec<Continuation<P>>,
+    continuations: Vec<Step<P>>,
 }
 
 // Manual Clone: `#[stacksafe]` keeps a deeply nested chain (member arms and
@@ -48,45 +54,33 @@ impl<P: Phase> Clone for Chain<P> {
     }
 }
 
-impl<P: Phase> Chain<P> {
-    /// A chain that is nothing but its head.
-    pub fn ground(head: Grelex<P>) -> Self {
-        Chain {
-            head,
-            continuations: Vec::new(),
-        }
-    }
-
-    /// A chain headed by a named relational form.
-    pub fn relation(relation: Relation<P>) -> Self {
-        Chain::ground(Grelex::Reference(relation))
+impl<P: Phase<Scope = ()>> Chain<P> {
+    /// A chain that is nothing but its authored head.
+    ///
+    /// The authored phase has no relation to pair, so ordinary syntax
+    /// constructors live here: there is nothing a caller could mispair.
+    pub fn authored(form: GroundForm<P>) -> Self {
+        Chain::ground(Grelex::authored(form))
     }
 
     /// A READ: a relation, and what the parens on it asked for. The one
     /// constructor for the pairing, so a mention cannot be built without an
     /// access or an access without the relation it asks of.
-    pub fn read(
-        relation: Relation<P>,
-        access: super::access::Access<P>,
-        cpr_schema: P::Scope,
-    ) -> Self {
-        Chain::relation(relation).then(Continuation::Access { access, cpr_schema })
+    pub fn read(relation: Relation<P>, access: super::access::Access<P>) -> Self {
+        Chain::authored(GroundForm::Reference(relation)).then(Step::authored(
+            Continuation::Access {
+                access,
+                named: P::no_stage_name(),
+            },
+        ))
     }
 
     /// The same pairing over a head that is already built.
-    pub fn read_head(
-        head: Grelex<P>,
-        access: super::access::Access<P>,
-        cpr_schema: P::Scope,
-    ) -> Self {
-        Chain::ground(head).then(Continuation::Access { access, cpr_schema })
-    }
-
-    /// Extend the chain. The continuation consumes everything to its left,
-    /// which is what makes ordering structural rather than remembered.
-    pub fn then(mut self, continuation: Continuation<P>) -> Self {
-        self.continuations.push(continuation);
-        self
+    pub fn read_head(head: GroundForm<P>, access: super::access::Access<P>) -> Self {
+        Chain::authored(head).then(Step::authored(Continuation::Access {
+            access,
+            named: P::no_stage_name(),
+        }))
     }
 
     /// One bag operation. The chain-so-far is the left operand and `arm` is
@@ -94,19 +88,629 @@ impl<P: Phase> Chain<P> {
     /// these steps, never one grouped node. There is no grouped constructor
     /// because a group has nowhere to record which pair a correlation
     /// relates (ruling 3).
-    pub fn bag_op(
-        self,
-        operator: SetOperator,
-        arm: Chain<P>,
-        correlation: P::Corr,
-        cpr_schema: P::Scope,
-    ) -> Self {
-        self.then(Continuation::BagOp {
+    pub fn bag_op(self, operator: SetOperator, arm: Chain<P>, correlation: P::Corr) -> Self {
+        self.then(Step::authored(Continuation::BagOp {
             operator,
             arm,
             correlation,
-            cpr_schema,
+        }))
+    }
+}
+
+impl<P: Phase<Scope = ()>> Chain<P> {
+    /// Extend an AUTHORED chain. Nothing is paired in this phase, so
+    /// ordering is the only thing a step carries and there is nothing a
+    /// caller could relate wrongly.
+    ///
+    /// There is no bound-phase twin. A step that already publishes a
+    /// relation cannot be appended behind another prefix, because the
+    /// relation it publishes is an answer about the prefix it was derived
+    /// over; putting it behind a different one keeps an answer to a
+    /// question nobody asked. Bound chains grow through the authority,
+    /// which derives the step's result from the prefix it is landing on.
+    pub fn then(mut self, step: Step<P>) -> Self {
+        self.continuations.push(step);
+        self
+    }
+
+    /// Bound the chain: THE ONE ROAD a row bound enters an authored chain.
+    ///
+    /// A bound consumes the ordering it stands immediately beside — the
+    /// ordering chooses which rows the bound keeps — so it lands INSIDE that
+    /// ordering's node rather than after it, and there is no authored shape
+    /// in which an ordering and the bound that consumes it are two steps.
+    /// An ordering that already carries a bound is a finished membership
+    /// act; a further bound selects from its members and stands alone,
+    /// as does a bound that no ordering precedes.
+    pub fn bounding(mut self, bound: TupleOrdinalClause) -> Self {
+        use super::super::specs::TupleOrdinalOperator;
+        if let Some(Continuation::Structural(StructuralStep {
+            form: StructuralForm::Ordering {
+                bound: consumer, ..
+            },
+            ..
+        })) = self.continuations.last_mut().map(Step::form_mut)
+        {
+            match consumer {
+                None => {
+                    *consumer = Some(bound);
+                    return self;
+                }
+                // AN OFFSET IS CONSUMED BY THE CAP IT PRECEDES: `#(x), #>a,
+                // #<m` is one row clause — the ordering, where its count
+                // starts, and how many — so the cap joins the act rather
+                // than capping its members arbitrarily.
+                Some(TupleOrdinalClause {
+                    operator: TupleOrdinalOperator::GreaterThan,
+                    value: skip,
+                    offset: None,
+                }) if matches!(
+                    bound,
+                    TupleOrdinalClause {
+                        operator: TupleOrdinalOperator::LessThan,
+                        offset: None,
+                        ..
+                    }
+                ) =>
+                {
+                    *consumer = Some(TupleOrdinalClause {
+                        operator: TupleOrdinalOperator::LessThan,
+                        value: bound.value,
+                        offset: Some(*skip),
+                    });
+                    return self;
+                }
+                Some(_) => {}
+            }
+        }
+        self.then(Step::authored(Continuation::Bound { bound }))
+    }
+
+    /// The head, for an authored walk that rewrites what it names.
+    pub fn head_mut(&mut self) -> &mut Grelex<P> {
+        &mut self.head
+    }
+
+    /// The steps, for an authored walk that rewrites payloads in place.
+    pub fn continuations_mut(&mut self) -> &mut Vec<Step<P>> {
+        &mut self.continuations
+    }
+}
+
+impl<P: Phase> Continuation<P> {
+    /// WHETHER THIS CONTINUATION PUBLISHES ITS OPERAND'S OWN RELATION, BY
+    /// LAW.
+    ///
+    /// A restriction drops rows, a bound selects a prefix of an order, a
+    /// correlation states an alignment — none creates an occurrence. An
+    /// ordering re-orders rows and republishes its operand ONE-TO-ONE
+    /// through the stage export: removing it removes only the re-ordering,
+    /// and every position it published lands on its operand through the
+    /// construction record.
+    ///
+    /// ONE ANSWER, and every road that moves or drops a step asks HERE —
+    /// so "which steps may move" is decided once rather than re-listed at
+    /// each pass.
+    pub fn is_transparent(&self) -> bool {
+        match self {
+            Continuation::Restrict { .. }
+            | Continuation::Bound { .. }
+            | Continuation::Correlate { .. } => true,
+            Continuation::Structural(step) => {
+                matches!(step.form, StructuralForm::Ordering { .. })
+            }
+            Continuation::Access { .. }
+            | Continuation::Member { .. }
+            | Continuation::BagOp { .. }
+            | Continuation::Destructure { .. }
+            | Continuation::Pipe { .. }
+            | Continuation::ErJoin(_) => false,
+        }
+    }
+}
+
+/// WHETHER A STEP STANDS. See [`Chain::rebuilding`].
+///
+/// Two answers, and neither of them replaces anything: the walk that asks
+/// holds no road to a payload or a result, so a step that stands publishes
+/// exactly what it published.
+pub enum Standing {
+    /// The step stands, and the operand nested inside it is rebuilt.
+    Keep,
+    /// A transparent step comes off. Refused for any other form.
+    Drop,
+}
+
+/// A CONTINUATION THAT PUBLISHES ITS OPERAND'S OWN RELATION, BY LAW.
+///
+/// Three, and the taxonomy is closed: a restriction drops rows, a bound
+/// selects an arbitrary prefix (the ordered bound is the ordering's own
+/// node, a stage), a correlation states an alignment. None creates an
+/// occurrence, so none creates an interface — what such a step publishes
+/// IS the relation standing to its left.
+///
+/// That is why [`Chain::transparently`] needs no construction capability:
+/// nothing is constructed. It is also why moving one of these onto a
+/// different operand is safe where moving any other step is not — the
+/// result is RESTATED from the prefix it lands on, never carried over from
+/// the prefix it came off.
+pub enum Transparent<P: Phase = Unresolved> {
+    Restrict {
+        condition: TruthExpression<P>,
+        origin: FilterOrigin,
+    },
+    Bound {
+        bound: TupleOrdinalClause,
+    },
+    Correlate {
+        whole: WholeHeading<P>,
+    },
+}
+
+impl<P: Phase> Transparent<P> {
+    /// The continuation this is, for the tree to store.
+    pub fn into_form(self) -> Continuation<P> {
+        match self {
+            Transparent::Restrict { condition, origin } => {
+                Continuation::Restrict { condition, origin }
+            }
+            Transparent::Bound { bound } => Continuation::Bound { bound },
+            Transparent::Correlate { whole } => Continuation::Correlate { whole },
+        }
+    }
+
+    /// The same, read back off a stored continuation. `None` says the
+    /// continuation publishes a heading of its own, which is a refusal for
+    /// whoever wanted to move it.
+    pub fn of(form: Continuation<P>) -> std::result::Result<Self, Continuation<P>> {
+        match form {
+            Continuation::Restrict { condition, origin } => {
+                Ok(Transparent::Restrict { condition, origin })
+            }
+            Continuation::Bound { bound } => Ok(Transparent::Bound { bound }),
+            Continuation::Correlate { whole } => Ok(Transparent::Correlate { whole }),
+            other => Err(other),
+        }
+    }
+}
+
+impl<P: Phase<Scope = crate::relation::SemanticRelation>> Chain<P> {
+    /// INSERT A TRANSPARENT CONTINUATION AT A POSITION.
+    ///
+    /// What it publishes is the relation standing to its LEFT at that
+    /// position, restated here. Every later node stands on exactly what it
+    /// stood on, because a transparent step creates no occurrence — which
+    /// is why this is a lawful move for these forms and for no other.
+    pub fn transparently_at(mut self, at: usize, form: Transparent<P>) -> Self {
+        let result = match at.checked_sub(1) {
+            Some(before) => self.continuations[before].result.clone(),
+            None => self.head.result.clone(),
+        };
+        self.continuations.insert(
+            at,
+            Step {
+                form: form.into_form(),
+                result,
+            },
+        );
+        self
+    }
+
+    /// EXTEND BY A CONTINUATION THAT PUBLISHES THIS CHAIN'S OWN RELATION.
+    ///
+    /// See [`Transparent`]. The result is not an argument and not derived:
+    /// it is the relation this chain already publishes, restated at the
+    /// step. A capability would be theatre — the preserve law returns its
+    /// input, so there is nothing here to mint.
+    pub fn transparently(mut self, form: Transparent<P>) -> Self {
+        let result = self.semantic_relation();
+        self.continuations.push(Step {
+            form: form.into_form(),
+            result,
+        });
+        self
+    }
+
+    /// RESTATE WHAT THE OUTERMOST NODE PUBLISHES, and only the authority
+    /// may.
+    ///
+    /// One operation reaches here: an authored alias, which derives an
+    /// export OUT OF what the node already publishes and puts the export
+    /// where it stood. The form does not move and the caller never holds
+    /// either relation, so this is not a road for re-choosing a result —
+    /// it is the one act that replaces a result with a relation derived
+    /// from it.
+    pub(crate) fn restate_outermost(
+        &mut self,
+        authority: &crate::relation::builder::SemanticConstruction,
+        result: crate::relation::SemanticRelation,
+    ) {
+        let _ = authority;
+        match self.continuations.last_mut() {
+            Some(step) => step.result = result,
+            None => self.head.result = result,
+        }
+    }
+
+    /// RESTATE ONE NODE, and only the authority may.
+    ///
+    /// An authored alias EXPORTS what a node publishes under a new
+    /// answering name: the node stays where it is, its payload is either
+    /// unchanged or rebuilt in its interior, and what it publishes becomes
+    /// a relation derived FROM what it published. The caller holds neither
+    /// relation — the authority derives the export from the node's own
+    /// result and writes it back here.
+    pub(crate) fn restate_step(
+        &mut self,
+        _authority: &crate::relation::builder::SemanticConstruction,
+        at: usize,
+        form: Option<Continuation<P>>,
+        result: Option<crate::relation::SemanticRelation>,
+    ) {
+        let step = &mut self.continuations[at];
+        if let Some(form) = form {
+            step.form = form;
+        }
+        if let Some(result) = result {
+            step.result = result;
+        }
+    }
+
+    /// The same act at the head.
+    pub(crate) fn restate_head(
+        &mut self,
+        _authority: &crate::relation::builder::SemanticConstruction,
+        form: Option<GroundForm<P>>,
+        result: Option<crate::relation::SemanticRelation>,
+    ) {
+        if let Some(form) = form {
+            self.head.form = form;
+        }
+        if let Some(result) = result {
+            self.head.result = result;
+        }
+    }
+
+    /// LAND A STEP BACK, and only the authority may.
+    ///
+    /// The authority checks what a caller could get wrong — that the
+    /// step's relation DESCENDS from the operand it is landing on — and
+    /// that check needs the construction record, so the road is
+    /// [`crate::relation::SemanticBuilder::reland`] and this is its
+    /// landing.
+    pub(crate) fn landed(
+        mut self,
+        _authority: &crate::relation::builder::SemanticConstruction,
+        step: Step<P>,
+    ) -> Self {
+        self.continuations.push(step);
+        self
+    }
+
+    /// EXTEND A BOUND CHAIN, and only the authority may.
+    ///
+    /// The token is unforgeable outside semantic construction, so the one
+    /// road that appends a bound step is the road that just derived it over
+    /// THIS prefix.
+    pub(crate) fn then_derived(
+        mut self,
+        _authority: &crate::relation::builder::SemanticConstruction,
+        step: Step<P>,
+    ) -> Self {
+        self.continuations.push(step);
+        self
+    }
+}
+
+impl<P: Phase> Chain<P> {
+    /// A chain that is nothing but its head.
+    ///
+    /// Safe in every phase: the head carries its own result, so there is no
+    /// second thing here to pair it with.
+    pub fn ground(head: Grelex<P>) -> Self {
+        Chain {
+            head,
+            continuations: Vec::new(),
+        }
+    }
+
+    /// The ground expression this chain stands on.
+    pub fn head(&self) -> &Grelex<P> {
+        &self.head
+    }
+
+    /// The steps consuming it, in authored order.
+    pub fn continuations(&self) -> &[Step<P>] {
+        &self.continuations
+    }
+
+    /// The head and its steps, by value, for a walk that owns the tree.
+    pub fn into_parts(self) -> (Grelex<P>, Vec<Step<P>>) {
+        (self.head, self.continuations)
+    }
+
+    /// REBUILD THE OPERANDS STANDING INSIDE THIS CHAIN, keeping what every
+    /// surviving node publishes.
+    ///
+    /// THE ONE payload-preserving rewrite, and what it reaches is exactly
+    /// the relational operands NESTED inside the nodes — a member's right
+    /// arm, a bag step's arm, a derived table's subquery. It is handed the
+    /// operand and nothing else, so there is no borrow here through which a
+    /// payload could be replaced while the relation it publishes stays.
+    /// Every surviving node keeps the result it already had because nothing
+    /// could have moved what it means.
+    ///
+    /// The one structural move is [`Standing::Drop`], and it refuses a step
+    /// that publishes a heading of its own: dropping one of those would
+    /// leave every later node claiming a relation built over an operand
+    /// that is no longer there.
+    pub fn rebuilding(
+        self,
+        mut nested: impl FnMut(Chain<P>) -> crate::error::Result<Chain<P>>,
+        mut standing: impl FnMut(usize, &Continuation<P>) -> crate::error::Result<Standing>,
+    ) -> crate::error::Result<Self> {
+        let Chain {
+            head,
+            continuations,
+        } = self;
+        let head = head.rebuilding_nested(&mut nested)?;
+        let mut kept = Vec::with_capacity(continuations.len());
+        for (at, step) in continuations.into_iter().enumerate() {
+            match standing(at, &step.form)? {
+                Standing::Keep => kept.push(step.rebuilding_arm(&mut nested)?),
+                Standing::Drop if step.form.is_transparent() => {}
+                Standing::Drop => {
+                    return Err(crate::error::DelightQLError::transformation_error(
+                        "a step publishing a heading of its own cannot be dropped from a chain",
+                        "chain",
+                    ))
+                }
+            }
+        }
+        Ok(Chain {
+            head,
+            continuations: kept,
         })
+    }
+
+    /// THE CORRELATION ON ONE BAG STEP, for the pass that decides which
+    /// earlier arm an operand is filtered by.
+    ///
+    /// A correlation constrains the PAIRING, not the heading: the arms
+    /// contribute exactly what they contributed, so the step publishes what
+    /// it published and this borrow cannot move it. `None` says the step at
+    /// that position is not a bag operation, which is a refusal for whoever
+    /// wanted to correlate it.
+    pub fn bag_correlation_at(&mut self, at: usize) -> Option<&mut P::Corr> {
+        match &mut self.continuations.get_mut(at)?.form {
+            Continuation::BagOp { correlation, .. } => Some(correlation),
+            _ => None,
+        }
+    }
+
+    /// MARK THE HEAD AN OUTER-JOIN OPERAND. See [`Relation::mark_outer`]:
+    /// orientation is how the head is joined, never what it publishes, so
+    /// this reaches one field and the result is untouched.
+    pub fn mark_head_outer(&mut self, orientation: bool) {
+        if let GroundForm::Reference(relation) = &mut self.head.form {
+            relation.mark_outer(orientation);
+        }
+    }
+
+    /// Which set operation the step at that position is. `None` says it is
+    /// not a set operation at all.
+    pub fn bag_operator_at(&self, at: usize) -> Option<SetOperator> {
+        match &self.continuations.get(at)?.form {
+            Continuation::BagOp { operator, .. } => Some(*operator),
+            _ => None,
+        }
+    }
+
+    /// TAKE ONE TRANSPARENT STEP OUT OF THE MIDDLE.
+    ///
+    /// A rewrite lifts a bound or an ordering out to re-express it as a
+    /// window: what stood above it publishes exactly what it published,
+    /// because the step it stood on created no occurrence. A step that
+    /// publishes a heading of its own REFUSES — taking that one out would
+    /// leave every later node claiming a relation built over an operand
+    /// that is no longer there.
+    pub fn without(mut self, at: usize) -> crate::error::Result<Self> {
+        if !self.continuations[at].form.is_transparent() {
+            return Err(crate::error::DelightQLError::transformation_error(
+                "a step publishing a heading of its own cannot be taken out of a chain",
+                "chain",
+            ));
+        }
+        self.continuations.remove(at);
+        Ok(self)
+    }
+
+    /// AN ORDERING SURRENDERS ITS BOUND. The window rewrite performs the
+    /// membership act by ranking instead: the ordering's node stays — it
+    /// republishes its operand through the stage export, and everything
+    /// above it stands on the ports that export minted — and its bound
+    /// comes off to be spent as the rank filter. The relation the node
+    /// publishes is unchanged: the bound was never part of the derivation,
+    /// only the row-bounded fact stamped on its result. Answers `None` for
+    /// any step that is not an ordering carrying a bound, and changes
+    /// nothing then.
+    pub fn surrender_bound(&mut self, at: usize) -> Option<TupleOrdinalClause> {
+        match &mut self.continuations[at].form {
+            Continuation::Structural(StructuralStep {
+                form: StructuralForm::Ordering { bound, .. },
+                ..
+            }) => bound.take(),
+            _ => None,
+        }
+    }
+
+    /// THE OPERAND A STEP CONSUMES: this chain's head and its first `at`
+    /// steps.
+    ///
+    /// A PREFIX OF ONE CHAIN. Every node in it publishes exactly what it
+    /// published, because it is the same node standing on the same
+    /// operand; nothing here relates two chains.
+    pub fn prefix(&self, at: usize) -> Self {
+        Chain {
+            head: self.head.clone(),
+            continuations: self.continuations[..at].to_vec(),
+        }
+    }
+
+    /// CUT THE CHAIN BACK TO ITS FIRST `at` STEPS.
+    ///
+    /// Dropping a SUFFIX touches nothing that survives: every remaining
+    /// node stands on the same operand it stood on and publishes what it
+    /// published.
+    pub fn truncated(mut self, at: usize) -> Self {
+        self.continuations.truncate(at);
+        self
+    }
+
+    /// TAKE A TRAILING SUFFIX OFF, deciding step by step where it stops.
+    ///
+    /// `admit` says whether a step belongs to the suffix; the first
+    /// refusal ends it and that step stays where it is. The head's own
+    /// access is never taken.
+    pub fn peel_while(mut self, mut admit: impl FnMut(&Continuation<P>) -> bool) -> Run<P> {
+        let mut steps = Vec::new();
+        while self.has_steps()
+            && self
+                .continuations
+                .last()
+                .is_some_and(|step| admit(&step.form))
+        {
+            steps.push(self.continuations.pop().expect("just matched a step"));
+        }
+        steps.reverse();
+        Run {
+            prefix: self,
+            steps,
+        }
+    }
+
+    /// TAKE THE TRAILING RUN OFF, with the operand it shapes.
+    ///
+    /// `Err` hands the chain back untouched: there is no run. The
+    /// partition is [`Chain::pop_run_step`]'s, so membership is decided in
+    /// one place and this cannot disagree with it.
+    pub fn peel_run(mut self) -> std::result::Result<Run<P>, Chain<P>> {
+        let mut steps = Vec::new();
+        while let Some(step) = self.pop_run_step() {
+            steps.push(step.into_step());
+        }
+        if steps.is_empty() {
+            return Err(self);
+        }
+        steps.reverse();
+        Ok(Run {
+            prefix: self,
+            steps,
+        })
+    }
+
+    /// TAKE THE TRAILING TRANSPARENT STEPS OFF, as the forms they are.
+    ///
+    /// No step comes out — only the payloads — so what a caller holds
+    /// cannot be put back carrying an old result. Putting them back is
+    /// [`Chain::transparently`], which restates the relation from the
+    /// prefix they land on. A step past `from` that publishes a heading of
+    /// its own REFUSES: it is not a form this road may move.
+    pub fn split_transparent_tail(
+        &mut self,
+        from: usize,
+    ) -> crate::error::Result<Vec<Transparent<P>>> {
+        self.continuations
+            .split_off(from)
+            .into_iter()
+            .map(|step| {
+                Transparent::of(step.form).map_err(|_| {
+                    crate::error::DelightQLError::transformation_error(
+                        "a step publishing a heading of its own cannot be lifted off a chain",
+                        "chain",
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// SPLIT THE TRAILING BAG RUN OFF, as the steps it is made of.
+    ///
+    /// What is left is arm 0 — the chain the run stands on. The run is
+    /// named by a [`BagRun`], which only [`Chain::trailing_bag_run`]
+    /// produces, so this cuts where the partition says and nowhere else.
+    /// Nothing goes back on: a run lowers as ONE operation over its arms.
+    pub fn split_run(&mut self, run: BagRun) -> Vec<Step<P>> {
+        self.continuations.split_off(run.base)
+    }
+
+    /// TAKE THE CHAIN APART AT ITS OUTERMOST STEP.
+    ///
+    /// The operand and the step come back as ONE value, so a walk that
+    /// looks at what the outermost step does cannot end up holding the step
+    /// beside somebody else's chain. `Err` hands the chain back untouched:
+    /// nothing stands on the head's own read.
+    pub fn peel(mut self) -> std::result::Result<Peel<P>, Chain<P>> {
+        match self.pop_step() {
+            Some(last) => Ok(Peel { prefix: self, last }),
+            None => Err(self),
+        }
+    }
+
+    /// PUT BACK STEPS THIS CHAIN GAVE UP.
+    ///
+    /// The exact inverse of taking them off, and the ONLY road that
+    /// appends a bound step without deriving one. It is not an attachment
+    /// road: what goes back on is what came off, in order, over the prefix
+    /// it came off — nothing here pairs a step with a relation it did not
+    /// already publish.
+    ///
+    /// Visible to the AST carriers alone, so the compression a
+    /// `ScalarizedRelation` lifts out can be put back where it was and
+    /// nowhere else.
+    pub(super) fn rejoin(mut self, taken: Vec<Step<P>>) -> Self {
+        self.continuations.extend(taken);
+        self
+    }
+
+    /// The other half of that inverse: the steps, mutably, for the carrier
+    /// that lifts its own compression off. Same narrow visibility.
+    pub(super) fn steps_mut(&mut self) -> &mut Vec<Step<P>> {
+        &mut self.continuations
+    }
+
+    /// CROSS A PHASE BOUNDARY.
+    ///
+    /// Each node goes through its OWN fold — the head through the head's,
+    /// each step through the step's — and every result goes through the
+    /// phases' scope fold. There is no argument here for a relation and no
+    /// reassembly from loose parts, so a walk cannot land one node's
+    /// payload on another node's result.
+    #[stacksafe::stacksafe]
+    pub fn folded<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
+        self,
+        walk: &mut F,
+    ) -> crate::error::Result<Chain<Q>> {
+        Ok(Chain {
+            head: walk.transform_grelex(self.head)?,
+            continuations: self
+                .continuations
+                .into_iter()
+                .map(|step| walk.transform_step(step))
+                .collect::<crate::error::Result<Vec<_>>>()?,
+        })
+    }
+
+    /// The forms of this chain's steps past the head's own read, borrowed
+    /// for a pattern match over the run.
+    pub fn step_forms(&self) -> Vec<&Continuation<P>> {
+        self.steps().iter().map(Step::form).collect()
+    }
+
+    /// The forms of this chain's steps, for a walk that reads what happened
+    /// and not what each step publishes.
+    pub fn forms(&self) -> impl DoubleEndedIterator<Item = &Continuation<P>> {
+        self.continuations.iter().map(Step::form)
     }
 
     /// The trailing run of bag steps this chain ends in, when they carry one
@@ -120,14 +724,14 @@ impl<P: Phase> Chain<P> {
     /// the lowering that reads one ask HERE, so the two cannot disagree
     /// about which arm a number names.
     pub fn trailing_bag_run(&self) -> Option<BagRun> {
-        let operator = match self.continuations.last()? {
+        let operator = match self.continuations.last()?.form() {
             Continuation::BagOp { operator, .. } => *operator,
             _ => return None,
         };
         let mut base = self.continuations.len() - 1;
         if operator.accumulates_arm_rows() {
             while base > 0 {
-                match &self.continuations[base - 1] {
+                match self.continuations[base - 1].form() {
                     Continuation::BagOp {
                         operator: earlier, ..
                     } if *earlier == operator => base -= 1,
@@ -151,8 +755,7 @@ impl<P: Phase> Chain<P> {
     /// predicate segment is what turned "which arms does this relate" into
     /// a classification guess.
     pub fn stands_on_bag_step(&self) -> bool {
-        self.continuations
-            .iter()
+        self.forms()
             .rev()
             .find_map(|continuation| match continuation {
                 Continuation::BagOp { .. } => Some(true),
@@ -185,7 +788,7 @@ impl<P: Phase> Chain<P> {
         if !self.head_takes_an_access() {
             return None;
         }
-        match self.continuations.first() {
+        match self.continuations.first().map(Step::form) {
             Some(Continuation::Access { access, .. }) => Some(access),
             _ => None,
         }
@@ -194,9 +797,9 @@ impl<P: Phase> Chain<P> {
     /// Whether the head is a MENTION — the two relational forms whose read a
     /// leading access parameterizes.
     pub fn head_takes_an_access(&self) -> bool {
-        match &self.head {
-            Grelex::Reference(relation) => relation.takes_an_access(),
-            Grelex::Literal(_) => false,
+        match self.head.form() {
+            GroundForm::Reference(relation) => relation.takes_an_access(),
+            GroundForm::Literal(_) => false,
         }
     }
 
@@ -213,7 +816,7 @@ impl<P: Phase> Chain<P> {
     /// An outside-in walk reads these; the head and its access are the walk's
     /// base, because separating a mention from what its parens asked for
     /// leaves a read nobody parameterized.
-    pub fn steps(&self) -> &[Continuation<P>] {
+    pub fn steps(&self) -> &[Step<P>] {
         &self.continuations[self.head_span()..]
     }
 
@@ -224,12 +827,22 @@ impl<P: Phase> Chain<P> {
 
     /// The outermost step, taken off. `None` leaves the chain at its base:
     /// the head and the access its own read consumes.
-    pub fn pop_step(&mut self) -> Option<Continuation<P>> {
+    pub fn pop_step(&mut self) -> Option<Step<P>> {
         self.has_steps().then(|| {
             self.continuations
                 .pop()
                 .expect("a chain with steps has a last continuation")
         })
+    }
+
+    /// Take the outermost CONTINUATION off — the head's own access
+    /// included.
+    ///
+    /// [`Chain::pop_step`] stops at the read the chain stands on; this
+    /// does not. A mutation terminal's RECEIPT is the head's own access,
+    /// so the road that takes a terminal apart has to be able to reach it.
+    pub fn pop_continuation(&mut self) -> Option<Step<P>> {
+        self.continuations.pop()
     }
 
     /// THE ONE RUN PARTITION, exercised in place: take the chain's outermost
@@ -244,20 +857,20 @@ impl<P: Phase> Chain<P> {
     /// the exact typed family, never the broad continuation.
     pub fn pop_run_step(&mut self) -> Option<RunStep<P>> {
         let step = self.pop_step()?;
-        match step {
-            Continuation::Pipe {
-                operator,
-                named,
-                cpr_schema,
-            } => Some(RunStep::Pipe {
-                operator,
-                named,
-                cpr_schema,
+        let Step { form, result } = step;
+        match form {
+            Continuation::Pipe { operator, named } => Some(RunStep {
+                form: RunForm::Pipe { operator, named },
+                result,
             }),
-            Continuation::Access { access, cpr_schema } => {
-                Some(RunStep::Access { access, cpr_schema })
-            }
-            Continuation::Structural(step) => Some(RunStep::Structural(step)),
+            Continuation::Access { access, named } => Some(RunStep {
+                form: RunForm::Access { access, named },
+                result,
+            }),
+            Continuation::Structural(structural) => Some(RunStep {
+                form: RunForm::Structural(structural),
+                result,
+            }),
             other @ (Continuation::Restrict { .. }
             | Continuation::Correlate { .. }
             | Continuation::Bound { .. }
@@ -265,7 +878,10 @@ impl<P: Phase> Chain<P> {
             | Continuation::Member { .. }
             | Continuation::BagOp { .. }
             | Continuation::ErJoin(_)) => {
-                self.continuations.push(other);
+                self.continuations.push(Step {
+                    form: other,
+                    result,
+                });
                 None
             }
         }
@@ -277,7 +893,7 @@ impl<P: Phase> Chain<P> {
     /// The two travel together by construction, so a walk that takes a chain
     /// apart cannot leave a mention holding no access or an access holding
     /// no mention.
-    pub fn split_read(mut self) -> (Chain<P>, Vec<Continuation<P>>) {
+    pub fn split_read(mut self) -> (Chain<P>, Vec<Step<P>>) {
         let steps = self.continuations.split_off(self.head_span());
         (self, steps)
     }
@@ -287,13 +903,12 @@ impl<P: Phase> Chain<P> {
     #[allow(clippy::type_complexity)]
     pub fn split_head_access(
         mut self,
-    ) -> (
-        Grelex<P>,
-        Option<super::access::Access<P>>,
-        Vec<Continuation<P>>,
-    ) {
+    ) -> (Grelex<P>, Option<super::access::Access<P>>, Vec<Step<P>>) {
+        // THE READ'S OWN ACCESS CARRIES NO NAME: the name of a read is the
+        // mention's, so the leading access is taken as the bare shape it
+        // is, and a name standing on it would be a normalizer defect.
         let access = match self.head_span() {
-            1 => match self.continuations.remove(0) {
+            1 => match self.continuations.remove(0).into_form() {
                 Continuation::Access { access, .. } => Some(access),
                 _ => unreachable!("head_span counted an access"),
             },
@@ -309,16 +924,16 @@ impl<P: Phase> Chain<P> {
     /// continuation. A caller that also needs what the read asked for takes
     /// [`Chain::head_access`] beside this.
     pub fn as_read_relation(&self) -> Option<&Relation<P>> {
-        match (&self.head, self.has_steps()) {
-            (Grelex::Reference(relation), false) => Some(relation),
+        match (self.head.form(), self.has_steps()) {
+            (GroundForm::Reference(relation), false) => Some(relation),
             _ => None,
         }
     }
 
     /// The relation this chain names when nothing has consumed it yet.
     pub fn as_bare_relation(&self) -> Option<&Relation<P>> {
-        match (&self.head, self.continuations.is_empty()) {
-            (Grelex::Reference(relation), true) => Some(relation),
+        match (self.head.form(), self.continuations.is_empty()) {
+            (GroundForm::Reference(relation), true) => Some(relation),
             _ => None,
         }
     }
@@ -328,21 +943,10 @@ impl<P: Phase> Chain<P> {
         self.continuations.is_empty().then_some(self.head)
     }
 
-    /// The bare relation, by value.
-    pub fn into_bare_relation(self) -> Result<Relation<P>, Self> {
-        match (self.head, self.continuations.is_empty()) {
-            (Grelex::Reference(relation), true) => Ok(relation),
-            (head, _) => Err(Chain {
-                head,
-                continuations: self.continuations,
-            }),
-        }
-    }
-
     /// The last continuation, and the chain that produces its operand.
     /// This is the fold read backwards — the shape a consumer needs when it
     /// asks what produced the relation it is looking at.
-    pub fn split_last(&self) -> Option<(&Continuation<P>, ChainPrefix<'_, P>)> {
+    pub fn split_last(&self) -> Option<(&Step<P>, ChainPrefix<'_, P>)> {
         let (last, rest) = self.continuations.split_last()?;
         Some((
             last,
@@ -351,6 +955,357 @@ impl<P: Phase> Chain<P> {
                 continuations: rest,
             },
         ))
+    }
+}
+
+impl<P: Phase<Scope = crate::relation::SemanticRelation>> Chain<P> {
+    /// The semantic result this tree inherently publishes.
+    pub(crate) fn semantic_relation(&self) -> crate::relation::SemanticRelation {
+        match self.continuations.last() {
+            Some(step) => *step.result(),
+            None => *self.head.result(),
+        }
+    }
+}
+
+/// ONE STEP OF A CHAIN: what it does, and the relation it publishes.
+///
+/// PRIVATE FIELDS, and no setter. Before resolution there is nothing to
+/// pair — the phase has no relation — so [`Step::authored`] builds one from
+/// the form alone. After it the only road is the semantic authority's, and
+/// that road derives the relation from THIS form in one act: a caller never
+/// holds a loose relation, so it has nothing to attach to another node and
+/// nothing to swap in afterwards.
+///
+/// The result lives HERE rather than in each continuation variant because
+/// an enum variant's fields are as public as the enum: a `result` field on
+/// `Continuation::Pipe` is a construction road no visibility can close.
+#[derive(Debug, PartialEq, ToLispy)]
+#[lispy("step")]
+pub struct Step<P: Phase = Unresolved> {
+    #[lispy("form")]
+    form: Continuation<P>,
+    #[lispy("result")]
+    result: P::Scope,
+}
+
+impl<P: Phase> Step<P> {
+    /// What this step does.
+    pub fn form(&self) -> &Continuation<P> {
+        &self.form
+    }
+
+    pub fn into_form(self) -> Continuation<P> {
+        self.form
+    }
+
+    /// What this step publishes.
+    pub fn result(&self) -> &P::Scope {
+        &self.result
+    }
+}
+
+impl<P: Phase<Scope = ()>> Step<P> {
+    /// The authored step. Nothing is paired here — the phase has no
+    /// relation to pair — so the form alone builds it.
+    pub fn authored(form: Continuation<P>) -> Self {
+        Step { form, result: () }
+    }
+
+    /// The payload, for an authored walk that rewrites in place.
+    ///
+    /// AUTHORED ONLY. A bound step's payload is what its relation was
+    /// derived FROM, so a road that swaps the payload while the result
+    /// stays is the mismatch this cut exists to remove: the bound phase
+    /// takes the form off and lands the new one through the authority,
+    /// which derives what the step publishes over the prefix it is landing
+    /// on.
+    pub fn form_mut(&mut self) -> &mut Continuation<P> {
+        &mut self.form
+    }
+
+    /// Rewrite an authored payload by value.
+    pub fn rewrite_form(
+        self,
+        rewrite: impl FnOnce(Continuation<P>) -> crate::error::Result<Continuation<P>>,
+    ) -> crate::error::Result<Self> {
+        Ok(Step {
+            form: rewrite(self.form)?,
+            result: (),
+        })
+    }
+}
+
+impl<P: Phase<Scope = crate::relation::SemanticRelation>> Step<P> {
+    /// THE ONE BOUND-PHASE CONSTRUCTOR, and it is the authority's.
+    ///
+    /// The token is unforgeable outside the semantic construction module,
+    /// so this cannot be reached with a relation somebody chose.
+    pub(crate) fn derived(
+        _authority: &crate::relation::builder::SemanticConstruction,
+        form: Continuation<P>,
+        result: crate::relation::SemanticRelation,
+    ) -> Self {
+        Step { form, result }
+    }
+}
+
+impl<P: Phase> Step<P> {
+    /// REBUILD THE RELATIONAL ARM STANDING INSIDE THIS STEP.
+    ///
+    /// A member's right arm and a bag step's arm are the only chains a step
+    /// holds. The rewrite is handed the ARM and answers with an arm; the
+    /// step's own operation is rebuilt around it HERE, so there is nothing
+    /// a caller could hand back that changes what the step means. A join
+    /// still concatenates two headings and a set still merges its arms
+    /// through the matrix it was built with, and the step keeps the result
+    /// it has because nothing could have moved it.
+    ///
+    /// A step holding no arm stands unchanged. A change that DOES move what
+    /// a step publishes goes through the authority, which derives the
+    /// result over the operand the step lands on.
+    pub fn rebuilding_arm(
+        self,
+        arm: impl FnOnce(Chain<P>) -> crate::error::Result<Chain<P>>,
+    ) -> crate::error::Result<Self> {
+        let Step { form, result } = self;
+        let form = match form {
+            Continuation::Member {
+                rhs,
+                correlation,
+                join_type,
+            } => Continuation::Member {
+                rhs: arm(rhs)?,
+                correlation,
+                join_type,
+            },
+            Continuation::BagOp {
+                operator,
+                arm: standing,
+                correlation,
+            } => Continuation::BagOp {
+                operator,
+                arm: arm(standing)?,
+                correlation,
+            },
+            held @ (Continuation::Access { .. }
+            | Continuation::Restrict { .. }
+            | Continuation::Bound { .. }
+            | Continuation::Destructure { .. }
+            | Continuation::Correlate { .. }
+            | Continuation::Pipe { .. }
+            | Continuation::ErJoin(_)
+            | Continuation::Structural(_)) => held,
+        };
+        Ok(Step { form, result })
+    }
+
+    /// Cross a phase boundary.
+    ///
+    /// The new form is this step's own, transformed by the walk; what it
+    /// publishes goes through the SCOPE FOLD the two phases define, which
+    /// is the same door every phase-selected payload uses and which refuses
+    /// where no relation can be carried. There is no argument here for a
+    /// relation, so a fold cannot be the place a step acquires a different
+    /// result.
+    pub fn folded<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
+        self,
+        walk: &mut F,
+        form: Continuation<Q>,
+    ) -> crate::error::Result<Step<Q>> {
+        Ok(Step {
+            form,
+            result: walk.fold_scope(self.result)?,
+        })
+    }
+}
+
+// Manual Clone for the same reason `Chain`'s is manual.
+impl<P: Phase> Clone for Step<P> {
+    #[stacksafe::stacksafe]
+    fn clone(&self) -> Self {
+        Step {
+            form: self.form.clone(),
+            result: self.result.clone(),
+        }
+    }
+}
+
+/// A CHAIN TAKEN APART AT ITS OUTERMOST STEP: the operand, and the step
+/// that consumes it.
+///
+/// ONE value. There is no accessor that hands the step out beside the
+/// prefix, so a walk cannot carry a bound step to a chain it was not
+/// derived over — the two roads out are putting it back exactly
+/// ([`Peel::rejoin`]) and taking it apart into halves that carry no
+/// pairing ([`Peel::take_apart`]).
+pub struct Peel<P: Phase> {
+    prefix: Chain<P>,
+    last: Step<P>,
+}
+
+impl<P: Phase> Peel<P> {
+    /// The operand the outermost step consumes.
+    pub fn prefix(&self) -> &Chain<P> {
+        &self.prefix
+    }
+
+    /// What the outermost step does, and what it publishes.
+    pub fn last(&self) -> &Step<P> {
+        &self.last
+    }
+
+    /// Put it back, exactly. Not an attachment: what goes on is what came
+    /// off, over the prefix it came off.
+    pub fn rejoin(mut self) -> Chain<P> {
+        self.prefix.continuations.push(self.last);
+        self.prefix
+    }
+
+    /// The operand, and the NODE that consumes it — two values, and the
+    /// step is still one of them. A step handed out here carries what it
+    /// publishes with it, so there is no loose relation to pair with
+    /// another payload; a consumer reads the pair and a rebuild goes
+    /// through the authority.
+    pub fn split(self) -> (Chain<P>, Step<P>) {
+        (self.prefix, self.last)
+    }
+
+    /// THE OPERAND AND A TRANSPARENT STEP'S OWN PAYLOAD.
+    ///
+    /// A restriction, a bound and a correlation publish their operand's
+    /// relation by law, so what comes off here is the payload ALONE — there
+    /// is no relation to hand back, and the road that puts one on
+    /// ([`Chain::transparently`]) restates the result from the prefix it
+    /// lands on. `Err` says the step publishes a heading of its own, which
+    /// is a refusal for whoever wanted to move it.
+    #[allow(clippy::result_large_err)]
+    pub fn transparent(self) -> std::result::Result<(Chain<P>, Transparent<P>), Self> {
+        match Transparent::of(self.last.form) {
+            Ok(payload) => Ok((self.prefix, payload)),
+            Err(form) => Err(Peel {
+                prefix: self.prefix,
+                last: Step {
+                    form,
+                    result: self.last.result,
+                },
+            }),
+        }
+    }
+
+    /// REBUILD THE OPERAND, AND THE ARM STANDING INSIDE THE STEP.
+    ///
+    /// A member's right arm and a bag step's arm are operands standing
+    /// INSIDE one node. The rebuild is handed each operand ALONE — the
+    /// step is rebuilt around its arm rather than replaced — so the join still
+    /// concatenates two headings and the set still merges its arms through
+    /// the matrix it was built with, and the step keeps the result it had
+    /// because nothing could have moved it. The two halves land back at the
+    /// node they occupied and neither is ever loose.
+    pub fn rebuilding_arms(
+        self,
+        prefix: impl FnOnce(Chain<P>) -> crate::error::Result<Chain<P>>,
+        arm: impl FnOnce(Chain<P>) -> crate::error::Result<Chain<P>>,
+    ) -> crate::error::Result<Chain<P>> {
+        let Peel {
+            prefix: operand,
+            last,
+        } = self;
+        let last = last.rebuilding_arm(arm)?;
+        let mut landed = prefix(operand)?;
+        landed.continuations.push(last);
+        Ok(landed)
+    }
+
+    /// CROSS A PHASE WITHOUT TAKING THE NODE APART.
+    ///
+    /// `cross` refines the operand and the payload; the step's own result
+    /// crosses through the phases' SCOPE FOLD, which is not an argument
+    /// here and cannot be one. The two halves land back together at the
+    /// node they occupied, so at no point does a crossed step exist beside
+    /// a chain it did not come off.
+    pub fn crossing<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
+        self,
+        walk: &mut F,
+        cross: impl FnOnce(
+            &mut F,
+            Chain<P>,
+            Continuation<P>,
+            &P::Scope,
+        ) -> crate::error::Result<(Chain<Q>, Continuation<Q>)>,
+    ) -> crate::error::Result<Chain<Q>> {
+        let Peel { prefix, last } = self;
+        let Step { form, result } = last;
+        let (mut landed, form) = cross(walk, prefix, form, &result)?;
+        landed.continuations.push(Step {
+            form,
+            result: walk.fold_scope(result)?,
+        });
+        Ok(landed)
+    }
+}
+
+/// A CHAIN TAKEN APART AT ITS TRAILING RUN: the operand, and the run's
+/// steps in authored order.
+///
+/// ONE value, for the reason [`Peel`] is one. The run is the pipe stages,
+/// dimension accesses and structural steps standing at the end — the
+/// partition [`Chain::pop_run_step`] states — and it goes back on in the
+/// order it came off or crosses a phase whole.
+pub struct Run<P: Phase> {
+    prefix: Chain<P>,
+    steps: Vec<Step<P>>,
+}
+
+impl<P: Phase> Run<P> {
+    /// The relation the run shapes.
+    pub fn prefix(&self) -> &Chain<P> {
+        &self.prefix
+    }
+
+    /// The run's steps, innermost first.
+    pub fn steps(&self) -> &[Step<P>] {
+        &self.steps
+    }
+
+    /// The run's steps, by value, for a pass that lands each one back
+    /// through [`Chain::relanded`].
+    pub fn into_parts(self) -> (Chain<P>, Vec<Step<P>>) {
+        (self.prefix, self.steps)
+    }
+
+    /// Put the run back, exactly.
+    pub fn rejoin(mut self) -> Chain<P> {
+        self.prefix.continuations.extend(self.steps);
+        self.prefix
+    }
+
+    /// CROSS A PHASE WITH THE RUN STILL ON.
+    ///
+    /// The operand crosses by `prefix` and each payload by `form`; every
+    /// step's result crosses through the phases' SCOPE FOLD, which is not
+    /// an argument. The run lands back in its own order on the chain its
+    /// operand became.
+    pub fn crossing<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
+        self,
+        walk: &mut F,
+        prefix: impl FnOnce(&mut F, Chain<P>) -> crate::error::Result<Chain<Q>>,
+        mut form: impl FnMut(&mut F, Continuation<P>) -> crate::error::Result<Continuation<Q>>,
+    ) -> crate::error::Result<Chain<Q>> {
+        let Run {
+            prefix: operand,
+            steps,
+        } = self;
+        let mut landed = prefix(walk, operand)?;
+        for step in steps {
+            let Step { form: was, result } = step;
+            let now = form(walk, was)?;
+            landed.continuations.push(Step {
+                form: now,
+                result: walk.fold_scope(result)?,
+            });
+        }
+        Ok(landed)
     }
 }
 
@@ -367,12 +1322,6 @@ pub struct BagRun {
 }
 
 impl BagRun {
-    /// The arm this run's `k`th step owns, counting arm 0 as the chain the
-    /// run stands on.
-    pub fn arm_of_step(&self, step: usize) -> ArmIx {
-        ArmIx::from_raw((step + 1) as u16)
-    }
-
     /// The number of operands the run combines, arm 0 included.
     pub fn arms(&self) -> usize {
         self.steps + 1
@@ -396,11 +1345,32 @@ pub enum SpineStep<'a, P: Phase> {
     Structural(&'a StructuralForm<P>),
 }
 
+impl<'a, P: Phase> SpineStep<'a, P> {
+    /// The row bound this step carries, if it bounds: the arbitrary bound's
+    /// own clause, or the one an ordering consumed. ONE ANSWER for both
+    /// spellings, so a reader asking "is the run bounded here" cannot see
+    /// the bare bound and miss the ordered one.
+    pub fn bound(&self) -> Option<&'a TupleOrdinalClause> {
+        match self {
+            SpineStep::Bound(bound) => Some(bound),
+            SpineStep::Structural(StructuralForm::Ordering {
+                bound: Some(bound), ..
+            }) => Some(bound),
+            SpineStep::Structural(_)
+            | SpineStep::Restrict(_)
+            | SpineStep::Correlate(_)
+            | SpineStep::Destructure
+            | SpineStep::Pipe(_)
+            | SpineStep::Access(_) => None,
+        }
+    }
+}
+
 /// Reads a chain's shaping continuations, outermost first, and stops at the
 /// first continuation that brings another relation in (a member, a bag arm,
 /// an ER edge).
 pub struct SourceSpine<'a, P: Phase> {
-    rest: &'a [Continuation<P>],
+    rest: &'a [Step<P>],
 }
 
 impl<'a, P: Phase> Iterator for SourceSpine<'a, P> {
@@ -408,7 +1378,7 @@ impl<'a, P: Phase> Iterator for SourceSpine<'a, P> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let (last, rest) = self.rest.split_last()?;
-        let step = match last {
+        let step = match last.form() {
             Continuation::Access { access, .. } => SpineStep::Access(access),
             Continuation::Restrict { condition, .. } => SpineStep::Restrict(condition),
             Continuation::Correlate { whole, .. } => SpineStep::Correlate(whole),
@@ -459,7 +1429,7 @@ impl<P: Phase> Chain<P> {
         let Some((last, prefix)) = self.split_last() else {
             return leaf(self);
         };
-        match last {
+        match last.form() {
             Continuation::Member { rhs, .. } => rhs.fold_tail(leaf, set_fold),
             Continuation::BagOp { arm, .. } => set_fold(vec![
                 prefix.to_chain().fold_tail(leaf, set_fold),
@@ -480,7 +1450,7 @@ impl<P: Phase> Chain<P> {
 /// A borrowed view of a chain's prefix: the operand a continuation consumes.
 pub struct ChainPrefix<'a, P: Phase> {
     pub head: &'a Grelex<P>,
-    pub continuations: &'a [Continuation<P>],
+    pub continuations: &'a [Step<P>],
 }
 
 impl<'a, P: Phase> ChainPrefix<'a, P> {
@@ -492,14 +1462,144 @@ impl<'a, P: Phase> ChainPrefix<'a, P> {
     }
 }
 
-/// §2.2 — the ground relational expression: what a chain starts from.
+/// §2.2 — THE CHAIN'S HEAD: the ground relational expression, and the
+/// relation it publishes.
 ///
+/// Private fields, exactly as a [`Step`]'s are, and for the same reason: a
+/// relation attachable to any valid head is a relation attachable to the
+/// wrong one. Before resolution the pairing is empty and
+/// [`Grelex::authored`] builds one from the form; after it, only the
+/// semantic authority can, and it derives the relation from THIS form.
+#[derive(Debug, PartialEq, ToLispy)]
+#[lispy("grelex")]
+pub struct Grelex<P: Phase = Unresolved> {
+    #[lispy("form")]
+    form: GroundForm<P>,
+    #[lispy("result")]
+    result: P::Scope,
+}
+
+impl<P: Phase> Grelex<P> {
+    pub fn form(&self) -> &GroundForm<P> {
+        &self.form
+    }
+
+    pub fn into_form(self) -> GroundForm<P> {
+        self.form
+    }
+
+    pub fn result(&self) -> &P::Scope {
+        &self.result
+    }
+}
+
+impl<P: Phase<Scope = ()>> Grelex<P> {
+    /// The authored head. Nothing is paired — the phase has no relation.
+    pub fn authored(form: GroundForm<P>) -> Self {
+        Grelex { form, result: () }
+    }
+
+    /// The payload, for an authored walk. AUTHORED ONLY, for the reason
+    /// [`Step::form_mut`] states.
+    pub fn form_mut(&mut self) -> &mut GroundForm<P> {
+        &mut self.form
+    }
+
+    /// Rewrite an authored head payload by value.
+    pub fn rewrite_form(
+        self,
+        rewrite: impl FnOnce(GroundForm<P>) -> crate::error::Result<GroundForm<P>>,
+    ) -> crate::error::Result<Self> {
+        Ok(Grelex {
+            form: rewrite(self.form)?,
+            result: (),
+        })
+    }
+}
+
+impl<P: Phase<Scope = crate::relation::SemanticRelation>> Grelex<P> {
+    /// THE ONE BOUND-PHASE CONSTRUCTOR, and it is the authority's.
+    pub(crate) fn derived(
+        _authority: &crate::relation::builder::SemanticConstruction,
+        form: GroundForm<P>,
+        result: crate::relation::SemanticRelation,
+    ) -> Self {
+        Grelex { form, result }
+    }
+}
+
+impl<P: Phase> Grelex<P> {
+    /// REBUILD THE RELATIONAL OPERAND STANDING INSIDE THIS HEAD.
+    ///
+    /// Same contract as [`Step::rebuilding_arm`], at the head: a derived
+    /// table's subquery is an operand nested in ONE node, the rewrite is
+    /// handed that operand alone, and the head is rebuilt around it here —
+    /// so which relation the head IS cannot change, and what it publishes
+    /// stays true.
+    pub fn rebuilding_nested(
+        self,
+        nested: impl FnOnce(Chain<P>) -> crate::error::Result<Chain<P>>,
+    ) -> crate::error::Result<Self> {
+        let Grelex { form, result } = self;
+        let form = match form {
+            GroundForm::Reference(relation) => {
+                GroundForm::Reference(relation.rebuilding_nested(nested)?)
+            }
+            literal @ GroundForm::Literal(_) => literal,
+        };
+        Ok(Grelex { form, result })
+    }
+
+    /// CROSS A PHASE, keeping what this head publishes.
+    ///
+    /// The head's own form is rebuilt into the next phase; what it publishes
+    /// crosses UNCHANGED, because a crossing is not the place a head
+    /// acquires a different relation. There is no argument here for a
+    /// result — which is the whole difference between crossing a node and
+    /// rebuilding one out of its parts.
+    pub(crate) fn crossing<Q>(
+        self,
+        form: impl FnOnce(GroundForm<P>) -> crate::error::Result<GroundForm<Q>>,
+    ) -> crate::error::Result<Grelex<Q>>
+    where
+        P: Phase<Scope = crate::relation::SemanticRelation>,
+        Q: Phase<Scope = crate::relation::SemanticRelation>,
+    {
+        Ok(Grelex {
+            form: form(self.form)?,
+            result: self.result,
+        })
+    }
+
+    /// Cross a phase boundary, through the same scope fold a [`Step`] uses.
+    pub fn folded<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
+        self,
+        walk: &mut F,
+        form: GroundForm<Q>,
+    ) -> crate::error::Result<Grelex<Q>> {
+        Ok(Grelex {
+            form,
+            result: walk.fold_scope(self.result)?,
+        })
+    }
+}
+
+impl<P: Phase> Clone for Grelex<P> {
+    #[stacksafe::stacksafe]
+    fn clone(&self) -> Self {
+        Grelex {
+            form: self.form.clone(),
+            result: self.result.clone(),
+        }
+    }
+}
+
 /// The two alternatives are the owner's taxonomy: R-REFERENCE names
 /// something, R-LITERAL writes rows out. Which one a head is gets decided
 /// where the head is built, and is never rediscovered by inspecting a
 /// payload downstream.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
-pub enum Grelex<P: Phase = Unresolved> {
+pub enum GroundForm<P: Phase = Unresolved> {
     /// Every named relational form: table, view, TVF, HO application, inner
     /// relation, consulted view, plan scratch, the DML target.
     #[lispy("grelex:reference")]
@@ -629,14 +1729,12 @@ impl<P: Phase> Datum<P> {
 #[lispy("anon_table")]
 pub struct AnonTable<P: Phase = Unresolved> {
     pub body: TabularBody<HeaderItem<P>, Datum<P>>,
-    pub cpr_schema: P::Scope,
 }
 
 impl<P: Phase> AnonTable<P> {
     pub fn from_values(
         header: Option<Vec<DomainExpression<P>>>,
         rows: Vec<Vec<DomainExpression<P>>>,
-        cpr_schema: P::Scope,
     ) -> Option<Self> {
         let header = match header {
             Some(terms) => Some(TabularRow(Box::new(
@@ -666,7 +1764,6 @@ impl<P: Phase> AnonTable<P> {
                 header,
                 rows: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(rows)?,
             },
-            cpr_schema,
         })
     }
 
@@ -699,7 +1796,15 @@ pub enum Continuation<P: Phase = Unresolved> {
     #[lispy("continuation:access")]
     Access {
         access: super::access::Access<P>,
-        cpr_schema: P::Scope,
+        /// `t(*) as u(a, b)` — the name the occurrence this access
+        /// publishes answers to. Naming and patterning are one act at one
+        /// occurrence: the slot row replaces the operand's interface and
+        /// the name is the result's. A head's own leading access never
+        /// carries one — the name of the read is the mention's.
+        ///
+        /// Phase-selected exactly as a pipe stage's: authored characters
+        /// before resolution, nothing after.
+        named: P::StageName,
     },
     /// Codd's σ — a truth expression standing where one can stand.
     ///
@@ -712,16 +1817,15 @@ pub enum Continuation<P: Phase = Unresolved> {
     Restrict {
         condition: TruthExpression<P>,
         origin: FilterOrigin,
-        cpr_schema: P::Scope,
     },
-    /// `#<n` / `#>n` — the authored row bound. Not a restriction: it selects
-    /// by position in an order, so it consumes an adjacent ordering rather
-    /// than testing a tuple.
+    /// `#<n` / `#>n` — the authored row bound standing beside NO ordering.
+    /// Not a restriction: it selects by position, and with no order to
+    /// select from its members are arbitrary. A bound written immediately
+    /// after an ordering never stands here: [`Chain::bounding`] folds it
+    /// into that ordering's own node, so the ordering a bound consumes is
+    /// never a step beside it.
     #[lispy("continuation:bound")]
-    Bound {
-        bound: TupleOrdinalClause,
-        cpr_schema: P::Scope,
-    },
+    Bound { bound: TupleOrdinalClause },
     /// `col ~= {…}` / `col ~= ~> {…}` — top-grammar's `destructure_relex`,
     /// an EXPANSION continuation. The scalar mode reads fields out of one
     /// document; the aggregate mode iterates and explodes rows.
@@ -735,16 +1839,14 @@ pub enum Continuation<P: Phase = Unresolved> {
         mode: DestructureMode,
         /// The columns the expansion publishes — empty before resolution.
         schema: P::Destructure,
-        cpr_schema: P::Scope,
     },
     /// §5 — the comma's relation case: another relation joined to the
     /// chain-so-far. Outerness and what correlates the pair are member data.
     #[lispy("continuation:member")]
     Member {
         rhs: Chain<P>,
-        correlation: Option<MemberCorrelation<P>>,
+        correlation: P::MemberCorr,
         join_type: Option<JoinType>,
-        cpr_schema: P::Scope,
     },
     /// §6 — the `;` `|;|` `||` `-` family, BINARY: the chain-so-far is the
     /// left operand and this step owns exactly one right arm. `a ; b ; c` is
@@ -759,7 +1861,6 @@ pub enum Continuation<P: Phase = Unresolved> {
         operator: SetOperator,
         arm: Chain<P>,
         correlation: P::Corr,
-        cpr_schema: P::Scope,
     },
     /// `x.* = y.*` in the comma position, BEFORE the pair of arms it
     /// relates is known.
@@ -770,10 +1871,7 @@ pub enum Continuation<P: Phase = Unresolved> {
     /// anywhere else it correlates nothing, and that refuses where the
     /// chain is read rather than reaching a lowering with no arm for it.
     #[lispy("continuation:correlate")]
-    Correlate {
-        whole: WholeHeading<P>,
-        cpr_schema: P::Scope,
-    },
+    Correlate { whole: WholeHeading<P> },
     /// §4 — everything written after a pipe that is not a call.
     #[lispy("continuation:pipe")]
     Pipe {
@@ -787,7 +1885,6 @@ pub enum Continuation<P: Phase = Unresolved> {
         /// nothing after — resolution spends the spelling on the stage's
         /// scope, and the scope is what answers from then on.
         named: P::StageName,
-        cpr_schema: P::Scope,
     },
     /// `&` / `&&` with its mandatory per-edge context. Consumed by the
     /// resolver, which expands the edge into ordinary members — so after
@@ -806,7 +1903,7 @@ pub enum Continuation<P: Phase = Unresolved> {
 /// A structural step of the trailing run: one of the seven structural forms,
 /// with the stage name and published scope every run step owns.
 ///
-/// This is the exact payload [`RunStep::Structural`] carries, and the same
+/// This is the exact payload [`RunForm::Structural`] carries, and the same
 /// value a [`Continuation::Structural`] holds in the chain — one type, so the
 /// partition moves it whole and no phase classifies it again.
 #[derive(Debug, PartialEq, ToLispy)]
@@ -818,8 +1915,6 @@ pub struct StructuralStep<P: Phase = Unresolved> {
     /// Pipe step: a run step owns its stage name whatever its kind.
     #[lispy("named")]
     pub named: P::StageName,
-    #[lispy("cpr_schema")]
-    pub cpr_schema: P::Scope,
 }
 
 /// The seven structural forms, each with its exact payload. Adding a member
@@ -827,14 +1922,20 @@ pub struct StructuralStep<P: Phase = Unresolved> {
 /// become a runtime panic.
 #[derive(Debug, PartialEq, ToLispy)]
 pub enum StructuralForm<P: Phase = Unresolved> {
-    /// `#(a, b desc)` — tuple ordering. ORDER IS CONSUMED, NEVER CARRIED:
-    /// terminal position presents, an adjacent bound takes it, a
-    /// bound-to-one compression owns it. Chain structure, not an anonymous
+    /// `#(a, b desc)` — tuple ordering, WITH THE BOUND THAT CONSUMES IT.
+    /// ORDER IS CONSUMED, NEVER CARRIED: terminal position presents
+    /// (`bound: None`), and the immediately adjacent bound takes it
+    /// (`bound: Some`) — `#(a), #<2` is ONE membership act, the ordering
+    /// choosing which rows the bound keeps. The two are one node so no
+    /// pass can move, commute, or lower one without the other, and the
+    /// lowering emits both in one query scope. A bound-to-one compression
+    /// owns its ordering the same way. Chain structure, not an anonymous
     /// operator — it directs row order and publishes the heading it
     /// received.
     #[lispy("structural:ordering")]
     Ordering {
         specs: Vec<super::super::specs::OrderingSpec<P>>,
+        bound: Option<TupleOrdinalClause>,
     },
     /// `*[c as n]` — reposition: move columns to positions. Chain
     /// structure; the heading's names are untouched.
@@ -881,7 +1982,6 @@ impl<P: Phase> Clone for StructuralStep<P> {
         StructuralStep {
             form: self.form.clone(),
             named: self.named.clone(),
-            cpr_schema: self.cpr_schema.clone(),
         }
     }
 }
@@ -889,8 +1989,9 @@ impl<P: Phase> Clone for StructuralStep<P> {
 impl<P: Phase> Clone for StructuralForm<P> {
     fn clone(&self) -> Self {
         match self {
-            StructuralForm::Ordering { specs } => StructuralForm::Ordering {
+            StructuralForm::Ordering { specs, bound } => StructuralForm::Ordering {
                 specs: specs.clone(),
+                bound: bound.clone(),
             },
             StructuralForm::Reposition { moves } => StructuralForm::Reposition {
                 moves: moves.clone(),
@@ -922,19 +2023,56 @@ impl<P: Phase> Clone for StructuralForm<P> {
 /// IS the membership proof — a consumer matches this family exhaustively and
 /// never re-derives membership from the continuation list.
 #[derive(Debug)]
-pub enum RunStep<P: Phase> {
+pub enum RunForm<P: Phase> {
     Pipe {
         operator: PipeOp<P>,
         named: P::StageName,
-        cpr_schema: P::Scope,
     },
     Access {
         access: super::super::Access<P>,
-        cpr_schema: P::Scope,
+        named: P::StageName,
     },
     /// A structural step, moved whole — the exact family, never the broad
     /// continuation enum.
     Structural(StructuralStep<P>),
+}
+
+/// A run step and what it publishes, taken off a chain as one value.
+///
+/// Private fields: the partition is the only producer, so holding one is
+/// the membership proof, and the relation cannot be separated from the
+/// exact form that published it.
+#[derive(Debug)]
+pub struct RunStep<P: Phase> {
+    form: RunForm<P>,
+    result: P::Scope,
+}
+
+impl<P: Phase> RunStep<P> {
+    pub fn form(&self) -> &RunForm<P> {
+        &self.form
+    }
+
+    pub fn into_form(self) -> RunForm<P> {
+        self.form
+    }
+
+    pub fn result(&self) -> &P::Scope {
+        &self.result
+    }
+
+    /// Put the step back on the chain it came off, unchanged. Visible to
+    /// the carrier alone: [`Chain::peel_run`] is what puts a run back.
+    pub(super) fn into_step(self) -> Step<P> {
+        Step {
+            form: match self.form {
+                RunForm::Pipe { operator, named } => Continuation::Pipe { operator, named },
+                RunForm::Access { access, named } => Continuation::Access { access, named },
+                RunForm::Structural(step) => Continuation::Structural(step),
+            },
+            result: self.result,
+        }
+    }
 }
 
 // Manual Clone for the same reason `Chain`'s is manual.
@@ -942,108 +2080,55 @@ impl<P: Phase> Clone for Continuation<P> {
     #[stacksafe::stacksafe]
     fn clone(&self) -> Self {
         match self {
-            Continuation::Access { access, cpr_schema } => Continuation::Access {
+            Continuation::Access { access, named } => Continuation::Access {
                 access: access.clone(),
-                cpr_schema: cpr_schema.clone(),
+                named: named.clone(),
             },
-            Continuation::Restrict {
-                condition,
-                origin,
-                cpr_schema,
-            } => Continuation::Restrict {
+            Continuation::Restrict { condition, origin } => Continuation::Restrict {
                 condition: condition.clone(),
                 origin: origin.clone(),
-                cpr_schema: cpr_schema.clone(),
             },
-            Continuation::Bound { bound, cpr_schema } => Continuation::Bound {
+            Continuation::Bound { bound } => Continuation::Bound {
                 bound: bound.clone(),
-                cpr_schema: cpr_schema.clone(),
             },
-            Continuation::Correlate { whole, cpr_schema } => Continuation::Correlate {
+            Continuation::Correlate { whole } => Continuation::Correlate {
                 whole: whole.clone(),
-                cpr_schema: cpr_schema.clone(),
             },
             Continuation::Destructure {
                 source,
                 pattern,
                 mode,
                 schema,
-                cpr_schema,
             } => Continuation::Destructure {
                 source: source.clone(),
                 pattern: pattern.clone(),
                 mode: mode.clone(),
                 schema: schema.clone(),
-                cpr_schema: cpr_schema.clone(),
             },
             Continuation::Member {
                 rhs,
                 correlation,
                 join_type,
-                cpr_schema,
             } => Continuation::Member {
                 rhs: rhs.clone(),
                 correlation: correlation.clone(),
                 join_type: join_type.clone(),
-                cpr_schema: cpr_schema.clone(),
             },
             Continuation::BagOp {
                 operator,
                 arm,
                 correlation,
-                cpr_schema,
             } => Continuation::BagOp {
                 operator: *operator,
                 arm: arm.clone(),
                 correlation: correlation.clone(),
-                cpr_schema: cpr_schema.clone(),
             },
-            Continuation::Pipe {
-                operator,
-                named,
-                cpr_schema,
-            } => Continuation::Pipe {
+            Continuation::Pipe { operator, named } => Continuation::Pipe {
                 operator: operator.clone(),
                 named: named.clone(),
-                cpr_schema: cpr_schema.clone(),
             },
             Continuation::ErJoin(step) => Continuation::ErJoin(step.clone()),
             Continuation::Structural(step) => Continuation::Structural(step.clone()),
-        }
-    }
-}
-
-impl<P: Phase> Continuation<P> {
-    /// The schema the chain publishes once this continuation has consumed
-    /// it. `None` for the preverbal forms, which are gone before any
-    /// schema exists.
-    pub fn cpr_schema(&self) -> Option<&P::Scope> {
-        match self {
-            Continuation::Access { cpr_schema, .. }
-            | Continuation::Restrict { cpr_schema, .. }
-            | Continuation::Correlate { cpr_schema, .. }
-            | Continuation::Bound { cpr_schema, .. }
-            | Continuation::Destructure { cpr_schema, .. }
-            | Continuation::Member { cpr_schema, .. }
-            | Continuation::BagOp { cpr_schema, .. }
-            | Continuation::Pipe { cpr_schema, .. } => Some(cpr_schema),
-            Continuation::Structural(step) => Some(&step.cpr_schema),
-            Continuation::ErJoin(_) => None,
-        }
-    }
-
-    pub fn cpr_schema_mut(&mut self) -> Option<&mut P::Scope> {
-        match self {
-            Continuation::Access { cpr_schema, .. }
-            | Continuation::Restrict { cpr_schema, .. }
-            | Continuation::Correlate { cpr_schema, .. }
-            | Continuation::Bound { cpr_schema, .. }
-            | Continuation::Destructure { cpr_schema, .. }
-            | Continuation::Member { cpr_schema, .. }
-            | Continuation::BagOp { cpr_schema, .. }
-            | Continuation::Pipe { cpr_schema, .. } => Some(cpr_schema),
-            Continuation::Structural(step) => Some(&mut step.cpr_schema),
-            Continuation::ErJoin(_) => None,
         }
     }
 }
@@ -1081,21 +2166,56 @@ pub struct BagCorrelation<P: Phase = Unresolved> {
 /// correspondence merges the column it joined on and an ordinary condition
 /// repeats it, so the two would join the same rows under different headings.
 ///
-/// The names are canonical symbols because a strop is part of the name a
-/// join corresponds on.
+/// The exact operand ports are recorded at resolution. A spelling chose the
+/// pair lexically; it is not retained as evidence after that judgment.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("correspondence")]
 pub struct Correspondence {
-    pub columns: Vec<crate::names::Sym>,
+    pub pairs: Vec<crate::relation::form::MergedKey>,
 }
 
 impl Correspondence {
-    pub fn new(columns: Vec<crate::names::Sym>) -> Self {
-        Correspondence { columns }
+    pub fn new(pairs: Vec<crate::relation::form::MergedKey>) -> Self {
+        Correspondence { pairs }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.columns.is_empty()
+        self.pairs.is_empty()
+    }
+
+    /// Spend lexical names into exact operand ports while both complete
+    /// ordered interfaces are present.
+    pub(crate) fn between(
+        names: impl IntoIterator<Item = crate::names::Sym>,
+        left: &[crate::relation::PortId],
+        right: &[crate::relation::PortId],
+        identities: &crate::names::Registry,
+    ) -> crate::error::Result<Self> {
+        let mut pairs = Vec::new();
+        for name in names {
+            let left_hits: Vec<_> = left
+                .iter()
+                .copied()
+                .filter(|port| identities.published_sym(port.column()) == Some(name))
+                .collect();
+            let right_hits: Vec<_> = right
+                .iter()
+                .copied()
+                .filter(|port| identities.published_sym(port.column()) == Some(name))
+                .collect();
+            let ([left], [right]) = (left_hits.as_slice(), right_hits.as_slice()) else {
+                return Err(crate::error::DelightQLError::validation_error_categorized(
+                    "resolution/correspondence/not-exact",
+                    "a correspondence name does not select exactly one port in each operand",
+                    "project or rename each operand to a unique heading",
+                ));
+            };
+            pairs.push(crate::relation::form::MergedKey {
+                left: *left,
+                right: *right,
+            });
+        }
+        Ok(Self::new(pairs))
     }
 }
 
@@ -1117,6 +2237,13 @@ pub enum MemberCorrelation<P: Phase = Unresolved> {
     /// carry and no authored/resolved twin to drift.
     #[lispy("member_correlation:correspond")]
     Correspond(P::Correspondence),
+    /// The pair CROSSES, deliberately: resolution enumerated the complete
+    /// live bare interface and found no reuse, no correspondence, and no
+    /// stated condition. Phase-witnessed, so an authored tree cannot state
+    /// it — and lowering, holding this instead of an absence, cannot let
+    /// missing evidence masquerade as a natural join.
+    #[lispy("member_correlation:cartesian")]
+    Cartesian(P::Decided),
 }
 
 impl<P: Phase> MemberCorrelation<P> {
@@ -1126,14 +2253,14 @@ impl<P: Phase> MemberCorrelation<P> {
     pub fn condition(&self) -> Option<&TruthExpression<P>> {
         match self {
             MemberCorrelation::Condition(condition) => Some(condition),
-            MemberCorrelation::Correspond(_) => None,
+            MemberCorrelation::Correspond(_) | MemberCorrelation::Cartesian(_) => None,
         }
     }
 
     pub fn into_condition(self) -> Option<TruthExpression<P>> {
         match self {
             MemberCorrelation::Condition(condition) => Some(condition),
-            MemberCorrelation::Correspond(_) => None,
+            MemberCorrelation::Correspond(_) | MemberCorrelation::Cartesian(_) => None,
         }
     }
 
@@ -1141,7 +2268,7 @@ impl<P: Phase> MemberCorrelation<P> {
     pub fn correspondence(&self) -> Option<&Correspondence> {
         match self {
             MemberCorrelation::Correspond(carried) => Some(P::correspondence(carried)),
-            MemberCorrelation::Condition(_) => None,
+            MemberCorrelation::Condition(_) | MemberCorrelation::Cartesian(_) => None,
         }
     }
 }

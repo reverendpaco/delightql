@@ -5,9 +5,13 @@ use crate::pipeline::generator::{GeneratorError, SqlGenerator};
 use super::sql_ast::{SqlColumnDef, SqlCreateTable, SqlDefaultClause, SqlTableConstraint};
 
 /// Generate a SQL CREATE TABLE string from a SQL DDL AST.
+///
+/// The bin registry is the same one the query generator consults: a CHECK's
+/// sigma predicate is rendered by the entity the resolver selected.
 pub fn generate(
     table: &SqlCreateTable,
     identities: &crate::names::Registry,
+    bin_registry: std::sync::Arc<crate::bin_cartridge::registry::BinCartridgeRegistry>,
 ) -> crate::Result<String> {
     let mut collector = crate::pipeline::sql_ast::names::NameCollector::new(identities);
     collector.scope(table.table);
@@ -48,13 +52,12 @@ pub fn generate(
             }
         }
     }
-    let bundle = crate::names::Bundle {
-        statements: vec![collector.finish()],
-    };
+    let bundle =
+        crate::names::Bundle::gather(vec![collector.finish()]).reserve_authored(identities);
     let baptised = crate::names::baptise(identities, &bundle).map_err(|error| {
         crate::error::DelightQLError::parse_error(format!("DDL naming failed: {error:?}"))
     })?;
-    let gen = SqlGenerator::new(&baptised);
+    let gen = SqlGenerator::new(&baptised).with_bin_registry(bin_registry);
     let mut sql = String::new();
 
     // CREATE [TEMP ]TABLE "name"
@@ -116,21 +119,19 @@ fn generate_column(
                 s.push_str(" DEFAULT ");
                 // SQLite requires parentheses around non-literal defaults (e.g., function calls).
                 // Always wrap in parens for safety — SQLite accepts DEFAULT (42) and DEFAULT ('x') too.
-                let needs_parens = !matches!(
-                    expr,
-                    crate::pipeline::sql_ast::DomainExpression::Literal(_)
-                );
+                let needs_parens =
+                    !matches!(expr, crate::pipeline::sql_ast::DomainExpression::Literal(_));
                 if needs_parens {
                     s.push('(');
                 }
-                s.push_str(&gen.render_expression(expr, at)?);
+                s.push_str(&gen.render_ddl_expression(expr, at)?);
                 if needs_parens {
                     s.push(')');
                 }
             }
             SqlDefaultClause::Generated { expr, kind } => {
                 s.push_str(" GENERATED ALWAYS AS (");
-                s.push_str(&gen.render_expression(expr, at)?);
+                s.push_str(&gen.render_ddl_expression(expr, at)?);
                 s.push(')');
                 match kind {
                     super::asts::GeneratedKind::Virtual => s.push_str(" VIRTUAL"),
@@ -142,7 +143,7 @@ fn generate_column(
 
     for check_expr in &col.checks {
         s.push_str(" CHECK(");
-        s.push_str(&gen.render_expression(check_expr, at)?);
+        s.push_str(&gen.render_ddl_expression(check_expr, at)?);
         s.push(')');
     }
 
@@ -170,7 +171,7 @@ fn generate_table_constraint(
         }
         SqlTableConstraint::Check { expr, .. } => {
             s.push_str("CHECK(");
-            s.push_str(&gen.render_expression(expr, at)?);
+            s.push_str(&gen.render_ddl_expression(expr, at)?);
             s.push(')');
         }
         SqlTableConstraint::ForeignKey {
@@ -212,32 +213,33 @@ mod tests {
     use crate::ddl_pipeline::sql_ast::{
         SqlColumnDef, SqlCreateTable, SqlDefaultClause, SqlTableConstraint,
     };
-    use crate::names::{
-        Addressing, ColumnOrigin, Hint, Registry, ScopeId, ScopeOrigin, ValueFacts,
-    };
+    use crate::names::{Addressing, Registry, ScopeId};
+
+    /// The registry the DDL generator renders CHECK sigma predicates through.
+    fn bin_registry() -> std::sync::Arc<crate::bin_cartridge::registry::BinCartridgeRegistry> {
+        let mut registry = crate::bin_cartridge::registry::BinCartridgeRegistry::new();
+        registry.register_cartridge(crate::bin_cartridge::prelude::create_prelude_cartridge());
+        registry
+            .register_cartridge(crate::bin_cartridge::predicates::create_predicates_cartridge());
+        std::sync::Arc::new(registry)
+    }
     use crate::pipeline::asts::core::LiteralValue;
     use crate::pipeline::sql_ast::{BinaryOperator, DomainExpression as SqlExpression};
 
-    fn table(registry: &Registry, name: &str) -> ScopeId {
+    fn table(registry: &crate::names::Registry, name: &str) -> ScopeId {
         let spelling = registry.intern(name, false);
-        registry.mint_scope(ScopeOrigin::AnonRelation, Hint::User(spelling), None)
+        registry.anonymous_scope(Some(spelling))
     }
 
     fn simple_col(
-        registry: &Registry,
+        registry: &crate::names::Registry,
         table: ScopeId,
         name: &str,
         col_type: &str,
-        position: u32,
+        _position: u32,
     ) -> SqlColumnDef {
         let spelling = registry.intern(name, false);
-        let column = registry.mint_column(
-            table,
-            ColumnOrigin::Bound { position },
-            Some(spelling),
-            Addressing::Published,
-            ValueFacts::default(),
-        );
+        let column = registry.sql_column(table, Some(spelling), Addressing::Published);
         SqlColumnDef {
             column,
             col_type: col_type.to_string(),
@@ -262,7 +264,7 @@ mod tests {
             }],
             table_constraints: vec![],
         };
-        let sql = generate(&table, &registry).unwrap();
+        let sql = generate(&table, &registry, bin_registry()).unwrap();
         assert!(sql.contains("CREATE TABLE \"users\""));
         assert!(sql.contains("\"id\" INTEGER PRIMARY KEY"));
     }
@@ -283,7 +285,7 @@ mod tests {
             }],
             table_constraints: vec![],
         };
-        let sql = generate(&table, &registry).unwrap();
+        let sql = generate(&table, &registry, bin_registry()).unwrap();
         assert!(sql.contains("NOT NULL"));
         assert!(sql.contains("DEFAULT 42"));
     }
@@ -304,7 +306,7 @@ mod tests {
             columns: vec![age],
             table_constraints: vec![],
         };
-        let sql = generate(&table, &registry).unwrap();
+        let sql = generate(&table, &registry, bin_registry()).unwrap();
         assert!(sql.contains("CHECK(age > 0)"));
     }
 
@@ -322,7 +324,7 @@ mod tests {
                 columns: vec![a.column, b.column],
             }],
         };
-        let sql = generate(&table, &registry).unwrap();
+        let sql = generate(&table, &registry, bin_registry()).unwrap();
         assert!(sql.contains("PRIMARY KEY(\"a\", \"b\")"));
     }
 
@@ -336,7 +338,7 @@ mod tests {
             columns: vec![simple_col(&registry, table_id, "x", "TEXT", 0)],
             table_constraints: vec![],
         };
-        let sql = generate(&table, &registry).unwrap();
+        let sql = generate(&table, &registry, bin_registry()).unwrap();
         assert!(sql.starts_with("CREATE TEMP TABLE"));
     }
 
@@ -357,7 +359,7 @@ mod tests {
                 ref_columns: vec![id.column],
             }],
         };
-        let sql = generate(&table, &registry).unwrap();
+        let sql = generate(&table, &registry, bin_registry()).unwrap();
         assert!(sql.contains("FOREIGN KEY(\"user_id\") REFERENCES \"users\"(\"id\")"));
     }
 
@@ -374,7 +376,7 @@ mod tests {
             }],
             table_constraints: vec![],
         };
-        let sql = generate(&table, &registry).unwrap();
+        let sql = generate(&table, &registry, bin_registry()).unwrap();
         assert!(sql.contains("UNIQUE"));
     }
 }

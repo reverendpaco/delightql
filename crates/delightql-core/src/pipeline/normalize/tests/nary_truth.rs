@@ -22,18 +22,17 @@
 
 use super::support::query;
 use crate::pipeline::asts::core::{
-    Chain, Comparison, Continuation, DomainExpression, LiteralValue, Query, TruthExpression,
-    Unresolved,
+    Comparison, Continuation, DomainExpression, LiteralValue, TruthExpression, Unresolved,
 };
 
 type Truth = TruthExpression<Unresolved>;
 
 /// The one restriction a single-comma query states.
 fn restriction(source: &str) -> Truth {
-    let Chain { continuations, .. } = query(source).body;
+    let (_, continuations) = query(source).body.into_parts();
     let mut found: Vec<Truth> = continuations
         .into_iter()
-        .filter_map(|continuation| match continuation {
+        .filter_map(|continuation| match continuation.into_form() {
             Continuation::Restrict { condition, .. } => Some(condition),
             _ => None,
         })
@@ -43,7 +42,9 @@ fn restriction(source: &str) -> Truth {
 }
 
 fn ground(n: &str) -> DomainExpression<Unresolved> {
-    DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::Number(n.to_string())))
+    DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(
+        LiteralValue::Number(n.to_string()),
+    ))
 }
 
 /// A comparison whose content does not matter, distinguishable by its

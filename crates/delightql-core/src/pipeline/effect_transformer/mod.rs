@@ -29,23 +29,24 @@ use crate::pipeline::asts::core::AuthoredColumn;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::defuse::admitted::EffectWorld;
 use crate::error::{DelightQLError, Result};
 use crate::names::DmlVerb;
 use crate::names::Registry;
 use crate::pipeline::ast_transform::{walk_transform_relation, AstTransform};
 use crate::pipeline::ast_unresolved::{
-    Chain, Continuation, Grelex, GroundMention, PipeOp, Query, Relation,
+    Chain, Continuation, GroundMention, PipeOp, Query, Relation,
 };
 use crate::pipeline::ast_visit::{walk_visit_relational, AstVisit, Descent};
 use crate::pipeline::asts::core::operators::HoArgument;
 use crate::pipeline::asts::core::Comparison;
-use crate::pipeline::asts::core::OutValue;
 use crate::pipeline::asts::core::{
-    Access, DomainExpression, FunctorCall, QualifiedName, ReductionPlan, SealedCall, Unresolved,
+    Access, DomainExpression, FunctorCall, GroundForm, QualifiedName, ReductionPlan, SealedCall,
+    Step, Unresolved,
 };
 use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::ddl::HoParam;
-use crate::pipeline::asts::effects::{self, DirectiveCategory, EffectCteDef, EffectRule};
+use crate::pipeline::asts::effects::{self, DirectiveCategory};
 use crate::pipeline::compiled_query::{
     self, CompiledPlan, PlanCreatedObject, PlanEntry, PlanStatement,
 };
@@ -56,7 +57,7 @@ use crate::pipeline::sql_ast::{
 use crate::pipeline::{
     ast_refined, danger_gates, dialect_pack, generator, refiner, resolver, transformer,
 };
-use crate::resolution::EntityRegistry;
+use crate::resolution::ResolverCore;
 use crate::system::{DelightQLSystem, PRIMARY_CONNECTION_ID};
 
 #[cfg(test)]
@@ -70,6 +71,65 @@ mod tests;
 /// rows carry deltas).
 const CANONICAL_SCRATCH_SCHEMA: &str = "temp";
 const UNSUPPORTED_BADGE: &str = "effect/transform/unsupported";
+
+/// How an effect-rule invocation supplies its scalar parameters: the bare
+/// demand roads (top rule, run_namespace!) supply none; a call form
+/// carries the authored argument list, with the glob law enforced where
+/// the pseudo-predicate spelling requires it.
+enum EffectRuleArguments {
+    Bare,
+    Values {
+        supplied: Vec<DomainExpression>,
+        glob_required: bool,
+    },
+    Row(crate::pipeline::asts::core::operators::CallArguments<Unresolved>),
+}
+
+enum EffectActualSyntax {
+    Value(DomainExpression),
+    Rule(Chain),
+}
+
+fn effect_actual_row(
+    arguments: crate::pipeline::asts::core::operators::CallArguments<Unresolved>,
+) -> Result<Vec<EffectActualSyntax>> {
+    use crate::pipeline::asts::core::operators::{CallArguments, ScalarArgument};
+    match arguments {
+        CallArguments::None => Ok(Vec::new()),
+        CallArguments::HigherOrder(part) => part
+            .into_members()
+            .into_vec()
+            .into_iter()
+            .map(|member| match member {
+                HoArgument::Relation(relation) | HoArgument::Rule(relation) => {
+                    Ok(EffectActualSyntax::Rule(relation))
+                }
+                HoArgument::Value(value) => Ok(EffectActualSyntax::Value(value.value)),
+                HoArgument::Landed(_) | HoArgument::Landing(_) | HoArgument::Skip => {
+                    Err(DelightQLError::validation_error_categorized(
+                        "effect/rule/arguments",
+                        "an effect invocation's written row contains an unspent structural member",
+                        "supply scalar and closed rule-value actuals directly; the pipe supplies the final relation",
+                    ))
+                }
+            })
+            .collect(),
+        CallArguments::Scalar(arguments) => arguments
+            .into_iter()
+            .map(|argument| match argument {
+                ScalarArgument::Value(value) => Ok(EffectActualSyntax::Value(value.value)),
+                ScalarArgument::Callable(_)
+                | ScalarArgument::Spread(_)
+                | ScalarArgument::Star
+                | ScalarArgument::Context(_) => Err(DelightQLError::validation_error_categorized(
+                    "effect/rule/arguments",
+                    "an effect invocation requires one concrete actual per declared parameter",
+                    "supply scalar values directly",
+                )),
+            })
+            .collect(),
+    }
+}
 /// The outer rule receipt's emptiness count, named so the gate that reads it
 /// can say which column it means. A receipt's own heading is `success`,
 /// `operation`, `returned`, so this name collides with no sibling receipt the
@@ -100,18 +160,28 @@ pub(crate) fn compile_rule_plan(
     namespace: &str,
     rule_name: &str,
 ) -> Result<CompiledPlan> {
-    let rule = demand_rule(system, namespace, rule_name)?;
+    // Refuse an absent rule BEFORE either pass runs, then demand it
+    // freshly per pass: discovery and replay each open one invocation.
+    demand_rule(system, namespace, rule_name)?;
     let registry = plan_registry(system)?;
     compile_with_settled_connection(
         system,
-        || PlanBuilder::new(system, Some(namespace), Rc::clone(&registry)),
-        |b| b.compile_top_rule(&rule),
+        registry,
+        |epoch, replay| PlanBuilder::new(system, Some(namespace), epoch, replay),
+        |b| {
+            let rule = demand_rule(system, namespace, rule_name)?;
+            b.compile_top_rule(rule)
+        },
     )
 }
 
 /// Look up a rule for demanding, minting the F3 refusal when absent.
-fn demand_rule(system: &DelightQLSystem, namespace: &str, rule_name: &str) -> Result<EffectRule> {
-    lookup_effect_rule(system, namespace, rule_name)?.ok_or_else(|| {
+fn demand_rule<'s>(
+    system: &'s DelightQLSystem,
+    namespace: &str,
+    rule_name: &str,
+) -> Result<crate::defuse::bound_use::EffectUse<'s>> {
+    crate::defuse::bound_use::use_effect_rule(system, namespace, rule_name)?.ok_or_else(|| {
         DelightQLError::validation_error_categorized(
             NO_MAIN_BADGE,
             format!(
@@ -136,29 +206,17 @@ pub(crate) fn compile_query_plan(
     system: &DelightQLSystem,
     query: &Query,
     namespace: Option<&str>,
-) -> Result<CompiledPlan> {
-    compile_query_plan_annotated(system, query, namespace, &[])
-}
-
-/// Semantic routing: annotated statements ride the
-/// SAME typed program as unannotated ones — assertions and emits become
-/// typed steps at the head of the plan, in the ruled order (assertions
-/// first, abort on failure; emits notify-never-abort).
-pub(crate) fn compile_query_plan_annotated(
-    system: &DelightQLSystem,
-    query: &Query,
-    namespace: Option<&str>,
-    assertions: &[crate::pipeline::asts::core::queries::AssertionSpec],
+    danger_specs: &[crate::pipeline::asts::unresolved::DangerSpec],
 ) -> Result<CompiledPlan> {
     let body = effects::EffectBody::from_query(query)?;
     let registry = plan_registry(system)?;
     compile_with_settled_connection(
         system,
-        || PlanBuilder::new(system, namespace, Rc::clone(&registry)),
-        |b| {
-            b.pending_assertions = assertions.to_vec();
-            b.compile_top_body(body.clone())
+        registry,
+        |epoch, replay| {
+            PlanBuilder::new(system, namespace, epoch, replay).with_danger_specs(danger_specs)
         },
+        |b| b.compile_top_body(body.clone()),
     )
 }
 
@@ -166,7 +224,7 @@ pub(crate) fn compile_query_plan_annotated(
 /// names. Session-created user objects are catalogued, while abandoned plan
 /// scratch is not, so a user temp survives and compiler residue remains
 /// replaceable by the next run.
-fn plan_registry(system: &DelightQLSystem) -> Result<Rc<Registry>> {
+fn plan_registry(system: &DelightQLSystem) -> Result<crate::relation::Planning> {
     let connection = system.bootstrap_connection().lock().map_err(|error| {
         DelightQLError::connection_poison_error(
             "Failed to acquire bootstrap lock for plan-name reservations",
@@ -188,7 +246,7 @@ fn plan_registry(system: &DelightQLSystem) -> Result<Rc<Registry>> {
             DelightQLError::database_error("collect plan-name reservations", error.to_string())
         })?;
     let borrowed = reserved.iter().map(String::as_str).collect::<Vec<_>>();
-    Ok(Rc::new(Registry::new(&borrowed)))
+    Ok(crate::relation::Planning::open(Registry::new(&borrowed)))
 }
 
 /// Plan-to-connection attribution: settle the plan's ONE connection BEFORE
@@ -226,51 +284,45 @@ fn plan_registry(system: &DelightQLSystem) -> Result<Rc<Registry>> {
 /// `all_sqlite_plan_keeps_hub_convergent_stamps` (tests.rs).
 fn compile_with_settled_connection<'a, B, F>(
     system: &DelightQLSystem,
+    planning: crate::relation::Planning,
     new_builder: B,
     compile: F,
 ) -> Result<CompiledPlan>
 where
-    B: Fn() -> PlanBuilder<'a>,
+    B: Fn(PlanEpoch, Rc<std::cell::RefCell<SemanticReplay>>) -> PlanBuilder<'a>,
     F: Fn(&mut PlanBuilder<'a>) -> Result<CompiledPlan>,
 {
-    let mut discovery = new_builder();
-    let plan = compile(&mut discovery)?;
-    let settled = match discovery.plan_connection {
-        // The walk latched a real (non-hub) connection: seed it.
-        Some(c) if c != PRIMARY_CONNECTION_ID => Some(c),
-        // The hub convergence: keep the discovery plan byte-identical.
-        Some(_) => None,
-        // Nothing resolved: an anon-source plan executes wherever the user
-        // pointed dql — the main mount — when that mount is fatboy-backed.
-        // SQLite/pipe mains keep today's hub convergence (siso lanes
-        // deliberately untouched).
-        None => system.fatboy_main_connection_for_effect_plan(),
+    let replay = Rc::new(std::cell::RefCell::new(SemanticReplay::default()));
+    // THE DISCOVERY PASS OWNS THE CAPABILITY, so every lowering it runs can
+    // MOVE it out of reach for the length of the act. What comes back here
+    // is the same one value, and the transition below spends it.
+    let (planning, settled) = {
+        let mut discovery = new_builder(PlanEpoch::Discovering(planning), Rc::clone(&replay));
+        let _ = compile(&mut discovery)?;
+        let settled = match discovery.plan_connection {
+            // The walk latched a real (non-hub) connection: seed it.
+            Some(c) if c != PRIMARY_CONNECTION_ID => Some(c),
+            // The hub convergence: keep the discovery plan byte-identical.
+            Some(_) => None,
+            // Nothing resolved: an anon-source plan executes wherever the user
+            // pointed dql — the main mount — when that mount is fatboy-backed.
+            // SQLite/pipe mains keep today's hub convergence (siso lanes
+            // deliberately untouched).
+            None => system.fatboy_main_connection_for_effect_plan(),
+        };
+        let PlanEpoch::Discovering(planning) = discovery.epoch else {
+            return Err(internal(
+                "the discovery pass ended without its construction capability".to_string(),
+            ));
+        };
+        (planning, settled)
     };
-    let Some(c) = settled else {
-        return Ok(plan);
-    };
-    let mut builder = new_builder();
-    builder.plan_connection = Some(c);
+    // THE CAPABILITY ENDS HERE. Discovery has resolved and refined every
+    // statement; the replay pass is handed the reader alone, so the pass
+    // that produces the plan cannot construct.
+    let mut builder = new_builder(PlanEpoch::Replaying(planning.seal()), replay);
+    builder.plan_connection = settled;
     compile(&mut builder)
-}
-
-/// Look up a registered effect rule (entity type 20) and re-parse its
-/// definition text into the typed `EffectRule` (the ephemeral-AST house
-/// pattern: the database stores text; ASTs are re-parsed on demand).
-fn lookup_effect_rule(
-    system: &DelightQLSystem,
-    namespace: &str,
-    rule_name: &str,
-) -> Result<Option<EffectRule>> {
-    let consult = crate::resolution::registry::ConsultRegistry::new_with_system(system);
-    let Some(entity) = consult.lookup_entity(rule_name, false, namespace, None) else {
-        return Ok(None);
-    };
-    if entity.entity_type != crate::enums::EntityType::DqlEffectRule {
-        return Ok(None);
-    }
-    let group = crate::ddl::reconstruct::group(&entity.definition)?;
-    Ok(Some(EffectRule::from_definition_group(&group)?))
 }
 
 // ============================================================================
@@ -285,14 +337,19 @@ enum GuardSource {
     /// The left conjunct is a bare glob read of a plan scratch table (the
     /// receipt-gate case) — renders `EXISTS (SELECT 1 FROM t)`, the
     /// TORTURE-TEST-NORMAL spelling.
-    Table(crate::names::ScopeId),
+    Table(crate::relation::SemanticRelation),
     /// Arbitrary pure left conjunct — compiled to a subquery at stamp time.
     ///
     /// Lowered once per consumer: a gated DML carries the guard, and so does
     /// the receipt insert reporting on that DML. Each lowering is a separate
     /// occurrence of the conjunct and mints its own scopes, which is why the
     /// expression stored here holds no pre-decided identity to collide over.
-    Expr(Box<Chain>),
+    Expr {
+        body: Box<Chain>,
+        /// The pure face of the block the conjunct was written in — the
+        /// claims and the manifestations that answer them, together.
+        locals: crate::pipeline::asts::core::QueryLocals<Unresolved>,
+    },
 }
 
 /// A higher-order input bound into a rule invocation (`X |> rule!(*)` binds
@@ -302,15 +359,20 @@ enum GuardSource {
 /// retro-materialized at `insertion_index` (before the mutation) and the
 /// splice reads the snapshot instead.
 struct BoundInput {
-    expr: Chain,
-    bound_epoch: u64,
-    insertion_index: usize,
-    materialized_as: Option<crate::names::ScopeId>,
+    /// The plan scratch the piped input was staged into AT THE DEMAND
+    /// SITE; every mention inside the rule reads it by its receipt.
+    scope: crate::relation::ScratchRow,
 }
 
 /// Per-walk lexical context. Cloned at scope boundaries.
 #[derive(Clone)]
-struct WalkCtx {
+pub(crate) struct WalkCtx<'w> {
+    /// THE WORLD THIS WALK'S STATEMENTS RESOLVE IN: the invoked rule's
+    /// world, owned by the invocation that built it, or the plan's own
+    /// program world. Reached only through the world's named operations;
+    /// the builder never holds an environment and has no stack to place
+    /// one on.
+    world: &'w EffectWorld,
     /// EXISTS gates from enclosing left conjuncts.
     guards: Vec<GuardSource>,
     /// When walking a rule CLAUSE, the shared receipt table its ENDING
@@ -319,29 +381,117 @@ struct WalkCtx {
     /// through a pipe to its terminal, to a join's right, into every union
     /// arm; cleared into pipe sources / join lefts / filters.
     sink: Option<ReceiptSink>,
-    /// The current body's effect-CTE definitions — `!`-names resolve here
-    /// BEFORE rule lookup.
-    ctes: Vec<EffectCteDef>,
+    /// The current body's complete lexical CTE bindings. Pure bindings enter
+    /// ordinary resolution; `!`-marked bindings resolve here before rule
+    /// lookup, without either road discarding the binding carrier.
+    /// The current body's query-local bindings — relation and
+    /// higher-order — under the same split — pure ones enter every statement's
+    /// resolution, effect mirrors are demands resolved here before rule
+    /// lookup — and the one name/visibility authority that governs them,
+    /// as ONE block: a walk never holds a ledger beside manifestations it
+    /// did not mint.
+    locals: crate::pipeline::asts::core::QueryLocals<Unresolved>,
+    /// The authored declaration horizon of the query-scoped body currently
+    /// walking; unrestricted for an ordinary query body.
+    horizon: crate::pipeline::asts::core::LexicalHorizon,
     /// HO parameter bindings (param name → index into `bound_inputs`).
     bindings: HashMap<String, usize>,
     /// The enclosing effect rule's receipt family.
     receipt_name: String,
 }
 
-impl WalkCtx {
+impl<'w> WalkCtx<'w> {
+    /// These facts standing in `world`: the one road a world enters a
+    /// context. An invoked rule's atom takes it for its own clauses; the
+    /// builder itself can only re-stand a context in a world it already
+    /// holds.
+    pub(crate) fn standing_in<'v>(self, world: &'v EffectWorld) -> WalkCtx<'v> {
+        WalkCtx {
+            world,
+            guards: self.guards,
+            sink: self.sink,
+            locals: self.locals,
+            horizon: self.horizon,
+            bindings: self.bindings,
+            receipt_name: self.receipt_name,
+        }
+    }
+
+    /// The same facts standing where they already stand — the demand
+    /// site's own world, which a query-scoped effect rule compiles in.
+    pub(crate) fn standing_in_caller(self) -> WalkCtx<'w> {
+        self
+    }
+
+    /// These facts with the given query-local block in place of their own.
+    pub(crate) fn with_locals(
+        mut self,
+        locals: crate::pipeline::asts::core::QueryLocals<Unresolved>,
+    ) -> Self {
+        self.locals = locals;
+        self
+    }
+
+    pub(crate) fn at_horizon(
+        mut self,
+        horizon: crate::pipeline::asts::core::LexicalHorizon,
+    ) -> Self {
+        self.horizon = horizon;
+        self
+    }
+
+    pub(crate) fn locals(&self) -> &crate::pipeline::asts::core::QueryLocals<Unresolved> {
+        &self.locals
+    }
+
+    pub(crate) fn ctes(&self) -> &[crate::pipeline::asts::core::CteBinding<Unresolved>] {
+        self.locals.ctes()
+    }
+
+    pub(crate) fn hos(&self) -> &[crate::pipeline::asts::core::HoDefinition] {
+        self.locals.hos()
+    }
+
+    pub(crate) fn local_names(&self) -> &crate::pipeline::asts::core::QueryLocalNames {
+        self.locals.names()
+    }
+
+    /// The world's cell, for the body-frame lease a query-scoped effect
+    /// rule holds over the demand site's world.
+    pub(crate) fn world_cell(
+        &self,
+    ) -> &'w std::cell::RefCell<crate::defuse::environment::Environment> {
+        self.world.cell()
+    }
+
     /// The child context for a non-value position (pipe source, join left):
     /// same scope, no sink.
-    fn without_sink(&self) -> WalkCtx {
+    fn without_sink(&self) -> WalkCtx<'w> {
         let mut c = self.clone();
         c.sink = None;
         c
+    }
+
+    /// One pure statement in this lexical body. Effect-marked bindings are
+    /// executable demands, not SQL CTEs; every pure binding otherwise enters
+    /// the ordinary grouping, head and fixpoint authority unchanged.
+    fn pure_query(&self, body: Chain) -> Query {
+        // Effect manifestations leave the block, their claims stay in it:
+        // a pure demand must see a wrong kind rather than a local miss.
+        Query::binding(self.pure_locals(), body)
+    }
+
+    fn pure_locals(&self) -> crate::pipeline::asts::core::QueryLocals<Unresolved> {
+        self.locals.pure()
     }
 }
 
 /// The shared receipt table of a rule invocation.
 #[derive(Clone)]
 struct ReceiptSink {
-    table: crate::names::ScopeId,
+    /// The receipt of the shared receipt table, minted at its allocation;
+    /// a built-in rule value evaluated over it stands over this receipt.
+    table: crate::relation::ScratchRow,
 }
 
 /// Static shape of a receipt-producing directive's row (EFFECT-ALGEBRA §3):
@@ -432,10 +582,11 @@ enum ReceiptGate {
     /// sliver: non-deterministic sources evaluate twice; a staging
     /// remedy exists if ever needed). Pinned
     /// by `duckdb_dml_receipt_gates_on_the_staged_precount`.
-    Precount(crate::names::ScopeId),
+    Precount(crate::relation::SemanticRelation),
 }
 
 /// One compiled pure statement, pre-generation.
+#[derive(Clone)]
 struct CompiledStmt {
     stmt: SqlStatement,
     /// Reads this statement may not run without — evaluated before it, in
@@ -444,9 +595,37 @@ struct CompiledStmt {
     /// Statements that stage what this one reads, and the temporary
     /// relations they create.
     prepare: Vec<SqlStatement>,
-    staged: Vec<crate::names::ScopeId>,
+    staged: Vec<crate::relation::SemanticRelation>,
     /// Structural output heading of the transformed select list.
     columns: Vec<crate::names::ColId>,
+    /// Semantic output positions of the resolved statement.
+    ports: Vec<crate::relation::PortId>,
+    relation: crate::relation::SemanticRelation,
+    connection_id: Option<i64>,
+}
+
+#[derive(Default)]
+struct SemanticReplay {
+    statements: Vec<PlannedStmt>,
+    allocations: Vec<crate::relation::SemanticRelation>,
+    /// Scratch rows allocated in walk order, as the receipts the lexical
+    /// authority minted for them; a replay pass hands out the same
+    /// receipts.
+    scratch_rows: Vec<crate::relation::ScratchRow>,
+    // Caller-resolved effect-rule actuals, one entry per invocation in
+    // walk order: the replay pass holds no construction capability, so it
+    // replays the discovery pass's resolution rather than resolving again.
+    arguments: Vec<Vec<crate::pipeline::asts::resolved::DomainExpression>>,
+    rule_arguments: Vec<HashMap<delightql_types::SqlIdentifier, crate::defuse::ho::RuleValueId>>,
+    builtin_rule_values: Vec<crate::defuse::ho::RuleValueId>,
+}
+
+#[derive(Clone)]
+struct PlannedStmt {
+    serve_bootstrap: bool,
+    refined: crate::pipeline::ast_refined::Query,
+    gates: danger_gates::DangerGateMap,
+    resolved_columns: Vec<crate::relation::PortId>,
     connection_id: Option<i64>,
 }
 
@@ -484,21 +663,18 @@ impl DeferredSql {
                 crate::pipeline::sql_ast::names::statement_names(statement, identities),
             ),
             Self::Expression { expression, at } => {
-                let mut collector =
-                    crate::pipeline::sql_ast::names::NameCollector::new(identities);
+                let mut collector = crate::pipeline::sql_ast::names::NameCollector::new(identities);
                 collector.scope(*at);
                 collector.expression(expression);
                 statements.push(collector.finish());
             }
             Self::Scope(scope) => {
-                let mut collector =
-                    crate::pipeline::sql_ast::names::NameCollector::new(identities);
+                let mut collector = crate::pipeline::sql_ast::names::NameCollector::new(identities);
                 collector.scope(*scope);
                 statements.push(collector.finish());
             }
             Self::Column(column) => {
-                let mut collector =
-                    crate::pipeline::sql_ast::names::NameCollector::new(identities);
+                let mut collector = crate::pipeline::sql_ast::names::NameCollector::new(identities);
                 collector.column(*column);
                 statements.push(collector.finish());
             }
@@ -556,18 +732,24 @@ struct PendingPlanStatement {
     comment: Option<String>,
 }
 
+impl PendingPlanStatement {
+    fn collect_names(&self, identities: &Registry, statements: &mut Vec<crate::names::Statement>) {
+        self.sql.collect_names(identities, statements);
+    }
+
+    fn render(&self, generator: &generator::SqlGenerator<'_, '_>) -> Result<PlanStatement> {
+        Ok(PlanStatement {
+            sql: self.sql.render(generator)?,
+            connection_id: self.connection_id,
+            comment: self.comment.clone(),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 enum PendingPlanEntry {
     Statement(PendingPlanStatement),
     ShippedStatement(PendingPlanStatement),
-}
-
-struct PendingAssertion {
-    index: usize,
-    name: Option<String>,
-    source_location: Option<(usize, usize)>,
-    connection_id: Option<i64>,
-    sql: DeferredSql,
 }
 
 impl PendingPlanEntry {
@@ -578,17 +760,10 @@ impl PendingPlanEntry {
     }
 
     fn render(&self, generator: &generator::SqlGenerator<'_, '_>) -> Result<PlanEntry> {
-        let render_statement = |statement: &PendingPlanStatement| -> Result<PlanStatement> {
-            Ok(PlanStatement {
-                sql: statement.sql.render(generator)?,
-                connection_id: statement.connection_id,
-                comment: statement.comment.clone(),
-            })
-        };
         match self {
-            Self::Statement(statement) => Ok(PlanEntry::Statement(render_statement(statement)?)),
+            Self::Statement(statement) => Ok(PlanEntry::Statement(statement.render(generator)?)),
             Self::ShippedStatement(statement) => {
-                Ok(PlanEntry::ShippedStatement(render_statement(statement)?))
+                Ok(PlanEntry::ShippedStatement(statement.render(generator)?))
             }
         }
     }
@@ -598,39 +773,136 @@ impl PendingPlanEntry {
 // The plan builder
 // ============================================================================
 
-struct PlanBuilder<'a> {
+/// WHICH EPOCH A PASS OF THE PLAN WALK IS IN.
+///
+/// Discovery constructs: it resolves and refines every statement, and it
+/// lowers each one as it goes, so its own lowering reads a store that is
+/// still open. Replay constructs nothing — it holds the READER and no
+/// capability at all — so the pass that produces the final plan cannot mint
+/// a relation into a compilation whose statements are already settled.
+enum PlanEpoch {
+    /// The discovery pass OWNS the one capability. It cannot copy it, and
+    /// it cannot lower with it: every lowering MOVES it out through
+    /// [`PlanEpoch::Lowering`] and gets it back only after.
+    Discovering(crate::relation::Planning),
+    Replaying(crate::relation::Relations),
+    /// The transient. A lowering is running and the capability is inside
+    /// it, spent — so there is no arrangement of these lines in which a
+    /// lowering and a live constructor exist at once.
+    Lowering,
+}
+
+/// WHAT A LOWERING RUNS AGAINST, and there is no third thing.
+///
+/// The replay pass holds the sealed reader outright. The discovery pass
+/// holds a capability, so it does not lower with it — it SPENDS it for the
+/// length of the act ([`crate::relation::Planning::lowering`]), which closes
+/// the store while the lowering runs and hands the capability back only
+/// after. Either way, nothing that can extend the epoch is reachable inside
+/// a lowering.
+
+impl PlanEpoch {
+    /// The naming handle every epoch reads from.
+    fn names(&self) -> &Rc<Registry> {
+        match self {
+            PlanEpoch::Discovering(planning) => planning.shared(),
+            PlanEpoch::Replaying(relations) => relations.names(),
+            PlanEpoch::Lowering => unreachable!("a lowering holds the reader, not the builder"),
+        }
+    }
+
+    /// The construction capability, when this pass has one.
+    fn planning(&self) -> Result<&crate::relation::Planning> {
+        match self {
+            PlanEpoch::Discovering(planning) => Ok(planning),
+            PlanEpoch::Replaying(_) => Err(internal(
+                "the replay pass reached semantic construction".to_string(),
+            )),
+            PlanEpoch::Lowering => Err(internal(
+                "semantic construction was reached from inside a lowering".to_string(),
+            )),
+        }
+    }
+
+    /// RUN ONE LOWERING against a store nothing can extend while it runs.
+    ///
+    /// The discovery pass's capability is MOVED into the act, which closes
+    /// the store for its length; the replay pass has none to move. Either
+    /// way what the lowering holds is a reader over a closed store.
+    fn lowering<T>(&mut self, lower: impl FnOnce(&crate::relation::Relations) -> T) -> Result<T> {
+        match std::mem::replace(self, PlanEpoch::Lowering) {
+            PlanEpoch::Discovering(planning) => {
+                let (planning, answer) = planning.lowering(lower);
+                *self = PlanEpoch::Discovering(planning);
+                Ok(answer)
+            }
+            PlanEpoch::Replaying(relations) => {
+                let answer = lower(&relations);
+                *self = PlanEpoch::Replaying(relations);
+                Ok(answer)
+            }
+            PlanEpoch::Lowering => Err(internal(
+                "a lowering was entered from inside a lowering".to_string(),
+            )),
+        }
+    }
+
+    fn is_discovering(&self) -> bool {
+        matches!(self, PlanEpoch::Discovering(_))
+    }
+}
+
+pub(crate) struct PlanBuilder<'a> {
     system: &'a DelightQLSystem,
     config: resolver::ResolutionConfig,
-    registry: Rc<Registry>,
-
-    /// Annotation specs riding the typed program — compiled into
-    /// Assertion/Emit steps at the head of the plan.
-    pending_assertions: Vec<crate::pipeline::asts::core::queries::AssertionSpec>,
+    /// The namespace this plan compiles for (`run_namespace!`, consulted
+    /// rules); `None` for ad-hoc session statements.
+    plan_namespace: Option<String>,
+    /// THE PASS'S EPOCH. Its lifetime is its OWN — the discovery pass
+    /// borrows the capability and the borrow ends where the pass does, so
+    /// the transition that spends it can happen the moment discovery is
+    /// over.
+    epoch: PlanEpoch,
+    semantic_replay: Rc<std::cell::RefCell<SemanticReplay>>,
+    statement_cursor: usize,
+    allocation_cursor: usize,
+    scratch_cursor: usize,
+    argument_cursor: usize,
+    builtin_rule_cursor: usize,
 
     /// Scratch shells (receipt tables + exit flag): assembled BEFORE the
     /// transaction bracket.
     shells: Vec<PendingPlanEntry>,
-    /// The body entries, bracketed by BEGIN/COMMIT at assembly.
+    /// Entries emitted by the current occurrence and not yet moved into its
+    /// construction action.
     body: Vec<PendingPlanEntry>,
 
     /// Plan notes: physical tables this plan creates, made resolvable to later
     /// statements through the query-local materialized-relation registry.
-    notes: Vec<(String, crate::names::ScopeId)>,
+    notes: Vec<(String, crate::relation::SemanticRelation)>,
     /// Base tables read by each plan-created temp VIEW — the
     /// self-reference hazard map.
     view_bases: HashMap<String, HashSet<String>>,
 
-    object_scopes: HashMap<String, crate::names::ScopeId>,
     /// Plan scratch in mint order — the trailing-cleanup DROP list.
-    scratch_tables: Vec<crate::names::ScopeId>,
+    scratch_tables: Vec<crate::relation::SemanticRelation>,
+    /// The relation each created name stands for, so a plan that creates
+    /// one name twice keeps one object behind it.
+    object_scopes: HashMap<String, crate::relation::SemanticRelation>,
     exit_armed: bool,
     exit_shell_made: bool,
-    exit_scope: Option<crate::names::ScopeId>,
+    exit_scope: Option<crate::relation::SemanticRelation>,
     /// Monotone mutation counter (CTAS / INSERT / UPDATE / DELETE bump it).
     mutation_epoch: u64,
     /// HO inputs bound during rule invocations (`WalkCtx.bindings` indexes).
     bound_inputs: Vec<BoundInput>,
-    /// Rule expansion stack (a belt — consult already validated the DAG).
+    /// Closed pure rule values constructed at effect demand sites. Every
+    /// statement resolver in this plan shares this compilation-local store,
+    /// so an opaque formal identity opens the exact value that crossed.
+    residuals: Rc<crate::defuse::ho::ResidualStore>,
+    /// The CURRENT invocation path, FOR STEP-MARK DISPLAY ONLY: nothing
+    /// branches on membership — recursion is the definition-use
+    /// authority's admission law, not this list's.
     rule_stack: Vec<String>,
     /// First non-None connection any statement resolved to. A second,
     /// different one refuses: plan notes carry no connection attribution,
@@ -645,101 +917,154 @@ struct PlanBuilder<'a> {
     created_objects: Vec<PlanCreatedObject>,
     /// Dialect pack, loaded once per plan compile (mirrors Pipeline).
     pack: Option<std::sync::Arc<dialect_pack::DialectPack>>,
+    /// Query-local danger policy applied uniformly to every pure statement
+    /// the ad-hoc plan constructs.
+    danger_gates: danger_gates::DangerGateMap,
 
-    /// Step marks — each is an occurrence's slice of
-    /// `body`, closed by `mark_step` at the dispatch site right after the
-    /// handler emitted. The marks partition `body[0..step_marked]` in
-    /// order, so the typed steps' statement streams concatenate to the
-    /// flat entry list exactly.
+    /// Completed construction actions. Each mark owns the entries emitted by
+    /// its occurrence; terminal marks already own their typed disposition and
+    /// cannot be reconstructed from a generic statement range.
     step_marks: Vec<StepMark>,
     /// What the next marked step's false verdict means, when the compiler
     /// wrote the check. Taken by `mark_step`, so it cannot outlive the step
     /// it was set for.
     pending_refusal: Option<compiled_query::Refusal>,
-    /// `body` index up to which entries have been claimed by a mark.
-    step_marked: usize,
     /// Guard DEFINITIONS — deduplicated by their
     /// rendered SQL; requirements reference them by id.
     guard_defs: Vec<(usize, DeferredSql)>,
 }
 
-/// One occurrence's claim on a `body` range (see `mark_step`).
+/// One completed occurrence and the action it constructed.
 struct StepMark {
-    start: usize,
-    end: usize,
-    kind: compiled_query::EffectStepKind,
+    action: PendingMarkedAction,
     occurrence: String,
     operation: String,
     requirements: Vec<compiled_query::Requirement>,
-    /// For a compiler-written check: what its false verdict means.
-    refusal: Option<compiled_query::Refusal>,
+}
+
+/// A non-terminal construction identity over an owned emitted stream.
+#[derive(Clone)]
+enum MarkedStepKind {
+    Check,
+    Stage,
+    Dml,
+    Ddl,
+    Host,
+    Return,
+    RuleBoundary,
+}
+
+/// A construction-owned action. Terminals are already a closed sum here:
+/// abort owns its mandatory probe and provenance, while exit has neither.
+enum PendingMarkedAction {
+    Stream {
+        kind: MarkedStepKind,
+        entries: Vec<PendingPlanEntry>,
+        refusal: Option<compiled_query::Refusal>,
+    },
+    Terminal(PendingTerminalAction),
+}
+
+enum PendingTerminalAction {
+    Exit {
+        statements: Vec<PendingPlanStatement>,
+    },
+    Abort {
+        statements: Vec<PendingPlanStatement>,
+        probe: PendingPlanStatement,
+        provenance: compiled_query::AbortProvenance,
+    },
 }
 
 impl<'a> PlanBuilder<'a> {
-    fn new(system: &'a DelightQLSystem, namespace: Option<&str>, registry: Rc<Registry>) -> Self {
+    /// The plan's OWN program world — the scope of statements standing
+    /// outside every rule body, rooted at the plan's namespace (`home` for
+    /// an ad-hoc statement). Built by the authority as a use world and
+    /// owned by the top-level compilation that walks under it.
+    fn program_world(&self) -> Result<EffectWorld> {
+        let consult = crate::resolution::registry::ConsultRegistry::new_with_system(self.system);
+        EffectWorld::program(&consult, self.plan_namespace.as_deref().unwrap_or("home"))
+    }
+
+    fn new(
+        system: &'a DelightQLSystem,
+        namespace: Option<&str>,
+        epoch: PlanEpoch,
+        semantic_replay: Rc<std::cell::RefCell<SemanticReplay>>,
+    ) -> Self {
         PlanBuilder {
             system,
-            registry,
-            config: resolver::ResolutionConfig {
-                resolution_namespace: namespace.map(|n| n.to_string()),
-                ..resolver::ResolutionConfig::default()
-            },
-            pending_assertions: Vec::new(),
+            epoch,
+            semantic_replay,
+            statement_cursor: 0,
+            allocation_cursor: 0,
+            scratch_cursor: 0,
+            argument_cursor: 0,
+            builtin_rule_cursor: 0,
+            config: resolver::ResolutionConfig::default(),
+            plan_namespace: namespace.map(|n| n.to_string()),
             shells: Vec::new(),
             body: Vec::new(),
             notes: Vec::new(),
             view_bases: HashMap::new(),
-            object_scopes: HashMap::new(),
             scratch_tables: Vec::new(),
+            object_scopes: HashMap::new(),
             exit_armed: false,
             exit_shell_made: false,
             exit_scope: None,
             mutation_epoch: 0,
             bound_inputs: Vec::new(),
+            residuals: Rc::new(crate::defuse::ho::ResidualStore::default()),
             rule_stack: Vec::new(),
             plan_connection: None,
             pending_comment: None,
             created_objects: Vec::new(),
             pack: None,
+            danger_gates: danger_gates::DangerGateMap::with_defaults(),
             step_marks: Vec::new(),
             pending_refusal: None,
-            step_marked: 0,
             guard_defs: Vec::new(),
         }
+    }
+
+    fn with_danger_specs(
+        mut self,
+        specs: &[crate::pipeline::asts::unresolved::DangerSpec],
+    ) -> Self {
+        self.danger_gates.apply_overrides(specs);
+        self
     }
 
     /// The compile namespace (Some for consulted rules / run_namespace!
     /// demands; None for ad-hoc session statements, which have no namespace
     /// to look user rules up in).
     fn namespace(&self) -> Option<&str> {
-        self.config.resolution_namespace.as_deref()
-    }
-
-    /// The namespace user-rule lookup requires; refuses cleanly for ad-hoc
-    /// statements (a user directive cannot resolve outside a consulted
-    /// namespace).
-    fn lookup_namespace(&self, for_directive: &str) -> Result<&str> {
-        self.namespace().ok_or_else(|| {
-            unsupported(format!(
-                "directive '{}' is not a built-in and this statement is not \
-                 compiled inside a consulted namespace, so no effect rule can \
-                 be looked up",
-                for_directive
-            ))
-        })
+        self.plan_namespace.as_deref()
     }
 
     /// Compile the demanded rule into the bracketed plan (emission 8).
-    fn compile_top_rule(&mut self, rule: &EffectRule) -> Result<CompiledPlan> {
+    fn compile_top_rule(
+        &mut self,
+        effect_use: crate::defuse::bound_use::EffectUse,
+    ) -> Result<CompiledPlan> {
+        let world = self.program_world()?;
         let top_ctx = WalkCtx {
+            world: &world,
             guards: Vec::new(),
             sink: None,
-            ctes: Vec::new(),
+            locals: crate::pipeline::asts::core::QueryLocals::none(),
+            horizon: crate::pipeline::asts::core::LexicalHorizon::all(),
             bindings: HashMap::new(),
-            receipt_name: bare_name(&rule.name).to_string(),
+            receipt_name: bare_name(effect_use.rule_name().as_str()).to_string(),
         };
-        let value = self.invoke_rule(rule, None, &top_ctx)?;
-        self.finish_plan(value)
+        let value = self.invoke_rule(
+            crate::defuse::bound_use::EffectSelection::Consulted(effect_use),
+            EffectRuleArguments::Bare,
+            None,
+            &top_ctx,
+            true,
+        )?;
+        self.finish_plan(value, &top_ctx)
     }
 
     /// Compile an ad-hoc body (a top-level directive-demanding statement)
@@ -748,29 +1073,37 @@ impl<'a> PlanBuilder<'a> {
     /// receipt read, pinned by the effects ball's
     /// dml_receipt/ddl_receipt groups.
     fn compile_top_body(&mut self, body: effects::EffectBody) -> Result<CompiledPlan> {
-        refuse_unlowered_pure_ctes(&body.ctes)?;
+        let world = self.program_world()?;
         let top_ctx = WalkCtx {
+            world: &world,
             guards: Vec::new(),
             sink: None,
-            ctes: body.ctes,
+            locals: body.locals,
+            horizon: crate::pipeline::asts::core::LexicalHorizon::all(),
             bindings: HashMap::new(),
             receipt_name: "main".to_string(),
         };
         let value = self.walk_value(body.expression, &top_ctx)?;
-        self.finish_plan(value)
+        self.finish_plan(value, &top_ctx)
     }
 
     /// The shared plan tail: ship the final value, then assemble
     /// shells → BEGIN → body → COMMIT (emission 8).
-    fn finish_plan(&mut self, value: Chain) -> Result<CompiledPlan> {
+    fn finish_plan(&mut self, value: Chain, ctx: &WalkCtx) -> Result<CompiledPlan> {
         // The run's return value: ship the body's value. If the body
         // ended in stdout!, the exact same text just shipped — don't ship
         // it twice (pinned by `body_ending_in_stdout_ships_once`).
-        let final_text = self.compile_value_text(&value)?;
+        let final_text = self.compile_value_text(&value, ctx)?;
         let scratch_schema = self.scratch_schema()?;
         let guarded = self.wrap_shipped(final_text.sql, &[], &scratch_schema);
+        let last_emitted = self.body.last().or_else(|| {
+            self.step_marks.last().and_then(|mark| match &mark.action {
+                PendingMarkedAction::Stream { entries, .. } => entries.last(),
+                PendingMarkedAction::Terminal(_) => None,
+            })
+        });
         let already_shipped = matches!(
-            self.body.last(),
+            last_emitted,
             Some(PendingPlanEntry::ShippedStatement(st)) if st.sql == guarded
         );
         if !already_shipped {
@@ -789,31 +1122,7 @@ impl<'a> PlanBuilder<'a> {
         // (`TypedEffectPlan::flatten`) — one source, no second positional
         // authority to drift from, no arithmetic range reconstruction.
         let armed = self.exit_armed;
-        self.mark_step(
-            compiled_query::EffectStepKind::Return,
-            "return",
-            None,
-            armed,
-        )?;
-
-        let assertion_specs = std::mem::take(&mut self.pending_assertions);
-        let mut pending_assertions = Vec::with_capacity(assertion_specs.len());
-        for (index, spec) in assertion_specs.iter().enumerate() {
-            let left = self.compile_value_text(&spec.body)?;
-            let right = match &spec.right_operand {
-                Some(expression) => Some(self.compile_value_text(expression)?.sql),
-                None => None,
-            };
-            let sql = deferred_assertion_bool(left.sql, right);
-            let connection_id = self.route(left.connection_id)?;
-            pending_assertions.push(PendingAssertion {
-                index,
-                name: spec.name.clone(),
-                source_location: spec.source_location,
-                connection_id,
-                sql,
-            });
-        }
+        self.mark_step(MarkedStepKind::Return, "return", None, armed)?;
 
         let cleanup: Vec<PendingPlanStatement> = self
             .scratch_tables
@@ -821,7 +1130,7 @@ impl<'a> PlanBuilder<'a> {
             .map(|scope| PendingPlanStatement {
                 sql: DeferredSql::concat([
                     DeferredSql::text(format!("DROP TABLE IF EXISTS {}.", scratch_schema)),
-                    DeferredSql::Scope(*scope),
+                    DeferredSql::Scope(scope.scope()),
                 ]),
                 connection_id: self.plan_connection,
                 comment: Some("plan-scratch cleanup".to_string()),
@@ -830,38 +1139,77 @@ impl<'a> PlanBuilder<'a> {
         let exit_probe = match self.exit_scope {
             Some(scope) => Some(DeferredSql::concat([
                 DeferredSql::text(format!("SELECT count(*) FROM {}.", scratch_schema)),
-                DeferredSql::Scope(scope),
+                DeferredSql::Scope(scope.scope()),
             ])),
             None => None,
         };
 
-        let mut name_statements = Vec::new();
-        for assertion in &pending_assertions {
-            assertion
-                .sql
-                .collect_names(&self.registry, &mut name_statements);
+        if self.epoch.is_discovering() {
+            return Ok(CompiledPlan {
+                entries: Vec::new(),
+                exit_probe_sql: None,
+                created_objects: Vec::new(),
+                typed: None,
+            });
         }
-        for entry in self.shells.iter().chain(self.body.iter()) {
+        let replay = self.semantic_replay.borrow();
+        if self.statement_cursor != replay.statements.len()
+            || self.allocation_cursor != replay.allocations.len()
+            || self.scratch_cursor != replay.scratch_rows.len()
+            || self.argument_cursor != replay.arguments.len()
+        {
+            return Err(internal(
+                "effect-plan replay did not consume its complete semantic plan".to_string(),
+            ));
+        }
+        drop(replay);
+
+        let mut name_statements = Vec::new();
+        for entry in &self.shells {
             entry
                 .sql()
-                .collect_names(&self.registry, &mut name_statements);
+                .collect_names(&self.epoch.names(), &mut name_statements);
+        }
+        for mark in &self.step_marks {
+            match &mark.action {
+                PendingMarkedAction::Stream { entries, .. } => {
+                    for entry in entries {
+                        entry
+                            .sql()
+                            .collect_names(&self.epoch.names(), &mut name_statements);
+                    }
+                }
+                PendingMarkedAction::Terminal(PendingTerminalAction::Exit { statements }) => {
+                    for statement in statements {
+                        statement.collect_names(&self.epoch.names(), &mut name_statements);
+                    }
+                }
+                PendingMarkedAction::Terminal(PendingTerminalAction::Abort {
+                    statements,
+                    probe,
+                    ..
+                }) => {
+                    for statement in statements {
+                        statement.collect_names(&self.epoch.names(), &mut name_statements);
+                    }
+                    probe.collect_names(&self.epoch.names(), &mut name_statements);
+                }
+            }
         }
         for statement in &cleanup {
             statement
                 .sql
-                .collect_names(&self.registry, &mut name_statements);
+                .collect_names(&self.epoch.names(), &mut name_statements);
         }
         for (_, sql) in &self.guard_defs {
-            sql.collect_names(&self.registry, &mut name_statements);
+            sql.collect_names(&self.epoch.names(), &mut name_statements);
         }
         if let Some(sql) = &exit_probe {
-            sql.collect_names(&self.registry, &mut name_statements);
+            sql.collect_names(&self.epoch.names(), &mut name_statements);
         }
 
-        let registry = Rc::clone(&self.registry);
-        let bundle = crate::names::Bundle {
-            statements: name_statements,
-        };
+        let registry = Rc::clone(self.epoch.names());
+        let bundle = crate::names::Bundle::gather(name_statements).reserve_authored(&registry);
         let names = crate::names::baptise(&registry, &bundle)
             .map_err(|e| internal(format!("effect plan SQL naming failed: {e:?}")))?;
         let pack = self.dialect_pack()?;
@@ -874,14 +1222,10 @@ impl<'a> PlanBuilder<'a> {
             .iter()
             .map(|entry| entry.render(&generator))
             .collect::<Result<Vec<_>>>()?;
-        let body = std::mem::take(&mut self.body)
-            .iter()
-            .map(|entry| entry.render(&generator))
-            .collect::<Result<Vec<_>>>()?;
-        let rendered_assertions = pending_assertions
-            .iter()
-            .map(|assertion| assertion.sql.render(&generator))
-            .collect::<Result<Vec<_>>>()?;
+        debug_assert!(
+            self.body.is_empty(),
+            "the return mark owns the final stream"
+        );
         let rendered_cleanup = cleanup
             .iter()
             .map(|statement| {
@@ -909,7 +1253,7 @@ impl<'a> PlanBuilder<'a> {
 
         let entry_route = |e: &PlanEntry| match e {
             PlanEntry::Statement(st) | PlanEntry::ShippedStatement(st) => st.connection_id,
-            PlanEntry::Assertion { statement, .. } => statement.connection_id,
+            PlanEntry::Check { statement, .. } => statement.connection_id,
             PlanEntry::BeginTransaction { connection_id, .. }
             | PlanEntry::CommitTransaction { connection_id, .. } => *connection_id,
         };
@@ -931,7 +1275,6 @@ impl<'a> PlanBuilder<'a> {
                 compiled_query::EffectStep {
                     occurrence: name.to_string(),
                     operation: name.to_string(),
-                    span: None,
                     route,
                     requirements: Vec::new(),
                     action,
@@ -939,29 +1282,6 @@ impl<'a> PlanBuilder<'a> {
             };
 
         let mut steps: Vec<compiled_query::EffectStep> = Vec::new();
-        // Annotation steps lead the plan — assertions
-        // first (read-only pre-checks, abort on a false verdict), then
-        // emit streams (notify-never-abort) — the SAME ruled order the
-        // degenerate conversion pins (`degenerate_entry_order_mirrors_relay`).
-        // Both sit OUTSIDE the bracket, before Setup/Begin.
-        for (assertion, sql) in pending_assertions.iter().zip(rendered_assertions) {
-            steps.push(compiled_query::EffectStep {
-                occurrence: format!("assert#{}", assertion.index + 1),
-                operation: "assert".to_string(),
-                span: assertion.source_location,
-                route: assertion.connection_id,
-                requirements: Vec::new(),
-                action: compiled_query::EffectAction::Assertion {
-                    name: assertion.name.clone(),
-                    statement: PlanStatement {
-                        sql,
-                        connection_id: assertion.connection_id,
-                        comment: Some("assertion".to_string()),
-                    },
-                    refusal: None,
-                },
-            });
-        }
         // Setup (scratch shells). POSITION encodes the dialect's placement:
         // before Begin on SQLite/DuckDB; after Begin on
         // PG, whose shells carry ON COMMIT DROP (the recommended form —
@@ -995,75 +1315,120 @@ impl<'a> PlanBuilder<'a> {
         // action (the sum type validates ship placement structurally:
         // only Host and Return can carry one).
         for m in &self.step_marks {
-            let slice = &body[m.start..m.end];
-            let route = slice.iter().find_map(entry_route);
-            let action = match m.kind {
-                compiled_query::EffectStepKind::Assertion => {
-                    let statements = stmts_only(slice)?;
-                    let [statement] = statements.as_slice() else {
-                        return Err(internal(
-                            "typed-plan construction: an obligation is one statement".to_string(),
-                        ));
-                    };
-                    compiled_query::EffectAction::Assertion {
-                        statement: statement.clone(),
-                        name: Some(m.operation.clone()),
-                        refusal: m.refusal.clone(),
-                    }
+            let (route, action) = match &m.action {
+                PendingMarkedAction::Terminal(PendingTerminalAction::Exit { statements }) => {
+                    let statements = statements
+                        .iter()
+                        .map(|statement| statement.render(&generator))
+                        .collect::<Result<Vec<_>>>()?;
+                    let route = statements
+                        .iter()
+                        .find_map(|statement| statement.connection_id);
+                    (
+                        route,
+                        compiled_query::EffectAction::Terminal(
+                            compiled_query::TerminalAction::Exit { statements },
+                        ),
+                    )
                 }
-                compiled_query::EffectStepKind::Stage => {
-                    compiled_query::EffectAction::Stage(stmts_only(slice)?)
+                PendingMarkedAction::Terminal(PendingTerminalAction::Abort {
+                    statements,
+                    probe,
+                    provenance,
+                }) => {
+                    let statements = statements
+                        .iter()
+                        .map(|statement| statement.render(&generator))
+                        .collect::<Result<Vec<_>>>()?;
+                    let probe = probe.render(&generator)?;
+                    let route = statements
+                        .iter()
+                        .find_map(|statement| statement.connection_id)
+                        .or(probe.connection_id);
+                    (
+                        route,
+                        compiled_query::EffectAction::Terminal(
+                            compiled_query::TerminalAction::Abort {
+                                statements,
+                                probe,
+                                provenance: provenance.clone(),
+                            },
+                        ),
+                    )
                 }
-                compiled_query::EffectStepKind::Dml => {
-                    compiled_query::EffectAction::Dml(stmts_only(slice)?)
-                }
-                compiled_query::EffectStepKind::Ddl => {
-                    compiled_query::EffectAction::Ddl(stmts_only(slice)?)
-                }
-                compiled_query::EffectStepKind::Exit => {
-                    compiled_query::EffectAction::Exit(stmts_only(slice)?)
-                }
-                compiled_query::EffectStepKind::RuleBoundary => {
-                    compiled_query::EffectAction::RuleBoundary(stmts_only(slice)?)
-                }
-                compiled_query::EffectStepKind::Host => {
-                    let (last, init) = slice.split_last().ok_or_else(|| {
-                        internal("typed-plan construction: an empty host stream".to_string())
-                    })?;
-                    let PlanEntry::ShippedStatement(ship) = last else {
-                        return Err(internal(
-                            "typed-plan construction: a host action must end in \
-                             its ship"
-                                .to_string(),
-                        ));
-                    };
-                    compiled_query::EffectAction::Host {
-                        statements: stmts_only(init)?,
-                        ship: ship.clone(),
-                    }
-                }
-                compiled_query::EffectStepKind::Return => {
-                    let (ship, init) = match slice.split_last() {
-                        Some((PlanEntry::ShippedStatement(ship), init)) => {
-                            (Some(ship.clone()), init)
+                PendingMarkedAction::Stream {
+                    kind,
+                    entries,
+                    refusal,
+                } => {
+                    let entries = entries
+                        .iter()
+                        .map(|entry| entry.render(&generator))
+                        .collect::<Result<Vec<_>>>()?;
+                    let route = entries.iter().find_map(entry_route);
+                    let action = match kind {
+                        MarkedStepKind::Check => {
+                            let statements = stmts_only(&entries)?;
+                            let [statement] = statements.as_slice() else {
+                                return Err(internal(
+                                    "typed-plan construction: an obligation is one statement"
+                                        .to_string(),
+                                ));
+                            };
+                            compiled_query::EffectAction::Check {
+                                statement: statement.clone(),
+                                refusal: refusal.clone(),
+                            }
                         }
-                        _ => (None, slice),
+                        MarkedStepKind::Stage => {
+                            compiled_query::EffectAction::Stage(stmts_only(&entries)?)
+                        }
+                        MarkedStepKind::Dml => {
+                            compiled_query::EffectAction::Dml(stmts_only(&entries)?)
+                        }
+                        MarkedStepKind::Ddl => {
+                            compiled_query::EffectAction::Ddl(stmts_only(&entries)?)
+                        }
+                        MarkedStepKind::RuleBoundary => {
+                            compiled_query::EffectAction::RuleBoundary(stmts_only(&entries)?)
+                        }
+                        MarkedStepKind::Host => {
+                            let (last, init) = entries.split_last().ok_or_else(|| {
+                                internal(
+                                    "typed-plan construction: an empty host stream".to_string(),
+                                )
+                            })?;
+                            let PlanEntry::ShippedStatement(ship) = last else {
+                                return Err(internal(
+                                    "typed-plan construction: a host action must end in \
+                                     its ship"
+                                        .to_string(),
+                                ));
+                            };
+                            compiled_query::EffectAction::Host {
+                                statements: stmts_only(init)?,
+                                ship: ship.clone(),
+                            }
+                        }
+                        MarkedStepKind::Return => {
+                            let (ship, init) = match entries.split_last() {
+                                Some((PlanEntry::ShippedStatement(ship), init)) => {
+                                    (Some(ship.clone()), init)
+                                }
+                                _ => (None, entries.as_slice()),
+                            };
+                            compiled_query::EffectAction::Return {
+                                statements: stmts_only(init)?,
+                                ship,
+                            }
+                        }
                     };
-                    compiled_query::EffectAction::Return {
-                        statements: stmts_only(init)?,
-                        ship,
-                    }
-                }
-                other => {
-                    return Err(internal(format!(
-                        "typed-plan construction: unexpected mark kind {other:?}"
-                    )))
+                    (route, action)
                 }
             };
             steps.push(compiled_query::EffectStep {
                 occurrence: m.occurrence.clone(),
                 operation: m.operation.clone(),
-                span: None,
                 route,
                 requirements: m.requirements.clone(),
                 action,
@@ -1123,21 +1488,20 @@ impl<'a> PlanBuilder<'a> {
         let mut expr = expr;
         let Some(last) = expr.pop_step() else {
             let (head, access, _) = expr.split_head_access();
-            return match head {
-                Grelex::Reference(rel) => self.walk_read(rel, access, ctx),
+            return match head.into_form() {
+                GroundForm::Reference(rel) => self.walk_read(rel, access, ctx),
                 head => {
-                    let expr = Chain::ground(head);
+                    let expr = Chain::authored(head);
                     self.refuse_if_effectful(&expr)?;
                     Ok(expr)
                 }
             };
         };
-        match last {
+        match last.into_form() {
             Continuation::Member {
                 rhs,
                 correlation,
                 join_type,
-                cpr_schema,
             } => {
                 // A join condition carries the same boolean subquery edges as
                 // a filter predicate. A directive demanded there is not
@@ -1156,24 +1520,19 @@ impl<'a> PlanBuilder<'a> {
                 // when the right actually demands one.
                 let walked_right = if effects::expression_demands_directive(&rhs) {
                     let mut gated = ctx.clone();
-                    gated.guards.push(self.guard_from_value(&walked_left));
+                    gated.guards.push(self.guard_from_value(&walked_left, ctx));
                     self.walk_value(rhs, &gated)?
                 } else {
                     self.walk_value(rhs, &ctx.without_sink())?
                 };
-                Ok(walked_left.then(Continuation::Member {
+                Ok(walked_left.then(Step::authored(Continuation::Member {
                     rhs: walked_right,
                     correlation,
                     join_type,
-                    cpr_schema,
-                }))
+                })))
             }
 
-            Continuation::Restrict {
-                condition,
-                origin,
-                cpr_schema,
-            } => {
+            Continuation::Restrict { condition, origin } => {
                 // The predicate is NOT on the lowered source spine. A
                 // directive demanded through an IN/EXISTS/scalar subquery here
                 // reaches SQL unprocessed under the old walker; instead refuse
@@ -1184,11 +1543,7 @@ impl<'a> PlanBuilder<'a> {
                     ));
                 }
                 let walked = self.walk_value(expr, &ctx.without_sink())?;
-                Ok(walked.then(Continuation::Restrict {
-                    condition,
-                    origin,
-                    cpr_schema,
-                }))
+                Ok(walked.then(Step::authored(Continuation::Restrict { condition, origin })))
             }
 
             // A bound names no expression to demand a directive; a
@@ -1205,7 +1560,7 @@ impl<'a> PlanBuilder<'a> {
                 ..
             }) => {
                 let walked = self.walk_value(expr, ctx)?;
-                Ok(walked.then(step))
+                Ok(walked.then(Step::authored(step)))
             }
             step @ (Continuation::Access { .. }
             | Continuation::Bound { .. }
@@ -1250,27 +1605,26 @@ impl<'a> PlanBuilder<'a> {
                     }
                 }
                 let walked = self.walk_value(expr, &ctx.without_sink())?;
-                Ok(walked.then(step))
+                Ok(walked.then(Step::authored(step)))
             }
 
             Continuation::BagOp {
                 operator,
                 arm,
                 correlation,
-                cpr_schema,
             } => {
                 // Disjunction — both operands evaluate, in order. The
                 // sink (if any) flows into each: a union value's ending
                 // directives all land in the one rule receipt table.
                 let left = self.walk_value(expr, ctx)?;
                 let arm = self.walk_value(arm, ctx)?;
-                Ok(left.bag_op(operator, arm, correlation, cpr_schema))
+                Ok(left.bag_op(operator, arm, correlation))
             }
 
             Continuation::Pipe { operator, .. } => self.walk_pipe(expr, operator, ctx),
 
             last @ Continuation::ErJoin(_) => {
-                let other = expr.then(last);
+                let other = expr.then(Step::authored(last));
                 self.refuse_if_effectful(&other)?;
                 Ok(other)
             }
@@ -1280,23 +1634,32 @@ impl<'a> PlanBuilder<'a> {
     /// Walk a READ: the relation, and what its parens asked of it.
     fn walk_read(&mut self, rel: Relation, access: Option<Access>, ctx: &WalkCtx) -> Result<Chain> {
         let restore = |head: Relation, access: Option<Access>| match access {
-            Some(access) => Chain::read(head, access, ()),
-            None => Chain::relation(head),
+            Some(access) => Chain::read(head, access),
+            None => Chain::authored(GroundForm::Reference(head)),
         };
         match rel {
-            // A plan read names compiler-owned storage by identity: nothing
-            // in it can be an HO parameter and nothing in it can hide a
-            // directive, so it passes through whole.
+            // A scratch or receipt read names compiler-owned storage by the
+            // receipt of its allocation: nothing in it can be an HO
+            // parameter and nothing in it can hide a directive, so it
+            // passes through whole.
             Relation::Ground {
-                mention: GroundMention::Plan { .. },
+                mention:
+                    GroundMention::Scratch { .. }
+                    | GroundMention::Receipt { .. }
+                    | GroundMention::Structural { .. },
                 ..
             } => Ok(restore(rel, access)),
             Relation::FunctorCall { call, alias, .. } => {
                 self.walk_functor_call(call, alias, access.unwrap_or(Access::Unasked), ctx)
             }
             Relation::Ground {
-                mention: GroundMention::Named { ref identifier, .. },
-                ..
+                mention:
+                    GroundMention::Named {
+                        ref identifier,
+                        alias: _,
+                        ..
+                    },
+                outer: _,
             } => {
                 let access = access.unwrap_or(Access::Unasked);
                 // The lowering walker closes every recursive position where a
@@ -1330,7 +1693,7 @@ impl<'a> PlanBuilder<'a> {
                 Ok(restore(rel, Some(access)))
             }
 
-            other @ Relation::InnerRelation { .. } => {
+            other @ (Relation::InnerRelation { .. } | Relation::ConsultedView { .. }) => {
                 let expr = restore(other, access);
                 self.refuse_if_effectful(&expr)?;
                 Ok(expr)
@@ -1342,7 +1705,52 @@ impl<'a> PlanBuilder<'a> {
     ///
     /// The receipt is the access standing in the effect position, handed in
     /// beside the call — call identity carries no receipt of its own.
+    /// A RECEIPT IS A RELATION, and a name authored on the call names it:
+    /// `|> insert!(t(*))(*) as r` makes `r` the receipt's owner exactly as
+    /// `as r` names any other landed result. The read the walk produces
+    /// for the receipt is a plan read of the receipt table; the authored
+    /// name rides on that read, where resolution binds it.
     fn walk_functor_call(
+        &mut self,
+        call: SealedCall,
+        alias: Option<delightql_types::SqlIdentifier>,
+        receipt: Access,
+        ctx: &WalkCtx,
+    ) -> Result<Chain> {
+        let mut chain = self.walk_functor_call_read(call, alias.clone(), receipt, ctx)?;
+        if let Some(alias) = alias {
+            if let GroundForm::Reference(Relation::Ground { mention, .. }) =
+                chain.head_mut().form_mut()
+            {
+                match mention {
+                    // THE RECEIPT IS NAMED HERE: the plan pairs the row it
+                    // allocated with the name the author wrote on the call.
+                    GroundMention::Scratch { row } => {
+                        let row = *row;
+                        *mention = GroundMention::Receipt {
+                            receipt: crate::relation::NamedScratch::under(
+                                row,
+                                alias,
+                                ReceiptNaming(()),
+                            ),
+                            alias: None,
+                        };
+                    }
+                    GroundMention::Receipt {
+                        alias: slot @ None, ..
+                    } => {
+                        *slot = Some(alias);
+                    }
+                    GroundMention::Named { .. }
+                    | GroundMention::Receipt { .. }
+                    | GroundMention::Structural { .. } => {}
+                }
+            }
+        }
+        Ok(chain)
+    }
+
+    fn walk_functor_call_read(
         &mut self,
         mut call: SealedCall,
         // The name the READ answers to. A pure relation call keeps it; a
@@ -1353,24 +1761,31 @@ impl<'a> PlanBuilder<'a> {
     ) -> Result<Chain> {
         let name = call.call().callee.name_text();
 
-        // THE POSITION IS THE FORMAL. Normalization lays the group out by
-        // the callee's category — a mutation's destination first and its
-        // source after it; any other directive's source first — so the
-        // positions carry what the deleted role marks used to say, and a
-        // direct call and a piped one read identically here.
-        let mut table_arguments: Vec<Chain> = Vec::new();
+        // THE POSITION IS THE FORMAL. Normalization lays every group out the
+        // same way — the written arguments, then the relation the effect
+        // consumes — so the positions carry what the deleted role marks used
+        // to say, and a direct call and a piped one read identically here.
+        let judged = call.call().arguments.judged()?;
+        let mut table_arguments: Vec<Chain> = judged
+            .relations()
+            .iter()
+            .map(|argument| argument.relation.clone())
+            .collect();
         let mut scalar_arguments = Vec::new();
+        // THE ROLES ARE THE MEMBERS' OWN. A landed relation says it is the
+        // pipe's where it stands, so the two roles separate as the row is
+        // read rather than by comparing an index against a position list.
         for argument in call.call().arguments.ho_members() {
             match argument {
-                HoArgument::Relation(relation) => table_arguments.push(relation.clone()),
-                HoArgument::Value(value) => {
-                    if let Some(expression) = value.domain() {
-                        scalar_arguments.push(expression.clone())
-                    }
-                }
-                HoArgument::Landing(_) | HoArgument::Skip => {}
+                HoArgument::Value(value) => scalar_arguments.push(value.value.clone()),
+                HoArgument::Relation(_)
+                | HoArgument::Rule(_)
+                | HoArgument::Landed(_)
+                | HoArgument::Landing(_)
+                | HoArgument::Skip => {}
             }
         }
+        let landed_at = judged.landed().map(|landed| landed.position);
         // THE GLOB IS HOW A DEMAND SPELLS "WHOLE", not a value handed to a
         // parameter, so a rule's arity is counted without it.
         for member in call.call().arguments.scalar_members() {
@@ -1384,16 +1799,15 @@ impl<'a> PlanBuilder<'a> {
         // The exclamation mark is the syntax boundary for effect/directive
         // eligibility; an unavailable callable descriptor must not turn
         // `foo(*)` into a demanded effect rule.
-        if !name.ends_with('!') && effects::descriptor(&name).is_none() {
-            let read = Chain::read(
-                Relation::FunctorCall {
-                    call,
-                    alias,
-                    cpr_schema: (),
-                },
-                receipt,
-                (),
-            );
+        if !name.ends_with('!') && effects::descriptor_for_reference(&call.call().callee).is_none()
+        {
+            // The relations this row carries are walked; what each position
+            // IS — authored actual or landed relation — is not this walk's
+            // to change.
+            call.call_mut().arguments.rewrite_relations(|relation| {
+                self.walk_value(relation.clone(), &ctx.without_sink())
+            })?;
+            let read = Chain::read(Relation::FunctorCall { call, alias }, receipt);
             self.refuse_if_effectful(&read)?;
             return Ok(read);
         }
@@ -1419,51 +1833,42 @@ impl<'a> PlanBuilder<'a> {
             let only = table_arguments
                 .pop()
                 .expect("one relational argument exists");
-            call.call_mut().arguments =
+            call.call_mut().arguments = if landed_at.is_some() {
                 crate::pipeline::asts::core::operators::CallArguments::higher_order(
-                    scalar_arguments
-                        .into_iter()
-                        .map(|value| {
-                            HoArgument::Value(crate::pipeline::asts::core::ArgumentValue::plain(
-                                value,
-                            ))
-                        })
+                    call.call()
+                        .arguments
+                        .ho_members()
+                        .filter(|member| !matches!(member, HoArgument::Landed(_)))
+                        .cloned()
                         .collect(),
-                );
+                )
+            } else {
+                crate::pipeline::asts::core::operators::CallArguments::higher_order(
+                    call.call()
+                        .arguments
+                        .ho_members()
+                        .filter(|member| {
+                            matches!(member, HoArgument::Rule(_) | HoArgument::Value(_))
+                        })
+                        .cloned()
+                        .collect(),
+                )
+            };
             return self.walk_directive_terminal(only, call, receipt, ctx);
         }
-        // Two relations: the landing slot says which member the pipe put
-        // there; the other is the authored argument. Without one, the
-        // mutation layout is [target, source] and every other directive's
-        // is [source, other] — the same positions the landing would have
-        // chosen.
-        let landing = call.call().arguments.ho().and_then(|part| part.landing);
-        let relation_positions: Vec<usize> = call
-            .call()
-            .arguments
-            .ho_members()
-            .enumerate()
-            .filter(|(_, member)| member.relation().is_some())
-            .map(|(position, _)| position)
-            .collect();
+        // Two relations: the LANDED member is the pipe's, and the other is
+        // the authored argument. Without one — a direct call — the layout is
+        // the same row the landing would have built, written arguments then
+        // the consumed relation, and there is no per-category layout to look
+        // up.
         let mut relations = table_arguments.into_iter();
         let (first, second) = (
             relations.next().expect("two relational arguments exist"),
             relations.next().expect("two relational arguments exist"),
         );
-        let (argument, source) = match landing {
-            Some(index) if relation_positions.first() == Some(&index) => (second, first),
-            Some(_) => (first, second),
-            None => {
-                if matches!(
-                    effects::directive_category(&name),
-                    DirectiveCategory::Dml(_)
-                ) {
-                    (first, second)
-                } else {
-                    (second, first)
-                }
-            }
+        let (argument, source) = match landed_at {
+            Some(0) => (second, first),
+            _ => (first, second),
         };
         call.call_mut().arguments =
             crate::pipeline::asts::core::operators::CallArguments::higher_order(
@@ -1509,12 +1914,28 @@ impl<'a> PlanBuilder<'a> {
         //    identity, so the bare spelling keeps the strop bit it was
         //    written with.
         let demanded_bare = bare_demand_identifier(demanded);
-        let matching: Vec<_> = ctx
-            .ctes
-            .iter()
-            .filter(|c| c.name == demanded_bare)
-            .cloned()
-            .collect();
+        let local_kind = if qualifier.is_none() {
+            ctx.local_names().select(
+                &demanded_bare,
+                ctx.horizon,
+                crate::pipeline::asts::core::QueryLocalDemand::Effect,
+            )?
+        } else {
+            None
+        };
+        let matching: Vec<_> =
+            if local_kind == Some(crate::pipeline::asts::core::QueryLocalKind::EffectRelation) {
+                ctx.ctes()
+                    .iter()
+                    .filter(|cte| {
+                        cte.subject().declares_effect()
+                            && cte.subject().authored_name() == Some(&demanded_bare)
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
         if !matching.is_empty() {
             require_glob_args(name, arguments)?;
             self.pending_comment
@@ -1524,7 +1945,7 @@ impl<'a> PlanBuilder<'a> {
             arm_ctx.receipt_name = bare.to_string();
             let mut walked = Vec::with_capacity(matching.len());
             for cte in matching {
-                walked.push(self.walk_value(cte.expression, &arm_ctx)?);
+                walked.push(self.walk_value(cte.body().clone(), &arm_ctx)?);
             }
             let mut walked = walked.into_iter();
             let mut accumulated = walked.next().expect("matching is non-empty");
@@ -1533,51 +1954,80 @@ impl<'a> PlanBuilder<'a> {
                     crate::pipeline::asts::core::expressions::metadata_types::SetOperator::UnionCorresponding,
                     arm,
                     (),
-                    (),
                 );
             }
             return Ok(accumulated);
         }
 
+        // 1b. The query's own effect-mirror CHOE: NEAREST WINS over any
+        //     consulted rule of the name, as the label does. Its
+        //     invocation is the one bound-use road, in the demand site's
+        //     own world.
+        if local_kind == Some(crate::pipeline::asts::core::QueryLocalKind::EffectHigherOrder) {
+            let definition = ctx
+                .hos()
+                .iter()
+                .find(|ho| ho.declares_effect() && ho.name() == &demanded_bare)
+                .expect("the common name authority's effect CHOE has its manifestation");
+            let supplied = arguments.to_vec();
+            return self.invoke_rule(
+                crate::defuse::bound_use::EffectSelection::Scoped(
+                    crate::defuse::bound_use::ScopedEffectUse::of(definition.clone()),
+                ),
+                EffectRuleArguments::Values {
+                    supplied,
+                    glob_required: true,
+                },
+                None,
+                ctx,
+                false,
+            );
+        }
+
         // 2. Built-ins.
-        match effects::directive_category(name) {
+        let builtin =
+            crate::pipeline::asts::effects::DirectiveKind::select_identity(name, qualifier);
+        let category = builtin
+            .map(|kind| kind.descriptor().category)
+            .unwrap_or(DirectiveCategory::User);
+        match category {
             DirectiveCategory::Utility if bare == "exit" => {
                 require_glob_args(name, arguments)?;
                 let armed = self.exit_armed;
                 let v = self.handle_exit(None, ctx)?;
-                self.mark_step(
-                    compiled_query::EffectStepKind::Exit,
-                    "exit",
-                    Some(ctx),
-                    armed,
-                )?;
+                self.mark_exit_step(Some(ctx), armed)?;
                 Ok(v)
             }
             DirectiveCategory::User => {
-                let ns = match qualifier {
-                    Some(written) => written.to_string(),
-                    None => self.lookup_namespace(name)?.to_string(),
-                };
-                let rule = lookup_effect_rule(self.system, &ns, name)?.ok_or_else(|| {
-                    unsupported(format!(
-                        "unknown directive '{}' in effect body: not a built-in, \
-                             not an effect-CTE label of this body, and no effect \
-                             rule of that name is registered in namespace '{}'",
-                        name, ns
-                    ))
-                })?;
+                let rule = ctx
+                    .world
+                    .select_effect_rule(
+                        self.system,
+                        qualifier,
+                        name,
+                        demanded_bare.is_stropped(),
+                    )?
+                    .ok_or_else(|| {
+                        unsupported(format!(
+                            "directive '{}' is not a built-in, not an effect-CTE label of this body, and no effect rule of that name is visible from this demand site",
+                            name
+                        ))
+                    })?;
                 // A rule that declares scalar parameters is invoked WITH the
                 // arguments for them; the access glob is not one of those.
                 // A rule that declares none takes the glob form and nothing
                 // else, which is what it has always taken.
                 let supplied = arguments.to_vec();
-                let rule = if rule.scalar_params().is_empty() {
-                    require_glob_args(name, arguments)?;
-                    rule
-                } else {
-                    rule.with_scalar_arguments(&supplied)?
-                };
-                self.invoke_rule(&rule, None, ctx)
+                self.invoke_rule(
+                    crate::defuse::bound_use::EffectSelection::Consulted(rule),
+                    EffectRuleArguments::Values {
+                        supplied,
+                        glob_required: true,
+                    },
+                    None,
+                    ctx,
+                    false,
+                )
             }
             // `run_namespace!` is legal in effect
             // bodies — its target's rules already exist when the body is
@@ -1646,22 +2096,22 @@ impl<'a> PlanBuilder<'a> {
         // keep its receipt context.
         let source = if is_returned_heading_projection(&operator) {
             let drill = source
-                .continuations
+                .continuations()
                 .last()
+                .map(Step::form)
                 .is_some_and(is_returned_glob_drill);
             if drill {
                 let mut inner = source;
-                let Some(
-                    drill_step @ Continuation::Structural(
-                        crate::pipeline::asts::core::StructuralStep {
-                            form: crate::pipeline::asts::core::StructuralForm::Drill { .. },
-                            ..
-                        },
-                    ),
-                ) = inner.continuations.pop()
-                else {
+                let Some(drill_step) = inner.continuations_mut().pop() else {
                     unreachable!("just matched a drill")
                 };
+                debug_assert!(matches!(
+                    drill_step.form(),
+                    Continuation::Structural(crate::pipeline::asts::core::StructuralStep {
+                        form: crate::pipeline::asts::core::StructuralForm::Drill { .. },
+                        ..
+                    })
+                ));
                 match self.try_fuse_released_payload(inner, Access::Unasked, ctx)? {
                     FuseOutcome::Fused(v) => return Ok(v),
                     FuseOutcome::NotApplicable(s) => s.then(drill_step),
@@ -1695,6 +2145,36 @@ impl<'a> PlanBuilder<'a> {
         receipt: Access,
         ctx: &WalkCtx,
     ) -> Result<Chain> {
+        use crate::pipeline::asts::effects::DirectiveKind as K;
+
+        // A rule designator has its own typed carrier. A bare local name can
+        // initially look relation-shaped, while a configured or consulted
+        // value is already `Rule`; both enter the ordinary residual judgment
+        // below. Dispatch therefore follows the directive identity, never a
+        // guess based on the designator's provisional carrier.
+        let builtin = effects::kind_for_reference(&call.call().callee);
+        if builtin == Some(K::Assert) {
+            let property = call
+                .call()
+                .arguments
+                .ho_members()
+                .find_map(|member| match member {
+                    HoArgument::Rule(rule) | HoArgument::Relation(rule) => Some(rule.clone()),
+                    HoArgument::Landed(_)
+                    | HoArgument::Value(_)
+                    | HoArgument::Landing(_)
+                    | HoArgument::Skip => None,
+                })
+                .ok_or_else(|| internal("assert! has no property designator".to_string()))?;
+            let values = call
+                .call()
+                .arguments
+                .ho_members()
+                .filter_map(|member| member.scalar_domain().cloned())
+                .collect::<Vec<_>>();
+            return self.walk_assert_terminal(source, property, &values, receipt, ctx, false);
+        }
+
         if call.call().relations().next().is_none() {
             {
                 let name = call.call().callee.name_text();
@@ -1712,20 +2192,14 @@ impl<'a> PlanBuilder<'a> {
                     )
                     .collect::<Vec<_>>();
                 let bare = bare_name(&name).to_string();
-                use crate::pipeline::asts::effects::DirectiveKind as K;
-                match K::from_name(&name) {
+                match builtin {
                     // DDL directives.
                     Some(K::TempTable | K::TempView | K::Table) => {
                         let walked_source = self.walk_value(source, &ctx.without_sink())?;
                         let target = single_name_argument(&name, &arguments)?;
                         let armed = self.exit_armed;
                         let v = self.handle_ddl(walked_source, &bare, &target, ctx)?;
-                        self.mark_step(
-                            compiled_query::EffectStepKind::Ddl,
-                            &bare,
-                            Some(ctx),
-                            armed,
-                        )?;
+                        self.mark_step(MarkedStepKind::Ddl, &bare, Some(ctx), armed)?;
                         Ok(v)
                     }
                     // stdout! ships and passes through.
@@ -1733,12 +2207,7 @@ impl<'a> PlanBuilder<'a> {
                         let walked_source = self.walk_value(source, &ctx.without_sink())?;
                         let armed = self.exit_armed;
                         let v = self.handle_stdout(walked_source, ctx)?;
-                        self.mark_step(
-                            compiled_query::EffectStepKind::Host,
-                            "stdout",
-                            Some(ctx),
-                            armed,
-                        )?;
+                        self.mark_step(MarkedStepKind::Host, "stdout", Some(ctx), armed)?;
                         Ok(v)
                     }
                     // returning! packages the piped relation in its
@@ -1752,12 +2221,20 @@ impl<'a> PlanBuilder<'a> {
                         let walked_source = self.walk_value(source, &ctx.without_sink())?;
                         let armed = self.exit_armed;
                         let v = self.handle_exit(Some(walked_source), ctx)?;
-                        self.mark_step(
-                            compiled_query::EffectStepKind::Exit,
-                            "exit",
-                            Some(ctx),
-                            armed,
-                        )?;
+                        self.mark_exit_step(Some(ctx), armed)?;
+                        Ok(v)
+                    }
+                    // abort! is a typed erroneous terminal. The runner tests
+                    // the lowered input relation directly; no backend error
+                    // is manufactured and no exit latch is reused.
+                    Some(K::Abort) => {
+                        let walked_source = self.walk_value(source, &ctx.without_sink())?;
+                        let (identity, label) = abort_arguments(&name, &arguments)?;
+                        let armed = self.exit_armed;
+                        let provenance =
+                            compiled_query::AbortProvenance::Authored { identity, label };
+                        let (v, probe) = self.handle_abort(walked_source, ctx)?;
+                        self.mark_abort_step(probe, provenance, "abort", Some(ctx), armed)?;
                         Ok(v)
                     }
                     // The standalone two-paren form `run_namespace!(ns)(*)`
@@ -1783,16 +2260,55 @@ impl<'a> PlanBuilder<'a> {
                         // entity, one visibility rule, whichever way it is
                         // invoked.
                         let walked_source = self.walk_value(source, &ctx.without_sink())?;
-                        let ns = match call.call().callee.namespace_fq() {
-                            Some(written) => written,
-                            None => self.lookup_namespace(&name)?.to_string(),
-                        };
-                        let rule =
-                            lookup_effect_rule(self.system, &ns, &name)?.ok_or_else(|| {
+                        // The query's own effect-mirror CHOE answers a BARE
+                        // demand first — nearest wins.
+                        if call.call().callee.namespace_fq().is_none() {
+                            let demanded =
+                                bare_demand_identifier(&call.call().callee.name_identifier());
+                            let local_kind = ctx.local_names().select(
+                                &demanded,
+                                ctx.horizon,
+                                crate::pipeline::asts::core::QueryLocalDemand::Effect,
+                            )?;
+                            if local_kind
+                                == Some(
+                                    crate::pipeline::asts::core::QueryLocalKind::EffectHigherOrder,
+                                )
+                            {
+                                let definition = ctx
+                                    .hos()
+                                    .iter()
+                                    .find(|ho| ho.declares_effect() && ho.name() == &demanded)
+                                    .expect(
+                                        "the common name authority's effect CHOE has its manifestation",
+                                    );
+                                return self.invoke_rule(
+                                    crate::defuse::bound_use::EffectSelection::Scoped(
+                                        crate::defuse::bound_use::ScopedEffectUse::of(
+                                            definition.clone(),
+                                        ),
+                                    ),
+                                    EffectRuleArguments::Row(call.call().arguments.clone()),
+                                    Some(walked_source),
+                                    ctx,
+                                    false,
+                                );
+                            }
+                        }
+                        let written_namespace = call.call().callee.namespace_fq();
+                        let name_identifier = call.call().callee.name_identifier();
+                        let rule = ctx
+                            .world
+                            .select_effect_rule(
+                                self.system,
+                                written_namespace.as_deref(),
+                                &name,
+                                name_identifier.is_stropped(),
+                            )?
+                            .ok_or_else(|| {
                                 unsupported(format!(
-                                    "unknown piped directive '{}': no effect rule of \
-                                     that name is registered in namespace '{}'",
-                                    name, ns
+                                    "unknown piped directive '{}': no effect rule is visible from this demand site",
+                                    name
                                 ))
                             })?;
                         // The terminal's own argument list supplies the scalar
@@ -1800,21 +2316,19 @@ impl<'a> PlanBuilder<'a> {
                         // binding road as the pseudo-predicate form — one
                         // entity, one way of filling it, whichever way it is
                         // invoked.
-                        let supplied: Vec<DomainExpression> =
-                            call.call().arguments.value_domains().cloned().collect();
-                        let rule = if rule.scalar_params().is_empty() {
-                            rule
-                        } else {
-                            rule.with_scalar_arguments(&supplied)?
-                        };
-                        self.invoke_rule(&rule, Some(walked_source), ctx)
+                        self.invoke_rule(
+                            crate::defuse::bound_use::EffectSelection::Consulted(rule),
+                            EffectRuleArguments::Row(call.call().arguments.clone()),
+                            Some(walked_source),
+                            ctx,
+                            false,
+                        )
                     }
                     // Declared identities without a one-group effect-body
                     // realization — the POLICY refusal, never a fallthrough
                     // that mistakes a declared identity for a user rule.
                     Some(
                         K::Consult
-                        | K::ConsultConcatIntoNs
                         | K::ConsultTree
                         | K::Reconsult
                         | K::Unconsult
@@ -1834,7 +2348,8 @@ impl<'a> PlanBuilder<'a> {
                         | K::Insert
                         | K::Update
                         | K::Delete
-                        | K::ReturningOther,
+                        | K::ReturningOther
+                        | K::Assert,
                     ) => Err(unsupported(format!(
                         "piped directive '{}' is not supported in v0.1 effect bodies",
                         name
@@ -1846,6 +2361,63 @@ impl<'a> PlanBuilder<'a> {
             // (its effects happen), then discarded; the argument returns.
             {
                 let name = call.call().callee.name_text();
+                if builtin.is_none() {
+                    let walked_source = self.walk_value(source, &ctx.without_sink())?;
+                    if call.call().callee.namespace_fq().is_none() {
+                        let demanded =
+                            bare_demand_identifier(&call.call().callee.name_identifier());
+                        let local_kind = ctx.local_names().select(
+                            &demanded,
+                            ctx.horizon,
+                            crate::pipeline::asts::core::QueryLocalDemand::Effect,
+                        )?;
+                        if local_kind
+                            == Some(crate::pipeline::asts::core::QueryLocalKind::EffectHigherOrder)
+                        {
+                            let definition = ctx
+                                .hos()
+                                .iter()
+                                .find(|ho| ho.declares_effect() && ho.name() == &demanded)
+                                .expect(
+                                    "the common name authority's effect CHOE has its manifestation",
+                                );
+                            return self.invoke_rule(
+                                crate::defuse::bound_use::EffectSelection::Scoped(
+                                    crate::defuse::bound_use::ScopedEffectUse::of(
+                                        definition.clone(),
+                                    ),
+                                ),
+                                EffectRuleArguments::Row(call.call().arguments.clone()),
+                                Some(walked_source),
+                                ctx,
+                                false,
+                            );
+                        }
+                    }
+                    let written_namespace = call.call().callee.namespace_fq();
+                    let name_identifier = call.call().callee.name_identifier();
+                    let rule = ctx
+                        .world
+                        .select_effect_rule(
+                            self.system,
+                            written_namespace.as_deref(),
+                            &name,
+                            name_identifier.is_stropped(),
+                        )?
+                        .ok_or_else(|| {
+                        unsupported(format!(
+                            "unknown piped directive '{}': no effect rule is visible from this demand site",
+                            name
+                        ))
+                    })?;
+                    return self.invoke_rule(
+                        crate::defuse::bound_use::EffectSelection::Consulted(rule),
+                        EffectRuleArguments::Row(call.call().arguments.clone()),
+                        Some(walked_source),
+                        ctx,
+                        false,
+                    );
+                }
                 // THE TARGET IS A PARAMETER: on this road the piped relation
                 // rides the spine, so the group's first relation is the
                 // designator the author wrote.
@@ -1865,8 +2437,10 @@ impl<'a> PlanBuilder<'a> {
                 // as the same preserved relational DESIGNATOR the DDL path
                 // carries; interpreted deliberately or refused — never a
                 // string minted by the parser.
-                let dml_kind = match effects::directive_category(&name) {
-                    crate::pipeline::asts::effects::DirectiveCategory::Dml(verb) => Some(verb),
+                let dml_kind = match builtin.map(|kind| kind.descriptor().category) {
+                    Some(crate::pipeline::asts::effects::DirectiveCategory::Dml(verb)) => {
+                        Some(verb)
+                    }
                     _ => None,
                 };
                 if let Some(kind) = dml_kind {
@@ -1888,11 +2462,11 @@ impl<'a> PlanBuilder<'a> {
                         access,
                         ctx,
                     )?;
-                    self.mark_step(compiled_query::EffectStepKind::Dml, &bare, Some(ctx), armed)?;
+                    self.mark_step(MarkedStepKind::Dml, &bare, Some(ctx), armed)?;
                     return Ok(v);
                 }
                 if matches!(
-                    crate::pipeline::asts::effects::DirectiveKind::from_name(&name),
+                    builtin,
                     Some(
                         crate::pipeline::asts::effects::DirectiveKind::Table
                             | crate::pipeline::asts::effects::DirectiveKind::TempTable
@@ -1915,12 +2489,10 @@ impl<'a> PlanBuilder<'a> {
                         target_namespace.as_deref(),
                         ctx,
                     )?;
-                    self.mark_step(compiled_query::EffectStepKind::Ddl, &bare, Some(ctx), armed)?;
+                    self.mark_step(MarkedStepKind::Ddl, &bare, Some(ctx), armed)?;
                     return Ok(v);
                 }
-                if crate::pipeline::asts::effects::DirectiveKind::from_name(&name)
-                    != Some(crate::pipeline::asts::effects::DirectiveKind::ReturningOther)
-                {
+                if builtin != Some(crate::pipeline::asts::effects::DirectiveKind::ReturningOther) {
                     return Err(unsupported(format!(
                         "piped two-paren directive '{}' is not supported in the v0.1 \
                          effect transformer",
@@ -1939,6 +2511,43 @@ impl<'a> PlanBuilder<'a> {
                 ))
             }
         }
+    }
+
+    fn walk_assert_terminal(
+        &mut self,
+        source: Chain,
+        property: Chain,
+        values: &[DomainExpression],
+        receipt: Access,
+        ctx: &WalkCtx,
+        release: bool,
+    ) -> Result<Chain> {
+        require_whole_access("assert!", &receipt)?;
+        if values.len() > 1 {
+            return Err(DelightQLError::validation_error_categorized(
+                "directive/binding/arity",
+                "assert! accepts one property and an optional label".to_string(),
+                "assert!(property, \"label\")(*)",
+            ));
+        }
+        let label = match values.first() {
+            Some(value) => run_target_from_value(value).ok_or_else(|| {
+                DelightQLError::validation_error_categorized(
+                    "directive/binding/value",
+                    "assert! label must be a string or bare name".to_string(),
+                    "assert label",
+                )
+            })?,
+            None => format!("assert!#{}", self.step_marks.len()),
+        };
+        let walked_source = self.walk_value(source, &ctx.without_sink())?;
+        let armed = self.exit_armed;
+        let provenance = compiled_query::AbortProvenance::Assertion {
+            label: label.clone(),
+        };
+        let (receipt, returned, probe) = self.handle_assert(property, walked_source, label, ctx)?;
+        self.mark_abort_step(probe, provenance, "assert", Some(ctx), armed)?;
+        Ok(if release { returned } else { receipt })
     }
 
     // ========================================================================
@@ -1985,7 +2594,7 @@ impl<'a> PlanBuilder<'a> {
         // derived relation first (pinned by
         // `self_referential_dml_materializes_view_source`).
         let walked_source = if matches!(kind, DmlVerb::Update | DmlVerb::Delete) {
-            self.materialize_hazardous_views(walked_source, &target)?
+            self.materialize_hazardous_views(walked_source, &target, ctx)?
         } else {
             walked_source
         };
@@ -2002,14 +2611,13 @@ impl<'a> PlanBuilder<'a> {
             ]),
             marks: Default::default(),
         };
-        let dml_expr = Chain::relation(Relation::FunctorCall {
+        let dml_expr = Chain::authored(GroundForm::Reference(Relation::FunctorCall {
             call: dml_call.into(),
             alias: None,
-            cpr_schema: (),
-        });
-        let mut compiled = self.compile_statement(Query::relational(dml_expr))?;
+        }));
+        let mut compiled = self.compile_statement(ctx, ctx.pure_query(dml_expr))?;
         let gates = self.gate_exprs(ctx, true)?;
-        stamp_statement(&mut compiled.stmt, gates, &self.registry);
+        stamp_statement(&mut compiled.stmt, gates, &self.epoch.names());
         let conn = self.route(compiled.connection_id)?;
 
         // THE SOURCE IS STAGED FIRST, and the plan's trailing cleanup drops
@@ -2026,7 +2634,7 @@ impl<'a> PlanBuilder<'a> {
                 self.emit_statement(sql, conn);
             }
             self.mark_step(
-                compiled_query::EffectStepKind::Stage,
+                MarkedStepKind::Stage,
                 dml_kind_name(&kind),
                 Some(ctx),
                 armed,
@@ -2036,7 +2644,7 @@ impl<'a> PlanBuilder<'a> {
             .extend(std::mem::take(&mut compiled.staged));
 
         // WHAT THE MUTATION MAY NOT RUN WITHOUT. Each obligation is its own
-        // step, marked as an assertion, standing immediately before the
+        // check step, standing immediately before the
         // mutation it guards: the plan runs steps in order and a false
         // verdict aborts the run and rolls the bracket back, so the mutation
         // does not happen and the program is told. Folding the check into
@@ -2054,7 +2662,7 @@ impl<'a> PlanBuilder<'a> {
             self.pending_refusal = Some(obligation.refusal);
             self.emit_statement(sql, conn);
             self.mark_step(
-                compiled_query::EffectStepKind::Assertion,
+                MarkedStepKind::Check,
                 dml_kind_name(&kind),
                 Some(ctx),
                 armed,
@@ -2091,16 +2699,14 @@ impl<'a> PlanBuilder<'a> {
                         ))
                     }
                 };
-                let fused_scope = self.registry.mint_derived_scope(
-                    crate::names::ScopeOrigin::Cte {
-                        input,
-                        role: crate::names::CteRole::Materialize,
-                    },
-                    crate::names::Hint::Exact(self.registry.intern("__dml", false)),
+                let fused_scope = self.epoch.names().cte_scope(
+                    input,
+                    crate::names::CteRole::Materialize,
+                    crate::names::CteLabel::Exact(self.epoch.names().intern("__dml", false)),
                 );
                 let dml_sql = self.finish_statement(&compiled.stmt)?;
                 let receipt_sql = self.build_receipt_insert_sql(
-                    table,
+                    table.relation(),
                     &shape,
                     ReceiptGate::FusedDml(fused_scope),
                     ctx,
@@ -2123,12 +2729,18 @@ impl<'a> PlanBuilder<'a> {
                 // load-bearing here), then gate the receipt on
                 // it. The stage is built from the STAMPED statement, so
                 // the count sees the same guards/exit gates the DML does.
-                let aff_scope =
-                    self.alloc_named_scratch(crate::names::ScratchRole::Barrier, "__aff");
+                let aff_scope = self
+                    .alloc_scratch(
+                        crate::names::ScratchRole::Barrier,
+                        "__aff",
+                        &["c".to_string()],
+                        None,
+                    )?
+                    .relation();
                 let (with_clause, count_query) =
-                    precount_query(&compiled.stmt, &self.registry, aff_scope)?;
+                    precount_query(&compiled.stmt, &self.epoch.names(), aff_scope)?;
                 let stage = SqlStatement::CreateTempTable {
-                    table: aff_scope,
+                    table: aff_scope.scope(),
                     with_clause,
                     query: count_query,
                 };
@@ -2141,7 +2753,7 @@ impl<'a> PlanBuilder<'a> {
                     .push(PendingPlanEntry::Statement(PendingPlanStatement {
                         sql: DeferredSql::concat([
                             DeferredSql::text(format!("DROP TABLE IF EXISTS {}.", scratch_schema)),
-                            DeferredSql::Scope(aff_scope),
+                            DeferredSql::Scope(aff_scope.scope()),
                         ]),
                         connection_id: conn,
                         comment: None,
@@ -2158,7 +2770,12 @@ impl<'a> PlanBuilder<'a> {
                 let sql = self.finish_statement(&compiled.stmt)?;
                 self.emit_statement(sql, conn);
                 self.mutation_epoch += 1;
-                self.emit_receipt_insert(table, &shape, ReceiptGate::Precount(aff_scope), ctx)?;
+                self.emit_receipt_insert(
+                    table.relation(),
+                    &shape,
+                    ReceiptGate::Precount(aff_scope),
+                    ctx,
+                )?;
             }
             _ => {
                 // SQLite (canonical; also the unreachable mysql/sqlserver
@@ -2169,10 +2786,10 @@ impl<'a> PlanBuilder<'a> {
                 // The changes() gate is connection state —
                 // the receipt insert follows its DML immediately, nothing
                 // between.
-                self.emit_receipt_insert(table, &shape, ReceiptGate::Changes, ctx)?;
+                self.emit_receipt_insert(table.relation(), &shape, ReceiptGate::Changes, ctx)?;
             }
         }
-        Ok(plan_scope_read(table))
+        Ok(scratch_read(table))
     }
 
     /// DDL directive → CTAS / CREATE VIEW + UNCONDITIONAL
@@ -2195,7 +2812,7 @@ impl<'a> PlanBuilder<'a> {
         // a system-kind namespace is never a creation target.
         self.refuse_system_namespace_target(target, target_namespace, "DDL")?;
         if let Some(ns) = target_namespace {
-            let compiled = self.compile_statement(Query::relational(walked_source.clone()))?;
+            let compiled = self.compile_statement(ctx, ctx.pure_query(walked_source.clone()))?;
             let source_conn = self.route(compiled.connection_id)?;
             let ns_path = delightql_types::namespace::NamespacePath::from_fq_string(ns);
             let resolved = self.system.resolve_namespace_path(&ns_path).map_err(|e| {
@@ -2246,7 +2863,7 @@ impl<'a> PlanBuilder<'a> {
         // one user connection plus sys:: attributes to that user
         // connection with the sys rows carried in the compiled source.
         let compiled =
-            self.compile_statement_with(Query::relational(walked_source.clone()), true)?;
+            self.compile_statement_with(ctx, ctx.pure_query(walked_source.clone()), true, None)?;
         // Route on the attribution: durable placement, the durable clash
         // universe, and the cross-kind holder probe are all keyed on the
         // statement's CONNECTION (counted after resolution).
@@ -2311,7 +2928,11 @@ impl<'a> PlanBuilder<'a> {
         // predicate inside their SELECT would gate content, not creation.
         // The typed absence requirement therefore skips the complete DDL
         // step after exit on every engine.
-        let target_scope = self.named_scope(target);
+        // THE CREATED OBJECT'S RELATION, derived with the heading the
+        // statement that creates it emits. One derivation: the name the
+        // CREATE renders and the note later statements resolve against are
+        // the same relation, so there is no interface to grow afterwards.
+        let target_scope = self.create_object_relation(target, &compiled.ports)?;
         let sql = if bare == "table" {
             // sql_ast has no durable-CTAS variant, so `table!` renders
             // its SELECT through the ordinary chain and takes the CREATE
@@ -2351,7 +2972,7 @@ impl<'a> PlanBuilder<'a> {
                     {
                         Some(schema) => DeferredSql::concat([
                             DeferredSql::text(format!("CREATE TABLE {}.", schema)),
-                            DeferredSql::Scope(target_scope),
+                            DeferredSql::Scope(target_scope.scope()),
                             DeferredSql::text(" AS "),
                             select_sql,
                         ]),
@@ -2386,7 +3007,7 @@ impl<'a> PlanBuilder<'a> {
                     // `duckdb_table_bang_on_the_direct_open_primary_stays_unqualified`.
                     DeferredSql::concat([
                         DeferredSql::text("CREATE TABLE "),
-                        DeferredSql::Scope(target_scope),
+                        DeferredSql::Scope(target_scope.scope()),
                         DeferredSql::text(" AS "),
                         select_sql,
                     ])
@@ -2412,13 +3033,13 @@ impl<'a> PlanBuilder<'a> {
                     match alias {
                         Some(alias) => DeferredSql::concat([
                             DeferredSql::text(format!("CREATE TABLE {}.", alias)),
-                            DeferredSql::Scope(target_scope),
+                            DeferredSql::Scope(target_scope.scope()),
                             DeferredSql::text(" AS "),
                             select_sql,
                         ]),
                         None => DeferredSql::concat([
                             DeferredSql::text("CREATE TABLE "),
-                            DeferredSql::Scope(target_scope),
+                            DeferredSql::Scope(target_scope.scope()),
                             DeferredSql::text(" AS "),
                             select_sql,
                         ]),
@@ -2428,13 +3049,13 @@ impl<'a> PlanBuilder<'a> {
         } else {
             let ddl_stmt = if bare == "temp_table" {
                 SqlStatement::CreateTempTable {
-                    table: target_scope,
+                    table: target_scope.scope(),
                     with_clause: None,
                     query: source_query,
                 }
             } else {
                 SqlStatement::CreateTempView {
-                    view: target_scope,
+                    view: target_scope.scope(),
                     with_clause: None,
                     query: source_query,
                 }
@@ -2483,7 +3104,7 @@ impl<'a> PlanBuilder<'a> {
                             if holder_is_view { "VIEW" } else { "TABLE" },
                             scratch_schema
                         )),
-                        DeferredSql::Scope(target_scope),
+                        DeferredSql::Scope(target_scope.scope()),
                     ]);
                     self.emit_ddl_action(
                         holder_drop,
@@ -2498,7 +3119,7 @@ impl<'a> PlanBuilder<'a> {
                     if creating_view { "VIEW" } else { "TABLE" },
                     scratch_schema
                 )),
-                DeferredSql::Scope(target_scope),
+                DeferredSql::Scope(target_scope.scope()),
             ]);
             self.emit_ddl_action(
                 drop_sql,
@@ -2518,8 +3139,6 @@ impl<'a> PlanBuilder<'a> {
             connection_id: conn,
         });
 
-        // The created object's schema is a plan note for later statements.
-        self.register_note(target, &compiled.columns);
         if bare == "temp_view" {
             // The self-reference hazard map: which base tables this view reads.
             let mut bases = collect_ground_names(&walked_source);
@@ -2552,8 +3171,8 @@ impl<'a> PlanBuilder<'a> {
         // Creation receipts are UNCONDITIONAL (no rowcount
         // gate — CTAS from an empty source still creates the object); the
         // exit guard still applies (oracle arm v!).
-        self.emit_receipt_insert(table, &shape, ReceiptGate::Unconditional, ctx)?;
-        Ok(plan_scope_read(table))
+        self.emit_receipt_insert(table.relation(), &shape, ReceiptGate::Unconditional, ctx)?;
+        Ok(scratch_read(table))
     }
 
     /// Emission 6: stdout! ships its input and passes it through. The pure
@@ -2603,8 +3222,8 @@ impl<'a> PlanBuilder<'a> {
         // argument, so the canonical release arrives as a bare
         // Relation::FunctorCall head with no continuations.
         let receipt = source.head_access().cloned().unwrap_or(receipt);
-        let call = match &source.head {
-            Grelex::Reference(Relation::FunctorCall { call, .. }) if !source.has_steps() => {
+        let call = match source.head().form() {
+            GroundForm::Reference(Relation::FunctorCall { call, .. }) if !source.has_steps() => {
                 call.clone()
             }
             _ => return Ok(FuseOutcome::NotApplicable(source)),
@@ -2619,8 +3238,8 @@ impl<'a> PlanBuilder<'a> {
         let (input, other_argument) = (second.clone().or(first.clone()), second.and(first));
         let input = input.expect("canonical call has an input table");
         let provenance = {
-            let name = call.call().callee.name_text();
-            effects::descriptor(&name).map(|d| (d.receipt_payload, d.side_effects))
+            effects::descriptor_for_reference(&call.call().callee)
+                .map(|d| (d.receipt_payload, d.side_effects))
         };
         match provenance {
             Some((ReceiptPayload::Input, side_effects)) => {
@@ -2628,21 +3247,16 @@ impl<'a> PlanBuilder<'a> {
                 if !side_effects {
                     return Ok(FuseOutcome::Fused(walked));
                 }
-                let snap = self.snapshot_relation(walked)?;
+                let snap = self.snapshot_relation(walked, ctx)?;
                 let mut replay = call;
-                let mut replaced = false;
-                for argument in replay.call_mut().arguments.ho_members_mut() {
-                    if !replaced {
-                        if let HoArgument::Relation(relation) = argument {
-                            *relation = plan_scope_read(snap);
-                            replaced = true;
-                        }
-                    }
-                }
+                replay
+                    .call_mut()
+                    .arguments
+                    .replace_first_relation(scratch_read(snap));
                 // A replayed effect step is executed for its receipt; the read
                 // it stands for was already named where it stood.
                 let _receipt = self.walk_functor_call(replay, None, receipt.clone(), ctx)?;
-                Ok(FuseOutcome::Fused(plan_scope_read(snap)))
+                Ok(FuseOutcome::Fused(scratch_read(snap)))
             }
             Some((ReceiptPayload::OtherRelation, _)) => {
                 let name = call.call().callee.name_text();
@@ -2654,6 +3268,38 @@ impl<'a> PlanBuilder<'a> {
                 let fused = self.walk_value(argument, ctx)?;
                 Ok(FuseOutcome::Fused(fused))
             }
+            Some((ReceiptPayload::Assertion, _)) => {
+                let property = call
+                    .call()
+                    .arguments
+                    .ho_members()
+                    .find_map(|member| match member {
+                        HoArgument::Rule(rule) => Some(rule.clone()),
+                        HoArgument::Relation(_)
+                        | HoArgument::Landed(_)
+                        | HoArgument::Value(_)
+                        | HoArgument::Landing(_)
+                        | HoArgument::Skip => None,
+                    })
+                    .or(other_argument)
+                    .ok_or_else(|| internal("assert! fusion has no property value".to_string()))?;
+                let values = call
+                    .call()
+                    .arguments
+                    .ho_members()
+                    .filter_map(|member| member.scalar_domain().cloned())
+                    .chain(
+                        call.call()
+                            .arguments
+                            .scalar_members()
+                            .iter()
+                            .filter_map(|member| member.scalar_domain().cloned()),
+                    )
+                    .collect::<Vec<_>>();
+                let released =
+                    self.walk_assert_terminal(input, property, &values, receipt, ctx, true)?;
+                Ok(FuseOutcome::Fused(released))
+            }
             _ => Ok(FuseOutcome::NotApplicable(source)),
         }
     }
@@ -2662,15 +3308,24 @@ impl<'a> PlanBuilder<'a> {
     /// (the fusion snapshot: native heading and values). The DROP+CTAS
     /// land in the CURRENT step (`mark_step` spans from the previous
     /// mark), so a closed edge skips snapshot and consumer together.
-    fn snapshot_relation(&mut self, walked: Chain) -> Result<crate::names::ScopeId> {
-        let snapshot = self.alloc_named_scratch(crate::names::ScratchRole::Tee, "__tee_stdout");
+    fn snapshot_relation(
+        &mut self,
+        walked: Chain,
+        ctx: &WalkCtx,
+    ) -> Result<crate::relation::ScratchRow> {
         let compiled = self
-            .compile_statement(Query::relational(walked))
+            .compile_statement(ctx, ctx.pure_query(walked))
             .map_err(|e| {
                 internal(format!(
                     "observed-payload snapshot failed to compile its source: {e}"
                 ))
             })?;
+        let snapshot = self.alloc_scratch(
+            crate::names::ScratchRole::Tee,
+            "__tee_stdout",
+            &[],
+            Some(&compiled.relation),
+        )?;
         let source_query = match compiled.stmt {
             SqlStatement::Query { query, .. } => query,
             _ => {
@@ -2679,8 +3334,10 @@ impl<'a> PlanBuilder<'a> {
                 ))
             }
         };
+        let mut source_query = source_query;
+        self.stage_onto_scratch(&mut source_query, &compiled.columns, &snapshot.relation())?;
         let ctas = SqlStatement::CreateTempTable {
-            table: snapshot,
+            table: snapshot.relation().scope(),
             with_clause: None,
             query: source_query,
         };
@@ -2691,13 +3348,12 @@ impl<'a> PlanBuilder<'a> {
             .push(PendingPlanEntry::Statement(PendingPlanStatement {
                 sql: DeferredSql::concat([
                     DeferredSql::text(format!("DROP TABLE IF EXISTS {}.", scratch_schema)),
-                    DeferredSql::Scope(snapshot),
+                    DeferredSql::Scope(snapshot.relation().scope()),
                 ]),
                 connection_id: conn,
                 comment: None,
             }));
         self.emit_statement(sql, conn);
-        self.register_plan_scope(snapshot, &compiled.columns);
         Ok(snapshot)
     }
 
@@ -2722,9 +3378,9 @@ impl<'a> PlanBuilder<'a> {
 
         let record = DomainExpression::Application(
             crate::pipeline::asts::core::FunctionApplication::Enclyph(Enclyph::Record(
-                Record::plain(crate::pipeline::asts::vocabulary::Vec1::new(RecordMember::Spread(
-                    Spread::Glob(Glob::whole()),
-                ))),
+                Record::plain(crate::pipeline::asts::vocabulary::Vec1::new(
+                    RecordMember::Spread(Spread::Glob(Glob::whole())),
+                )),
             )),
         );
         let grouped = make_pipe(
@@ -2732,13 +3388,9 @@ impl<'a> PlanBuilder<'a> {
             PipeOp::Group(GroupSpec::Reduce {
                 plan: ReductionPlan::empty(),
                 keys: Vec::new(),
-                reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(OutItem::One(
-                    OneOut {
-                        expr: OutValue::Domain(record),
-                        naming: Some("returned".into()),
-                        output: (),
-                    },
-                ))),
+                reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(
+                    OutItem::One(OneOut::authored(record, Some("returned".into()))),
+                )),
             }),
         );
         let widened = make_pipe(
@@ -2746,24 +3398,22 @@ impl<'a> PlanBuilder<'a> {
             PipeOp::Project(
                 crate::pipeline::asts::vocabulary::Vec1::try_from_vec(vec![
                     OutItem::Many(Spread::Glob(Glob::whole())),
-                    OutItem::One(OneOut {
-                        expr: OutValue::Domain(DomainExpression::Application(
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::Application(
                             crate::pipeline::asts::core::FunctionApplication::Ground(
                                 LiteralValue::Number("1".to_string()),
                             ),
-                        )),
-                        naming: Some("success".into()),
-                        output: (),
-                    }),
-                    OutItem::One(OneOut {
-                        expr: OutValue::Domain(DomainExpression::Application(
+                        ),
+                        Some("success".into()),
+                    )),
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::Application(
                             crate::pipeline::asts::core::FunctionApplication::Ground(
                                 LiteralValue::String(format!("{operation}!")),
                             ),
-                        )),
-                        naming: Some("operation".into()),
-                        output: (),
-                    }),
+                        ),
+                        Some("operation".into()),
+                    )),
                 ])
                 .expect("the synthesized receipt projection is nonempty"),
             ),
@@ -2772,26 +3422,97 @@ impl<'a> PlanBuilder<'a> {
             widened,
             PipeOp::Project(
                 crate::pipeline::asts::vocabulary::Vec1::try_from_vec(vec![
-                    OutItem::plain(
+                    OutItem::one(OneOut::authored(
                         DomainExpression::lvar_builder("success".to_string()).build(),
-                        (),
-                    ),
-                    OutItem::plain(
+                        None,
+                    )),
+                    OutItem::one(OneOut::authored(
                         DomainExpression::lvar_builder("operation".to_string()).build(),
-                        (),
-                    ),
-                    OutItem::plain(
+                        None,
+                    )),
+                    OutItem::one(OneOut::authored(
                         DomainExpression::lvar_builder("returned".to_string()).build(),
-                        (),
-                    ),
+                        None,
+                    )),
                 ])
                 .expect("the synthesized receipt projection is nonempty"),
             ),
         )
     }
 
+    fn assert_receipt(witnesses: Chain, returned: Chain, label: String) -> Chain {
+        use crate::pipeline::asts::core::literals::LiteralValue;
+        use crate::pipeline::asts::core::specs::{GroupSpec, OneOut, OutItem, ReductionItem};
+        use crate::pipeline::asts::core::{Enclyph, Glob, Record, RecordMember, Spread};
+
+        let package = |payload: Chain, name: &'static str| {
+            let record = DomainExpression::Application(
+                crate::pipeline::asts::core::FunctionApplication::Enclyph(Enclyph::Record(
+                    Record::plain(crate::pipeline::asts::vocabulary::Vec1::new(
+                        RecordMember::Spread(Spread::Glob(Glob::whole())),
+                    )),
+                )),
+            );
+            make_pipe(
+                payload,
+                PipeOp::Group(GroupSpec::Reduce {
+                    plan: ReductionPlan::empty(),
+                    keys: Vec::new(),
+                    reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(
+                        OutItem::One(OneOut::authored(record, Some(name.into()))),
+                    )),
+                }),
+            )
+        };
+        let joined = package(witnesses, "witnesses").then(Step::authored(Continuation::Member {
+            rhs: package(returned, "returned"),
+            correlation: None,
+            join_type: None,
+        }));
+        make_pipe(
+            joined,
+            PipeOp::Project(
+                crate::pipeline::asts::vocabulary::Vec1::try_from_vec(vec![
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::Application(
+                            crate::pipeline::asts::core::FunctionApplication::Ground(
+                                LiteralValue::Number("1".to_string()),
+                            ),
+                        ),
+                        Some("success".into()),
+                    )),
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::Application(
+                            crate::pipeline::asts::core::FunctionApplication::Ground(
+                                LiteralValue::String("assert!".to_string()),
+                            ),
+                        ),
+                        Some("operation".into()),
+                    )),
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::Application(
+                            crate::pipeline::asts::core::FunctionApplication::Ground(
+                                LiteralValue::String(label),
+                            ),
+                        ),
+                        Some("label".into()),
+                    )),
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::lvar_builder("witnesses".to_string()).build(),
+                        None,
+                    )),
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::lvar_builder("returned".to_string()).build(),
+                        None,
+                    )),
+                ])
+                .expect("the synthesized assert receipt projection is nonempty"),
+            ),
+        )
+    }
+
     fn handle_stdout(&mut self, walked_source: Chain, ctx: &WalkCtx) -> Result<Chain> {
-        let text = self.compile_value_text(&walked_source)?;
+        let text = self.compile_value_text(&walked_source, ctx)?;
         let gates = self.gate_exprs(ctx, false)?;
         let sql = self.wrap_shipped_with_gates(text.sql, gates)?;
         let conn = self.route(text.connection_id)?;
@@ -2822,36 +3543,33 @@ impl<'a> PlanBuilder<'a> {
         // conjuncts on a one-row SELECT.
         let mut gates = self.gate_exprs(ctx, false)?;
         if let Some(p) = piped {
-            gates.push(self.guard_to_sql(&self.guard_from_value(&p))?);
+            gates.push(self.guard_to_sql(ctx, &self.guard_from_value(&p, ctx))?);
         }
         if self.exit_armed {
             gates.push(self.exit_gate());
         }
-        let mut sb = SelectStatement::builder().select(SelectItem::expression(SqlExpr::literal(
-            ast_refined::LiteralValue::Number("1".to_string()),
-        )));
+        let mut sb = SelectStatement::builder().select(SelectItem::scaffolding_value(
+            SqlExpr::literal(ast_refined::LiteralValue::Number("1".to_string())),
+            self.epoch.names().scaffolding_slot(),
+        ));
         if let Some(w) = and_all(gates) {
             sb = sb.where_clause(w);
         }
-        let at = self.registry.mint_scope(
-            crate::names::ScopeOrigin::AnonRelation,
-            crate::names::Hint::None,
-            None,
-        );
-        let select =
-            crate::pipeline::transformer::builder::publish_at(at, [], sb, &self.registry)?;
+        let at = self.epoch.names().anonymous_scope(None);
+        let select = (sb)
+            .standing_at(at)
+            .map_err(crate::error::DelightQLError::parse_error)?;
         let exit_scope = self
             .exit_scope
             .expect("exit shell exists after ensure_exit_shell");
-        let hit = *self
-            .registry
-            .known_heading(exit_scope)?
-            .in_order()
+        let hit = crate::relation::published_ports(&self.epoch.names(), &exit_scope)?
+            .into_iter()
+            .map(|port| port.column())
             .next()
             .expect("exit shell has one result column");
         let insert = SqlStatement::Insert {
-            target: crate::pipeline::sql_ast::statements::RelationTarget::Scope(exit_scope),
-            target_scope: exit_scope,
+            target: crate::pipeline::sql_ast::statements::RelationTarget::Scope(exit_scope.scope()),
+            target_scope: exit_scope.scope(),
             columns: vec![hit],
             with_clause: None,
             source: QueryExpression::Select(Box::new(select)),
@@ -2869,39 +3587,378 @@ impl<'a> PlanBuilder<'a> {
             scratch_name: "__r_x".to_string(),
         };
         let table = self.receipt_table_for(ctx, &shape)?;
-        Ok(plan_scope_read(table))
+        Ok(scratch_read(table))
+    }
+
+    /// Fundamental abort: lower the exact input to a SELECT owned by this
+    /// terminal step. The runner interprets only row presence, preserving any
+    /// error raised while evaluating the SELECT and applying the typed abort
+    /// disposition only after a row is actually observed.
+    fn handle_abort(
+        &mut self,
+        input: Chain,
+        ctx: &WalkCtx,
+    ) -> Result<(Chain, PendingPlanStatement)> {
+        let probe = self.compile_value_text(&input, ctx)?;
+        let connection_id = self.route(probe.connection_id)?;
+        let probe = PendingPlanStatement {
+            sql: probe.sql,
+            connection_id,
+            comment: Some("abort probe".to_string()),
+        };
+        let shape = ReceiptShape {
+            operation: "abort!".to_string(),
+            echoes: vec![],
+            scratch_name: "__r_abort".to_string(),
+        };
+        let table = self.receipt_table_for(ctx, &shape)?;
+        Ok((scratch_read(table), probe))
+    }
+
+    fn close_builtin_rule_value(
+        &mut self,
+        designator: &Chain,
+        expected: &crate::pipeline::asts::core::definitions::ResidualSignature,
+        evaluation_relation: crate::relation::ScratchRow,
+        ctx: &WalkCtx,
+    ) -> Result<crate::defuse::ho::RuleValueId> {
+        let id = if self.epoch.is_discovering() {
+            let schema = self.system.get_schema()?;
+            let mut registry =
+                ResolverCore::new_with_system(schema, self.system, self.epoch.planning()?);
+            registry.residuals = Rc::clone(&self.residuals);
+            let id = ctx.world.close_rule_value_in_locals(
+                &mut registry,
+                self.config.clone(),
+                ctx.locals.clone(),
+                designator,
+                expected,
+                Some(evaluation_relation),
+            )?;
+            self.semantic_replay
+                .borrow_mut()
+                .builtin_rule_values
+                .push(id);
+            id
+        } else {
+            *self
+                .semantic_replay
+                .borrow()
+                .builtin_rule_values
+                .get(self.builtin_rule_cursor)
+                .ok_or_else(|| {
+                    internal("effect-plan replay exhausted built-in rule values".to_string())
+                })?
+        };
+        self.builtin_rule_cursor += 1;
+        Ok(id)
+    }
+
+    fn handle_assert(
+        &mut self,
+        property: Chain,
+        input: Chain,
+        label: String,
+        ctx: &WalkCtx,
+    ) -> Result<(Chain, Chain, PendingPlanStatement)> {
+        use crate::pipeline::asts::core::definitions::{
+            HeadItems, ResidualMode, ResidualSignature,
+        };
+        use crate::pipeline::asts::core::expressions::metadata_types::FilterOrigin;
+        use crate::pipeline::asts::core::literals::LiteralValue;
+
+        let input = self.stage_ho_input(input, ctx)?;
+        let signature = ResidualSignature {
+            remaining: vec![ResidualMode::Relation {
+                name: "T".into(),
+                cols: HeadItems::Glob,
+            }],
+            output: HeadItems::Glob,
+        };
+        let value = self.close_builtin_rule_value(&property, &signature, input, ctx)?;
+
+        let formal: delightql_types::SqlIdentifier = "__assert_property".into();
+        let application = Chain::read(
+            Relation::FunctorCall {
+                call: crate::pipeline::asts::core::FunctorCall::written(
+                    crate::pipeline::asts::vocabulary::Ref::synthetic_with_display(
+                        self.epoch.names(),
+                        crate::pipeline::asts::vocabulary::SyntheticReason::EffectReceipt,
+                        formal.as_str(),
+                    ),
+                    vec![HoArgument::Relation(scratch_read(input))],
+                )
+                .into(),
+                alias: None,
+            },
+            Access::All,
+        );
+        let witness =
+            self.compile_rule_application(ctx, ctx.pure_query(application), formal, value)?;
+        let witness = self.stage_compiled_input(witness, "__assert_witness")?;
+
+        let absent = scratch_read(witness)
+            .then(Step::authored(Continuation::Structural(
+                crate::pipeline::asts::core::StructuralStep {
+                    form: crate::pipeline::asts::core::StructuralForm::Witness {
+                        polarity: crate::pipeline::asts::core::Polarity::Positive,
+                    },
+                    named: Default::default(),
+                },
+            )))
+            .then(Step::authored(Continuation::Restrict {
+                condition: crate::pipeline::asts::core::TruthExpression::Comparison(Comparison {
+                    operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+                    left: Box::new(DomainExpression::lvar_builder("met".to_string()).build()),
+                    right: Box::new(DomainExpression::Application(
+                        crate::pipeline::asts::core::FunctionApplication::Ground(
+                            LiteralValue::Number("0".to_string()),
+                        ),
+                    )),
+                }),
+                origin: FilterOrigin::UserWritten,
+            }));
+        let (_, probe) = self.handle_abort(absent, ctx)?;
+        let returned = scratch_read(input);
+        Ok((
+            Self::assert_receipt(scratch_read(witness), returned.clone(), label),
+            returned,
+            probe,
+        ))
     }
 
     // ========================================================================
     // Rule invocation (clauses are arms; one receipt table per rule)
     // ========================================================================
 
+    /// Invoke one effect rule through the definition-use authority: the
+    /// rule's instance is ADMITTED (re-encountering it while invoked is
+    /// the R6 refusal, judged by the family's identity — a nested
+    /// run_namespace! demand invokes the TARGET namespace's main! while
+    /// an outer main! is open: same bare name, different family, so it
+    /// admits; effects ball main--24), the body opens and its declared
+    /// scope swaps in, the invocation's arguments bind on the admitted
+    /// artifact, and the caller's scope returns when the invocation
+    /// finishes.
+    /// Invoke one effect rule through the ONE bound-use transition: the
+    /// call form's spelling laws (glob) judge the AUTHORED arguments, the
+    /// arguments RESOLVE HERE in the caller's environment, and
+    /// [`crate::defuse::bound_use::EffectUse::invoke`] owns everything
+    /// after — semantic key, admission (the R6 refusal by family
+    /// identity), opening, head shaping, the declaration scope and the
+    /// parameter frame, and their STRUCTURAL restoration.
     fn invoke_rule(
         &mut self,
-        rule: &EffectRule,
+        effect_use: crate::defuse::bound_use::EffectSelection,
+        arguments: EffectRuleArguments,
         piped: Option<Chain>,
         ctx: &WalkCtx,
+        root: bool,
     ) -> Result<Chain> {
-        // A belt: consult validated the DAG; a cycle here is a bug, but
-        // refuse rather than loop forever. The stack key is
-        // namespace-qualified: a nested run_namespace! demand invokes the
-        // TARGET namespace's main! while an outer main! is already on the
-        // stack — same bare name, different rule (effects ball main--24).
-        let stack_key = format!("{}::{}", self.namespace().unwrap_or(""), rule.name);
-        if self.rule_stack.contains(&stack_key) {
-            return Err(unsupported(format!(
-                "effect rule '{}' recursed during plan expansion (R6)",
-                rule.name
-            )));
+        let declared = effect_use.declared_params()?;
+        let (supplied, row) = match arguments {
+            EffectRuleArguments::Bare => (Vec::new(), Vec::new()),
+            EffectRuleArguments::Values {
+                supplied,
+                glob_required,
+            } => {
+                let scalar_count = declared
+                    .iter()
+                    .filter(|param| matches!(param, HoParam::Scalar { .. }))
+                    .count();
+                if scalar_count == 0 {
+                    if glob_required {
+                        require_glob_args(effect_use.rule_name().as_str(), &supplied)?;
+                    }
+                    (Vec::new(), Vec::new())
+                } else {
+                    (supplied, Vec::new())
+                }
+            }
+            EffectRuleArguments::Row(arguments) => (Vec::new(), effect_actual_row(arguments)?),
+        };
+        let written_params = if piped.is_some() {
+            match declared.last() {
+                Some(HoParam::Relation { .. }) => &declared[..declared.len() - 1],
+                _ => {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "effect/pipe/landing",
+                        format!(
+                            "the pipe into '{}' requires a final relation parameter",
+                            effect_use.rule_name()
+                        ),
+                        "the written arguments bind a complete left prefix and the pipe supplies the final relation",
+                    ))
+                }
+            }
+        } else {
+            declared.as_slice()
+        };
+        let supplied = if row.is_empty() { supplied } else { Vec::new() };
+        if !row.is_empty() && row.len() != written_params.len() {
+            return Err(DelightQLError::validation_error_categorized(
+                "effect/rule/arity",
+                format!(
+                    "effect rule '{}' requires {} written actual(s) beside the pipe; {} were supplied",
+                    effect_use.rule_name(),
+                    written_params.len(),
+                    row.len()
+                ),
+                "bind the complete left prefix in one argument row",
+            ));
         }
-        self.rule_stack.push(stack_key);
-        crate::probe::probe!(
-            preminted,
-            "invoke {} stack={:?}",
-            rule.name,
-            self.rule_stack
-        );
-        let result = self.invoke_rule_inner(rule, piped, ctx);
+
+        let mut rule_arguments = HashMap::new();
+        let mut rule_designators = Vec::new();
+        let mut row_values = Vec::new();
+        for (param, actual) in written_params.iter().zip(row) {
+            match (param, actual) {
+                (HoParam::Scalar { .. }, EffectActualSyntax::Value(value)) => {
+                    row_values.push(value)
+                }
+                (HoParam::Rule { name, signature }, EffectActualSyntax::Rule(designator)) => {
+                    rule_designators.push((name.clone(), signature.clone(), designator));
+                }
+                (HoParam::Rule { name, .. }, EffectActualSyntax::Value(_)) => {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "resolution/ho/rule-value-form",
+                        format!("effect parameter '{name}' requires a closed rule value"),
+                        "supply a rule designator",
+                    ))
+                }
+                (HoParam::Scalar { name, .. }, EffectActualSyntax::Rule(_)) => {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "resolution/ho/residual-role",
+                        format!("effect scalar parameter '{name}' received a relation designator"),
+                        "supply a scalar value",
+                    ))
+                }
+                (HoParam::Relation { name, .. }, _) | (HoParam::Ground { name, .. }, _) => {
+                    return Err(DelightQLError::validation_error_categorized(
+                        "effect/rule/arguments",
+                        format!("effect parameter '{name}' is not a bound scalar or rule prefix position"),
+                        "the pipe supplies the final relation parameter",
+                    ))
+                }
+            }
+        }
+        let supplied = if row_values.is_empty() {
+            supplied
+        } else {
+            row_values
+        };
+        // The piped caller row is one construction fact for both the effect
+        // invocation and every residual actual in its argument row. Stage it
+        // before closing those values, then hand the same semantic relation
+        // to both consumers; neither can reconstruct or re-evaluate it.
+        let piped = match piped {
+            Some(chain) => Some(self.stage_ho_input(chain, ctx)?),
+            None => None,
+        };
+        let system = self.system;
+        let schema = system.get_schema()?;
+        let mut registry = if self.epoch.is_discovering() {
+            let mut registry =
+                ResolverCore::new_with_system(schema, system, self.epoch.planning()?);
+            registry.residuals = Rc::clone(&self.residuals);
+            for (name, signature, designator) in rule_designators {
+                let id = ctx.world.close_rule_value(
+                    &mut registry,
+                    self.config.clone(),
+                    &designator,
+                    &signature,
+                    piped,
+                )?;
+                rule_arguments.insert(name, id);
+            }
+            Some(registry)
+        } else {
+            rule_arguments = self
+                .semantic_replay
+                .borrow()
+                .rule_arguments
+                .get(self.argument_cursor)
+                .cloned()
+                .ok_or_else(|| {
+                    internal("effect-plan replay exhausted its rule-value arguments".to_string())
+                })?;
+            None
+        };
+        // THE CALLER'S ACTUALS RESOLVE FIRST, in the demand site's own
+        // environment — before any admission, so they can enter the
+        // semantic instance key. Scalar effect parameters remain row-free;
+        // rule-valued configured expressions resolve against the typed
+        // construction row above.
+        let resolved_arguments = if !self.epoch.is_discovering() {
+            // The replay pass replays the discovery pass's resolution: it
+            // holds a sealed reader, and the walk order is the plan's.
+            let replay = self.semantic_replay.borrow();
+            let resolved = replay
+                .arguments
+                .get(self.argument_cursor)
+                .cloned()
+                .ok_or_else(|| {
+                    internal("effect-plan replay exhausted its invocation arguments".to_string())
+                })?;
+            drop(replay);
+            self.argument_cursor += 1;
+            resolved
+        } else if supplied.is_empty() {
+            self.semantic_replay.borrow_mut().arguments.push(Vec::new());
+            Vec::new()
+        } else {
+            let config = self.config.clone();
+            let resolved = ctx.world.resolve_values(
+                registry
+                    .as_mut()
+                    .expect("discovery constructed its resolver core"),
+                config,
+                supplied,
+            )?;
+            self.semantic_replay
+                .borrow_mut()
+                .arguments
+                .push(resolved.clone());
+            resolved
+        };
+        if self.epoch.is_discovering() {
+            self.semantic_replay
+                .borrow_mut()
+                .rule_arguments
+                .push(rule_arguments.clone());
+        }
+        drop(registry);
+        crate::probe::probe!(preminted, "invoke {}", effect_use.rule_name());
+        let instances = self.config.instances.clone();
+        // THE CLOSED INVOCATION: the admitted use is consumed and the
+        // resolved artifact returns; plan compilation runs inside, under a
+        // world the invocation owns — under the read that selected the
+        // rule — through `compile_invoked` below.
+        effect_use.invoke(
+            &instances,
+            resolved_arguments,
+            rule_arguments,
+            self,
+            piped,
+            ctx,
+            root,
+        )
+    }
+
+    /// COMPILE AN INVOKED RULE. Reached only from the definition-use
+    /// authority's closed invocation, with the ONE atom that invocation
+    /// built: the rule's syntax is read off it, every clause context stands
+    /// in its world through the atom's own operation, and the world itself
+    /// is never in hand — nothing here can pair it with another rule or
+    /// keep it past this call.
+    pub(crate) fn compile_invoked(
+        &mut self,
+        invoked: &crate::defuse::admitted::InvokedRule,
+        piped: Option<crate::relation::ScratchRow>,
+        ctx: &WalkCtx<'_>,
+    ) -> Result<Chain> {
+        self.rule_stack.push(invoked.rule().name.clone());
+        let result = self.invoke_rule_inner(invoked, piped, ctx);
         self.rule_stack.pop();
         result
     }
@@ -2912,37 +3969,45 @@ impl<'a> PlanBuilder<'a> {
     /// statements resolve against its own consulted rules and tables.
     /// Enclosing guards propagate (a gated demand stays gated).
     fn invoke_namespace_main(&mut self, target_ns: &str, ctx: &WalkCtx) -> Result<Chain> {
-        let rule = lookup_effect_rule(self.system, target_ns, "main!")?.ok_or_else(|| {
-            DelightQLError::validation_error_categorized(
-                NO_MAIN_BADGE,
-                format!(
-                    "namespace '{}' has no main! to demand (EFFECT-ALGEBRA F3): \
+        let rule = crate::defuse::bound_use::use_effect_rule(self.system, target_ns, "main!")?
+            .ok_or_else(|| {
+                DelightQLError::validation_error_categorized(
+                    NO_MAIN_BADGE,
+                    format!(
+                        "namespace '{}' has no main! to demand (EFFECT-ALGEBRA F3): \
                      consult a file that defines 'main!(*) :- …' into it first",
-                    target_ns
-                ),
-                "no effect rule to demand",
-            )
-        })?;
+                        target_ns
+                    ),
+                    "no effect rule to demand",
+                )
+            })?;
         let nested_ctx = WalkCtx {
+            world: ctx.world,
             guards: ctx.guards.clone(),
             sink: None,
-            ctes: Vec::new(),
+            locals: crate::pipeline::asts::core::QueryLocals::none(),
+            horizon: crate::pipeline::asts::core::LexicalHorizon::all(),
             bindings: HashMap::new(),
             receipt_name: "main".to_string(),
         };
-        let saved = self.config.resolution_namespace.clone();
-        self.config.resolution_namespace = Some(target_ns.to_string());
-        let result = self.invoke_rule(&rule, None, &nested_ctx);
-        self.config.resolution_namespace = saved;
-        result
+        // The world is the invocation's: the demanded main! carries its
+        // own namespace and the one invocation road opens it.
+        self.invoke_rule(
+            crate::defuse::bound_use::EffectSelection::Consulted(rule),
+            EffectRuleArguments::Bare,
+            None,
+            &nested_ctx,
+            true,
+        )
     }
 
     fn invoke_rule_inner(
         &mut self,
-        rule: &EffectRule,
-        piped: Option<Chain>,
-        ctx: &WalkCtx,
+        invoked: &crate::defuse::admitted::InvokedRule,
+        piped: Option<crate::relation::ScratchRow>,
+        ctx: &WalkCtx<'_>,
     ) -> Result<Chain> {
+        let rule = invoked.rule();
         let bare = bare_name(&rule.name).to_string();
 
         // HO input binding (v0.1 slice: one table parameter, filled by
@@ -2956,7 +4021,7 @@ impl<'a> PlanBuilder<'a> {
         ) {
             (Some(input), Some([param])) => {
                 if !matches!(param, HoParam::Relation { .. }) {
-                    // A pipe lands at the FIRST parameter, and a relation
+                    // A pipe lands at the FINAL parameter, and a relation
                     // does not fit a scalar slot. The scalar is supplied at
                     // the call site — `rule!("Z")(*)` — where its own
                     // parameter is.
@@ -2964,21 +4029,16 @@ impl<'a> PlanBuilder<'a> {
                         "effect/pipe/landing",
                         format!(
                             "the pipe into '{}' has nowhere to land: the rule's \
-                             first parameter is a scalar, and a relation does not \
-                             fill it (EFFECT-ALGEBRA R8). Supply it as an \
-                             argument — '{}(<value>)(*)'",
+                             final parameter is a scalar, and a relation does not \
+                             fill it (EFFECT-ALGEBRA, STRICT LANDING). Supply it \
+                             as an argument — '{}(<value>)(*)'",
                             rule.name, rule.name
                         ),
                         "pipe has nowhere to land",
                     ));
                 }
                 let idx = self.bound_inputs.len();
-                self.bound_inputs.push(BoundInput {
-                    expr: input.clone(),
-                    bound_epoch: self.mutation_epoch,
-                    insertion_index: self.body.len(),
-                    materialized_as: None,
-                });
+                self.bound_inputs.push(BoundInput { scope: *input });
                 bindings.insert(param.name().to_string(), idx);
             }
             (Some(_), _) => {
@@ -2988,7 +4048,7 @@ impl<'a> PlanBuilder<'a> {
                     "effect/pipe/landing",
                     format!(
                         "the pipe into '{}' has nowhere to land: the rule declares \
-                         no higher-order parameter (EFFECT-ALGEBRA R8)",
+                         no higher-order parameter (EFFECT-ALGEBRA, STRICT LANDING)",
                         rule.name
                     ),
                     "pipe has nowhere to land",
@@ -3042,15 +4102,21 @@ impl<'a> PlanBuilder<'a> {
         // Clauses execute in definition order.
         let mut clause_values = Vec::with_capacity(rule.clauses.len());
         for (clause, kind) in rule.clauses.iter().zip(&ending_kinds) {
-            refuse_unlowered_pure_ctes(&clause.body.ctes)?;
             let self_sinking = kind.as_ref().map(|(_, s)| *s).unwrap_or(false);
-            let clause_ctx = WalkCtx {
-                guards: ctx.guards.clone(),
-                sink: if self_sinking { sink.clone() } else { None },
-                ctes: clause.body.ctes.clone(),
-                bindings: bindings.clone(),
-                receipt_name: bare.clone(),
-            };
+            // The clause's facts stand in the invoked rule's world through
+            // the atom — the builder never holds that world.
+            let clause_ctx = invoked.context_for(
+                clause,
+                WalkCtx {
+                    world: ctx.world,
+                    guards: ctx.guards.clone(),
+                    sink: if self_sinking { sink.clone() } else { None },
+                    locals: ctx.locals.clone(),
+                    horizon: ctx.horizon,
+                    bindings: bindings.clone(),
+                    receipt_name: bare.clone(),
+                },
+            )?;
             let value = self.walk_value(clause.body.expression.clone(), &clause_ctx)?;
             if let (Some(s), false) = (&sink, self_sinking) {
                 // Corresponding-aligned sink of a compositional clause
@@ -3061,18 +4127,13 @@ impl<'a> PlanBuilder<'a> {
                     .unwrap_or_default();
                 let armed = self.exit_armed;
                 self.sink_compositional_receipt(
-                    s.table,
+                    s.table.relation(),
                     &sink_columns,
                     &clause_shape,
                     &value,
                     ctx,
                 )?;
-                self.mark_step(
-                    compiled_query::EffectStepKind::RuleBoundary,
-                    &bare,
-                    Some(ctx),
-                    armed,
-                )?;
+                self.mark_step(MarkedStepKind::RuleBoundary, &bare, Some(ctx), armed)?;
             }
             clause_values.push(value);
         }
@@ -3085,7 +4146,7 @@ impl<'a> PlanBuilder<'a> {
         // value. Multiplicity moves into the payload; NO propagates.
         let has_shell = sink.is_some();
         let c_value = match sink {
-            Some(s) => plan_scope_read(s.table),
+            Some(s) => scratch_read(s.table),
             None => clause_values
                 .pop()
                 .expect("single-clause rule has one clause value"),
@@ -3094,18 +4155,9 @@ impl<'a> PlanBuilder<'a> {
             c_value,
             &bare,
             has_shell.then(|| sink_columns.as_slice()),
-            &self.registry,
+            &self.epoch.names(),
         );
-        // Give the derived receipt a relation identity so it composes in
-        // joins like the shell reads it replaced. The authored rule name is
-        // diagnostic vocabulary only; baptism names the physical wrapper.
-        let preminted_scope = self.registry.mint_scope(
-            crate::names::ScopeOrigin::AnonRelation,
-            crate::names::Hint::Prefix("effect_receipt"),
-            None,
-        );
-        crate::probe::probe!(preminted, "mint {preminted_scope:?} for rule {bare}");
-        Ok(Chain::relation(Relation::InnerRelation {
+        Ok(Chain::authored(GroundForm::Reference(Relation::InnerRelation {
             pattern: crate::pipeline::asts::core::expressions::relational::InnerRelationPattern::Indeterminate {
                 identifier: crate::pipeline::asts::core::expressions::helpers::QualifiedName {
                     namespace_path: crate::pipeline::asts::core::metadata::NamespacePath::empty(),
@@ -3113,11 +4165,9 @@ impl<'a> PlanBuilder<'a> {
                 },
                 subquery: Box::new(receipt),
             },
-            preminted_scope: Some(preminted_scope),
             alias: None,
             outer: false,
-            cpr_schema: (),
-        }))
+        })))
     }
 
     /// Sink a compositional clause's receipt VALUE into the shared shell
@@ -3128,32 +4178,58 @@ impl<'a> PlanBuilder<'a> {
     /// wrap, exactly like every other emission.
     fn sink_compositional_receipt(
         &mut self,
-        shell: crate::names::ScopeId,
+        shell: crate::relation::SemanticRelation,
         _shell_columns: &[String],
         _clause_shape: &[String],
         value: &Chain,
         ctx: &WalkCtx,
     ) -> Result<()> {
-        let text = self.compile_value_text(value)?;
+        let text = self.compile_value_text(value, ctx)?;
         let gates = self.gate_exprs(ctx, true)?;
         let gated = self.wrap_shipped_with_gates(text.sql, gates)?;
         let target = shell;
-        let target_columns = self.registry.known_heading(target)?;
+        let target_columns: Vec<_> =
+            crate::relation::published_ports(&self.epoch.names(), &target)?
+                .into_iter()
+                .map(|port| port.column())
+                .collect();
         let source_scope = self
-            .registry
+            .epoch
+            .names()
             .common_scope(&text.columns)
             .ok_or_else(|| internal("clause receipt value has no output scope".to_string()))?;
-        let alias = self.registry.mint_derived_scope(
-            crate::names::ScopeOrigin::Wrap {
-                input: source_scope,
-                why: crate::names::WrapReason::Projection,
-            },
-            crate::names::Hint::Prefix("clause"),
+        let alignment = self.semantic_allocation(|registry| {
+            Ok(registry
+                .authority()
+                .set_step(
+                    crate::pipeline::asts::core::SetOperator::UnionCorresponding,
+                    &[target, text.relation],
+                )?
+                .result())
+        })?;
+        let matrix = crate::relation::contributions(&self.epoch.names(), &alignment)?
+            .ok_or_else(|| internal("receipt alignment has no contribution matrix".to_string()))?;
+        let source_columns: std::collections::HashMap<_, _> = text
+            .ports
+            .iter()
+            .copied()
+            .zip(text.columns.iter().copied())
+            .collect();
+        let target_ports = crate::relation::published_ports(&self.epoch.names(), &target)?;
+        if matrix.outputs().len() != target_ports.len() {
+            return Err(internal(
+                "a clause receipt publishes a position outside its shell".to_string(),
+            ));
+        }
+        let alias = self.epoch.names().carrier_wrap_scope(
+            source_scope,
+            crate::names::WrapReason::Projection,
+            "clause",
         );
         let scratch_schema = self.scratch_schema()?;
         let mut sql = vec![
             DeferredSql::text(format!("INSERT INTO {}.", scratch_schema)),
-            DeferredSql::Scope(target),
+            DeferredSql::Scope(target.scope()),
             DeferredSql::text(" ("),
         ];
         for (index, column) in target_columns.iter().enumerate() {
@@ -3163,20 +4239,42 @@ impl<'a> PlanBuilder<'a> {
             sql.push(DeferredSql::Column(*column));
         }
         sql.push(DeferredSql::text(")\nSELECT "));
-        for (index, target_column) in target_columns.iter().enumerate() {
+        for (index, ((target_column, target_port), output)) in target_columns
+            .iter()
+            .zip(target_ports.iter())
+            .zip(matrix.outputs())
+            .enumerate()
+        {
             if index > 0 {
                 sql.push(DeferredSql::text(", "));
             }
-            if let Some(source_column) = self
-                .registry
-                .corresponding_slot(*target_column, &text.columns)?
-            {
-                sql.push(DeferredSql::Scope(alias));
-                sql.push(DeferredSql::text("."));
-                sql.push(DeferredSql::Column(source_column));
-            } else {
-                sql.push(DeferredSql::text("NULL AS "));
-                sql.push(DeferredSql::Column(*target_column));
+            let mut cells = output.by_arm().iter();
+            match cells.next() {
+                Some(crate::relation::set::Contribution::Port(port)) if port == target_port => {}
+                _ => {
+                    return Err(internal(
+                        "receipt alignment changed a shell position".to_string(),
+                    ))
+                }
+            }
+            match cells.next() {
+                Some(crate::relation::set::Contribution::Port(port)) => {
+                    let source_column = source_columns.get(port).copied().ok_or_else(|| {
+                        internal("receipt alignment names an unbound source port".to_string())
+                    })?;
+                    sql.push(DeferredSql::Scope(alias));
+                    sql.push(DeferredSql::text("."));
+                    sql.push(DeferredSql::Column(source_column));
+                }
+                Some(crate::relation::set::Contribution::Padding(_)) => {
+                    sql.push(DeferredSql::text("NULL AS "));
+                    sql.push(DeferredSql::Column(*target_column));
+                }
+                None => {
+                    return Err(internal(
+                        "receipt alignment omitted its clause arm".to_string(),
+                    ))
+                }
             }
         }
         sql.extend([
@@ -3297,23 +4395,21 @@ impl<'a> PlanBuilder<'a> {
                 plan: ReductionPlan::empty(),
                 keys: Vec::new(),
                 reductions: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(vec![
-                    ReductionItem::Out(OutItem::One(OneOut {
-                        expr: OutValue::Domain(record),
-                        naming: Some("returned".into()),
-                        output: (),
-                    })),
+                    ReductionItem::Out(OutItem::One(OneOut::authored(
+                        record,
+                        Some("returned".into()),
+                    ))),
                     // The gate reads this count by name, so the reduction
                     // publishes it under the name the gate addresses.
-                    ReductionItem::Out(OutItem::One(OneOut {
-                        expr: OutValue::Domain(count),
-                        naming: Some(RECEIPT_CARDINALITY.into()),
-                        output: (),
-                    })),
+                    ReductionItem::Out(OutItem::One(OneOut::authored(
+                        count,
+                        Some(RECEIPT_CARDINALITY.into()),
+                    ))),
                 ])
                 .expect("the receipt reduction carries its two members"),
             }),
         );
-        let gated = grouped.then(Continuation::Restrict {
+        let gated = grouped.then(Step::authored(Continuation::Restrict {
             condition: TruthExpression::Comparison(Comparison {
                 operator: crate::pipeline::asts::vocabulary::CmpOp::GreaterThan,
                 left: Box::new(
@@ -3326,34 +4422,31 @@ impl<'a> PlanBuilder<'a> {
                 )),
             }),
             origin: FilterOrigin::UserWritten,
-            cpr_schema: (),
-        });
+        }));
         let widened = make_pipe(
             gated,
             PipeOp::Project(
                 crate::pipeline::asts::vocabulary::Vec1::try_from_vec(vec![
-                    OutItem::plain(
+                    OutItem::one(OneOut::authored(
                         DomainExpression::lvar_builder("returned".to_string()).build(),
-                        (),
-                    ),
-                    OutItem::One(OneOut {
-                        expr: OutValue::Domain(DomainExpression::Application(
+                        None,
+                    )),
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::Application(
                             crate::pipeline::asts::core::FunctionApplication::Ground(
                                 LiteralValue::Number("1".to_string()),
                             ),
-                        )),
-                        naming: Some("success".into()),
-                        output: (),
-                    }),
-                    OutItem::One(OneOut {
-                        expr: OutValue::Domain(DomainExpression::Application(
+                        ),
+                        Some("success".into()),
+                    )),
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::Application(
                             crate::pipeline::asts::core::FunctionApplication::Ground(
                                 LiteralValue::String(format!("{bare}!")),
                             ),
-                        )),
-                        naming: Some("operation".into()),
-                        output: (),
-                    }),
+                        ),
+                        Some("operation".into()),
+                    )),
                 ])
                 .expect("the synthesized receipt projection is nonempty"),
             ),
@@ -3362,40 +4455,61 @@ impl<'a> PlanBuilder<'a> {
             widened,
             PipeOp::Project(
                 crate::pipeline::asts::vocabulary::Vec1::try_from_vec(vec![
-                    OutItem::plain(
+                    OutItem::one(OneOut::authored(
                         DomainExpression::lvar_builder("success".to_string()).build(),
-                        (),
-                    ),
-                    OutItem::plain(
+                        None,
+                    )),
+                    OutItem::one(OneOut::authored(
                         DomainExpression::lvar_builder("operation".to_string()).build(),
-                        (),
-                    ),
-                    OutItem::plain(
+                        None,
+                    )),
+                    OutItem::one(OneOut::authored(
                         DomainExpression::lvar_builder("returned".to_string()).build(),
-                        (),
-                    ),
+                        None,
+                    )),
                 ])
                 .expect("the synthesized receipt projection is nonempty"),
             ),
         )
     }
 
-    /// Splice a bound HO input at its reference site. If a
-    /// mutation was emitted since binding, the pure input may NOT
-    /// re-evaluate here — retro-materialize it at the binding point
-    /// (before the mutation) and read the snapshot.
+    /// Splice a bound HO input at its reference site: the input was
+    /// staged at the demand site, and every mention reads the SAME
+    /// snapshot by its receipt.
     fn splice_bound_input(&mut self, idx: usize) -> Result<Chain> {
-        if let Some(scope) = self.bound_inputs[idx].materialized_as {
-            return Ok(plan_scope_read(scope));
-        }
-        if self.bound_inputs[idx].bound_epoch == self.mutation_epoch {
-            return Ok(self.bound_inputs[idx].expr.clone());
-        }
-        // A mutation intervened: materialize the input as of binding time.
-        let input_expr = self.bound_inputs[idx].expr.clone();
-        let insertion_index = self.bound_inputs[idx].insertion_index;
-        let snapshot = self.alloc_scratch(crate::names::ScratchRole::Insert);
-        let compiled = self.compile_statement(Query::relational(input_expr))?;
+        Ok(scratch_read(self.bound_inputs[idx].scope))
+    }
+
+    /// Materialize a PIPED rule input ONCE, at the demand site, in the
+    /// demand site's own world: the input is a caller actual, and it
+    /// crosses into the rule as a scratch read BY ITS RECEIPT.
+    /// A later mutation cannot re-evaluate the pure prefix (invariant
+    /// §5.8) because the snapshot precedes it by construction.
+    fn stage_ho_input(
+        &mut self,
+        walked: Chain,
+        ctx: &WalkCtx,
+    ) -> Result<crate::relation::ScratchRow> {
+        let compiled = self.compile_statement(ctx, ctx.pure_query(walked))?;
+        self.stage_compiled_input(compiled, "__src_in")
+    }
+
+    /// Materialize an already-resolved SELECT once. A compiler-built
+    /// rule-value application must keep the formal frame under which it was
+    /// resolved, so it enters here after resolution instead of being rebuilt
+    /// from spelling.
+    fn stage_compiled_input(
+        &mut self,
+        compiled: CompiledStmt,
+        stem: &str,
+    ) -> Result<crate::relation::ScratchRow> {
+        let row = self.alloc_scratch(
+            crate::names::ScratchRole::Insert,
+            stem,
+            &[],
+            Some(&compiled.relation),
+        )?;
+        let snapshot = row.relation();
         let source_query = match compiled.stmt {
             SqlStatement::Query { with_clause, query } => match with_clause {
                 Some(ctes) => QueryExpression::WithCte {
@@ -3406,49 +4520,37 @@ impl<'a> PlanBuilder<'a> {
             },
             _ => return Err(internal("HO input did not compile to a SELECT".to_string())),
         };
+        let mut source_query = source_query;
+        self.stage_onto_scratch(&mut source_query, &compiled.columns, &snapshot)?;
         let ctas = SqlStatement::CreateTempTable {
-            table: snapshot,
+            table: snapshot.scope(),
             with_clause: None,
             query: source_query,
         };
         let sql = self.finish_statement(&ctas)?;
         let conn = self.route(compiled.connection_id)?;
-        self.body.insert(
-            insertion_index,
-            PendingPlanEntry::Statement(PendingPlanStatement {
-                sql,
-                connection_id: conn,
-                comment: Some(
-                    "materialized HO input (invariant §5.8: a pure prefix may not \
-                     re-evaluate across a mutation)"
-                        .to_string(),
-                ),
-            }),
-        );
-        // Adjacent drop-before-create for in-bracket scratch (the
-        // replace treatment): an exit-taken prior run skips the trailing
-        // cleanup, so a leftover snapshot must not error this CREATE.
-        // Qualifier = the `scratch.schema` dialect slot.
         let scratch_schema = self.scratch_schema()?;
-        self.body.insert(
-            insertion_index,
-            PendingPlanEntry::Statement(PendingPlanStatement {
+        self.body
+            .push(PendingPlanEntry::Statement(PendingPlanStatement {
                 sql: DeferredSql::concat([
                     DeferredSql::text(format!("DROP TABLE IF EXISTS {}.", scratch_schema)),
-                    DeferredSql::Scope(snapshot),
+                    DeferredSql::Scope(snapshot.scope()),
                 ]),
                 connection_id: conn,
                 comment: None,
-            }),
-        );
-        self.register_plan_scope(snapshot, &compiled.columns);
-        self.bound_inputs[idx].materialized_as = Some(snapshot);
-        Ok(plan_scope_read(snapshot))
+            }));
+        self.emit_statement(sql, conn);
+        Ok(row)
     }
 
     /// Replace reads of plan-created VIEWS whose base
     /// set contains the mutation target with materialized snapshots.
-    fn materialize_hazardous_views(&mut self, source: Chain, target: &str) -> Result<Chain> {
+    fn materialize_hazardous_views(
+        &mut self,
+        source: Chain,
+        target: &str,
+        ctx: &WalkCtx,
+    ) -> Result<Chain> {
         let referenced = collect_ground_names(&source);
         let hazardous: Vec<String> = referenced
             .into_iter()
@@ -3460,8 +4562,13 @@ impl<'a> PlanBuilder<'a> {
             .collect();
         let mut rewritten = source;
         for view in hazardous {
-            let snapshot = self.alloc_scratch(crate::names::ScratchRole::Snapshot);
-            let compiled = self.compile_statement(Query::relational(named_ground_read(&view)))?;
+            let compiled = self.compile_statement(ctx, ctx.pure_query(named_ground_read(&view)))?;
+            let snapshot = self.alloc_scratch(
+                crate::names::ScratchRole::Snapshot,
+                "__snap",
+                &[],
+                Some(&compiled.relation),
+            )?;
             let source_query = match compiled.stmt {
                 SqlStatement::Query { query, .. } => query,
                 _ => {
@@ -3470,8 +4577,10 @@ impl<'a> PlanBuilder<'a> {
                     ))
                 }
             };
+            let mut source_query = source_query;
+            self.stage_onto_scratch(&mut source_query, &compiled.columns, &snapshot.relation())?;
             let ctas = SqlStatement::CreateTempTable {
-                table: snapshot,
+                table: snapshot.relation().scope(),
                 with_clause: None,
                 query: source_query,
             };
@@ -3484,7 +4593,7 @@ impl<'a> PlanBuilder<'a> {
                 .push(PendingPlanEntry::Statement(PendingPlanStatement {
                     sql: DeferredSql::concat([
                         DeferredSql::text(format!("DROP TABLE IF EXISTS {}.", scratch_schema)),
-                        DeferredSql::Scope(snapshot),
+                        DeferredSql::Scope(snapshot.relation().scope()),
                     ]),
                     connection_id: conn,
                     comment: None,
@@ -3497,8 +4606,14 @@ impl<'a> PlanBuilder<'a> {
                 )
             });
             self.emit_statement(sql, conn);
-            self.register_plan_scope(snapshot, &compiled.columns);
-            rewritten = rename_ground_reads(rewritten, &view, snapshot);
+            rewritten = rename_ground_reads(
+                rewritten,
+                crate::relation::NamedScratch::under(
+                    snapshot,
+                    delightql_types::SqlIdentifier::new(view),
+                    ReceiptNaming(()),
+                ),
+            );
         }
         Ok(rewritten)
     }
@@ -3507,12 +4622,23 @@ impl<'a> PlanBuilder<'a> {
     // Statement compilation (the ordinary pipeline, invoked per statement)
     // ========================================================================
 
-    /// Phases 2–4 over one statement, with the plan notes injected into
-    /// the query-local registry: resolve_query_inline (notes first,
-    /// bootstrap gate second) → refine → address → transformer.
+    /// Phases 2–4 over one statement, resolved in the CURRENT lexical
+    /// world — the innermost open rule body, or the plan's session world —
+    /// with the plan's own creations registered as that world's
+    /// materialized relations → refine → address → transformer.
     /// Definitions are spent at their call sites during resolution.
-    fn compile_statement(&mut self, query: Query) -> Result<CompiledStmt> {
-        self.compile_statement_with(query, false)
+    fn compile_statement(&mut self, ctx: &WalkCtx<'_>, query: Query) -> Result<CompiledStmt> {
+        self.compile_statement_with(ctx, query, false, None)
+    }
+
+    fn compile_rule_application(
+        &mut self,
+        ctx: &WalkCtx<'_>,
+        query: Query,
+        formal: delightql_types::SqlIdentifier,
+        value: crate::defuse::ho::RuleValueId,
+    ) -> Result<CompiledStmt> {
+        self.compile_statement_with(ctx, query, false, Some((formal, value)))
     }
 
     /// `serve_bootstrap`: compile as a MATERIALIZATION SOURCE
@@ -3523,59 +4649,125 @@ impl<'a> PlanBuilder<'a> {
     /// ordinary federation refusal.
     fn compile_statement_with(
         &mut self,
+        ctx: &WalkCtx<'_>,
         query: Query,
         serve_bootstrap: bool,
+        rule_value: Option<(
+            delightql_types::SqlIdentifier,
+            crate::defuse::ho::RuleValueId,
+        )>,
     ) -> Result<CompiledStmt> {
-        let schema = self.system.get_schema()?;
-
-        let mut registry =
-            EntityRegistry::new_with_system(schema, self.system, Rc::clone(&self.registry));
-        for (name, note) in &self.notes {
-            registry.query_local.register_materialized_relation(
-                delightql_types::SqlIdentifier::new(name.clone()),
-                *note,
-            );
+        let world = ctx.world;
+        if !self.epoch.is_discovering() {
+            let replay = self.semantic_replay.borrow();
+            let planned = replay
+                .statements
+                .get(self.statement_cursor)
+                .cloned()
+                .ok_or_else(|| {
+                    internal("effect-plan replay exhausted its statements".to_string())
+                })?;
+            if planned.serve_bootstrap != serve_bootstrap {
+                return Err(internal(
+                    "effect-plan replay reached a different statement form".to_string(),
+                ));
+            }
+            self.statement_cursor += 1;
+            drop(replay);
+            return self.lower_planned_statement(planned);
         }
-        let config;
-        let config = if serve_bootstrap && !cfg!(target_arch = "wasm32") {
-            config = resolver::ResolutionConfig {
-                serve_bootstrap_reads: true,
-                ..self.config.clone()
-            };
-            &config
-        } else {
-            &self.config
+        let system = self.system;
+        let schema = system.get_schema()?;
+
+        let mut registry = ResolverCore::new_with_system(schema, system, self.epoch.planning()?);
+        registry.residuals = Rc::clone(&self.residuals);
+        // Every statement here is a REPLAY — an instantiated body or a
+        // compiler-built query — so the authored-environment judgments stay
+        // with the submission that authored them.
+        let mut config = resolver::ResolutionConfig {
+            authored_environment: false,
+            ..self.config.clone()
         };
-        let (resolved, bubbled) =
-            resolver::resolve_query_inline(query, &mut registry, None, config, None)?;
+        if serve_bootstrap && !cfg!(target_arch = "wasm32") {
+            config.serve_bootstrap_reads = true;
+        }
+        // THE PLAN'S OWN CREATIONS are program state: they register into a
+        // PROGRAM world and never into a consulted body — a rule body reads
+        // a plan creation only through an explicit actual.
+        for (name, note) in &self.notes {
+            world.register_materialized(delightql_types::SqlIdentifier::new(name.clone()), *note);
+        }
+        let resolved = match rule_value {
+            Some((formal, value)) => {
+                world.resolve_query_with_rule_value(&mut registry, config, query, formal, value)?
+            }
+            None => world.resolve_query(&mut registry, config, query)?,
+        }
+        .into_query();
         let connection_id = registry.validate_single_connection()?;
-        let resolved_columns = bubbled.i_provide;
 
-        let gates = danger_gates::DangerGateMap::with_defaults();
+        let gates = self.danger_gates.clone();
         let refined =
-            refiner::refine_query_with_gates(resolved, gates.clone(), Rc::clone(&self.registry))?;
-
-        let ctx = transformer::TransformCtx {
-            identities: Rc::clone(&self.registry),
-            names: transformer::builder::NameGenerator::new(Rc::clone(&self.registry)),
-            outer_columns: vec![],
-            danger_gates: gates,
+            refiner::refine_query_with_gates(resolved, gates.clone(), self.epoch.planning()?)?;
+        let output_relation = transformer::output_relation(&refined);
+        let resolved_columns =
+            crate::relation::published_ports(&self.epoch.names(), &output_relation)?;
+        let planned = PlannedStmt {
+            serve_bootstrap,
+            refined,
+            gates,
+            resolved_columns,
+            connection_id,
         };
-        let lowered = transformer::transform(refined, &ctx)?;
+        self.semantic_replay
+            .borrow_mut()
+            .statements
+            .push(planned.clone());
+        let compiled = self.lower_planned_statement(planned)?;
+        Ok(compiled)
+    }
 
-        // The columns the statement publishes, taken from the transformed
-        // select list because that is the one that survived lowering; fall
-        // back to the resolved schema for star-shaped selects. These are
-        // column occurrences, not names — what they are called is baptism's
-        // to say, later and for the whole bundle.
-        let columns = statement_output_columns(&lowered.statement).unwrap_or(resolved_columns);
-
+    fn lower_planned_statement(&mut self, planned: PlannedStmt) -> Result<CompiledStmt> {
+        let relation = transformer::output_relation(&planned.refined);
+        let PlannedStmt {
+            refined,
+            gates,
+            resolved_columns,
+            connection_id,
+            ..
+        } = planned;
+        // THE CAPABILITY IS SPENT FOR THE LENGTH OF THIS ACT. What the
+        // transformer holds is a reader over a store that refuses
+        // construction while it holds it, and the builder has no capability
+        // at all until the lowering has answered.
+        let names = Rc::clone(self.epoch.names());
+        let lowered = self.epoch.lowering(|relations| {
+            let ctx = transformer::TransformCtx {
+                relations: relations.clone(),
+                identities: Rc::clone(&names),
+                outer_sites: Vec::new(),
+                names: transformer::builder::NameGenerator::new(Rc::clone(&names)),
+                danger_gates: gates,
+            };
+            transformer::transform(refined, &ctx)
+        })??;
+        let ports = resolved_columns;
+        let columns = statement_output_columns(&lowered.statement).unwrap_or_else(|| {
+            ports
+                .iter()
+                .copied()
+                .into_iter()
+                .map(|port| port.column())
+                .collect()
+        });
         Ok(CompiledStmt {
             stmt: lowered.statement,
             obligations: lowered.obligations,
             prepare: lowered.prepare,
             staged: lowered.staged,
-            columns: columns.to_vec(),
+            columns,
+            ports,
+            relation,
             connection_id,
         })
     }
@@ -3591,7 +4783,7 @@ impl<'a> PlanBuilder<'a> {
             stmt,
             dialect,
             crate::pipeline::sql_optimizer::OptimizationLevel::Basic,
-            &self.registry,
+            &self.epoch.names(),
         )?;
         Ok(DeferredSql::Statement(lowered))
     }
@@ -3606,8 +4798,8 @@ impl<'a> PlanBuilder<'a> {
                 return;
             };
             if matches!(
-                self.registry.origin_of(*scope),
-                crate::names::ScopeOrigin::Scratch { .. }
+                self.epoch.names().kind_of(*scope),
+                crate::names::ScopeKind::Scratch { .. }
             ) {
                 *table = TableExpression::QualifiedScope {
                     schema: scratch_schema.to_string(),
@@ -3632,8 +4824,8 @@ impl<'a> PlanBuilder<'a> {
             return;
         };
         if matches!(
-            self.registry.origin_of(*scope),
-            crate::names::ScopeOrigin::Scratch { .. }
+            self.epoch.names().kind_of(*scope),
+            crate::names::ScopeKind::Scratch { .. }
         ) {
             *target = crate::pipeline::sql_ast::statements::RelationTarget::QualifiedScope {
                 schema: scratch_schema.to_string(),
@@ -3703,9 +4895,9 @@ impl<'a> PlanBuilder<'a> {
     /// Compile a PURE (already-walked) value expression to SQL text.
     /// Handles the signed witness compositionally; everything
     /// else takes the ordinary chain.
-    fn compile_value_text(&mut self, expr: &Chain) -> Result<CompiledText> {
+    fn compile_value_text(&mut self, expr: &Chain, ctx: &WalkCtx) -> Result<CompiledText> {
         if value_contains_witness(expr) {
-            let value = self.compile_value_qe(expr)?;
+            let value = self.compile_value_qe(expr, ctx)?;
             let stmt = SqlStatement::Query {
                 with_clause: None,
                 query: value.query,
@@ -3714,10 +4906,12 @@ impl<'a> PlanBuilder<'a> {
             return Ok(CompiledText {
                 sql,
                 columns: value.columns,
+                ports: value.ports,
+                relation: value.relation,
                 connection_id: value.connection_id,
             });
         }
-        let compiled = self.compile_statement(Query::relational(expr.clone()))?;
+        let compiled = self.compile_statement(ctx, ctx.pure_query(expr.clone()))?;
         match &compiled.stmt {
             SqlStatement::Query { .. } => {}
             _ => {
@@ -3730,6 +4924,8 @@ impl<'a> PlanBuilder<'a> {
         Ok(CompiledText {
             sql,
             columns: compiled.columns,
+            ports: compiled.ports,
+            relation: compiled.relation,
             connection_id: compiled.connection_id,
         })
     }
@@ -3752,8 +4948,11 @@ impl<'a> PlanBuilder<'a> {
     /// spelling produces the stacked union witness both docs now
     /// describe.
     #[stacksafe::stacksafe]
-    fn compile_value_qe(&mut self, expr: &Chain) -> Result<ValueQe> {
-        match expr.split_last() {
+    fn compile_value_qe(&mut self, expr: &Chain, ctx: &WalkCtx) -> Result<ValueQe> {
+        match expr
+            .split_last()
+            .map(|(step, prefix)| (step.form(), prefix))
+        {
             Some((
                 Continuation::Structural(crate::pipeline::asts::core::StructuralStep {
                     form: crate::pipeline::asts::core::StructuralForm::SignedWitness,
@@ -3761,19 +4960,19 @@ impl<'a> PlanBuilder<'a> {
                 }),
                 prefix,
             )) => {
-                let inner = self.compile_value_qe(&prefix.to_chain())?;
+                let inner = self.compile_value_qe(&prefix.to_chain(), ctx)?;
                 self.witness_wrap(inner)
             }
             Some((Continuation::BagOp { arm, .. }, prefix)) if value_contains_witness(expr) => {
                 let arms: Vec<ValueQe> = vec![
-                    self.compile_value_qe(&prefix.to_chain())?,
-                    self.compile_value_qe(arm)?,
+                    self.compile_value_qe(&prefix.to_chain(), ctx)?,
+                    self.compile_value_qe(arm, ctx)?,
                 ];
-                union_corresponding_qes(arms, &self.registry)
+                self.union_corresponding_qes(arms)
             }
             _ => {
                 let other = expr;
-                let compiled = self.compile_statement(Query::relational(other.clone()))?;
+                let compiled = self.compile_statement(ctx, ctx.pure_query(other.clone()))?;
                 let query = match compiled.stmt {
                     SqlStatement::Query { with_clause, query } => match with_clause {
                         Some(ctes) => QueryExpression::WithCte {
@@ -3791,6 +4990,8 @@ impl<'a> PlanBuilder<'a> {
                 Ok(ValueQe {
                     query,
                     columns: compiled.columns,
+                    ports: compiled.ports,
+                    relation: compiled.relation,
                     connection_id: compiled.connection_id,
                 })
             }
@@ -3801,81 +5002,57 @@ impl<'a> PlanBuilder<'a> {
     ///   SELECT r.c1 AS c1, ..., COALESCE(r.__p, 0) AS met
     ///   FROM (SELECT 1 AS __dee) AS dee
     ///   LEFT JOIN (SELECT 1 AS __p, a.* FROM (<V>) AS a) AS r ON 1 = 1
-    fn witness_wrap(&self, inner: ValueQe) -> Result<ValueQe> {
+    fn witness_wrap(&mut self, inner: ValueQe) -> Result<ValueQe> {
         let one = || SqlExpr::literal(ast_refined::LiteralValue::Number("1".to_string()));
         let source_scope = self
-            .registry
+            .epoch
+            .names()
             .common_scope(&inner.columns)
             .ok_or_else(|| internal("witness input has no common scope".to_string()))?;
-        let dee_scope = self.registry.mint_derived_scope(
-            crate::names::ScopeOrigin::Wrap {
-                input: source_scope,
-                why: crate::names::WrapReason::Witness,
-            },
-            crate::names::Hint::None,
-        );
-        let dee_column = self.registry.mint_column(
-            dee_scope,
-            crate::names::ColumnOrigin::Computed {
-                via: crate::names::Computation::Literal,
-            },
-            None,
-            crate::names::Addressing::Hygienic,
-            crate::names::ValueFacts::default(),
-        );
-        let dee = crate::pipeline::transformer::builder::publish_at(
-            dee_scope,
-            [dee_column],
-            SelectStatement::builder().select(SelectItem::expression_with_alias(one(), dee_column)),
-            &self.registry,
-        )?;
-        let source_alias = self.registry.mint_derived_scope(
-            crate::names::ScopeOrigin::Wrap {
-                input: source_scope,
-                why: crate::names::WrapReason::Witness,
-            },
-            crate::names::Hint::None,
-        );
+        let dee_scope = self
+            .epoch
+            .names()
+            .wrap_scope(source_scope, crate::names::WrapReason::Witness);
+        let dee_column =
+            self.epoch
+                .names()
+                .sql_column(dee_scope, None, crate::names::Addressing::Hygienic);
+        let dee = (SelectStatement::builder()
+            .select(SelectItem::expression_with_alias(one(), dee_column)))
+        .standing_at(dee_scope)
+        .map_err(crate::error::DelightQLError::parse_error)?;
+        let source_alias = self
+            .epoch
+            .names()
+            .wrap_scope(source_scope, crate::names::WrapReason::Witness);
         let source_columns = inner
             .columns
             .iter()
             .map(|column| {
-                self.registry.republish_column(
+                self.epoch.names().rebind_sql_column(
                     *column,
                     source_alias,
-                    crate::names::Republish::BoundaryExport,
-                    self.registry.published(*column),
-                    self.registry.addressing(*column),
-                    |_| {},
+                    self.epoch.names().published(*column),
                 )
             })
             .collect::<Vec<_>>();
-        let sentinel_scope = self.registry.mint_derived_scope(
-            crate::names::ScopeOrigin::Wrap {
-                input: source_alias,
-                why: crate::names::WrapReason::Witness,
-            },
-            crate::names::Hint::Exact(self.registry.intern("r", false)),
+        let sentinel_scope = self.epoch.names().exact_emission_scope(
+            source_alias,
+            crate::names::WrapReason::Witness,
+            self.epoch.names().intern("r", false),
         );
-        let sentinel_column = self.registry.mint_column(
+        let sentinel_column = self.epoch.names().sql_column(
             sentinel_scope,
-            crate::names::ColumnOrigin::Computed {
-                via: crate::names::Computation::Literal,
-            },
-            Some(self.registry.intern("__p", false)),
+            Some(self.epoch.names().intern("__p", false)),
             crate::names::Addressing::Hygienic,
-            crate::names::ValueFacts::default(),
         );
         let sentinel_payload = source_columns
             .iter()
             .map(|column| {
-                self.registry.republish_column(
+                self.epoch.names().rebind_sql_column(
                     *column,
                     sentinel_scope,
-                    crate::names::Republish::Passthrough,
-                    self.registry.published(*column),
-                    self.registry.addressing(*column),
-                    |_| {},
+                    self.epoch.names().published(*column),
                 )
             })
             .collect::<Vec<_>>();
@@ -3891,12 +5068,9 @@ impl<'a> PlanBuilder<'a> {
                     .collect(),
             )
             .from_tables(vec![TableExpression::subquery(inner.query, source_alias)]);
-        let sentinel = crate::pipeline::transformer::builder::publish_at(
-            sentinel_scope,
-            std::iter::once(sentinel_column).chain(sentinel_payload.iter().copied()),
-            sentinel,
-            &self.registry,
-        )?;
+        let sentinel = (sentinel)
+            .standing_at(sentinel_scope)
+            .map_err(crate::error::DelightQLError::parse_error)?;
 
         let join = TableExpression::Join {
             left: Box::new(TableExpression::subquery(
@@ -3911,40 +5085,31 @@ impl<'a> PlanBuilder<'a> {
             join_condition: JoinCondition::On(SqlExpr::eq(one(), one())),
         };
 
-        let output_scope = self.registry.mint_derived_scope(
-            crate::names::ScopeOrigin::Wrap {
-                input: sentinel_scope,
-                why: crate::names::WrapReason::Witness,
-            },
-            crate::names::Hint::None,
-        );
-        let outputs = sentinel_payload
-            .iter()
-            .map(|column| {
-                self.registry.republish_column(
-                    *column,
-                    output_scope,
-                    crate::names::Republish::Passthrough,
-                    self.registry.published(*column),
-                    self.registry.addressing(*column),
-                    |_| {},
-                )
-            })
-            .collect::<Vec<_>>();
-        let met_spelling = self.registry.intern("met", false);
-        let met = self.registry.mint_column(
-            output_scope,
-            crate::names::ColumnOrigin::Computed {
-                via: crate::names::Computation::Operator,
-            },
-            Some(met_spelling),
-            crate::names::Addressing::Published,
-            crate::names::ValueFacts::default(),
-        );
+        let relation = self.semantic_allocation(|registry| {
+            registry
+                .authority()
+                .derive(crate::relation::RelForm::SignedWitness(
+                    crate::relation::form::SignedWitnessSpec {
+                        input: inner.relation,
+                    },
+                ))
+        })?;
+        let ports = crate::relation::published_ports(&self.epoch.names(), &relation)?;
+        let (met, outputs) = ports
+            .split_last()
+            .ok_or_else(|| internal("a signed witness has no met position".to_string()))?;
+        if outputs.len() != sentinel_payload.len() {
+            return Err(internal(
+                "a signed witness changed its input width".to_string(),
+            ));
+        }
+        let output_scope = relation.scope();
+        let outputs: Vec<_> = outputs.iter().map(|port| port.column()).collect();
+        let met = met.column();
         let mut items: Vec<SelectItem> = Vec::with_capacity(inner.columns.len() + 1);
         for (source, output) in sentinel_payload.iter().zip(outputs.iter()) {
             let read = SqlExpr::Column(*source);
-            let expr = if self.registry.facts(*source).interior.is_some() {
+            let expr = if self.epoch.names().is_tree_valued(*source) {
                 SqlExpr::function(
                     "coalesce",
                     vec![
@@ -3970,18 +5135,138 @@ impl<'a> PlanBuilder<'a> {
 
         let mut columns = outputs;
         columns.push(met);
-        let select = crate::pipeline::transformer::builder::publish_at(
-            output_scope,
-            columns.iter().copied(),
-            SelectStatement::builder()
-                .select_all(items)
-                .from_tables(vec![join]),
-            &self.registry,
-        )?;
+        let select = (SelectStatement::builder()
+            .select_all(items)
+            .from_tables(vec![join]))
+        .standing_at(output_scope)
+        .map_err(crate::error::DelightQLError::parse_error)?;
         Ok(ValueQe {
             query: QueryExpression::Select(Box::new(select)),
             columns,
+            ports,
+            relation,
             connection_id: inner.connection_id,
+        })
+    }
+
+    /// UNION-CORRESPONDING over compiled values. The semantic authority
+    /// decides the total contribution matrix; this road only binds each
+    /// recorded arm port to the physical slot that arm emitted.
+    fn union_corresponding_qes(&mut self, arms: Vec<ValueQe>) -> Result<ValueQe> {
+        if arms.len() < 2 {
+            return Err(internal(
+                "corresponding union has fewer than two arms".to_string(),
+            ));
+        }
+        let relations: Vec<_> = arms.iter().map(|arm| arm.relation).collect();
+        let relation = self.semantic_allocation(|registry| {
+            Ok(registry
+                .authority()
+                .set_step(
+                    crate::pipeline::asts::core::SetOperator::UnionCorresponding,
+                    &relations,
+                )?
+                .result())
+        })?;
+        let matrix =
+            crate::relation::contributions(&self.epoch.names(), &relation)?.ok_or_else(|| {
+                internal("corresponding union has no contribution matrix".to_string())
+            })?;
+        let ports = crate::relation::published_ports(&self.epoch.names(), &relation)?;
+        if matrix.outputs().len() != ports.len() || matrix.arms().len() != arms.len() {
+            return Err(internal(
+                "corresponding union matrix and semantic interface disagree".to_string(),
+            ));
+        }
+        let output_scope = relation.scope();
+        let union_cols: Vec<_> = ports.iter().map(|port| port.column()).collect();
+        let mut connection: Option<i64> = None;
+        let mut result: Option<QueryExpression> = None;
+        for (arm_index, arm) in arms.into_iter().enumerate() {
+            connection = connection.or(arm.connection_id);
+            let arm_record = matrix
+                .arms()
+                .iter()
+                .nth(arm_index)
+                .ok_or_else(|| internal("corresponding union omitted an arm".to_string()))?;
+            if arm_record.relation() != arm.relation.relation()
+                || arm.ports.as_slice() != arm_record.ports()
+                || arm.ports.len() != arm.columns.len()
+            {
+                return Err(internal(
+                    "corresponding union arm changed after semantic construction".to_string(),
+                ));
+            }
+            let source_scope = self
+                .epoch
+                .names()
+                .common_scope(&arm.columns)
+                .ok_or_else(|| internal("corresponding union arm has no scope".to_string()))?;
+            let arm_scope = self
+                .epoch
+                .names()
+                .set_arm_scope(source_scope, arm_index as u16);
+            let active = arm
+                .columns
+                .iter()
+                .map(|column| {
+                    self.epoch.names().rebind_sql_column(
+                        *column,
+                        arm_scope,
+                        self.epoch.names().published(*column),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let physical_by_port: std::collections::HashMap<_, _> = arm
+                .ports
+                .iter()
+                .copied()
+                .zip(active.iter().copied())
+                .collect();
+            let mut items = Vec::with_capacity(union_cols.len());
+            for (output, column) in matrix.outputs().iter().zip(&union_cols) {
+                let cell = output.by_arm().iter().nth(arm_index).ok_or_else(|| {
+                    internal("corresponding union row omitted an arm".to_string())
+                })?;
+                match cell {
+                    crate::relation::set::Contribution::Port(port) => {
+                        let physical = physical_by_port.get(port).copied().ok_or_else(|| {
+                            internal("corresponding union names an unbound arm port".to_string())
+                        })?;
+                        items.push(SelectItem::expression_with_alias(
+                            SqlExpr::Column(physical),
+                            *column,
+                        ));
+                    }
+                    crate::relation::set::Contribution::Padding(_) => {
+                        items.push(SelectItem::expression_with_alias(
+                            SqlExpr::literal(ast_refined::LiteralValue::Null),
+                            *column,
+                        ));
+                    }
+                }
+            }
+            let select = (SelectStatement::builder()
+                .select_all(items)
+                .from_tables(vec![TableExpression::subquery(arm.query, arm_scope)]))
+            .standing_at(output_scope)
+            .map_err(crate::error::DelightQLError::parse_error)?;
+            let aligned = QueryExpression::Select(Box::new(select));
+            result = Some(match result {
+                None => aligned,
+                Some(acc) => QueryExpression::SetOperation {
+                    op: crate::pipeline::sql_ast::SetOperator::UnionAll,
+                    left: Box::new(acc),
+                    right: Box::new(aligned),
+                },
+            });
+        }
+        Ok(ValueQe {
+            query: result.expect("union has at least two arms"),
+            columns: union_cols,
+            ports,
+            relation,
+            connection_id: connection,
         })
     }
 
@@ -3989,31 +5274,31 @@ impl<'a> PlanBuilder<'a> {
     // Guards, receipts, shells, emission
     // ========================================================================
 
-    fn guard_from_value(&self, expr: &Chain) -> GuardSource {
+    fn guard_from_value(&self, expr: &Chain, ctx: &WalkCtx) -> GuardSource {
         if let (
             Some(Relation::Ground {
                 mention:
-                    GroundMention::Plan {
-                        scope,
-                        authored_name: None,
-                        alias: None,
-                    },
+                    GroundMention::Scratch { row },
                 outer: false,
                 ..
             }),
             Some(Access::All),
         ) = (expr.as_read_relation(), expr.head_access())
         {
-            return GuardSource::Table(*scope);
+            return GuardSource::Table(row.relation());
         }
-        GuardSource::Expr(Box::new(disown_preminted_scopes(expr.clone())))
+        GuardSource::Expr {
+            body: Box::new(expr.clone()),
+            locals: ctx.pure_locals(),
+        }
     }
 
-    fn guard_to_sql(&mut self, guard: &GuardSource) -> Result<SqlExpr> {
+    fn guard_to_sql(&mut self, ctx: &WalkCtx<'_>, guard: &GuardSource) -> Result<SqlExpr> {
         match guard {
-            GuardSource::Table(t) => Ok(SqlExpr::exists(select_one_from(*t, &self.registry)?)),
-            GuardSource::Expr(e) => {
-                let compiled = self.compile_statement(Query::relational((**e).clone()))?;
+            GuardSource::Table(t) => Ok(SqlExpr::exists(select_one_from(*t, &self.epoch.names())?)),
+            GuardSource::Expr { body, locals } => {
+                let compiled =
+                    self.compile_statement(ctx, Query::binding(locals.clone(), (**body).clone()))?;
                 match compiled.stmt {
                     SqlStatement::Query { with_clause, query } => {
                         let qe = match with_clause {
@@ -4040,7 +5325,7 @@ impl<'a> PlanBuilder<'a> {
         let guards = ctx.guards.clone();
         let mut out = Vec::with_capacity(guards.len() + 1);
         for g in &guards {
-            out.push(self.guard_to_sql(g)?);
+            out.push(self.guard_to_sql(ctx, g)?);
         }
         if include_exit && self.exit_armed {
             out.push(self.exit_gate());
@@ -4053,7 +5338,7 @@ impl<'a> PlanBuilder<'a> {
             .exit_scope
             .expect("exit scope exists whenever the exit gate is armed");
         SqlExpr::not_exists(
-            select_one_from(scope, &self.registry).expect("exit-table SELECT 1 always builds"),
+            select_one_from(scope, &self.epoch.names()).expect("exit-table SELECT 1 always builds"),
         )
     }
 
@@ -4064,7 +5349,7 @@ impl<'a> PlanBuilder<'a> {
         &mut self,
         ctx: &WalkCtx,
         shape: &ReceiptShape,
-    ) -> Result<crate::names::ScopeId> {
+    ) -> Result<crate::relation::ScratchRow> {
         if let Some(sink) = &ctx.sink {
             return Ok(sink.table);
         }
@@ -4072,15 +5357,24 @@ impl<'a> PlanBuilder<'a> {
     }
 
     /// Allocate a receipt table and publish its heading so later statements
-    /// resolve reads by scope identity. Non-hub plans settle the connection
+    /// resolve reads by its receipt. Non-hub plans settle the connection
     /// before emission; all-SQLite plans retain `None` for hub convergence.
     fn alloc_receipt_shell_named(
         &mut self,
         columns: &[String],
         scratch_name: &str,
-    ) -> Result<crate::names::ScopeId> {
-        let scope = self.alloc_named_scratch(crate::names::ScratchRole::Result, scratch_name);
-        let identities = self.named_columns(scope, columns);
+    ) -> Result<crate::relation::ScratchRow> {
+        let row = self.alloc_scratch(
+            crate::names::ScratchRole::Result,
+            scratch_name,
+            columns,
+            None,
+        )?;
+        let scope = row.relation();
+        let identities = crate::relation::published_ports(&self.epoch.names(), &scope)?
+            .into_iter()
+            .map(|port| port.column())
+            .collect::<Vec<_>>();
         let definitions = identities
             .iter()
             .zip(columns)
@@ -4089,8 +5383,7 @@ impl<'a> PlanBuilder<'a> {
         // The schema-qualified shell cannot bind into the user's durable
         // schema. The dialect pack supplies the scratch-schema spelling.
         self.push_shell(scope, &definitions)?;
-        self.register_plan_scope(scope, &identities);
-        Ok(scope)
+        Ok(row)
     }
 
     fn ensure_exit_shell(&mut self) -> Result<()> {
@@ -4098,12 +5391,21 @@ impl<'a> PlanBuilder<'a> {
             return Ok(());
         }
         self.exit_shell_made = true;
-        let exit_scope = self.alloc_named_scratch(crate::names::ScratchRole::Barrier, "__exit");
+        let exit_scope = self
+            .alloc_scratch(
+                crate::names::ScratchRole::Barrier,
+                "__exit",
+                &["hit".to_string()],
+                None,
+            )?
+            .relation();
         self.exit_scope = Some(exit_scope);
-        let hit = self.named_columns(exit_scope, &["hit".to_string()]);
+        let hit = crate::relation::published_ports(&self.epoch.names(), &exit_scope)?
+            .into_iter()
+            .map(|port| port.column())
+            .collect::<Vec<_>>();
         // The schema-qualified shell cannot bind to a durable user table.
         self.push_shell(exit_scope, &[(hit[0], "INTEGER")])?;
-        self.register_plan_scope(exit_scope, &hit);
         Ok(())
     }
 
@@ -4112,7 +5414,7 @@ impl<'a> PlanBuilder<'a> {
     /// any guard or exit-latch sampling.
     fn push_shell(
         &mut self,
-        scope: crate::names::ScopeId,
+        scope: crate::relation::SemanticRelation,
         columns: &[(crate::names::ColId, &str)],
     ) -> Result<()> {
         let scratch_schema = self.scratch_schema()?;
@@ -4120,7 +5422,7 @@ impl<'a> PlanBuilder<'a> {
             .push(PendingPlanEntry::Statement(PendingPlanStatement {
                 sql: DeferredSql::concat([
                     DeferredSql::text(format!("DROP TABLE IF EXISTS {}.", scratch_schema)),
-                    DeferredSql::Scope(scope),
+                    DeferredSql::Scope(scope.scope()),
                 ]),
                 connection_id: self.plan_connection,
                 comment: Some("clear plan scratch from a prior run".to_string()),
@@ -4144,7 +5446,7 @@ impl<'a> PlanBuilder<'a> {
     /// `sqlite_representative_plan_render_pinned_byte_for_byte`).
     fn shell_create_sql(
         &mut self,
-        scope: crate::names::ScopeId,
+        scope: crate::relation::SemanticRelation,
         columns: &[(crate::names::ColId, &str)],
     ) -> Result<DeferredSql> {
         let scratch_schema = self.scratch_schema()?;
@@ -4155,7 +5457,7 @@ impl<'a> PlanBuilder<'a> {
         };
         let mut parts = vec![
             DeferredSql::text(format!("CREATE TEMP TABLE {}.", scratch_schema)),
-            DeferredSql::Scope(scope),
+            DeferredSql::Scope(scope.scope()),
             DeferredSql::text(" ("),
         ];
         for (index, (column, sql_type)) in columns.iter().enumerate() {
@@ -4175,7 +5477,7 @@ impl<'a> PlanBuilder<'a> {
     /// fuses it with the DML into one statement.
     fn emit_receipt_insert(
         &mut self,
-        table: crate::names::ScopeId,
+        table: crate::relation::SemanticRelation,
         shape: &ReceiptShape,
         gate: ReceiptGate,
         ctx: &WalkCtx,
@@ -4195,7 +5497,7 @@ impl<'a> PlanBuilder<'a> {
     /// every form. For the adjacency discipline see `handle_dml`.
     fn build_receipt_insert_sql(
         &mut self,
-        table: crate::names::ScopeId,
+        table: crate::relation::SemanticRelation,
         shape: &ReceiptShape,
         gate: ReceiptGate,
         ctx: &WalkCtx,
@@ -4218,15 +5520,18 @@ impl<'a> PlanBuilder<'a> {
         }));
 
         let target = table;
-        let columns = self.registry.known_heading(target)?;
+        let columns: Vec<_> = crate::relation::published_ports(&self.epoch.names(), &target)?
+            .into_iter()
+            .map(|port| port.column())
+            .collect();
         let mut items = Vec::with_capacity(columns.len());
-        for column in columns.iter() {
-            let published = self.registry.published_sym(*column).ok_or_else(|| {
+        for column in &columns {
+            let published = self.epoch.names().published_sym(*column).ok_or_else(|| {
                 internal("a receipt-shell column has no published name".to_string())
             })?;
             let mut matches = values
                 .iter()
-                .filter(|(name, _)| self.registry.known_sym(name, false) == Some(published));
+                .filter(|(name, _)| self.epoch.names().known_sym(name, false) == Some(published));
             let value = match (matches.next(), matches.next()) {
                 (None, None) => ast_refined::LiteralValue::Null,
                 (Some((_, value)), None) => value.clone(),
@@ -4237,7 +5542,10 @@ impl<'a> PlanBuilder<'a> {
                 }
                 (None, Some(_)) => unreachable!("an iterator cannot have a second item only"),
             };
-            items.push(SelectItem::expression(SqlExpr::literal(value)));
+            items.push(SelectItem::scaffolding_value(
+                SqlExpr::literal(value),
+                self.epoch.names().scaffolding_slot(),
+            ));
         }
 
         let mut gates: Vec<SqlExpr> = Vec::new();
@@ -4251,24 +5559,26 @@ impl<'a> PlanBuilder<'a> {
             ReceiptGate::FusedDml(scope) => {
                 // The data-modifying CTE is statement-local rather than a
                 // plan scratch table, so its reference stays unqualified.
-                gates.push(SqlExpr::exists(select_one_from(*scope, &self.registry)?));
+                gates.push(SqlExpr::exists(select_one_from_scope(
+                    *scope,
+                    &self.epoch.names(),
+                )?));
             }
             ReceiptGate::Precount(aff) => {
-                let scope = *aff;
-                let count = *self
-                    .registry
-                    .known_heading(scope)?
-                    .in_order()
+                let scope = aff.scope();
+                let count = crate::relation::published_ports(&self.epoch.names(), aff)?
+                    .into_iter()
+                    .map(|port| port.column())
                     .next()
                     .expect("precount scope has one result column");
-                let count_read = crate::pipeline::transformer::builder::publish_at(
-                    scope,
-                    [count],
-                    SelectStatement::builder()
-                        .select(SelectItem::expression(SqlExpr::Column(count)))
-                        .from_tables(vec![TableExpression::Scope(scope)]),
-                    &self.registry,
-                )?;
+                let count_read = (SelectStatement::builder()
+                    .select(SelectItem::scaffolding_value(
+                        SqlExpr::Column(count),
+                        self.epoch.names().scaffolding_slot(),
+                    ))
+                    .from_tables(vec![TableExpression::Scope(scope)]))
+                .standing_at(scope)
+                .map_err(crate::error::DelightQLError::parse_error)?;
                 gates.push(
                     SqlExpr::subquery(QueryExpression::Select(Box::new(count_read))).gt(
                         SqlExpr::literal(ast_refined::LiteralValue::Number("0".to_string())),
@@ -4282,19 +5592,16 @@ impl<'a> PlanBuilder<'a> {
         if let Some(w) = and_all(gates) {
             sb = sb.where_clause(w);
         }
-        let at = self.registry.mint_scope(
-            crate::names::ScopeOrigin::AnonRelation,
-            crate::names::Hint::None,
-            None,
-        );
+        let at = self.epoch.names().anonymous_scope(None);
         // The source feeds an INSERT column list, which names the target's
         // columns; the source scope publishes none of its own.
-        let select =
-            crate::pipeline::transformer::builder::publish_at(at, [], sb, &self.registry)?;
+        let select = (sb)
+            .standing_at(at)
+            .map_err(crate::error::DelightQLError::parse_error)?;
 
         let insert = SqlStatement::Insert {
-            target: crate::pipeline::sql_ast::statements::RelationTarget::Scope(target),
-            target_scope: target,
+            target: crate::pipeline::sql_ast::statements::RelationTarget::Scope(target.scope()),
+            target_scope: target.scope(),
             columns: columns.to_vec(),
             with_clause: None,
             source: QueryExpression::Select(Box::new(select)),
@@ -4332,7 +5639,7 @@ impl<'a> PlanBuilder<'a> {
                 .expect("exit scope exists whenever exit is armed");
             conds.push(DeferredSql::concat([
                 DeferredSql::text(format!("NOT EXISTS (SELECT 1 FROM {}.", scratch_schema)),
-                DeferredSql::Scope(exit_scope),
+                DeferredSql::Scope(exit_scope.scope()),
                 DeferredSql::text(")"),
             ]));
         }
@@ -4364,95 +5671,203 @@ impl<'a> PlanBuilder<'a> {
     /// Render one boolean gate expression to SQL text (for the text-level
     /// wrap-guard), by generating a one-column SELECT and slicing it off.
     fn render_expr(&mut self, expr: SqlExpr) -> Result<DeferredSql> {
-        let at = self.registry.mint_derived_scope(
-            crate::names::ScopeOrigin::AnonRelation,
-            crate::names::Hint::None,
-        );
+        let at = self.epoch.names().anonymous_scope(None);
         Ok(DeferredSql::Expression {
             expression: expr,
             at,
         })
     }
 
-    fn register_note(&mut self, table: &str, columns: &[crate::names::ColId]) {
-        // A note SHADOWS everything for its name: the newest
-        // plan binding wins — replace any earlier note for the same name.
-        self.notes.retain(|(n, _)| n != table);
-        let scope = self.object_scopes.get(table).copied().unwrap_or_else(|| {
-            let spelling = self.registry.intern(table, false);
-            let entity = self.registry.mint_entity(spelling);
-            self.registry.mint_derived_scope(
-                crate::names::ScopeOrigin::BaseTable { entity },
-                crate::names::Hint::User(spelling),
-            )
-        });
-        self.notes
-            .push((table.to_string(), plan_note(columns, &self.registry, scope)));
-    }
-
-    fn register_plan_scope(&self, scope: crate::names::ScopeId, columns: &[crate::names::ColId]) {
-        plan_note(columns, &self.registry, scope);
-    }
-
-    fn named_scope(&mut self, name: &str) -> crate::names::ScopeId {
-        if let Some(scope) = self.object_scopes.get(name) {
-            return *scope;
-        }
-        let spelling = self.registry.intern(name, false);
-        let entity = self.registry.mint_entity(spelling);
-        let scope = self.registry.mint_derived_scope(
-            crate::names::ScopeOrigin::BaseTable { entity },
-            crate::names::Hint::User(spelling),
-        );
-        self.object_scopes.insert(name.to_string(), scope);
-        scope
-    }
-
-    fn named_columns(
-        &self,
-        scope: crate::names::ScopeId,
-        columns: &[String],
-    ) -> Vec<crate::names::ColId> {
-        columns
+    /// THE RELATION A CREATED OBJECT PUBLISHES, derived once with the
+    /// heading the statement that creates it emits.
+    ///
+    /// The name the CREATE renders and the note later statements resolve
+    /// against are the same relation, so nothing grows an interface after
+    /// the authority recorded it. A note SHADOWS everything for its name —
+    /// the newest plan binding wins — and shadowing mints a NEW relation
+    /// rather than regrowing the old one's: two bindings of one name are two
+    /// relations, and the statements already compiled against the first
+    /// still name it.
+    fn create_object_relation(
+        &mut self,
+        name: &str,
+        columns: &[crate::relation::PortId],
+    ) -> Result<crate::relation::SemanticRelation> {
+        let spelling = self.epoch.names().intern(name, false);
+        let slots: Vec<crate::relation::form::SourceSlot> = columns
             .iter()
             .enumerate()
-            .map(|(position, name)| {
-                let spelling = self.registry.intern(name, false);
-                self.registry.mint_column(
-                    scope,
-                    crate::names::ColumnOrigin::Bound {
-                        position: position as u32,
-                    },
-                    Some(spelling),
-                    crate::names::Addressing::Published,
-                    crate::names::ValueFacts::default(),
-                )
+            .map(|(position, column)| crate::relation::form::SourceSlot {
+                position: position as u32,
+                named: self.epoch.names().published(column.column()),
+                declared_type: self
+                    .epoch
+                    .names()
+                    .facts(column.column())
+                    .declared_type
+                    .map(|spelled| spelled.to_string()),
             })
-            .collect()
+            .collect();
+        // ONE RELATION PER CREATED NAME. A plan that creates `sw` twice
+        // creates ONE object — the second act replaces its contents — and
+        // one object answers to one name: deriving a second relation for it
+        // would put two scopes in front of one spelling, and the later one
+        // would lose the name to the collision.
+        //
+        // The heading must therefore agree. Where it does not, the name
+        // stands for something else than it did, and that is a replacement
+        // this road does not describe.
+        if let Some(known) = self.object_scopes.get(name).copied() {
+            let published = crate::relation::published_ports(&self.epoch.names(), &known)?;
+            if published.len() != slots.len()
+                || published.iter().zip(columns).any(|(port, column)| {
+                    self.epoch.names().published_sym(port.column())
+                        != self.epoch.names().published_sym(column.column())
+                })
+            {
+                return Err(unsupported(format!(
+                    "{name} is created twice in one plan with different headings"
+                )));
+            }
+            return Ok(known);
+        }
+        let object = self.semantic_allocation(|registry| {
+            let entity = registry.mint_entity(spelling);
+            registry
+                .authority()
+                .derive(crate::relation::RelForm::Source(
+                    crate::relation::form::SourceSpec {
+                        origin: crate::relation::form::SourceOrigin::Catalog { entity },
+                        slots: &slots,
+                        answers_to: Some(spelling),
+                    },
+                ))
+        })?;
+        self.object_scopes.insert(name.to_string(), object);
+        self.notes.retain(|(noted, _)| noted != name);
+        self.notes.push((name.to_string(), object));
+        Ok(object)
     }
 
-    fn alloc_named_scratch(
+    /// THE ONE ALLOCATION. A scratch's heading travels INTO its derivation:
+    /// one that acquired its positions afterwards would record an interface
+    /// the registry heading then diverged from, and every reader of the
+    /// record would answer with the heading nobody grew.
+    /// Write the scratch's OWN positions into the statement that fills it.
+    ///
+    /// A created table's columns are the scratch's heading: the read above it
+    /// addresses those ports, and an invented name is DRAWN per occurrence.
+    /// A select list still spelling the compiled statement's own occurrences
+    /// therefore creates a table whose columns nothing can name. The
+    /// authority already derived the scratch HOLDING this statement's
+    /// outputs; this writes that pairing into the SQL, so the two are one act
+    /// rather than two lists that agree until a name is drawn.
+    fn stage_onto_scratch(
+        &self,
+        query: &mut crate::pipeline::sql_ast::QueryExpression,
+        emitted: &[crate::names::ColId],
+        staged: &crate::relation::SemanticRelation,
+    ) -> Result<()> {
+        let into = crate::relation::published_ports(&self.epoch.names(), staged)?;
+        if emitted.len() < into.len() {
+            return Err(internal(
+                "a scratch holding a statement's outputs is wider than its SELECT".to_string(),
+            ));
+        }
+        let mut aliases: Vec<_> = emitted
+            .iter()
+            .take(into.len())
+            .zip(&into)
+            .map(|(source, target)| (*source, target.column()))
+            .collect();
+        aliases.extend(emitted.iter().skip(into.len()).map(|source| {
+            (
+                *source,
+                self.epoch.names().sql_column(
+                    staged.scope(),
+                    None,
+                    crate::names::Addressing::Hygienic,
+                ),
+            )
+        }));
+        crate::pipeline::transformer::builder::state::rewrite_output_aliases(
+            query,
+            staged.scope(),
+            &aliases,
+            &self.epoch.names(),
+        )
+    }
+
+    fn alloc_scratch(
         &mut self,
         role: crate::names::ScratchRole,
         name: &str,
-    ) -> crate::names::ScopeId {
-        let scope = self.registry.mint_derived_scope(
-            crate::names::ScopeOrigin::Scratch { role },
-            crate::names::Hint::Exact(self.registry.intern(name, false)),
-        );
-        self.scratch_tables.push(scope);
-        scope
+        names: &[String],
+        holds: Option<&crate::relation::SemanticRelation>,
+    ) -> crate::error::Result<crate::relation::ScratchRow> {
+        use crate::relation::form::{ScratchSlot, ScratchSpec, ScratchWhy};
+        let why = match role {
+            crate::names::ScratchRole::Snapshot => ScratchWhy::Snapshot,
+            crate::names::ScratchRole::Result => ScratchWhy::Result,
+            crate::names::ScratchRole::Tee => ScratchWhy::Tee,
+            crate::names::ScratchRole::Insert => ScratchWhy::Insert,
+            crate::names::ScratchRole::Barrier => ScratchWhy::Barrier,
+        };
+        let base = Some(self.epoch.names().intern(name, false));
+        let slots: Vec<ScratchSlot> = names
+            .iter()
+            .enumerate()
+            .map(|(position, spelling)| ScratchSlot {
+                position: position as u32,
+                named: self.epoch.names().intern(spelling, false),
+            })
+            .collect();
+        let spec = match holds {
+            None => ScratchSpec::stating(why, base, &slots),
+            Some(relation) => ScratchSpec::holding(why, base, relation),
+        };
+        // THE SCRATCH ROW IS ALLOCATED BY THE LEXICAL AUTHORITY'S ACT, which
+        // derives it from its spec and mints its receipt; the receipt is what
+        // a later construction stands over, and the replay pass hands out
+        // the same receipt.
+        let row = if let PlanEpoch::Discovering(planning) = &self.epoch {
+            let row = planning.authority().scratch_row(spec)?;
+            self.semantic_replay.borrow_mut().scratch_rows.push(row);
+            row
+        } else {
+            let replay = self.semantic_replay.borrow();
+            let row = replay
+                .scratch_rows
+                .get(self.scratch_cursor)
+                .copied()
+                .ok_or_else(|| {
+                    internal("effect-plan replay exhausted its scratch rows".to_string())
+                })?;
+            drop(replay);
+            self.scratch_cursor += 1;
+            row
+        };
+        self.scratch_tables.push(row.relation());
+        Ok(row)
     }
 
-    fn alloc_scratch(&mut self, role: crate::names::ScratchRole) -> crate::names::ScopeId {
-        let name = match role {
-            crate::names::ScratchRole::Snapshot => "__snap",
-            crate::names::ScratchRole::Result => "__r_main",
-            crate::names::ScratchRole::Tee => "__tee",
-            crate::names::ScratchRole::Insert => "__src_in",
-            crate::names::ScratchRole::Barrier => "__exit",
-        };
-        self.alloc_named_scratch(role, name)
+    fn semantic_allocation(
+        &mut self,
+        build: impl FnOnce(&crate::relation::Planning) -> Result<crate::relation::SemanticRelation>,
+    ) -> Result<crate::relation::SemanticRelation> {
+        if let PlanEpoch::Discovering(planning) = &self.epoch {
+            let relation = build(planning)?;
+            self.semantic_replay.borrow_mut().allocations.push(relation);
+            return Ok(relation);
+        }
+        let replay = self.semantic_replay.borrow();
+        let relation = replay
+            .allocations
+            .get(self.allocation_cursor)
+            .copied()
+            .ok_or_else(|| internal("effect-plan replay exhausted its allocations".to_string()))?;
+        self.allocation_cursor += 1;
+        Ok(relation)
     }
 
     fn emit_statement(&mut self, sql: DeferredSql, connection_id: Option<i64>) {
@@ -4504,21 +5919,15 @@ impl<'a> PlanBuilder<'a> {
     /// scope identity included in the plan bundle, so the runtime executes
     /// this SQL verbatim and never invents a post-baptism identifier.
     fn render_guard_select(&mut self, w: SqlExpr) -> Result<DeferredSql> {
-        let inner_at = self.registry.mint_scope(
-            crate::names::ScopeOrigin::AnonRelation,
-            crate::names::Hint::None,
-            None,
-        );
-        let inner = crate::pipeline::transformer::builder::publish_at(
-            inner_at,
-            [],
-            SelectStatement::builder()
-                .select(SelectItem::expression(SqlExpr::literal(
-                    ast_refined::LiteralValue::Number("1".to_string()),
-                )))
-                .where_clause(w),
-            &self.registry,
-        )?;
+        let inner_at = self.epoch.names().anonymous_scope(None);
+        let inner = (SelectStatement::builder()
+            .select(SelectItem::scaffolding_value(
+                SqlExpr::literal(ast_refined::LiteralValue::Number("1".to_string())),
+                self.epoch.names().scaffolding_slot(),
+            ))
+            .where_clause(w))
+        .standing_at(inner_at)
+        .map_err(crate::error::DelightQLError::parse_error)?;
         self.finish_statement(&SqlStatement::Query {
             with_clause: None,
             query: QueryExpression::Select(Box::new(inner)),
@@ -4537,33 +5946,21 @@ impl<'a> PlanBuilder<'a> {
         id
     }
 
-    /// Close the current step — claim every entry pushed
-    /// since the last mark as ONE occurrence's statement stream, with its
-    /// requirement edges. Called at the DISPATCH site right after a
-    /// handler returns, so lowering machinery emitted en route (precount
-    /// stages, snapshots) folds into the occurrence that needed it
-    /// (adjacency lives in the lowered stream). A mark with nothing
-    /// emitted records no step (PG's fused DML is one entry; a pure value
-    /// is none). `exit_armed_before` is the flag AS OF the handler's
-    /// entry, so exit!'s own step does not wear an absent-edge on the
-    /// latch it is about to set.
-    fn mark_step(
+    /// Build the requirement and occurrence metadata that every completed
+    /// action owns. `exit_armed_before` is the flag AS OF the handler's entry,
+    /// so exit!'s own step does not wear an absent-edge on the latch it sets.
+    fn step_metadata(
         &mut self,
-        kind: compiled_query::EffectStepKind,
         bare: &str,
         ctx: Option<&WalkCtx>,
         exit_armed_before: bool,
-    ) -> Result<()> {
+    ) -> Result<(String, Vec<compiled_query::Requirement>)> {
         use compiled_query::{GuardPolarity, Requirement};
-        let end = self.body.len();
-        if end == self.step_marked {
-            return Ok(());
-        }
         let mut requirements = Vec::new();
         if let Some(ctx) = ctx {
             let sources = ctx.guards.clone();
             for g in &sources {
-                let expr = self.guard_to_sql(g)?;
+                let expr = self.guard_to_sql(ctx, g)?;
                 let sql = self.render_guard_select(expr)?;
                 let guard_id = self.guard_def_id(sql);
                 // Two comma conjuncts can intern to one guard definition.
@@ -4586,7 +5983,7 @@ impl<'a> PlanBuilder<'a> {
                 .expect("exit scope exists whenever exit is armed");
             let sql = self.render_guard_select(SqlExpr::exists(select_one_from(
                 exit_scope,
-                &self.registry,
+                &self.epoch.names(),
             )?))?;
             let guard_id = self.guard_def_id(sql);
             requirements.push(Requirement {
@@ -4604,16 +6001,86 @@ impl<'a> PlanBuilder<'a> {
                 format!("{path}::{bare}!#{n}")
             }
         };
+        Ok((occurrence, requirements))
+    }
+
+    /// Move the current occurrence's emitted SQL into an owned statement
+    /// stream. A ship cannot be smuggled into a terminal construction.
+    fn take_statement_stream(&mut self, owner: &str) -> Result<Vec<PendingPlanStatement>> {
+        std::mem::take(&mut self.body)
+            .into_iter()
+            .map(|entry| match entry {
+                PendingPlanEntry::Statement(statement) => Ok(statement),
+                PendingPlanEntry::ShippedStatement(_) => Err(internal(format!(
+                    "typed-plan construction: a ship inside {owner}'s statement stream"
+                ))),
+            })
+            .collect()
+    }
+
+    /// Close a non-terminal step over the entries its handler emitted.
+    fn mark_step(
+        &mut self,
+        kind: MarkedStepKind,
+        bare: &str,
+        ctx: Option<&WalkCtx>,
+        exit_armed_before: bool,
+    ) -> Result<()> {
+        if self.body.is_empty() {
+            return Ok(());
+        }
+        let entries = std::mem::take(&mut self.body);
+        let refusal = self.pending_refusal.take();
+        let (occurrence, requirements) = self.step_metadata(bare, ctx, exit_armed_before)?;
         self.step_marks.push(StepMark {
-            start: self.step_marked,
-            end,
-            refusal: self.pending_refusal.take(),
-            kind,
+            action: PendingMarkedAction::Stream {
+                kind,
+                entries,
+                refusal,
+            },
             occurrence,
             operation: format!("{bare}!"),
             requirements,
         });
-        self.step_marked = end;
+        Ok(())
+    }
+
+    /// Construct graceful completion as a terminal value before assembly.
+    fn mark_exit_step(&mut self, ctx: Option<&WalkCtx>, exit_armed_before: bool) -> Result<()> {
+        let statements = self.take_statement_stream("exit!")?;
+        let (occurrence, requirements) = self.step_metadata("exit", ctx, exit_armed_before)?;
+        self.step_marks.push(StepMark {
+            action: PendingMarkedAction::Terminal(PendingTerminalAction::Exit { statements }),
+            occurrence,
+            operation: "exit!".to_string(),
+            requirements,
+        });
+        Ok(())
+    }
+
+    /// Construct erroneous completion in one act. The probe never enters the
+    /// generic body stream, so no later phase can infer or disagree about
+    /// which statement decides the abort.
+    fn mark_abort_step(
+        &mut self,
+        probe: PendingPlanStatement,
+        provenance: compiled_query::AbortProvenance,
+        bare: &str,
+        ctx: Option<&WalkCtx>,
+        exit_armed_before: bool,
+    ) -> Result<()> {
+        let statements = self.take_statement_stream(&format!("{bare}!"))?;
+        let (occurrence, requirements) = self.step_metadata(bare, ctx, exit_armed_before)?;
+        self.step_marks.push(StepMark {
+            action: PendingMarkedAction::Terminal(PendingTerminalAction::Abort {
+                statements,
+                probe,
+                provenance,
+            }),
+            occurrence,
+            operation: format!("{bare}!"),
+            requirements,
+        });
         Ok(())
     }
 
@@ -4709,32 +6176,9 @@ impl<'a> PlanBuilder<'a> {
 struct CompiledText {
     sql: DeferredSql,
     columns: Vec<crate::names::ColId>,
+    ports: Vec<crate::relation::PortId>,
+    relation: crate::relation::SemanticRelation,
     connection_id: Option<i64>,
-}
-
-fn deferred_assertion_bool(left: DeferredSql, right: Option<DeferredSql>) -> DeferredSql {
-    let Some(right) = right else {
-        return DeferredSql::concat([
-            DeferredSql::text("SELECT EXISTS("),
-            left,
-            DeferredSql::text(") AS bool"),
-        ]);
-    };
-    DeferredSql::concat([
-        DeferredSql::text("SELECT ((SELECT COUNT(*) FROM ("),
-        left.clone(),
-        DeferredSql::text(")) = (SELECT COUNT(*) FROM ("),
-        right.clone(),
-        DeferredSql::text(")) AND NOT EXISTS(SELECT * FROM ("),
-        left.clone(),
-        DeferredSql::text(") EXCEPT SELECT * FROM ("),
-        right.clone(),
-        DeferredSql::text(")) AND NOT EXISTS(SELECT * FROM ("),
-        right,
-        DeferredSql::text(") EXCEPT SELECT * FROM ("),
-        left,
-        DeferredSql::text("))) AS bool"),
-    ])
 }
 
 /// A compiled value expression: its query, output column names (as the SQL
@@ -4742,122 +6186,9 @@ fn deferred_assertion_bool(left: DeferredSql, right: Option<DeferredSql>) -> Def
 struct ValueQe {
     query: QueryExpression,
     columns: Vec<crate::names::ColId>,
+    ports: Vec<crate::relation::PortId>,
+    relation: crate::relation::SemanticRelation,
     connection_id: Option<i64>,
-}
-
-/// UNION-CORRESPONDING over compiled values: columns align by name in
-/// first-appearance order; absent columns pad NULL (SQLite UNION ALL is
-/// positional — the compiler knows every schema, TORTURE-TEST-NORMAL's
-/// ledger comment).
-fn union_corresponding_qes(
-    arms: Vec<ValueQe>,
-    identities: &crate::names::Registry,
-) -> Result<ValueQe> {
-    if arms.is_empty() {
-        return Err(internal("corresponding union has no arms".to_string()));
-    }
-    let mut representatives: Vec<crate::names::ColId> = Vec::new();
-    for arm in &arms {
-        let matched = identities.corresponding_slots(&representatives, &arm.columns)?;
-        let matched_columns = matched.iter().flatten().copied().collect::<Vec<_>>();
-        for column in &arm.columns {
-            if !matched_columns.contains(column) {
-                representatives.push(*column);
-            }
-        }
-    }
-    let source_scope = identities
-        .common_scope(&arms[0].columns)
-        .ok_or_else(|| internal("corresponding union arm has no scope".to_string()))?;
-    let output_scope = identities.mint_derived_scope(
-        crate::names::ScopeOrigin::Wrap {
-            input: source_scope,
-            why: crate::names::WrapReason::SetOperation,
-        },
-        crate::names::Hint::None,
-    );
-    let union_cols = representatives
-        .iter()
-        .map(|column| {
-            identities.republish_column(
-                *column,
-                output_scope,
-                crate::names::Republish::UnionCorresponding,
-                identities.published(*column),
-                identities.addressing(*column),
-                |_| {},
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut connection: Option<i64> = None;
-    let mut result: Option<QueryExpression> = None;
-    for (arm_index, arm) in arms.into_iter().enumerate() {
-        connection = connection.or(arm.connection_id);
-        let arm_source = identities
-            .common_scope(&arm.columns)
-            .ok_or_else(|| internal("corresponding union arm has no scope".to_string()))?;
-        let arm_scope = identities.mint_derived_scope(
-            crate::names::ScopeOrigin::SetArm {
-                of: arm_source,
-                arm: arm_index as u16,
-            },
-            crate::names::Hint::None,
-        );
-        let active = arm
-            .columns
-            .iter()
-            .map(|column| {
-                identities.republish_column(
-                    *column,
-                    arm_scope,
-                    crate::names::Republish::BoundaryExport,
-                    identities.published(*column),
-                    identities.addressing(*column),
-                    |_| {},
-                )
-            })
-            .collect::<Vec<_>>();
-        let corresponding = identities.corresponding_slots(&representatives, &active)?;
-        let mut items = Vec::with_capacity(union_cols.len());
-        for ((_, output), corresponding) in representatives
-            .iter()
-            .zip(union_cols.iter())
-            .zip(corresponding)
-        {
-            match corresponding {
-                Some(column) => items.push(SelectItem::expression_with_alias(
-                    SqlExpr::Column(column),
-                    *output,
-                )),
-                None => items.push(SelectItem::expression_with_alias(
-                    SqlExpr::literal(ast_refined::LiteralValue::Null),
-                    *output,
-                )),
-            }
-        }
-        let select = crate::pipeline::transformer::builder::publish_at(
-            output_scope,
-            union_cols.iter().copied(),
-            SelectStatement::builder()
-                .select_all(items)
-                .from_tables(vec![TableExpression::subquery(arm.query, arm_scope)]),
-            identities,
-        )?;
-        let aligned = QueryExpression::Select(Box::new(select));
-        result = Some(match result {
-            None => aligned,
-            Some(acc) => QueryExpression::SetOperation {
-                op: crate::pipeline::sql_ast::SetOperator::UnionAll,
-                left: Box::new(acc),
-                right: Box::new(aligned),
-            },
-        });
-    }
-    Ok(ValueQe {
-        query: result.expect("union has at least one arm"),
-        columns: union_cols,
-        connection_id: connection,
-    })
 }
 
 // ============================================================================
@@ -4892,28 +6223,6 @@ fn dml_kind_name(kind: &DmlVerb) -> &'static str {
         DmlVerb::Update => "update",
         DmlVerb::Delete => "delete",
     }
-}
-
-/// A PURE CTE in an effect body has no lowering yet.
-///
-/// A pure CTE in an effect body
-/// evaluates at demand, so a body demanding it after a mutation sees
-/// post-mutation state — and the effect-CTE road inlines its labels at their
-/// mention sites, which is that meaning. The PURE labels have no such road:
-/// they are separated out of the body's `WithCtes` and nothing puts them
-/// back, so a reference to one reaches resolution as an unknown relation.
-/// Refuse where the gap is, rather than let the name take the blame.
-fn refuse_unlowered_pure_ctes(ctes: &[effects::EffectCteDef]) -> Result<()> {
-    let Some(pure) = ctes.iter().find(|cte| !cte.effect_marked()) else {
-        return Ok(());
-    };
-    Err(unsupported(format!(
-        "the pure CTE '{}' is bound inside an effect body, and a pure binding \
-         has no lowering there yet (EFFECT-ALGEBRA E3): its label would name \
-         nothing at the demand site. Define it outside the effect body, or — \
-         if its body demands a directive — mark it ('{}!')",
-        pure.name, pure.name
-    )))
 }
 
 fn unsupported(message: String) -> DelightQLError {
@@ -5028,7 +6337,9 @@ fn run_target_from_args(name: &str, arguments: &[DomainExpression]) -> Result<St
 /// which the builder spells as a one-row anonymous source (holding the
 /// argument) piped into the terminal.
 fn run_target_from_source(name: &str, source: &Chain) -> Result<String> {
-    if let (Grelex::Literal(anon), true) = (&source.head, source.continuations.is_empty()) {
+    if let (GroundForm::Literal(anon), true) =
+        (source.head().form(), source.continuations().is_empty())
+    {
         let rows = &anon.table.body.rows;
         if rows.len() == 1 {
             let row = rows.first();
@@ -5061,29 +6372,56 @@ fn run_target_from_value(value: &DomainExpression) -> Option<String> {
     }
 }
 
-fn make_pipe(source: Chain, operator: PipeOp) -> Chain {
-    source.then(Continuation::Pipe {
-        operator: operator,
-        named: None,
-        cpr_schema: (),
-    })
+fn abort_arguments(name: &str, arguments: &[DomainExpression]) -> Result<(String, String)> {
+    if !(1..=2).contains(&arguments.len()) {
+        return Err(DelightQLError::validation_error_categorized(
+            "directive/binding/arity",
+            format!("{name} expects an error identity and an optional label"),
+            "write abort!(\"identity\", \"label\")(*)",
+        ));
+    }
+    let identity = run_target_from_value(&arguments[0]).ok_or_else(|| {
+        DelightQLError::validation_error_categorized(
+            "directive/binding/value",
+            format!("{name}'s identity must be a string or bare name"),
+            "abort identity",
+        )
+    })?;
+    let label = match arguments.get(1) {
+        Some(value) => run_target_from_value(value).ok_or_else(|| {
+            DelightQLError::validation_error_categorized(
+                "directive/binding/value",
+                format!("{name}'s label must be a string or bare name"),
+                "abort label",
+            )
+        })?,
+        None => identity.clone(),
+    };
+    Ok((identity, label))
 }
 
-/// A bare glob read of a plan-lifetime relation. Resolution follows the
-/// registered scope directly; no character-bearing lookup key exists.
-fn plan_scope_read(scope: crate::names::ScopeId) -> Chain {
+fn make_pipe(source: Chain, operator: PipeOp) -> Chain {
+    source.then(Step::authored(Continuation::Pipe {
+        operator: operator,
+        named: None,
+    }))
+}
+
+/// THE WITNESS THAT A RECEIPT IS BEING NAMED BY THE PLAN: a scratch row is
+/// placed under an authored name only here, where the plan places it, and
+/// only this module constructs the witness.
+pub struct ReceiptNaming(());
+
+/// A bare glob read of a scratch row the plan allocated, by its receipt.
+/// Resolution follows the receipt directly; no character-bearing lookup
+/// key exists.
+fn scratch_read(row: crate::relation::ScratchRow) -> Chain {
     Chain::read(
         Relation::Ground {
-            mention: GroundMention::Plan {
-                scope,
-                authored_name: None,
-                alias: None,
-            },
+            mention: GroundMention::Scratch { row },
             outer: false,
-            cpr_schema: (),
         },
         Access::All,
-        (),
     )
 }
 
@@ -5102,28 +6440,33 @@ fn named_ground_read(table: &str) -> Chain {
                 passthrough: false,
             },
             outer: false,
-            cpr_schema: (),
         },
         Access::All,
-        (),
     )
 }
 
 /// `SELECT 1 FROM t` (the guard subquery spelling).
 fn select_one_from(
+    table: crate::relation::SemanticRelation,
+    identities: &crate::names::Registry,
+) -> Result<QueryExpression> {
+    select_one_from_scope(table.scope(), identities)
+}
+
+/// The same, for an object the plan names physically rather than
+/// semantically — a statement-local data-modifying CTE.
+fn select_one_from_scope(
     table: crate::names::ScopeId,
     identities: &crate::names::Registry,
 ) -> Result<QueryExpression> {
-    let select = crate::pipeline::transformer::builder::publish_at(
-        table,
-        [],
-        SelectStatement::builder()
-            .select(SelectItem::expression(SqlExpr::literal(
-                ast_refined::LiteralValue::Number("1".to_string()),
-            )))
-            .from_tables(vec![TableExpression::Scope(table)]),
-        identities,
-    )?;
+    let select = (SelectStatement::builder()
+        .select(SelectItem::scaffolding_value(
+            SqlExpr::literal(ast_refined::LiteralValue::Number("1".to_string())),
+            identities.scaffolding_slot(),
+        ))
+        .from_tables(vec![TableExpression::Scope(table)]))
+    .standing_at(table)
+    .map_err(crate::error::DelightQLError::parse_error)?;
     Ok(QueryExpression::Select(Box::new(select)))
 }
 
@@ -5151,22 +6494,15 @@ fn stamp_statement(
     };
     match stmt {
         SqlStatement::Insert { source, .. } => {
-            let alias = identities.mint_scope(
-                crate::names::ScopeOrigin::AnonRelation,
-                crate::names::Hint::None,
-                None,
-            );
+            let alias = identities.anonymous_scope(None);
             let wrapped = SelectStatement::builder()
                 .select(SelectItem::star_over_nothing())
                 .from_tables(vec![TableExpression::subquery(source.clone(), alias)])
                 .where_clause(guard);
-            let wrapped = crate::pipeline::transformer::builder::publish_at(
-                alias,
-                [],
-                wrapped,
-                identities,
-            )
-            .expect("gated wrapper publishes nothing and always builds");
+            let wrapped = (wrapped)
+                .standing_at(alias)
+                .map_err(crate::error::DelightQLError::parse_error)
+                .expect("gated wrapper publishes nothing and always builds");
             *source = QueryExpression::Select(Box::new(wrapped));
         }
         SqlStatement::Update { where_clause, .. } | SqlStatement::Delete { where_clause, .. } => {
@@ -5176,22 +6512,15 @@ fn stamp_statement(
             });
         }
         SqlStatement::Query { query, .. } => {
-            let alias = identities.mint_scope(
-                crate::names::ScopeOrigin::AnonRelation,
-                crate::names::Hint::None,
-                None,
-            );
+            let alias = identities.anonymous_scope(None);
             let wrapped = SelectStatement::builder()
                 .select(SelectItem::star_over_nothing())
                 .from_tables(vec![TableExpression::subquery(query.clone(), alias)])
                 .where_clause(guard);
-            let wrapped = crate::pipeline::transformer::builder::publish_at(
-                alias,
-                [],
-                wrapped,
-                identities,
-            )
-            .expect("gated wrapper publishes nothing and always builds");
+            let wrapped = (wrapped)
+                .standing_at(alias)
+                .map_err(crate::error::DelightQLError::parse_error)
+                .expect("gated wrapper publishes nothing and always builds");
             *query = QueryExpression::Select(Box::new(wrapped));
         }
         SqlStatement::CreateTempTable { .. }
@@ -5214,21 +6543,15 @@ fn stamp_statement(
 fn precount_query(
     stmt: &SqlStatement,
     identities: &crate::names::Registry,
-    output_scope: crate::names::ScopeId,
-) -> Result<(
-    Option<Vec<crate::pipeline::sql_ast::Cte>>,
-    QueryExpression,
-)> {
-    let count_spelling = identities.intern("c", false);
-    let count_column = identities.mint_column(
-        output_scope,
-        crate::names::ColumnOrigin::Computed {
-            via: crate::names::Computation::Aggregate,
-        },
-        Some(count_spelling),
-        crate::names::Addressing::Published,
-        crate::names::ValueFacts::default(),
-    );
+    output_scope: crate::relation::SemanticRelation,
+) -> Result<(Option<Vec<crate::pipeline::sql_ast::Cte>>, QueryExpression)> {
+    let count_ports = crate::relation::published_ports(identities, &output_scope)?;
+    let [count_port] = count_ports.as_slice() else {
+        return Err(internal(
+            "the pre-count scratch does not publish exactly one position".to_string(),
+        ));
+    };
+    let count_column = count_port.column();
     let count_item = SelectItem::expression_with_alias(
         SqlExpr::function("count", vec![SqlExpr::star()]),
         count_column,
@@ -5239,22 +6562,15 @@ fn precount_query(
             source,
             ..
         } => {
-            let source_scope = identities.mint_scope(
-                crate::names::ScopeOrigin::AnonRelation,
-                crate::names::Hint::None,
-                None,
-            );
-            let select = crate::pipeline::transformer::builder::publish_at(
-                output_scope,
-                [count_column],
-                SelectStatement::builder()
-                    .select(count_item)
-                    .from_tables(vec![TableExpression::subquery(
-                        source.clone(),
-                        source_scope,
-                    )]),
-                identities,
-            )?;
+            let source_scope = identities.anonymous_scope(None);
+            let select = (SelectStatement::builder()
+                .select(count_item)
+                .from_tables(vec![TableExpression::subquery(
+                    source.clone(),
+                    source_scope,
+                )]))
+            .standing_at(output_scope.scope())
+            .map_err(crate::error::DelightQLError::parse_error)?;
             Ok((
                 with_clause.clone(),
                 QueryExpression::Select(Box::new(select)),
@@ -5298,12 +6614,9 @@ fn precount_query(
             if let Some(w) = where_clause {
                 sb = sb.where_clause(w.clone());
             }
-            let select = crate::pipeline::transformer::builder::publish_at(
-                output_scope,
-                [count_column],
-                sb,
-                identities,
-            )?;
+            let select = (sb)
+                .standing_at(output_scope.scope())
+                .map_err(crate::error::DelightQLError::parse_error)?;
             Ok((
                 with_clause.clone(),
                 QueryExpression::Select(Box::new(select)),
@@ -5325,7 +6638,10 @@ fn value_contains_witness(expr: &Chain) -> bool {
     // Top-level-by-contract: a signed witness is recognized only as the
     // chain's own trailing pipe or inside a bag arm. Restrictions, members
     // and ER edges are DELIBERATELY not descended.
-    match expr.split_last() {
+    match expr
+        .split_last()
+        .map(|(step, prefix)| (step.form(), prefix))
+    {
         Some((
             Continuation::Structural(crate::pipeline::asts::core::StructuralStep {
                 form: crate::pipeline::asts::core::StructuralForm::SignedWitness,
@@ -5351,12 +6667,15 @@ fn leaf_terminal_call(leaf: &Chain) -> Option<&SealedCall> {
     // under a trailing access — including the mention's own, when the
     // directive heads the chain.
     let mut steps = leaf.steps();
-    while let Some((Continuation::Access { .. }, rest)) = steps.split_last() {
+    while let Some((step, rest)) = steps.split_last() {
+        if !matches!(step.form(), Continuation::Access { .. }) {
+            break;
+        }
         steps = rest;
     }
     match steps.last() {
-        None => match &leaf.head {
-            Grelex::Reference(Relation::FunctorCall { call, .. }) => Some(call),
+        None => match leaf.head().form() {
+            GroundForm::Reference(Relation::FunctorCall { call, .. }) => Some(call),
             _ => None,
         },
         _ => None,
@@ -5369,7 +6688,7 @@ fn tail_payload_free_directive(expr: &Chain) -> Option<String> {
         &|leaf: &Chain| -> Option<String> {
             let call = leaf_terminal_call(leaf)?;
             let name = call.call().callee.name_text();
-            match effects::descriptor(&name) {
+            match effects::descriptor_for_reference(&call.call().callee) {
                 Some(d) if d.receipt_payload == ReceiptPayload::None => Some(name),
                 _ => None,
             }
@@ -5407,24 +6726,28 @@ fn ending_kind(expr: &Chain) -> Option<(Vec<String>, bool)> {
                 ))
             };
             let call = leaf_terminal_call(leaf)?;
-            let name = call.call().callee.name_text();
-            let bare = bare_name(&name);
+            let builtin = effects::kind_for_reference(&call.call().callee);
             if matches!(
-                crate::pipeline::asts::effects::DirectiveKind::from_name(bare),
+                builtin,
                 Some(
                     crate::pipeline::asts::effects::DirectiveKind::Stdout
                         | crate::pipeline::asts::effects::DirectiveKind::Returning
                 )
-            ) || effects::directive_category(&name) == DirectiveCategory::User
+            ) || builtin.is_none()
             {
                 universal()
             } else if call.call().relations().next().is_some()
-                && (crate::pipeline::asts::effects::DirectiveKind::from_name(bare)
-                    == Some(crate::pipeline::asts::effects::DirectiveKind::ReturningOther)
-                    || effects::descriptor(bare)
-                        .is_some_and(|descriptor| descriptor.is_adhoc_statement_terminal()))
+                && (builtin == Some(crate::pipeline::asts::effects::DirectiveKind::ReturningOther)
+                    || builtin.is_some_and(|kind| kind.descriptor().is_adhoc_statement_terminal()))
             {
-                Some((receipt_shape_from_descriptor(bare), true))
+                Some((
+                    receipt_shape(
+                        builtin
+                            .expect("a sinkable built-in has a descriptor")
+                            .descriptor(),
+                    ),
+                    true,
+                ))
             } else {
                 None
             }
@@ -5449,9 +6772,7 @@ fn ending_kind(expr: &Chain) -> Option<(Vec<String>, bool)> {
 /// A self-sinking terminal's receipt SHAPE, read from its descriptor's
 /// declared echoes (descriptor authority): the
 /// guaranteed core followed by the ledger-ordered echo names.
-fn receipt_shape_from_descriptor(bare: &str) -> Vec<String> {
-    let desc =
-        effects::descriptor(bare).unwrap_or_else(|| panic!("no directive descriptor for '{bare}'"));
+fn receipt_shape(desc: &crate::pipeline::asts::effects::DirectiveDescriptor) -> Vec<String> {
     let mut shape = vec!["success".to_string(), "operation".to_string()];
     shape.extend(desc.receipt_echoes.iter().map(|e| e.name.to_string()));
     shape
@@ -5483,16 +6804,9 @@ fn ending_receipt_leaf(expr: &Chain) -> Option<Vec<String>> {
     // A tail leaf that is not an invocation is not a sinkable terminal; its
     // recursive fields are DELIBERATELY not descended (the tail contract).
     let call = leaf_terminal_call(expr)?;
-    let name = Some(&call.call().callee)?.name_text();
-    let bare = bare_name(&name);
-    if call.call().relations().next().is_some()
-        && effects::descriptor(bare)
-            .is_some_and(|descriptor| descriptor.is_adhoc_statement_terminal())
-    {
-        Some(receipt_shape_from_descriptor(bare))
-    } else {
-        None
-    }
+    let descriptor = effects::descriptor_for_reference(&call.call().callee)?;
+    (call.call().relations().next().is_some() && descriptor.is_adhoc_statement_terminal())
+        .then(|| receipt_shape(descriptor))
 }
 
 /// All bare Ground relation names an expression reads (the hazard
@@ -5551,19 +6865,21 @@ impl AstVisit<Unresolved> for GroundNameCollector {
 /// COINCIDES with the paired detection
 /// `collect_ground_names` (both centralized recursion schemes, both proven
 /// complete by `p1_closure_matrix_detection_and_rewrite_agree`).
-fn rename_ground_reads(expr: Chain, from: &str, to: crate::names::ScopeId) -> Chain {
-    let mut r = GroundReadRenamer { from, to };
+/// Every read of the named relation reads the receipt instead: the row was
+/// paired with the name by the plan that materialized it, and the read
+/// stays an authored access under that name.
+fn rename_ground_reads(expr: Chain, to: crate::relation::NamedScratch) -> Chain {
+    let mut r = GroundReadRenamer { to };
     // A same-phase Ground-identifier rewrite never fails.
     r.transform_relational(expr)
         .expect("ground-read rename is infallible")
 }
 
-struct GroundReadRenamer<'a> {
-    from: &'a str,
-    to: crate::names::ScopeId,
+struct GroundReadRenamer {
+    to: crate::relation::NamedScratch,
 }
 
-impl AstTransform<Unresolved, Unresolved> for GroundReadRenamer<'_> {
+impl AstTransform<Unresolved, Unresolved> for GroundReadRenamer {
     crate::pipeline::ast_transform::same_phase_payload_folds!(Unresolved);
 
     fn transform_relation(&mut self, r: Relation) -> Result<Relation> {
@@ -5577,24 +6893,21 @@ impl AstTransform<Unresolved, Unresolved> for GroundReadRenamer<'_> {
                         passthrough,
                     },
                 outer,
-                cpr_schema,
             } => {
                 let is_rewritten = identifier.namespace_path.is_empty()
                     && !mutation_target
                     && !passthrough
-                    && identifier.name.as_str() == self.from;
+                    && identifier.name.as_str() == self.to.name().as_str();
                 if is_rewritten {
                     // The access beside this read is walked in its own right,
                     // so a scalar subquery inside a positional argument takes
                     // part in the same whole-tree rewrite.
                     return Ok(Relation::Ground {
-                        mention: GroundMention::Plan {
-                            scope: self.to,
-                            authored_name: Some(identifier.name),
+                        mention: GroundMention::Receipt {
+                            receipt: self.to.clone(),
                             alias,
                         },
                         outer,
-                        cpr_schema,
                     });
                 }
                 walk_transform_relation(
@@ -5607,78 +6920,12 @@ impl AstTransform<Unresolved, Unresolved> for GroundReadRenamer<'_> {
                             passthrough,
                         },
                         outer,
-                        cpr_schema,
                     },
                 )
             }
             other => walk_transform_relation(self, other),
         }
     }
-}
-
-/// Strip the pre-decided relation identities from a copy of a conjunct.
-///
-/// A rule demand expands to a relation carrying a pre-minted scope, so the
-/// receipt composes in joins under one identity. The conjunct is then read
-/// twice — as the value it contributes, and as the gate the conjunct to its
-/// right hangs on — and those are two occurrences of one relation, exactly as
-/// a subquery spliced into two FROM positions is. A scope is populated once,
-/// so the copy cannot keep the original's: it asks for one of its own, which
-/// the resolver mints. Nothing outside an EXISTS reads its columns, so the
-/// occurrence needs no name.
-fn disown_preminted_scopes(expr: Chain) -> Chain {
-    let mut d = PremintedScopeDisowner;
-    d.transform_relational(expr)
-        .expect("clearing a pre-minted scope is infallible")
-}
-
-struct PremintedScopeDisowner;
-
-impl AstTransform<Unresolved, Unresolved> for PremintedScopeDisowner {
-    crate::pipeline::ast_transform::same_phase_payload_folds!(Unresolved);
-
-    fn transform_relation(&mut self, r: Relation) -> Result<Relation> {
-        match walk_transform_relation(self, r)? {
-            Relation::InnerRelation {
-                pattern,
-                alias,
-                outer,
-                cpr_schema,
-                ..
-            } => Ok(Relation::InnerRelation {
-                pattern,
-                preminted_scope: None,
-                alias,
-                outer,
-                cpr_schema,
-            }),
-            other => Ok(other),
-        }
-    }
-}
-
-/// Build a plan note: the schema later statements resolve the created
-/// table against — byte-for-byte the shape `DatabaseRegistry::lookup_table`
-/// builds from a catalog row, minus declared
-/// types (a CTAS target's types are whatever the SELECT produced).
-fn plan_note(
-    columns: &[crate::names::ColId],
-    identities: &crate::names::Registry,
-    scope: crate::names::ScopeId,
-) -> crate::names::ScopeId {
-    for column in columns {
-        if identities.scope_of(*column) != scope {
-            identities.republish_column(
-                *column,
-                scope,
-                crate::names::Republish::BoundaryExport,
-                identities.published(*column),
-                crate::names::Addressing::Published,
-                |_| {},
-            );
-        }
-    }
-    scope
 }
 
 /// The output column names of a transformed statement's top select list,
@@ -5702,15 +6949,10 @@ fn qe_output_columns(qe: &QueryExpression) -> Option<Vec<crate::names::ColId>> {
         QueryExpression::Select(select) => {
             let mut cols = Vec::new();
             for item in select.select_list() {
-                match item {
-                    SelectItem::Expression { expr, alias } => match alias {
-                        Some(a) => cols.push(*a),
-                        None => match expr {
-                            SqlExpr::Column(column) => cols.push(*column),
-                            _ => return None,
-                        },
-                    },
-                    SelectItem::Star { .. } => return None,
+                match item.publishes() {
+                    crate::pipeline::sql_ast::Publishes::One(column) => cols.push(column),
+                    crate::pipeline::sql_ast::Publishes::Nothing
+                    | crate::pipeline::sql_ast::Publishes::Run(_) => return None,
                 }
             }
             Some(cols)

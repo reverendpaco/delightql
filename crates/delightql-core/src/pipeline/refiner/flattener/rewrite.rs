@@ -10,7 +10,7 @@ use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::resolved;
 
 struct HygienicRewrite<'a> {
-    carriers: &'a [(crate::names::ColId, crate::names::ColId)],
+    carriers: &'a [(crate::relation::PortId, crate::relation::PortId)],
 }
 
 impl AstTransform<resolved::Resolved, resolved::Resolved> for HygienicRewrite<'_> {
@@ -22,11 +22,9 @@ impl AstTransform<resolved::Resolved, resolved::Resolved> for HygienicRewrite<'_
     ) -> Result<resolved::DomainExpression> {
         match expr {
             resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                ColumnOccurrence {
-                    column,
-                    explicit_qualifier,
-                },
+                occurrence @ ColumnOccurrence { .. },
             ))) => {
+                let column = occurrence.column;
                 let mut carrying = self
                     .carriers
                     .iter()
@@ -45,10 +43,7 @@ impl AstTransform<resolved::Resolved, resolved::Resolved> for HygienicRewrite<'_
                     }
                 };
                 Ok(resolved::DomainExpression::Reference(Reference::Named(
-                    NamedReference(ColumnOccurrence {
-                        column,
-                        explicit_qualifier,
-                    }),
+                    NamedReference(occurrence.rebound(column)),
                 )))
             }
             other => ast_transform::walk_transform_domain(self, other),
@@ -79,7 +74,7 @@ impl AstTransform<resolved::Resolved, resolved::Resolved> for HygienicRewrite<'_
 /// `pattern_classifier::correlation_carriers`.
 pub(super) fn rewrite_with_hygienic_names(
     expr: resolved::TruthExpression,
-    carriers: &[(crate::names::ColId, crate::names::ColId)],
+    carriers: &[(crate::relation::PortId, crate::relation::PortId)],
 ) -> Result<resolved::TruthExpression> {
     let mut fold = HygienicRewrite { carriers };
     fold.transform_boolean(expr)

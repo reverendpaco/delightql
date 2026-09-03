@@ -264,20 +264,6 @@ lib::analytics.young_users(*)       // Still works (qualified)
 
 Groundable namespaces have free variables -- references to tables that aren't defined in the namespace. Grounding binds those variables to a data namespace.
 
-### Formal Rule {.dqlh}
-
-In the expression `F^S.e(*)`:
-
-- Only entities of **S** are visible. The entity `e` must be defined in S.
-- **F** is never directly accessible. It supplies bindings for free variables
-  inside S's entity bodies.
-- Grounding does **not** grant access to S's other entities (e.g.,
-  functions defined in S are not made available in pipe expressions).
-  Functions must be accessed via qualification (`S.func:(x)`) or
-  `enlist!("S")`.
-
-Put differently: `F^S.e(*)` means "from S, give me `e`, and when `e`'s body
-references tables, find them in F." It does not mean "merge F and S together."
 
 ### The Problem Again {.dqlh}
 
@@ -288,33 +274,10 @@ young_users(*) :- users(*), age < 30
 
 `users` is referenced but not defined. This namespace can't be used until `users` is bound to an actual table.
 
-### Query-Time Grounding {.dqlh}
 
-Use `^` to ground at the point of use:
-```delightql
-data::production^lib::analytics.young_users(*)
-```
+### Grounding {.dqlh}
 
-This binds `users` to `data::production.users` for this query.
-
-Query-time grounding uses **lazy validation** -- only the accessed entity and
-its dependencies are checked. Other entities in the namespace may have
-unresolved references; they won't cause failure unless you use them.
-
-```delightql
-// lib::analytics has:
-//   young_users(*) :- users(*), age < 30       // OK; users exists in production
-//   revenue_report(*) :- sales(*), amount > 0  // FAIL; sales doesn't exist
-
-data::production^lib::analytics.young_users(*)    // OK
-data::production^lib::analytics.revenue_report(*) // FAIL: sales not found
-```
-
-
-
-### Permanent Grounding {.dqlh}
-
-Query-time and enlist-time grounding are temporary. For a permanent binding, use `ground!()`:
+For a permanent binding, use `ground!()`:
 ```delightql
 ground!(data::production, lib::analytics, "lib::analytics_prod")
 ```
@@ -329,43 +292,10 @@ This:
    entire operation fails -- nothing is created.
 2. Creates a new namespace `lib::analytics_prod`
 3. Copies all entities with free variables bound to `data::production`
-4. The new namespace is pre-grounded -- no `^` operator needed
 
-The result is a new namespace, not a mutation of the original. This prevents
-stateful bugs and makes the operation idempotent.
+The result is a new namespace, not a mutation of the original.
 
-### Chained Grounding {.dqlh}
 
-Ground through multiple layers:
-```delightql
-data::production^lib::base^lib::extended.final_view(*)
-```
-
-Each `^` binds the namespace to its right against the accumulated context to its left.
-
-### Grounding as Inverse Enlist {.dqlh}
-
-Another way to think about grounding: `enlist!()` brings a namespace's entities into your scope; grounding injects bindings into a namespace's scope.
-
-```delightql
-// Enlist: bring lib::analytics INTO main
-enlist!("lib::analytics")
-
-// Ground: inject data::production INTO lib::analytics
-data::production^lib::analytics
-```
-
-Grounding reaches into the groundable namespace and says "when you reference `users`, you mean `data::production.users`."
-
-### Validation Summary {.dqlh}
-
-| Operation                    | Validation               | Persistence               |
-|------------------------------|--------------------------|---------------------------|
-| `data::ns^lib::ns.entity(*)` | Lazy (just this entity)  | Query only                |
-| `enlist!(data::ns^lib::ns)`  | Strict (whole namespace) | Enlist scope              |
-| `ground!(data, lib, "new")`  | Strict (whole namespace) | Permanent (new namespace) |
-
-: Grounding validation summary
 
 ### Constraints {.dqlh}
 
@@ -379,15 +309,8 @@ Session-scoped entities (created with `:-`) disappear when the session ends. Imp
 
 More so than most of what we've discussed before:  **this is where actual SQL DDL will be generated**.
 
-### The Problem {.dqlh}
-```delightql
-consult!("schema.dql", "lib::schema")
-// Creates session views
 
-// Session ends... views are gone
-```
-
-### The Solution {.dqlh}
+### Imprinting syntax {.dqlh}
 ```delightql
 imprint!("lib::schema", "data::production")
 ```
@@ -401,31 +324,7 @@ Imprinting:
 
 ### Grounding and Imprinting {.dqlh}
 
-
 Grounding and imprinting are highly related: where
 grounding proves compatibility, imprinting makes it permanent.
 
-If `data::production^lib::analytics` is valid grounding, then `imprint!("lib::analytics", "data::production")` is valid imprinting. The grounding operation proves that the derived namespace can bind against the data namespace. Imprinting persists that binding.
-
-```delightql
-// 1. Load database
-mount!("prod.db", "data::production")
-
-// 2. Load groundable rules
-consult!("analytics.dql", "lib::analytics")
-
-// 3. Ground and test (lazy validation)
-data::production^lib::analytics.young_users(*) |> count:(*)
-
-// 4. Commit to grounding (strict validation)
-enlist!(data::production^lib::analytics) as analytics
-
-// 5. Work confidently
-analytics.young_users(*)
-analytics.revenue_report(*)
-
-// 6. Persist (strict validation)
-imprint!("lib::analytics", "data::production")
-```
-
-Steps 4 and 6 both perform strict validation. If enlist succeeds, imprint will succeed (assuming no concurrent changes).
+If `data::production` grounded into `lib::analytics` is valid grounding, then `imprint!("lib::analytics", "data::production")` is valid imprinting. The grounding operation proves that the derived namespace can bind against the data namespace. Imprinting persists that binding.

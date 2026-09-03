@@ -36,68 +36,6 @@ fn parse_attach_spec(spec: &str) -> Result<(String, String)> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
-/// Handle .attach REPL dot command
-///
-/// Parses and executes a .attach command via mount!().
-///
-/// # Syntax
-/// `.attach 'path/to/db.db' to "namespace::path"`
-pub fn handle_attach_command(
-    cmd: &str,
-    handle: &mut dyn delightql_core::api::DqlHandle,
-) -> Result<bool> {
-    if !cmd.starts_with(".attach") {
-        return Ok(false);
-    }
-
-    let cmd = cmd.trim();
-
-    // Find the single-quoted path
-    let path_start = match cmd.find('\'') {
-        Some(pos) => pos + 1,
-        None => {
-            return Err(anyhow!(
-                "Invalid .attach syntax. Expected: .attach 'path' to \"namespace\""
-            ))
-        }
-    };
-
-    let path_end = match cmd[path_start..].find('\'') {
-        Some(pos) => path_start + pos,
-        None => {
-            return Err(anyhow!(
-                "Invalid .attach syntax. Missing closing quote for path"
-            ))
-        }
-    };
-
-    let db_path = &cmd[path_start..path_end];
-
-    // Find the double-quoted namespace
-    let ns_start = match cmd[path_end..].find('"') {
-        Some(pos) => path_end + pos + 1,
-        None => {
-            return Err(anyhow!(
-                "Invalid .attach syntax. Expected: .attach 'path' to \"namespace\""
-            ))
-        }
-    };
-
-    let ns_end = match cmd[ns_start..].find('"') {
-        Some(pos) => ns_start + pos,
-        None => {
-            return Err(anyhow!(
-                "Invalid .attach syntax. Missing closing quote for namespace"
-            ))
-        }
-    };
-
-    let namespace = &cmd[ns_start..ns_end];
-
-    mount_via_session(handle, db_path, namespace)?;
-    println!("✓ Attached {} to {}", db_path, namespace);
-    Ok(true)
-}
 
 /// Route through the session protocol via mount!() DQL command.
 fn mount_via_session(

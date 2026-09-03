@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! THE SUBSTITUTION LAW, at value level — spent here and nowhere later.
+//! THE SUBSTITUTION LAW — spent here, for every composition family, and
+//! nowhere later.
 //!
-//! ONE LAW, TWO CARRIERS. `pipe-operators-grammar.md` states it once: what
-//! flows in lands where the receiving form says it lands. At relation level
-//! that is the relational pipe; here it is the function pipe. This module is
-//! the value level's half.
+//! ONE LAW, TWO CARRIERS. `pipe-operators-grammar.md` states it once: an
+//! authored argument row binds a complete LEFT PREFIX of the callee's mode,
+//! and the pipe supplies the one formal still remaining — the FINAL one.
+//! The relational pipe carries a relation, the function pipe a value, the
+//! effect pipe a relation into a directive; the landing is the same act in
+//! all three, so both carriers spend it here and neither level can choose a
+//! direction of its own.
 //!
-//! A form with an argument row that wrote no hole takes the implicit landing
-//! its sigil chose — `/->` at the row's first place, `/->>` at its last. A
-//! form with no argument row (a lambda, an open string) must write the hole:
+//! A form with an argument row that wrote no hole takes that default. A form
+//! with no argument row (a lambda, an open string) must write the hole:
 //! nothing else can receive the value, so a hole-less one discards it and
 //! refuses toward the constant.
 //!
@@ -30,35 +33,67 @@ use crate::pipeline::ast_transform::{
 use crate::pipeline::ast_visit::{
     walk_visit_domain, walk_visit_standard_application, AstVisit, Descent,
 };
+use crate::pipeline::asts::core::operators::HoArgument;
 use crate::pipeline::asts::core::{
     Callable, DomainExpression, FunctionApplication, StandardApplication, Unresolved,
 };
 
 type Domex = DomainExpression<Unresolved>;
 
-/// Where an implicit landing puts the flowing value in an argument row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Landing {
-    /// `/->` — the row's first place.
-    First,
-    /// `/->>` — the row's last place.
-    Last,
+/// THE DEFAULT LANDING, over any argument row: the row's FINAL place.
+///
+/// This is the whole of the default. There is no direction to select, no
+/// per-family layout to look up and no caller that may supply one — a
+/// composition family chooses its VALUE, never where the value lands, so a
+/// second answer here would be a second application judgment.
+pub(crate) fn land_final<T>(flowing: T, mut written: Vec<T>) -> Vec<T> {
+    written.push(flowing);
+    written
 }
 
-impl Landing {
-    /// Put the flowing value into an argument row that wrote no hole.
-    pub(crate) fn thread<T>(self, flowing: T, mut written: Vec<T>) -> Vec<T> {
-        match self {
-            Landing::First => {
-                written.insert(0, flowing);
-                written
-            }
-            Landing::Last => {
-                written.push(flowing);
-                written
-            }
+/// THE RELATIONAL LANDING, SPENT. The piped relation takes the one place
+/// the row leaves for it: a written `@`, or — with none written — the place
+/// after everything authored, which is the final formal.
+///
+/// It is spent INTO THE ROW, as a landed member. Nothing is answered back
+/// and nothing is recorded beside the row: the relation and the position it
+/// occupies are one member from here on, so no later phase can hold one
+/// without the other, and this is the only road that mints one.
+pub(crate) fn land_relation(
+    written: &mut Vec<HoArgument<Unresolved>>,
+    flowing: crate::pipeline::asts::core::Chain<Unresolved>,
+) -> Result<()> {
+    let holes: Vec<usize> = written
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| matches!(argument, HoArgument::Landing(_)))
+        .map(|(index, _)| index)
+        .collect();
+    match holes.as_slice() {
+        [] => {
+            written.push(HoArgument::Landed(flowing));
+            Ok(())
         }
+        [only] => {
+            written[*only] = HoArgument::Landed(flowing);
+            Ok(())
+        }
+        several => Err(two_landings(several.len())),
     }
+}
+
+/// ONE pipe, ONE landing. The teaching is the law's own words, and the
+/// identity is one for every position that can hold a landing — a pure
+/// invocation and a directive break the same rule.
+pub(crate) fn two_landings(count: usize) -> DelightQLError {
+    DelightQLError::validation_error_categorized(
+        "resolution/ho/pipe_landing",
+        format!(
+            "one pipe, one landing — this call writes {count} placeholders; \
+             exactly one @ names the parameter that receives the pipe"
+        ),
+        "exactly one explicit @",
+    )
 }
 
 /// Whether this node is the hole a landing spends.

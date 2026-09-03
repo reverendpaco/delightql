@@ -10,6 +10,10 @@
 //! - `delist!(namespace)` - Remove unqualified access to namespace entities
 //! - `run!(file_path)` - Execute queries from a file
 //!
+//! It also carries the SQL-interoperability sigma predicates `sql_eq` and
+//! `sql_ne`: the target's own three-valued comparison, distinct from
+//! DelightQL's null-safe `=` / `!=`.
+//!
 //! The prelude cartridge is registered in the `std::prelude` namespace
 //! and is marked as universal, making these predicates available everywhere
 //! without needing an explicit `enlist!()`.
@@ -30,12 +34,13 @@ mod mount_tree;
 mod reconsult;
 mod refresh;
 mod run;
+mod sql_comparison;
 mod unconsult;
 mod unmount;
 
 pub use alias::AliasPredicate;
 pub use compile::CompilePredicate;
-pub use consult::{ConsultConcatPredicate, ConsultPredicate};
+pub use consult::ConsultPredicate;
 pub use consult_tree::ConsultTreePredicate;
 pub use delist::DelistPredicate;
 pub use doc::DocPredicate;
@@ -49,12 +54,12 @@ pub use mount_tree::MountTreePredicate;
 pub use reconsult::ReconsultPredicate;
 pub use refresh::RefreshPredicate;
 pub use run::{RunNamespacePredicate, RunPredicate};
+pub use sql_comparison::{SqlEqPredicate, SqlNePredicate};
 pub use unconsult::UnconsultPredicate;
 pub use unmount::UnmountPredicate;
 
 use super::{BinCartridge, BinCartridgeMetadata, BinEntity};
 use crate::enums::Language;
-use crate::pipeline::asts::core::OutValue;
 use crate::pipeline::asts::unresolved::*;
 use std::sync::Arc;
 
@@ -78,7 +83,7 @@ pub(crate) fn descriptor_core_receipt(
     bare_name: &str,
     values: &[Option<String>],
     alias: Option<String>,
-) -> Grelex {
+) -> GroundForm {
     let desc = crate::pipeline::asts::effects::descriptor(bare_name)
         .unwrap_or_else(|| panic!("no directive descriptor for '{bare_name}'"));
     assert_eq!(
@@ -104,7 +109,7 @@ fn core_receipt_result(
     operation: &str,
     echoes: &[(&str, Option<String>)],
     alias: Option<String>,
-) -> Grelex {
+) -> GroundForm {
     let mut headers = vec![
         DomainExpression::lvar_builder("success".to_string()).build(),
         DomainExpression::lvar_builder("operation".to_string()).build(),
@@ -128,8 +133,8 @@ fn core_receipt_result(
             None => LiteralValue::Null,
         }))
     }));
-    Grelex::Literal(AnonRelation {
-        table: AnonTable::from_values(Some(headers), vec![values], ())
+    GroundForm::Literal(AnonRelation {
+        table: AnonTable::from_values(Some(headers), vec![values])
             .expect("an effect receipt has one nonempty row"),
         alias: alias.map(|s| s.into()),
         outer: false,
@@ -155,7 +160,7 @@ pub(crate) fn interior_receipt_result(
     returned_heading: &[&str],
     returned_rows: &[Vec<Option<String>>],
     alias: Option<String>,
-) -> Grelex {
+) -> GroundForm {
     receipt_with_interiors(
         operation,
         &[],
@@ -179,7 +184,7 @@ pub(crate) fn descriptor_tree_receipt(
     returned_heading: &[&str],
     returned_rows: &[Vec<Option<String>>],
     alias: Option<String>,
-) -> Grelex {
+) -> GroundForm {
     let desc = crate::pipeline::asts::effects::descriptor(bare_name)
         .unwrap_or_else(|| panic!("no directive descriptor for '{bare_name}'"));
     assert!(
@@ -213,7 +218,7 @@ pub(crate) fn input_receipt_result(
     input_heading: &[&str],
     input_rows: &[Vec<Option<String>>],
     alias: Option<String>,
-) -> Grelex {
+) -> GroundForm {
     receipt_with_interiors(
         operation,
         &[],
@@ -227,13 +232,13 @@ fn receipt_with_interiors(
     echoes: &[(&str, Option<String>)],
     interiors: &[(&str, &[&str], &[Vec<Option<String>>])],
     alias: Option<String>,
-) -> Grelex {
+) -> GroundForm {
     use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
     use crate::pipeline::asts::core::metadata::NamespacePath;
     use crate::pipeline::asts::core::specs::{GroupSpec, OneOut, OutItem, ReductionItem};
     use crate::pipeline::asts::core::FunctionApplication;
     use crate::pipeline::asts::core::RecordMember;
-    use crate::pipeline::asts::core::{Glob, Spread};
+    use crate::pipeline::asts::core::{Glob, GroundForm, Spread, Step};
 
     let anon = |heading: &[&str], rows: &[Vec<Option<String>>]| {
         AnonTable::from_values(
@@ -258,42 +263,39 @@ fn receipt_with_interiors(
                         .collect()
                 })
                 .collect(),
-            (),
         )
         .expect("an interior receipt has a nonempty heading and body")
     };
     let pipe = |source: Chain, operator: PipeOp| {
-        source.then(Continuation::Pipe {
+        source.then(Step::authored(Continuation::Pipe {
             operator: operator,
             named: None,
-            cpr_schema: (),
-        })
+        }))
     };
     let grouped = |source: AnonTable, interior_name: &str| {
         pipe(
-            Chain::ground(Grelex::Literal(AnonRelation::plain(source))),
+            Chain::authored(GroundForm::Literal(AnonRelation::plain(source))),
             PipeOp::Group(GroupSpec::Reduce {
                 plan: ReductionPlan::empty(),
                 keys: Vec::new(),
-                reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(OutItem::One(
-                    OneOut {
-                        expr: OutValue::Domain(DomainExpression::Application(
-                            FunctionApplication::Enclyph(
-                                crate::pipeline::asts::core::Enclyph::Record(
-                                    crate::pipeline::asts::core::Record::plain(
-                                        crate::pipeline::asts::vocabulary::Vec1::new(RecordMember::Spread(
+                reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(
+                    OutItem::One(OneOut::authored(
+                        DomainExpression::Application(FunctionApplication::Enclyph(
+                            crate::pipeline::asts::core::Enclyph::Record(
+                                crate::pipeline::asts::core::Record::plain(
+                                    crate::pipeline::asts::vocabulary::Vec1::new(
+                                        RecordMember::Spread(
                                             crate::pipeline::asts::core::Spread::Glob(
                                                 crate::pipeline::asts::core::Glob::whole(),
                                             ),
-                                        )),
+                                        ),
                                     ),
                                 ),
                             ),
                         )),
-                        naming: Some(interior_name.into()),
-                        output: (),
-                    },
-                ))),
+                        Some(interior_name.into()),
+                    )),
+                )),
             }),
         )
     };
@@ -304,19 +306,14 @@ fn receipt_with_interiors(
         .map(|(col, heading, rows)| grouped(anon(heading, rows), col));
     let mut joined = groups.next().expect("at least one declared interior");
     for right in groups {
-        joined = joined.then(Continuation::Member {
+        joined = joined.then(Step::authored(Continuation::Member {
             rhs: right,
             correlation: None,
             join_type: None,
-            cpr_schema: (),
-        });
+        }));
     }
     let named = |expr, naming: delightql_types::SqlIdentifier| {
-        OutItem::One(OneOut {
-            expr: OutValue::Domain(expr),
-            naming: Some(naming),
-            output: (),
-        })
+        OutItem::One(OneOut::authored(expr, Some(naming)))
     };
     let mut widening = vec![
         OutItem::Many(Spread::Glob(Glob::whole())),
@@ -361,7 +358,10 @@ fn receipt_with_interiors(
                 order
                     .iter()
                     .map(|n| {
-                        OutItem::plain(DomainExpression::lvar_builder(n.to_string()).build(), ())
+                        OutItem::one(OneOut::authored(
+                            DomainExpression::lvar_builder(n.to_string()).build(),
+                            None,
+                        ))
                     })
                     .collect(),
             )
@@ -372,7 +372,7 @@ fn receipt_with_interiors(
     let identifier = alias
         .as_deref()
         .unwrap_or_else(|| operation.trim_end_matches('!'));
-    Grelex::Reference(Relation::InnerRelation {
+    GroundForm::Reference(Relation::InnerRelation {
         pattern: InnerRelationPattern::Indeterminate {
             identifier: crate::pipeline::asts::core::expressions::helpers::QualifiedName {
                 namespace_path: NamespacePath::empty(),
@@ -380,10 +380,8 @@ fn receipt_with_interiors(
             },
             subquery: Box::new(ordered),
         },
-        preminted_scope: None,
         alias: alias.map(Into::into),
         outer: false,
-        cpr_schema: (),
     })
 }
 
@@ -434,6 +432,11 @@ impl BinCartridge for PreludeCartridge {
         // own (`sys::execution`), never part of the directive universe.
         entities.push(Arc::new(CompilePredicate) as Arc<dyn BinEntity>);
         entities.push(Arc::new(ExplainRunPredicate) as Arc<dyn BinEntity>);
+        // The prelude's sigma predicates: universal bare names, and the
+        // qualified `std::prelude.sql_eq` identity a local shadow cannot
+        // displace.
+        entities.push(Arc::new(SqlEqPredicate) as Arc<dyn BinEntity>);
+        entities.push(Arc::new(SqlNePredicate) as Arc<dyn BinEntity>);
         entities
     }
 }
@@ -449,7 +452,6 @@ fn directive_realization(
     use crate::pipeline::asts::effects::DirectiveKind as K;
     match kind {
         K::Consult => Some(Arc::new(ConsultPredicate)),
-        K::ConsultConcatIntoNs => Some(Arc::new(ConsultConcatPredicate)),
         K::ConsultTree => Some(Arc::new(ConsultTreePredicate)),
         K::Reconsult => Some(Arc::new(ReconsultPredicate)),
         K::Unconsult => Some(Arc::new(UnconsultPredicate)),
@@ -477,6 +479,8 @@ fn directive_realization(
         | K::Update
         | K::Delete
         | K::Exit
+        | K::Abort
+        | K::Assert
         | K::Returning
         | K::ReturningOther
         | K::Stdout => None,
@@ -544,17 +548,17 @@ mod descriptor_agreement {
     use super::*;
     use crate::enums::EntityType;
     use crate::pipeline::asts::effects::{
-        descriptor, directive_category, is_liminal_eligible, DirectiveCategory,
-        DirectiveRealization, DIRECTIVE_DESCRIPTORS,
+        directive_category, is_liminal_eligible, DirectiveCategory, DirectiveRealization,
+        DIRECTIVE_DESCRIPTORS,
     };
 
     #[test]
     fn the_declaration_carries_the_ruled_category_counts() {
-        assert_eq!(DIRECTIVE_DESCRIPTORS.len(), 30);
+        assert_eq!(DIRECTIVE_DESCRIPTORS.len(), 31);
         let mut names: Vec<&str> = DIRECTIVE_DESCRIPTORS.iter().map(|d| d.name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 30, "descriptor names must be unique");
+        assert_eq!(names.len(), 31, "descriptor names must be unique");
 
         let count = |want: fn(&DirectiveCategory) -> bool| {
             DIRECTIVE_DESCRIPTORS
@@ -562,11 +566,11 @@ mod descriptor_agreement {
                 .filter(|d| want(&d.category))
                 .count()
         };
-        assert_eq!(count(|c| matches!(c, DirectiveCategory::Session)), 16);
+        assert_eq!(count(|c| matches!(c, DirectiveCategory::Session)), 15);
         assert_eq!(count(|c| matches!(c, DirectiveCategory::Ddl)), 5);
         assert_eq!(count(|c| matches!(c, DirectiveCategory::Dml(_))), 3);
         assert_eq!(count(|c| matches!(c, DirectiveCategory::Execution)), 2);
-        assert_eq!(count(|c| matches!(c, DirectiveCategory::Utility)), 4);
+        assert_eq!(count(|c| matches!(c, DirectiveCategory::Utility)), 6);
     }
 
     #[test]

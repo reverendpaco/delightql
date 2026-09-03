@@ -191,6 +191,23 @@ fn the_chain_continues_past_the_peer() {
     );
 }
 
+/// Once the interior group has made an existence atom, later syntax cannot
+/// reclassify that completed atom as a sigma application.
+#[test]
+fn existence_keeps_its_truth_carrier_before_every_tail() {
+    for src in [
+        "customers(*), +orders(*, cid = c) |> (c)",
+        "customers(*), \\+orders(*, cid = c), (1 = 1)",
+        "customers(*), +orders(*, cid = c), #<3",
+        "customers(*), (+orders(*, cid = c))",
+        "customers(*), +orders(*, cid = c) : found\nfound(*)",
+    ] {
+        let tree = admits(src);
+        assert_eq!(count::<Existence>(&tree), 1, "{src}");
+        assert_eq!(count::<SigmaApplication>(&tree), 0, "{src}");
+    }
+}
+
 /// After an ordinary head the marker keeps its existing left-outer reading and
 /// its existing carrier — the ruling added a position, it did not move one.
 #[test]
@@ -249,7 +266,7 @@ fn the_whole_heading_correlation_is_its_own_form() {
 #[test]
 fn a_definition_file_may_be_one_ddl_block() {
     let tree = admits_file(
-        "(~~ddl:\"_internal\"\nschema(\"products\")(name, type) :- _(name, type ---- \"id\", \"INTEGER\")\n~~)",
+        "(~~ddl:\"_internal\"\nschema(\"products\" as entity, name, type) :- _(name, type ---- \"id\", \"INTEGER\")\n~~)",
     );
     assert_eq!(count::<DdlAnnotation>(&tree), 1);
     let block = first::<DdlAnnotation>(&tree);

@@ -2,7 +2,6 @@
 // Copyright 2026 Daniel Eklund
 //! Specification types for various operations
 
-use super::expressions::OutValue;
 use super::expressions::{RenameSource, Spread};
 use super::{DomainExpression, Phase, Unresolved};
 use crate::{lispy::ToLispy, ToLispy};
@@ -89,14 +88,70 @@ pub struct MetadataOut<P: Phase = Unresolved> {
     pub group: super::expressions::MetadataGroup<P>,
     /// The `as` the author wrote. `None` is unnamed, not anonymous.
     pub naming: Option<SqlIdentifier>,
-    pub output: P::Output,
+    /// PRIVATE, for the reason [`OneOut::output`] states.
+    output: P::Output,
 }
+
+impl<P: Phase> MetadataOut<P> {
+    /// The column this position publishes.
+    pub fn output(&self) -> &P::Output {
+        &self.output
+    }
+}
+
+impl<P: Phase> MetadataOut<P> {
+    /// Cross a phase boundary. See [`OneOut::folded`].
+    pub fn folded<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
+        self,
+        walk: &mut F,
+        group: super::expressions::MetadataGroup<Q>,
+    ) -> crate::error::Result<MetadataOut<Q>> {
+        Ok(MetadataOut {
+            group,
+            naming: self.naming,
+            output: walk.fold_output(self.output)?,
+        })
+    }
+}
+
+impl<P: Phase<Output = ()>> MetadataOut<P> {
+    /// The authored position. Nothing is paired — the phase has no port.
+    pub fn authored(
+        group: super::expressions::MetadataGroup<P>,
+        naming: Option<SqlIdentifier>,
+    ) -> Self {
+        MetadataOut {
+            group,
+            naming,
+            output: (),
+        }
+    }
+}
+
+impl<P: Phase<Output = crate::relation::PortId>> MetadataOut<P> {
+    /// THE ONE BOUND-PHASE CONSTRUCTOR, and it is the authority's. The
+    /// port is the one the derivation made for THIS position.
+    pub(crate) fn published(
+        _authority: &crate::relation::builder::SemanticConstruction,
+        group: super::expressions::MetadataGroup<P>,
+        naming: Option<SqlIdentifier>,
+        output: crate::relation::PortId,
+    ) -> Self {
+        MetadataOut {
+            group,
+            naming,
+            output,
+        }
+    }
+
+}
+
 
 impl<P: Phase> ReductionItem<P> {
     /// The column this item publishes, once the resolver has decided.
     pub fn output(&self) -> &P::Output {
         match self {
-            Self::Out(OutItem::One(one)) => &one.output,
+            Self::Out(OutItem::One(one)) => one.output(),
             Self::Out(OutItem::Many(_)) | Self::Out(OutItem::Whole) => {
                 unreachable!("a spread and the whole publish no single output")
             }
@@ -104,9 +159,11 @@ impl<P: Phase> ReductionItem<P> {
                 unreachable!("a pivot publishes one column per value, not a single output")
             }
             Self::Delegate(_) => {
-                unreachable!("a delegate publishes one column per payload item, not a single output")
+                unreachable!(
+                    "a delegate publishes one column per payload item, not a single output"
+                )
             }
-            Self::Metadata(metadata) => &metadata.output,
+            Self::Metadata(metadata) => metadata.output(),
         }
     }
 
@@ -127,13 +184,13 @@ impl<P: Phase> ReductionItem<P> {
         }
     }
 
-    /// The DOMAIN value this item computes, when it computes one.
-    pub fn domain_value(&self) -> Option<&DomainExpression<P>> {
-        self.out_item()?.domain_value()
+    /// The value this item computes, when it computes one.
+    pub fn value(&self) -> Option<&DomainExpression<P>> {
+        self.out_item()?.value()
     }
 
-    pub fn domain_value_mut(&mut self) -> Option<&mut DomainExpression<P>> {
-        self.out_item_mut()?.domain_value_mut()
+    pub fn value_mut(&mut self) -> Option<&mut DomainExpression<P>> {
+        self.out_item_mut()?.value_mut()
     }
 
     /// The `as` the author wrote at this position.
@@ -176,20 +233,92 @@ pub struct DelegateSpec<P: Phase = Unresolved> {
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("out_item:one")]
 pub struct OneOut<P: Phase = Unresolved> {
-    /// A domain value, or the licensed truth-to-value crossing. Publication
-    /// is one of the three positions that admit the crossing and says so in
-    /// its own type, rather than accepting a domain enum with a truth arm
-    /// every other position could have reached.
-    pub expr: OutValue<P>,
+    /// The value this position publishes. A crossed truth is one such value.
+    pub expr: DomainExpression<P>,
     /// The `as` the author wrote, as written — strop and case included.
     /// `None` is unnamed, not anonymous: a reference publishes its own
     /// name and an application mints one.
     pub naming: Option<SqlIdentifier>,
-    /// The column this item publishes, once the resolver has decided.
-    /// Phantom before resolution. `None` after resolution = the resolver
-    /// decided this item contributes NO output column (today: a delegate
-    /// payload duplicating a group key, already emitted in group position).
-    pub output: P::Output,
+    /// What this item publishes, once the resolver has decided. Phantom
+    /// before resolution.
+    ///
+    /// PRIVATE. A port that any caller can write is a port any caller can
+    /// CHOOSE, and choosing which occurrence a publication position stands
+    /// at is the authority's act: the derivation that made the interface
+    /// is what says which port each position got. There is no setter.
+    ///
+    /// Three states after resolution, not two: the position it publishes,
+    /// a permanent judgment that it publishes no single one (a pivot's
+    /// fan-out, or a delegate payload already standing in group position),
+    /// and the interval before the publication pass has reached it. The
+    /// last is not the second — a consumer that read it so would wait for
+    /// an assignment that is never coming.
+    output: P::Output,
+}
+
+impl<P: Phase> OneOut<P> {
+    /// The column this position publishes.
+    pub fn output(&self) -> &P::Output {
+        &self.output
+    }
+}
+
+impl<P: Phase> OneOut<P> {
+    /// CROSS A PHASE BOUNDARY.
+    ///
+    /// The value crosses by `expr`; what the position publishes goes
+    /// through the phases' OUTPUT fold, which is not an argument here and
+    /// cannot be one. So a fold is never the place a position acquires a
+    /// different port.
+    pub fn folded<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
+        self,
+        walk: &mut F,
+        expr: DomainExpression<Q>,
+    ) -> crate::error::Result<OneOut<Q>> {
+        Ok(OneOut {
+            expr,
+            naming: self.naming,
+            output: walk.fold_output(self.output)?,
+        })
+    }
+}
+
+impl<P: Phase<Output = ()>> OneOut<P> {
+    /// The authored position. Nothing is paired — the phase has no port.
+    pub fn authored(expr: DomainExpression<P>, naming: Option<SqlIdentifier>) -> Self {
+        OneOut {
+            expr,
+            naming,
+            output: (),
+        }
+    }
+}
+
+impl<P: Phase<Output = crate::relation::PortId>> OneOut<P> {
+    /// THE ONE BOUND-PHASE CONSTRUCTOR, and it is the authority's. The
+    /// port is the one the derivation made for THIS position.
+    pub(crate) fn published(
+        _authority: &crate::relation::builder::SemanticConstruction,
+        expr: DomainExpression<P>,
+        naming: Option<SqlIdentifier>,
+        output: crate::relation::PortId,
+    ) -> Self {
+        OneOut {
+            expr,
+            naming,
+            output,
+        }
+    }
+
+
+    /// The same act over a port the authority followed one carry edge to.
+    pub(crate) fn reland(
+        &mut self,
+        _authority: &crate::relation::builder::SemanticConstruction,
+        output: crate::relation::PortId,
+    ) {
+        self.output = output;
+    }
 }
 
 /// A publication item: one value, or a spread standing for the several it
@@ -218,38 +347,22 @@ pub enum OutItem<P: Phase = Unresolved> {
 }
 
 impl<P: Phase> OutItem<P> {
-    /// An unnamed one-value item — what a publication position builds when
-    /// the author wrote no `as`.
-    pub fn plain(expr: impl Into<OutValue<P>>, output: P::Output) -> Self {
-        Self::One(OneOut {
-            expr: expr.into(),
-            naming: None,
-            output,
-        })
+    /// An unnamed one-value item.
+    pub fn one(one: OneOut<P>) -> Self {
+        Self::One(one)
     }
 
     /// The value a one-value item computes. Neither of the other two
     /// computes one: a spread enumerates and the whole names, so there is
     /// no expression to hand back.
-    pub fn value(&self) -> Option<&OutValue<P>> {
+    pub fn value(&self) -> Option<&DomainExpression<P>> {
         match self {
             Self::One(one) => Some(&one.expr),
             Self::Many(_) | Self::Whole => None,
         }
     }
 
-    /// The DOMAIN value this item computes. A published crossing answers
-    /// `None`: an analysis looking for a domain expression has not been
-    /// handed one, and a lowering reads the whole `OutValue` instead.
-    pub fn domain_value(&self) -> Option<&DomainExpression<P>> {
-        self.value()?.domain()
-    }
-
-    pub fn domain_value_mut(&mut self) -> Option<&mut DomainExpression<P>> {
-        self.value_mut()?.domain_mut()
-    }
-
-    pub fn value_mut(&mut self) -> Option<&mut OutValue<P>> {
+    pub fn value_mut(&mut self) -> Option<&mut DomainExpression<P>> {
         match self {
             Self::One(one) => Some(&mut one.expr),
             Self::Many(_) | Self::Whole => None,
@@ -259,11 +372,12 @@ impl<P: Phase> OutItem<P> {
 
 /// After resolution the stamp is there to read. A spread has none of its own:
 /// it published through its expansion, and the expansion is what carries the
-/// occurrences.
-impl<P: Phase<Output = Option<crate::names::ColId>>> OutItem<P> {
-    pub fn output(&self) -> Option<crate::names::ColId> {
+/// occurrences — which is a PERMANENT no-single-output, not an interval, and
+/// says so.
+impl<P: Phase<Output = crate::relation::PortId>> OutItem<P> {
+    pub fn output(&self) -> Option<crate::relation::PortId> {
         match self {
-            Self::One(one) => one.output,
+            Self::One(one) => Some(*one.output()),
             Self::Many(_) | Self::Whole => None,
         }
     }
@@ -278,11 +392,70 @@ impl<P: Phase<Output = Option<crate::names::ColId>>> OutItem<P> {
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("named_out_item")]
 pub struct NamedOutItem<P: Phase = Unresolved> {
-    pub expr: OutValue<P>,
+    pub expr: DomainExpression<P>,
     pub naming: SqlIdentifier,
     pub qualifier: Option<SqlIdentifier>,
     /// The column this item writes into, once the resolver has found it.
-    pub output: P::Output,
+    /// PRIVATE, for the reason [`OneOut::output`] states.
+    output: P::Output,
+}
+
+impl<P: Phase> NamedOutItem<P> {
+    /// The column this position writes into.
+    pub fn output(&self) -> &P::Output {
+        &self.output
+    }
+}
+
+impl<P: Phase> NamedOutItem<P> {
+    /// Cross a phase boundary. See [`OneOut::folded`].
+    pub fn folded<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
+        self,
+        walk: &mut F,
+        expr: DomainExpression<Q>,
+    ) -> crate::error::Result<NamedOutItem<Q>> {
+        Ok(NamedOutItem {
+            expr,
+            naming: self.naming,
+            qualifier: self.qualifier,
+            output: walk.fold_output(self.output)?,
+        })
+    }
+}
+
+impl<P: Phase<Output = ()>> NamedOutItem<P> {
+    /// The authored position. Nothing is paired — the phase has no port.
+    pub fn authored(
+        expr: DomainExpression<P>,
+        naming: SqlIdentifier,
+        qualifier: Option<SqlIdentifier>,
+    ) -> Self {
+        NamedOutItem {
+            expr,
+            naming,
+            qualifier,
+            output: (),
+        }
+    }
+}
+
+impl<P: Phase<Output = crate::relation::PortId>> NamedOutItem<P> {
+    /// THE ONE BOUND-PHASE CONSTRUCTOR, and it is the authority's.
+    pub(crate) fn published(
+        _authority: &crate::relation::builder::SemanticConstruction,
+        expr: DomainExpression<P>,
+        naming: SqlIdentifier,
+        qualifier: Option<SqlIdentifier>,
+        output: crate::relation::PortId,
+    ) -> Self {
+        NamedOutItem {
+            expr,
+            naming,
+            qualifier,
+            output,
+        }
+    }
+
 }
 
 /// Ordering direction for ORDER BY

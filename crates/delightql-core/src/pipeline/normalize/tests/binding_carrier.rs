@@ -13,12 +13,12 @@ use super::support::query;
 /// other by wrapping it.
 #[test]
 fn a_query_carries_both_binding_kinds_without_nesting() {
-    let q = query("double:(x) : (x * 2)  a(*) : c  c(*) |> (double:(age) as d)");
-    assert_eq!(q.cfes.len(), 1, "one CFE definition");
-    assert_eq!(q.ctes.len(), 1, "one CTE binding");
-    assert_eq!(q.cfes[0].name.as_str(), "double");
+    let q = query("dbl:(x) : (x * 2)  a(*) : c  c(*) |> (dbl:(age) as d)");
+    assert_eq!(q.cfes().len(), 1, "one CFE definition");
+    assert_eq!(q.ctes().len(), 1, "one CTE binding");
+    assert_eq!(q.cfes()[0].name.as_str(), "dbl");
     assert_eq!(
-        q.ctes[0].subject.authored_name().map(|n| n.as_str()),
+        q.ctes()[0].subject().authored_name().map(|n| n.as_str()),
         Some("c")
     );
 }
@@ -28,10 +28,10 @@ fn a_query_carries_both_binding_kinds_without_nesting() {
 fn binding_order_is_authored_order() {
     let q = query("a(*) : first  b(*) : second  first(*), second(*)");
     let names: Vec<_> = q
-        .ctes
+        .ctes()
         .iter()
         .map(|cte| {
-            cte.subject
+            cte.subject()
                 .authored_name()
                 .expect("an authored binding names itself")
                 .as_str()
@@ -41,7 +41,7 @@ fn binding_order_is_authored_order() {
     assert_eq!(names, ["first", "second"]);
 
     let q = query("f:(x) : (x + 1)  g:(x) : (x + 2)  a(*) |> (f:(age), g:(age))");
-    let names: Vec<_> = q.cfes.iter().map(|cfe| cfe.name.as_str()).collect();
+    let names: Vec<_> = q.cfes().iter().map(|cfe| cfe.name.as_str()).collect();
     assert_eq!(names, ["f", "g"]);
 }
 
@@ -63,7 +63,7 @@ fn a_bare_query_is_its_body() {
 #[test]
 fn effect_declarations_ride_the_canonical_bindings() {
     let q = query("x(*) : pure_one  s!(*) : marked!  pure_one(*), marked!(*)");
-    assert_eq!(q.ctes.len(), 2);
-    assert!(!q.ctes[0].subject.declares_effect());
-    assert!(q.ctes[1].subject.declares_effect());
+    assert_eq!(q.ctes().len(), 2);
+    assert!(!q.ctes()[0].subject().declares_effect());
+    assert!(q.ctes()[1].subject().declares_effect());
 }

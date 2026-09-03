@@ -10,7 +10,7 @@ use crate::error::{DelightQLError, Result};
 use delightql_types::{ColumnInfo, DatabaseConnection, DatabaseSchema, NamespacePath};
 use std::sync::{Arc, Mutex};
 
-/// Result of a `consult_file` operation.
+/// Mirror of a native published-load registration result.
 pub(crate) struct ConsultResult {
     /// Number of definitions loaded.
     pub definitions_loaded: usize,
@@ -26,14 +26,82 @@ pub(crate) struct LiminalReceipt {
     pub echoes: Vec<(String, Option<String>)>,
 }
 
-/// Mirror of the native `ConsultPost` (system.rs).
-#[allow(dead_code)]
-pub(crate) struct ConsultPost<'a> {
-    pub deferred_exposes: Vec<Vec<String>>,
-    pub deferred_docs: Vec<(String, String)>,
-    pub new_enlists: &'a [(i32, i32)],
-    pub new_aliases: &'a [(String, i32)],
-    pub record_source: bool,
+/// Mirror of the native `PreparedLoad` (system.rs): WASM consults nothing,
+/// so a load is never spent and its acts never succeed.
+pub(crate) struct PreparedLoad {
+    namespace: String,
+}
+
+impl PreparedLoad {
+    pub(crate) fn from_file(
+        namespace: &str,
+        _path: &str,
+        _mode: crate::bin_cartridge::prelude::consult::LiminalDirectiveMode,
+    ) -> Self {
+        PreparedLoad {
+            namespace: namespace.to_string(),
+        }
+    }
+
+    pub(crate) fn inline(
+        namespace: &str,
+        _definitions: Vec<crate::pipeline::asts::ddl::ClauseDecl>,
+    ) -> Self {
+        PreparedLoad {
+            namespace: namespace.to_string(),
+        }
+    }
+
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub(crate) fn define(&mut self, _clause: crate::pipeline::asts::ddl::ClauseDecl) {}
+
+    pub(crate) fn settle(&mut self, _row: crate::bin_cartridge::prelude::consult::PreparedRow) {}
+
+    pub(crate) fn doc(&mut self, _target: String, _doc: String) {}
+
+    pub(crate) fn enlist(&mut self, system: &mut DelightQLSystem, target: &str) -> Result<()> {
+        system.enlist_namespace(target)
+    }
+
+    pub(crate) fn alias(
+        &mut self,
+        system: &mut DelightQLSystem,
+        shorthand: &str,
+        target: &str,
+    ) -> Result<()> {
+        system.register_namespace_alias(shorthand, target)
+    }
+
+    pub(crate) fn expose(&mut self, _system: &DelightQLSystem, _child_fq: &str) -> Result<()> {
+        Err(DelightQLError::validation_error(
+            "expose!() not supported in WASM",
+            "Namespace exposure is only available in native builds",
+        ))
+    }
+}
+
+/// Mirror of the native `PublishedLoad` (system.rs).
+pub(crate) struct PublishedLoad(());
+
+impl PublishedLoad {
+    pub(crate) fn namespace_id(&self) -> i64 {
+        -1
+    }
+
+    pub(crate) fn definitions_loaded(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn replaced_entities(&self) -> &[String] {
+        &[]
+    }
+
+    pub(crate) fn into_ledger(self) -> Vec<crate::bin_cartridge::prelude::consult::PreparedRow> {
+        Vec::new()
+    }
 }
 
 /// Mirror of the native `LiminalProgramKind` (system.rs).
@@ -324,17 +392,10 @@ impl DelightQLSystem {
         ))
     }
 
-    /// Consult file - not supported in WASM. Signature mirrors the native
-    /// `consult_file`: a stub whose arity drifts from the native one is a
+    /// Load publication is not supported in WASM. The signature mirrors the
+    /// native `publish`: a stub whose arity drifts from it is a
     /// compile error waiting on the next WASM build, not on this one.
-    pub fn consult_file(
-        &mut self,
-        _path: &str,
-        _namespace: &str,
-        _definitions: Vec<crate::pipeline::asts::ddl::ClauseDecl>,
-        _liminal_receipts: &[LiminalReceipt],
-        _post: Option<&ConsultPost<'_>>,
-    ) -> Result<ConsultResult> {
+    pub(crate) fn publish(&mut self, _load: PreparedLoad) -> Result<PublishedLoad> {
         Err(DelightQLError::validation_error(
             "consult!() not supported in WASM",
             "File consultation is only available in native builds",

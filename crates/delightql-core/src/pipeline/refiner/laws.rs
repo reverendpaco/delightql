@@ -6,7 +6,7 @@
 
 use super::types::*;
 use crate::error::Result;
-use crate::names::{ColId, Registry, ScopeId};
+use crate::names::{Registry, ScopeId};
 use crate::pipeline::ast_visit::{walk_visit_boolean, AstVisit, Descent};
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::asts::core::Resolved;
@@ -33,7 +33,7 @@ pub fn check_law1(
     left_table: ScopeId,
     right_table: ScopeId,
     context: &LawContext,
-    identities: &Registry,
+    identities: &crate::relation::Planning,
 ) -> Option<ForbiddenReason> {
     for table in [left_table, right_table] {
         if context.bag_tables.contains(&table) && references_table(pred, table, identities) {
@@ -55,7 +55,7 @@ pub fn check_law1(
 pub fn find_earliest_scope(
     pred: &resolved::TruthExpression,
     tables_sequence: &[(usize, HashSet<ScopeId>)],
-    identities: &Registry,
+    identities: &crate::relation::Planning,
 ) -> ScopePoint {
     let referenced = extract_referenced_tables(pred, identities);
 
@@ -90,7 +90,7 @@ pub fn find_earliest_scope(
 fn references_table(
     pred: &resolved::TruthExpression,
     table: ScopeId,
-    identities: &Registry,
+    identities: &crate::relation::Planning,
 ) -> bool {
     let mut finder = QualifierRefFinder {
         table,
@@ -120,7 +120,9 @@ impl AstVisit<Resolved> for QualifierRefFinder<'_> {
             },
         ))) = e
         {
-            if self.identities.scope_of(*column) == self.table {
+            if crate::relation::owner(self.identities, *column)
+                .is_ok_and(|owner| owner == self.table)
+            {
                 self.found = true;
                 return Ok(Descent::Break);
             }
@@ -131,20 +133,20 @@ impl AstVisit<Resolved> for QualifierRefFinder<'_> {
 
 fn extract_referenced_tables(
     pred: &resolved::TruthExpression,
-    identities: &Registry,
+    identities: &crate::relation::Planning,
 ) -> HashSet<ScopeId> {
     let mut finder = ColumnFinder::default();
     let _ = walk_visit_boolean(&mut finder, pred);
     finder
         .columns
         .into_iter()
-        .map(|column| identities.scope_of(column))
+        .filter_map(|column| crate::relation::owner(identities, column).ok())
         .collect()
 }
 
 #[derive(Default)]
 struct ColumnFinder {
-    columns: HashSet<ColId>,
+    columns: HashSet<crate::relation::PortId>,
 }
 
 impl AstVisit<Resolved> for ColumnFinder {
@@ -163,43 +165,55 @@ impl AstVisit<Resolved> for ColumnFinder {
 
 #[cfg(test)]
 mod tests {
-    use crate::pipeline::asts::vocabulary::Vec1;
     use super::*;
+    use crate::pipeline::asts::vocabulary::Vec1;
 
-    fn lvar(column: ColId, explicit_qualifier: bool) -> resolved::DomainExpression {
-        resolved::DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
-            column,
-            explicit_qualifier,
-        })))
+    fn lvar(
+        column: crate::relation::PortId,
+        explicit_qualifier: bool,
+    ) -> resolved::DomainExpression {
+        resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            if explicit_qualifier {
+                ColumnOccurrence::engine_qualified(column)
+            } else {
+                ColumnOccurrence::engine(column)
+            },
+        )))
     }
 
     fn scope_with_column(
-        registry: &Registry,
+        registry: &crate::relation::Planning,
         scope_name: &str,
         column_name: &str,
-    ) -> (ScopeId, ColId) {
-        let scope_spelling = registry.intern(scope_name, false);
-        let scope = registry.mint_scope(
-            crate::names::ScopeOrigin::AnonRelation,
-            crate::names::Hint::User(scope_spelling),
-            None,
-        );
-        let column_spelling = registry.intern(column_name, false);
-        let column = registry.mint_column(
-            scope,
-            crate::names::ColumnOrigin::Bound { position: 0 },
-            Some(column_spelling),
-            crate::names::Addressing::Published,
-            crate::names::ValueFacts::default(),
-        );
-        (scope, column)
+    ) -> (ScopeId, crate::relation::PortId) {
+        let answer = registry.intern(scope_name, false);
+        let named = registry.intern(column_name, false);
+        let entity = registry.mint_entity(answer);
+        let relation = registry
+            .authority()
+            .derive(crate::relation::RelForm::Source(
+                crate::relation::form::SourceSpec {
+                    origin: crate::relation::form::SourceOrigin::Catalog { entity },
+                    slots: &[crate::relation::form::SourceSlot {
+                        position: 0,
+                        named: Some(named),
+                        declared_type: None,
+                    }],
+                    answers_to: Some(answer),
+                },
+            ))
+            .unwrap();
+        (
+            relation.scope(),
+            crate::relation::published_ports(registry, &relation).unwrap()[0],
+        )
     }
 
     // `references_table` reaches the qualified `Lvar` inside `In.value` — a
     // position a top-level-only match never descends into.
     #[test]
     fn references_table_finds_qualifier_in_in_predicate() {
-        let registry = Registry::new(&[]);
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         let (x, id) = scope_with_column(&registry, "x", "id");
         let (z, a) = scope_with_column(&registry, "z", "a");
         let pred = resolved::TruthExpression::Membership(Membership {

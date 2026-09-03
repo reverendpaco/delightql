@@ -2,21 +2,36 @@
 // Copyright 2026 Daniel Eklund
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
-use crate::pipeline::ast_visit::{walk_visit_relational, AstVisit, Descent};
 use crate::pipeline::asts::core::ColumnOccurrence;
 use delightql_types::error::{DelightQLError, Result};
 use std::collections::HashMap;
-use std::rc::Rc;
-
-mod pattern_resolver;
-pub use pattern_resolver::{JoinContext, PatternResolver};
 
 mod string_templates;
+
+/// The closed PIPE FORM inventory (fundamentals) over the normalized
+/// carriers, and the one crossing every pipe form's output takes.
+mod pipe_form;
 
 /// What publication decides, across the phases: which occurrence an item
 /// publishes, whether it publishes one at all, and what it answers to.
 #[cfg(test)]
 mod publication_boundary_tests;
+
+/// Exact pipe-output reuse, read where it is recorded: the resolved
+/// member's correspondence names the pipe's exact port, a fresh binding
+/// yields a stated Cartesian, and recursive SQL carries the condition.
+#[cfg(test)]
+mod pipe_reuse_tests;
+
+#[cfg(test)]
+mod merge_lowering_tests;
+/// An ordering and the bound that consumes it are one node and one SQL
+/// scope; a relation actual is admitted closed; a correspondence is spelled
+/// from its slots.
+#[cfg(test)]
+mod ordered_bound_tests;
+#[cfg(test)]
+mod relation_actual_tests;
 
 /// Probe tests: plan-note schema injection via the query-local
 /// registry (test code only — see the module header for the guarantee).
@@ -47,145 +62,95 @@ mod sigma_guard_scope_tests;
 #[cfg(test)]
 mod session_shadow_tests;
 
-/// In-flight consulted-definition expansions, shared across config clones
-/// and guarding the view/rule inliner against non-terminating expansion:
-/// re-encountering a name that is
-/// already being expanded means the self-reference did NOT resolve as the
-/// in-progress CTE (recursive clause before base, or an indirect cycle
-/// through another view) — refuse with a teaching error, never spin.
-#[derive(Debug, Clone, Default)]
-pub struct ExpansionGuard(Rc<std::cell::RefCell<Vec<String>>>);
+/// The catalog is current per statement: a statement's read is one state,
+/// and the next statement follows a completed replacement through every
+/// live definition road; a failed replacement leaves the prior state whole.
+#[cfg(test)]
+mod catalog_current_state_tests;
 
-impl ExpansionGuard {
-    /// Push `key` and return an RAII frame that pops on drop. Errors with
-    /// the current expansion chain if `key` is already in flight.
-    pub fn enter(&self, key: String, context: &str) -> Result<ExpansionFrame> {
-        {
-            let stack = self.0.borrow();
-            if stack.contains(&key) {
-                let chain = stack
-                    .iter()
-                    .chain(std::iter::once(&key))
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" → ");
-                return Err(DelightQLError::ValidationError {
-                    message: format!(
-                        "circular consulted-definition expansion: '{key}' is already \
-                         being expanded ({chain}). If this is a recursive rule, the \
-                         base (non-recursive) clause must come FIRST in the consulted \
-                         file — a self-reference is only recursive once a prior clause \
-                         has established the name. If the cycle runs through another \
-                         view, break the cycle. SEMANTICS/recursion-contract-law.md B5."
-                    ),
-                    context: context.to_string(),
-                    subcategory: Some(
-                        crate::uri_registry::subcat::RECURSION_CONSULTED_CLAUSE_ORDER,
-                    ),
-                });
-            }
-        }
-        self.0.borrow_mut().push(key);
-        Ok(ExpansionFrame(Rc::clone(&self.0)))
-    }
-}
-
-/// RAII frame for [`ExpansionGuard`]: pops the most recent entry on drop,
-/// so every return path (including `?` error propagation) unwinds the stack.
-pub struct ExpansionFrame(Rc<std::cell::RefCell<Vec<String>>>);
-
-impl Drop for ExpansionFrame {
-    fn drop(&mut self) {
-        self.0.borrow_mut().pop();
-    }
-}
-
-/// THE ONE instantiation allowance, owned by the compilation: every road
-/// that opens a definition — the ordinary value position and the pattern
-/// slot alike — spends the SAME state. Clones share the cell, so nested
-/// resolutions inherit spent depth rather than starting a private count.
-#[derive(Debug, Clone, Default)]
-pub struct InstantiationDepth {
-    spent: std::rc::Rc<std::cell::Cell<usize>>,
-}
-
-impl InstantiationDepth {
-    /// Open one instantiation; the returned frame closes it on drop.
-    /// Refuses when the compilation's allowance is exhausted.
-    pub(crate) fn enter(&self, name: &str) -> crate::error::Result<InstantiationFrame> {
-        if self.spent.get() >= grounding::INSTANTIATION_DEPTH_LIMIT {
-            return Err(grounding::instantiation_depth_refusal(name));
-        }
-        self.spent.set(self.spent.get() + 1);
-        Ok(InstantiationFrame {
-            spent: std::rc::Rc::clone(&self.spent),
-        })
-    }
-}
-
-pub(crate) struct InstantiationFrame {
-    spent: std::rc::Rc<std::cell::Cell<usize>>,
-}
-
-impl Drop for InstantiationFrame {
-    fn drop(&mut self) {
-        self.spent.set(self.spent.get().saturating_sub(1));
-    }
-}
+/// The higher-order occurrence is recorded, never chosen among equals: the
+/// formal lands on the position that CONTINUES the caller's actual.
+#[cfg(test)]
+mod ho_occurrence_tests;
 
 /// EVERYTHING a pattern slot needs to instantiate a definition, or
-/// nothing: the definition sources travel WITH the compilation's
-/// allowance, so a road that can instantiate cannot lack the bound.
+/// nothing: the resolver core, the ONE lexical world the slot stands in,
+/// and the compilation's allowance travel together, so a road that can
+/// instantiate cannot lack the bound and cannot choose a world of its own.
 #[derive(Clone, Copy)]
-pub(crate) struct SlotInstantiation<'a> {
-    pub scoped_cfes: &'a std::collections::HashMap<
-        delightql_types::SqlIdentifier,
-        crate::pipeline::asts::core::CfeDefinition,
-    >,
-    pub consult: &'a crate::resolution::ConsultRegistry,
-    pub lookup_scope: Option<&'a str>,
-    pub depth: &'a InstantiationDepth,
+pub(crate) struct SlotInstantiation<'a, 'db> {
+    pub(in crate::pipeline::resolver) core: &'a crate::resolution::ResolverCore<'db>,
+    pub(in crate::pipeline::resolver) env: &'a crate::defuse::environment::Environment,
+    pub(in crate::pipeline::resolver) instances: &'a crate::defuse::instance::InstanceTable,
+    /// A SCOPED body's own formal bindings ride the instantiation itself —
+    /// one value carries the world and the frame, so they cannot be paired
+    /// independently. A declaration body's formals live on its world and
+    /// this is `None`.
+    pub(in crate::pipeline::resolver) formals:
+        Option<&'a crate::defuse::environment::FormalBindings>,
+    pub(in crate::pipeline::resolver) horizon: Option<crate::pipeline::asts::core::LexicalHorizon>,
 }
 
-/// The code bound to a curried formal at an instantiation site.
-#[derive(Debug, Clone)]
-pub enum CallableBinding {
-    /// `upper:()` — a mention. Where the formal is invoked, this callee
-    /// stands and the invocation's own arguments replace the mention's.
-    Named(Box<crate::pipeline::asts::unresolved::StandardApplication>),
-    /// `:(@ + 5)` / `:"…{@}…"` — an open body, carried AS AUTHORED with
-    /// the caller's scope captured beside it. Invoking the formal resolves
-    /// the body in that scope with the supplied value standing in its
-    /// slots — the applying position spends the leaf, so no resolved tree
-    /// ever carries one.
-    Open(Box<OpenBinding>),
-}
+impl<'a, 'db> SlotInstantiation<'a, 'db> {
+    /// Read-only doors for the definition-use authority; construction
+    /// stays inside the resolver, so an allowance is never assembled from
+    /// loose pieces at a use position.
+    pub(crate) fn core(&self) -> &'a crate::resolution::ResolverCore<'db> {
+        self.core
+    }
+    pub(crate) fn instances(&self) -> &'a crate::defuse::instance::InstanceTable {
+        self.instances
+    }
+    pub(crate) fn env(&self) -> &'a crate::defuse::environment::Environment {
+        self.env
+    }
+    pub(crate) fn select_query_local(
+        &self,
+        name: &delightql_types::SqlIdentifier,
+        demand: crate::pipeline::asts::core::QueryLocalDemand,
+    ) -> crate::error::Result<Option<crate::defuse::environment::QueryLocalSelection>> {
+        self.env.select_query_local(name, demand, self.horizon)
+    }
 
-/// An open body a caller handed to a curried formal, and the scope it was
-/// written in. The interior is the caller's text: resolving it anywhere
-/// else would let the definition's formals capture the caller's names.
-#[derive(Debug, Clone)]
-pub struct OpenBinding {
-    pub body: crate::pipeline::asts::unresolved::DomainExpression,
-    pub available: Vec<crate::names::ColId>,
-    pub local_available: Vec<crate::names::ColId>,
-    pub qualifier_scope: Vec<crate::names::ScopeId>,
-}
+    /// An allowance standing in an OPENED consulted world — the world a
+    /// sealed slot body was sealed with, held by the definition-use
+    /// authority's own converting operation. The core and the instance
+    /// table carry over from this allowance; nothing mints them from loose
+    /// parts.
+    pub(crate) fn in_opened<'b>(
+        &self,
+        env: &'b crate::defuse::environment::Environment,
+    ) -> SlotInstantiation<'b, 'db>
+    where
+        'a: 'b,
+    {
+        SlotInstantiation {
+            core: self.core,
+            env,
+            instances: self.instances,
+            formals: None,
+            horizon: None,
+        }
+    }
 
-/// The innermost open instantiation's formals: canonical identity -> the
-/// argument as the CALLER resolved it. A spent formal never re-resolves, so
-/// no scope the body opens can capture it. The key is the identifier LAW's
-/// agreement — an unstropped spelling folds, a stropped one keeps its
-/// authored identity — never `==` on characters.
-#[derive(Debug, Default)]
-pub struct FormalFrame {
-    /// Value formals, resolved at the call site.
-    pub values: std::collections::HashMap<
-        delightql_types::SqlIdentifier,
-        crate::pipeline::asts::resolved::DomainExpression,
-    >,
-    /// Curried (code) formals.
-    pub callables: std::collections::HashMap<delightql_types::SqlIdentifier, CallableBinding>,
+    /// An allowance for a SCOPED body: its own frame standing on this
+    /// allowance's world.
+    pub(crate) fn in_scoped<'b>(
+        &self,
+        frame: &'b crate::defuse::environment::FormalBindings,
+        horizon: crate::pipeline::asts::core::LexicalHorizon,
+    ) -> SlotInstantiation<'b, 'db>
+    where
+        'a: 'b,
+    {
+        SlotInstantiation {
+            core: self.core,
+            env: self.env,
+            instances: self.instances,
+            formals: Some(frame),
+            horizon: Some(horizon),
+        }
+    }
 }
 
 /// Configuration for TVF resolution behavior
@@ -205,19 +170,23 @@ pub struct ResolutionConfig {
     /// EXISTS/semi-join/anti-join subqueries where the full column set
     /// (outer + inner) is known and validation is safe.
     pub validate_in_correlation: bool,
-    /// Namespace to scope ER-rule lookups to during qualified view body resolution.
-    /// Set when resolving a namespace-qualified view (`ns.view(*)`), so that ER-rules
-    /// from the view's namespace are found without requiring engage.
-    pub resolution_namespace: Option<String>,
-    /// In-flight consulted-definition expansions (shared across clones).
-    pub expansion_guard: ExpansionGuard,
-    /// Set only while a consulted value definition's body resolves; nested
-    /// resolutions inherit it with the config, so a formal reaches into the
-    /// subqueries and probes the body opens — and nothing else, because a
-    /// consulted BODY road clears it before resolving foreign text.
-    pub cfe_formal_frame: Option<std::sync::Arc<FormalFrame>>,
-    /// The one instantiation allowance (shared across clones).
-    pub instantiation_depth: InstantiationDepth,
+    /// The one recursion detector: the compilation-local definition
+    /// instance table (shared across clones). Instantiation installs the
+    /// instance before opening the family body; a same-key self-use
+    /// re-enters the active fixpoint and a changed-key self-use refuses
+    /// terminally.
+    pub instances: crate::defuse::instance::InstanceTable,
+    /// The danger gates in force for this compilation. Scope activation
+    /// reads `scope/duplicate` here, so the duplicate-answering judgment
+    /// honors the same acknowledgment surface every other gate uses.
+    pub danger_gates: crate::pipeline::danger_gates::DangerGateMap,
+    /// Whether this resolution reads an AUTHORED environment. The
+    /// duplicate-answering judgment runs only where an author composed the
+    /// co-live relations: an instantiated definition body and a
+    /// compiler-synthesized query are replays — a diamond call feeding one
+    /// relation to two formals is ruled lawful, and the compiler's own
+    /// repeated reads are its own business.
+    pub authored_environment: bool,
 }
 
 impl Default for ResolutionConfig {
@@ -226,10 +195,9 @@ impl Default for ResolutionConfig {
             permissive: true, // Default to permissive mode
             serve_bootstrap_reads: false,
             validate_in_correlation: false,
-            resolution_namespace: None,
-            expansion_guard: ExpansionGuard::default(),
-            cfe_formal_frame: None,
-            instantiation_depth: InstantiationDepth::default(),
+            instances: crate::defuse::instance::InstanceTable::default(),
+            danger_gates: crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+            authored_environment: true,
         }
     }
 }
@@ -240,107 +208,29 @@ use unification::ColumnReference;
 pub(crate) mod helpers;
 use self::helpers::*;
 mod bubbling;
+mod caller_row;
+mod lexical;
 use self::bubbling::*;
-mod cte_validation;
+pub(super) mod cte_validation;
 pub(crate) mod resolving;
-use self::cte_validation::*;
 mod type_conversion;
 
-mod set_operations;
-mod tvf;
-use self::set_operations::*;
-mod schema_utils;
-use self::schema_utils::*;
-mod join_resolver;
-use self::join_resolver::*;
 pub(crate) mod grounding;
-mod relation_resolver;
-mod resolver_fold;
+pub(crate) mod relation_resolver;
+pub(crate) mod resolver_fold;
+mod tvf;
 use crate::pipeline::asts::core::{
-    Comparison, Existence, Membership, RelationalMembership, SigmaApplication,
+    Comparison, Existence, GroundForm, Membership, RelationalMembership, SigmaApplication, Step,
 };
 use crate::pipeline::asts::core::{NamedReference, Reference};
 use resolver_fold::ResolverFold;
 
-#[derive(Debug, Clone)]
-pub struct BubbledState {
-    /// Columns produced by this relational expression. Unqualified references
-    /// resolve against this schema.
-    pub i_provide: Vec<crate::names::ColId>,
-    pub i_need: Vec<ColumnReference>,
-    /// Columns grouped under the lexical qualifiers which remain visible while
-    /// resolving a condition attached to this expression. This deliberately
-    /// differs from `i_provide`: a set operation produces one merged output
-    /// schema while its correlation condition can still name its operand
-    /// aliases. A pipe result, conversely, is Fresh and carries no old aliases.
-    pub qualifier_scope: Vec<crate::names::ScopeId>,
-}
-
-impl BubbledState {
-    pub fn empty() -> Self {
-        Self {
-            i_provide: Vec::new(),
-            i_need: Vec::new(),
-            qualifier_scope: Vec::new(),
-        }
-    }
-
-    pub fn resolved(columns: Vec<crate::names::ColId>, registry: &crate::names::Registry) -> Self {
-        let mut qualifier_scope = Vec::new();
-        for column in &columns {
-            let scope = registry.scope_of(*column);
-            if !qualifier_scope.contains(&scope) {
-                qualifier_scope.push(scope);
-            }
-        }
-        Self {
-            qualifier_scope,
-            i_provide: columns,
-            i_need: Vec::new(),
-        }
-    }
-
-    /// A relation whose dimensions the target does not publish.
-    ///
-    /// It offers no columns to enumerate and still carries its scope: a
-    /// reference standing over it must be able to find out that nothing was
-    /// enumerated, rather than be told the name is absent.
-    pub fn opaque(scope: crate::names::ScopeId) -> Self {
-        Self {
-            i_provide: Vec::new(),
-            i_need: Vec::new(),
-            qualifier_scope: vec![scope],
-        }
-    }
-
-    pub fn with_unresolved(
-        columns: Vec<crate::names::ColId>,
-        unresolved: Vec<ColumnReference>,
-    ) -> Self {
-        Self {
-            i_provide: columns,
-            i_need: unresolved,
-            qualifier_scope: Vec::new(),
-        }
-    }
-
-    pub fn combine(left: BubbledState, right: BubbledState) -> Self {
-        let mut combined_provide = left.i_provide;
-        combined_provide.extend(right.i_provide);
-
-        let mut combined_need = left.i_need;
-        combined_need.extend(right.i_need);
-
-        let mut combined_scope = left.qualifier_scope;
-        combined_scope.extend(right.qualifier_scope);
-
-        Self {
-            i_provide: combined_provide,
-            i_need: combined_need,
-            qualifier_scope: combined_scope,
-        }
-    }
-}
+pub(crate) use caller_row::CallerRow;
+pub(crate) use lexical::Terminal;
+pub(crate) use lexical::{
+    AnonRouting, PatternOperand, PatternOwner, Position, RowRead,
+    Reach, ResolvedQuery, ResolvedRelation, StrictPhaseConverter, Witness,
+};
 
 // Re-export DatabaseSchema from delightql-types: it lives in the types
 // crate, not core, to avoid circular dependencies.
@@ -356,307 +246,6 @@ pub struct ResolvedQueryResult {
     pub connection_id: Option<i64>,
 }
 
-/// Group a flat list of CTE bindings by subject, preserving first-appearance
-/// order, then validate inter-CTE dependencies (forward references, cycles).
-///
-/// An authored key compares by the identifier law — `SqlIdentifier`'s
-/// equality folds an unstropped spelling and keeps a stropped one verbatim —
-/// and a structural key is the carrier scope itself, so two same-spelled
-/// carriers can never merge and two fold-equal authored clauses always do.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum CteGroupKey {
-    Authored(delightql_types::SqlIdentifier),
-    /// A compiler-generated spelling. Its own key kind, so a generated
-    /// binding can never merge with an authored clause set that happens
-    /// to fold to the same characters.
-    Generated(delightql_types::SqlIdentifier),
-    Structural(crate::names::ScopeId),
-}
-
-fn bind_schema_to_scope(
-    input: crate::names::ScopeId,
-    scope: crate::names::ScopeId,
-    identities: &crate::names::Registry,
-) -> Result<crate::names::ScopeId> {
-    if !matches!(
-        identities.origin_of(scope),
-        crate::names::ScopeOrigin::HoCarrier {
-            role: crate::names::HoRole::Argument
-                | crate::names::HoRole::PipeSource
-                | crate::names::HoRole::ScalarInput
-        }
-    ) {
-        return Err(DelightQLError::parse_error(
-            "a structural CTE binding must be an argument carrier",
-        ));
-    }
-    if !identities.known_heading(scope)?.is_empty() {
-        return Err(DelightQLError::parse_error(
-            "a structural CTE binding was published more than once",
-        ));
-    }
-    // A hygienic carrier does not enter the binding's heading. It stands for a
-    // slot that introduced no name, and the constraint reading it is applied
-    // below this point — inside the body being bound — so it arrives spent.
-    // Publishing it anyway puts a target in the carrier's heading that the
-    // body no longer offers, and the two disagree the moment anything
-    // reconciles against it. `republish_heading` copies the whole heading,
-    // hygienic columns included, which is right where a carrier rides on to a
-    // JOIN above and wrong here, where nothing above can address it.
-    for column in identities.known_heading(input)? {
-        if identities.addressing(column) == crate::names::Addressing::Hygienic {
-            continue;
-        }
-        identities.republish_column(
-            column,
-            scope,
-            crate::names::Republish::BoundaryExport,
-            identities.published(column),
-            identities.addressing(column),
-            |_| {},
-        );
-    }
-    Ok(scope)
-}
-
-fn group_ctes(
-    ctes: Vec<ast_unresolved::CteBinding>,
-) -> Result<(
-    HashMap<CteGroupKey, Vec<ast_unresolved::CteBinding>>,
-    Vec<CteGroupKey>,
-)> {
-    use crate::pipeline::asts::core::CteSubject;
-
-    let mut authored_groups: HashMap<
-        delightql_types::SqlIdentifier,
-        Vec<ast_unresolved::CteBinding>,
-    > = HashMap::new();
-    let mut authored_order: Vec<delightql_types::SqlIdentifier> = Vec::new();
-    for cte in &ctes {
-        let CteSubject::Authored { name, .. } = &cte.subject else {
-            continue;
-        };
-        let is_new = !authored_groups.contains_key(name);
-        authored_groups
-            .entry(name.clone())
-            .or_default()
-            .push(cte.clone());
-        if is_new {
-            authored_order.push(name.clone());
-        }
-    }
-    validate_grouped_cte_dependencies(&authored_groups, &authored_order)?;
-
-    let mut cte_groups: HashMap<CteGroupKey, Vec<ast_unresolved::CteBinding>> = HashMap::new();
-    let mut cte_order: Vec<CteGroupKey> = Vec::new();
-
-    for cte in ctes {
-        let key = match &cte.subject {
-            CteSubject::Authored { name, .. } => CteGroupKey::Authored(name.clone()),
-            CteSubject::Generated { name } => CteGroupKey::Generated(name.clone()),
-            CteSubject::Structural(scope) => CteGroupKey::Structural(*scope),
-        };
-        let is_new = !cte_groups.contains_key(&key);
-        cte_groups.entry(key.clone()).or_default().push(cte);
-        if is_new {
-            cte_order.push(key);
-        }
-    }
-
-    Ok((cte_groups, cte_order))
-}
-
-#[cfg(test)]
-mod structural_cte_group_tests {
-    use super::*;
-
-    fn binding(
-        subject: crate::pipeline::asts::core::CteSubject,
-        relation_scope: crate::names::ScopeId,
-    ) -> ast_unresolved::CteBinding {
-        ast_unresolved::CteBinding {
-            expression: ast_unresolved::Chain::read(
-                ast_unresolved::Relation::Ground {
-                    mention: ast_unresolved::GroundMention::Plan {
-                        scope: relation_scope,
-                        authored_name: None,
-                        alias: None,
-                    },
-                    outer: false,
-                    cpr_schema: (),
-                },
-                ast_unresolved::Access::All,
-                (),
-            ),
-            subject,
-            authority: crate::pipeline::asts::core::CteAuthority {
-                head: crate::pipeline::asts::core::definitions::Head::glob(),
-                origin: crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
-                resolution_owner:
-                    crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity,
-            },
-            recursion: (),
-        }
-    }
-
-    fn authored(name: &str) -> crate::pipeline::asts::core::CteSubject {
-        crate::pipeline::asts::core::CteSubject::Authored {
-            name: delightql_types::SqlIdentifier::new(name),
-            effect: crate::pipeline::asts::core::CteEffectDeclaration::Pure,
-        }
-    }
-
-    #[test]
-    fn structural_ctes_do_not_merge_by_diagnostic_name() {
-        let identities = crate::names::Registry::new(&[]);
-        let carrier = || {
-            identities.mint_derived_scope(
-                crate::names::ScopeOrigin::HoCarrier {
-                    role: crate::names::HoRole::Argument,
-                },
-                crate::names::Hint::Prefix("ho"),
-            )
-        };
-        let first = carrier();
-        let second = carrier();
-
-        let (groups, order) = group_ctes(vec![
-            binding(authored("formal"), first),
-            binding(
-                crate::pipeline::asts::core::CteSubject::Structural(first),
-                first,
-            ),
-            binding(
-                crate::pipeline::asts::core::CteSubject::Structural(second),
-                second,
-            ),
-        ])
-        .expect("grouping should remain structural");
-
-        assert_eq!(
-            order,
-            vec![
-                CteGroupKey::Authored(delightql_types::SqlIdentifier::new("formal")),
-                CteGroupKey::Structural(first),
-                CteGroupKey::Structural(second),
-            ]
-        );
-        assert_eq!(groups.len(), 3);
-        assert_eq!(
-            groups[&CteGroupKey::Authored(delightql_types::SqlIdentifier::new("formal"))].len(),
-            1
-        );
-        assert_eq!(groups[&CteGroupKey::Structural(first)].len(), 1);
-        assert_eq!(groups[&CteGroupKey::Structural(second)].len(), 1);
-    }
-
-    /// Two unstropped clauses that differ only by case are ONE subject under
-    /// the identifier law, and a stropped spelling with different canonical
-    /// bytes is another.
-    #[test]
-    fn authored_grouping_follows_the_identifier_law() {
-        let identities = crate::names::Registry::new(&[]);
-        let scope = identities.mint_derived_scope(
-            crate::names::ScopeOrigin::AnonRelation,
-            crate::names::Hint::None,
-        );
-
-        let (groups, order) = group_ctes(vec![
-            binding(authored("c"), scope),
-            binding(authored("C"), scope),
-            binding(
-                crate::pipeline::asts::core::CteSubject::Authored {
-                    name: delightql_types::SqlIdentifier::stropped("C"),
-                    effect: crate::pipeline::asts::core::CteEffectDeclaration::Pure,
-                },
-                scope,
-            ),
-        ])
-        .expect("fold-equal clauses group; a stropped case survivor does not");
-
-        assert_eq!(order.len(), 2);
-        assert_eq!(
-            groups[&CteGroupKey::Authored(delightql_types::SqlIdentifier::new("c"))].len(),
-            2
-        );
-        assert_eq!(
-            groups[&CteGroupKey::Authored(delightql_types::SqlIdentifier::stropped("C"))].len(),
-            1
-        );
-    }
-}
-
-/// The recursion decision, taken WHERE THE SELF-REFERENCE BINDS.
-///
-/// A binding's own scope is registered before its later clauses resolve,
-/// so a self-reference is a resolved reference to that scope and nothing
-/// else — no name comparison, no shadowing question (a shadowed name
-/// resolves to the inner scope by construction, which is why this is
-/// decided here and not over spellings later).
-///
-/// The answer is stored, decided exactly once, here. Deriving it again
-/// independently in a later pass — an advisory walk, a structural
-/// re-marking over the SQL AST, the transformer's own walk — invites
-/// disagreement between the passes.
-fn decide_recursion(
-    expr: &ast_resolved::Chain,
-    binding: crate::names::ScopeId,
-    own_scopes: &[crate::names::ScopeId],
-    identities: &crate::names::Registry,
-) -> crate::pipeline::asts::vocabulary::RecursionState {
-    use crate::pipeline::asts::vocabulary::RecursionState;
-    // A group can answer to more than one scope while it is being built:
-    // a later clause reaches the ANCHOR the first clause registered, and
-    // the finished group publishes under that anchor only when the clauses
-    // agree on a heading. A reference to either is a reference to this
-    // definition, so both are asked; the decision names the binding.
-    let mut own: Vec<crate::names::ScopeId> = own_scopes.to_vec();
-    if !own.contains(&binding) {
-        own.push(binding);
-    }
-    let mut finder = SelfReferenceFinder {
-        own,
-        identities,
-        found: false,
-    };
-    walk_visit_relational(&mut finder, expr)
-        .expect("self-reference detection is infallible (hooks never return Err)");
-    if finder.found {
-        RecursionState::Recursive {
-            self_scope: binding,
-        }
-    } else {
-        RecursionState::NonRecursive
-    }
-}
-
-/// Finds any resolved relation standing on the binding's own scope,
-/// anywhere in the body — a predicate subquery, a pipe argument, a
-/// consulted view's body, a nested binding. The shared whole-tree descent
-/// names every recursive edge once, so a self-reference cannot hide in a
-/// field some hand-rolled walker forgot.
-struct SelfReferenceFinder<'a> {
-    own: Vec<crate::names::ScopeId>,
-    identities: &'a crate::names::Registry,
-    found: bool,
-}
-
-impl AstVisit<crate::pipeline::asts::core::Resolved> for SelfReferenceFinder<'_> {
-    fn enter_relation(&mut self, rel: &ast_resolved::Relation) -> Result<Descent> {
-        if let ast_resolved::Relation::Ground { cpr_schema, .. } = rel {
-            if self
-                .own
-                .iter()
-                .any(|own| self.identities.contains_scope(*cpr_schema, *own))
-            {
-                self.found = true;
-                return Ok(Descent::Break);
-            }
-        }
-        Ok(Descent::Continue)
-    }
-}
-
 /// Run one subject's clause heads through the one assembler and project
 /// each clause body through its own head.
 ///
@@ -664,14 +253,70 @@ impl AstVisit<crate::pipeline::asts::core::Resolved> for SelfReferenceFinder<'_>
 /// heading, names and order as they are. A listed group comes back with
 /// every head spent: the contract has been applied to the bodies, so what
 /// leaves here is what the subject publishes.
-fn apply_group_head(
+/// Every clause of a definition publishes the same heading.
+///
+/// The refusal names the clause and both headings, because a glob head
+/// declares nothing for the author to compare against: what disagrees is one
+/// body against another, and only the compiler has both in front of it.
+pub(super) fn clauses_publish_one_heading(
+    name: &delightql_types::SqlIdentifier,
+    schemas: &[crate::relation::SemanticRelation],
+    identities: &crate::relation::Planning,
+) -> Result<()> {
+    let spell = |relation: &crate::relation::SemanticRelation| -> Result<Vec<String>> {
+        Ok(crate::relation::published_ports(identities, relation)?
+            .into_iter()
+            .map(|port| {
+                let mut text = String::new();
+                match identities.published(port.column()) {
+                    Some(spelling) => {
+                        identities.write(spelling, &mut crate::names::Teaching(&mut text));
+                    }
+                    None => text.push('_'),
+                }
+                text
+            })
+            .collect())
+    };
+    let Some(first) = schemas.first() else {
+        return Ok(());
+    };
+    let expected = spell(first)?;
+    for (index, schema) in schemas.iter().enumerate().skip(1) {
+        let published = spell(schema)?;
+        // A HEADING IS NAMES IN ORDER. Two clauses agreeing only on width
+        // accumulate positionally and publish the first clause's names over
+        // the second's cells, which is the silent answer heads-law refuses
+        // in the same breath as the NULL-padding one.
+        if published == expected {
+            continue;
+        }
+        return Err(DelightQLError::validation_error_categorized(
+            "heads/clause_disagreement",
+            format!(
+                "the clauses of '{name}' publish different headings: clause 1 \
+                 publishes ({first}) and clause {clause} publishes ({other}). \
+                 A glob head takes its schema from the bodies, so every clause \
+                 must publish one heading — declare the shared heading in the \
+                 head, or project each body to it.",
+                first = expected.join(", "),
+                clause = index + 1,
+                other = published.join(", "),
+            ),
+            "clause accumulation",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn apply_group_head(
     name: &str,
     group: Vec<ast_unresolved::CteBinding>,
 ) -> Result<Vec<ast_unresolved::CteBinding>> {
     use crate::pipeline::asts::core::definitions::{assemble, spend_heads};
 
     let heads: Vec<&crate::pipeline::asts::core::definitions::Head> =
-        group.iter().map(|cte| &cte.authority.head).collect();
+        group.iter().map(|cte| &cte.authority().head).collect();
     let assembly = assemble(
         name,
         &heads,
@@ -681,324 +326,83 @@ fn apply_group_head(
 }
 
 /// Trait abstracting CTE resolution + registration so that `resolve_cte_bindings`
-/// can be shared between `resolve_query` (which uses a `ResolverFold`) and
-/// `resolve_query_inline` (which calls `resolve_relational_expression_with_pipe_cfes`).
-trait CteResolver {
-    /// Resolve an unresolved relational expression, returning the resolved form
-    /// plus any pipe-collected CFE definitions discovered during resolution.
-    /// `owner` is the CTE's TYPED resolution ownership, keyed on the
-    /// `Caller`/`Entity` enum: the caller-authored carrier CTEs resolve
-    /// under Caller, never inferred from a naming convention or from
-    /// construction site — the squished entity's own clause bodies are
-    /// also compiler-CONSTRUCTED, but the entity scope owns their names.
+/// resolves every binding through the ONE lexical world the resolver stands in.
+pub(crate) trait CteResolver {
+    /// Resolve an unresolved relational expression in the resolver's own
+    /// world. There is no owner argument: a CTE resolves where it is
+    /// written, and a body world receives its caller's carriers already
+    /// resolved.
     fn resolve_cte_expression(
         &mut self,
-        owner: crate::pipeline::asts::core::provenance::CteResolutionOwner,
         expr: ast_unresolved::Chain,
+        horizon: crate::pipeline::asts::core::LexicalHorizon,
     ) -> Result<ast_resolved::Chain>;
 
-    /// Register a resolved CTE's schema so subsequent CTEs can reference it.
-    /// The key is the authored spelling; the map compares by the identifier
-    /// law, so a folded reference reaches it and a stropped case survivor
-    /// stays distinct.
-    fn register_cte(&mut self, name: delightql_types::SqlIdentifier, scope: crate::names::ScopeId);
+    /// Register a resolved query-local manifestation through the lexical
+    /// world's single registration road.
+    fn register_query_local(
+        &mut self,
+        registration: crate::defuse::environment::QueryLocalRegistration,
+    );
 
-    /// Preserve mutation-target provenance when a DML source is named by a
-    /// CTE. The CTE heading alone cannot carry the authored `!!` marker.
+    fn register_frontier(
+        &mut self,
+        frontier: crate::defuse::FrontierGroup,
+        relation: crate::relation::SemanticRelation,
+    );
 
-    fn identities(&self) -> Rc<crate::names::Registry>;
+    /// The arena every relation in this resolution was derived in.
+    fn identities(&self) -> &crate::relation::Planning;
+
+    fn crossing_carriers(&self) -> &[crate::relation::PortId];
 }
 
 /// `ResolverFold` as a CTE resolver — used by the top-level `resolve_query`.
 impl CteResolver for ResolverFold<'_, '_> {
     fn resolve_cte_expression(
         &mut self,
-        _owner: crate::pipeline::asts::core::provenance::CteResolutionOwner,
         expr: ast_unresolved::Chain,
+        horizon: crate::pipeline::asts::core::LexicalHorizon,
     ) -> Result<ast_resolved::Chain> {
-        let (resolved, _bubbled) = self.resolve_relational(expr)?;
-        Ok(resolved)
-    }
-
-    fn register_cte(&mut self, name: delightql_types::SqlIdentifier, scope: crate::names::ScopeId) {
-        self.registry.query_local.register_cte(name, scope);
-    }
-
-    fn identities(&self) -> Rc<crate::names::Registry> {
-        Rc::clone(&self.registry.identities)
-    }
-}
-
-/// Wrapper for inline resolution — used by `resolve_query_inline`.
-struct InlineCteResolver<'a, 'db> {
-    registry: &'a mut crate::resolution::EntityRegistry<'db>,
-    outer_context: Option<&'a [crate::names::ColId]>,
-    config: &'a ResolutionConfig,
-    grounding: Option<&'a ast_unresolved::GroundedPath>,
-}
-
-impl CteResolver for InlineCteResolver<'_, '_> {
-    fn resolve_cte_expression(
-        &mut self,
-        owner: crate::pipeline::asts::core::provenance::CteResolutionOwner,
-        expr: ast_unresolved::Chain,
-    ) -> Result<ast_resolved::Chain> {
-        // The caller-authored carrier CTEs — the piped source, join input,
-        // and HO arguments, TYPED Caller-owned at construction — resolve
-        // under the CALLER's scope, while the entity's own body CTEs
-        // (Entity-owned, from its file text) keep the entity scope. One
-        // squished query, two honest scopes; typed ownership, never a
-        // naming convention and never construction provenance.
-        let caller_config;
-        let config: &ResolutionConfig = match owner {
-            crate::pipeline::asts::core::provenance::CteResolutionOwner::Caller {
-                resolution_namespace,
-            } => {
-                caller_config = ResolutionConfig {
-                    resolution_namespace,
-                    ..self.config.clone()
-                };
-                &caller_config
-            }
-            crate::pipeline::asts::core::provenance::CteResolutionOwner::Entity => self.config,
-        };
-        let (resolved, _bubbled) = resolve_relational_expression_with_registry(
-            expr,
-            self.registry,
-            self.outer_context,
-            config,
-            self.grounding,
-        )?;
-        Ok(resolved)
-    }
-
-    fn register_cte(&mut self, name: delightql_types::SqlIdentifier, scope: crate::names::ScopeId) {
-        self.registry.query_local.register_cte(name, scope);
-    }
-
-    fn identities(&self) -> Rc<crate::names::Registry> {
-        Rc::clone(&self.registry.identities)
-    }
-}
-
-/// Resolve grouped CTE bindings, registering each CTE in the entity registry
-/// so that later CTEs (and the main query) can reference earlier ones.
-///
-/// The `resolver` handles both expression resolution and CTE registration,
-/// avoiding borrow conflicts by bundling both operations behind a single
-/// `&mut self`.
-///
-/// The helper handles schema extraction, table-name transformation, CTE
-/// registration, and multi-head UNION assembly.
-fn resolve_cte_bindings(
-    mut cte_groups: HashMap<CteGroupKey, Vec<ast_unresolved::CteBinding>>,
-    cte_order: &[CteGroupKey],
-    resolver: &mut dyn CteResolver,
-) -> Result<Vec<ast_resolved::CteBinding>> {
-    let mut resolved_ctes = Vec::new();
-
-    for key in cte_order {
-        let group = cte_groups
-            .remove(key)
-            .expect("CTE should exist after ordering - invariant violation");
-        // The spelling, for registration and teaching — the author's or the
-        // compiler's. A structural group has none: its key is the carrier
-        // scope, and the assembler below sees only glob heads, which never
-        // name the subject.
-        let name = match key {
-            CteGroupKey::Authored(name) | CteGroupKey::Generated(name) => Some(name.clone()),
-            CteGroupKey::Structural(_) => None,
-        };
-        let teaching_name = name
-            .as_ref()
-            .map(|name| name.as_str().to_string())
-            .unwrap_or_default();
-
-        // The subject's clauses meet HERE, at the one assembler, before any
-        // scope is minted: mixed head forms, arity, the per-position
-        // name-offer contest, the Ground-Position rule, and output-heading
-        // collision are decided once for the whole group, and each clause
-        // body then carries the projection its head declares. A per-clause
-        // head applied at build time could not see its siblings, so a
-        // disagreement had nowhere to be caught and became a NULL-padded
-        // union instead.
-        let group = apply_group_head(&teaching_name, group)?;
-
-        if group.len() == 1 {
-            // Single CTE — resolve normally
-            let cte = group
-                .into_iter()
-                .next()
-                .expect("Group has len==1, must have element - invariant");
-            let crate::pipeline::asts::core::CteAuthority {
-                origin,
-                resolution_owner,
-                // Spent by apply_group_head: the group's contract is in the
-                // bodies.
-                head: _,
-            } = cte.authority;
-            let resolved_expr =
-                resolver.resolve_cte_expression(resolution_owner.clone(), cte.expression)?;
-            let mut cte_schema = extract_cpr_schema(&resolved_expr);
-            cte_schema = match (key, &name) {
-                (CteGroupKey::Authored(_) | CteGroupKey::Generated(_), Some(name)) => {
-                    transform_schema_table_names(
-                        cte_schema,
-                        name,
-                        origin,
-                        crate::names::CteRole::Materialize,
-                        &resolver.identities(),
-                    )
-                }
-                (CteGroupKey::Structural(scope), _) => {
-                    bind_schema_to_scope(cte_schema, *scope, &resolver.identities())?
-                }
-                (CteGroupKey::Authored(_) | CteGroupKey::Generated(_), None) => {
-                    unreachable!("a named group key carries its spelling")
-                }
-            };
-            if let Some(name) = &name {
-                resolver.register_cte(name.clone(), cte_schema);
-            }
-            let recursion =
-                decide_recursion(&resolved_expr, cte_schema, &[], &resolver.identities());
-
-            resolved_ctes.push(ast_resolved::CteBinding {
-                expression: resolved_expr,
-                // The authored spelling and effect declaration end here:
-                // the binding IS its scope from this point on. The head and
-                // provenance were spent above; the phase deletes their slot.
-                subject: cte_schema,
-                authority: (),
-                recursion,
-            });
-        } else {
-            let (CteGroupKey::Authored(_), Some(name)) = (key, &name) else {
-                return Err(DelightQLError::parse_error(
-                    "a compiler-built CTE binding was defined more than once",
-                ));
-            };
-            // Multiple CTEs with same name — create UNION
-            let mut operands = Vec::new();
-            let mut schemas = Vec::new();
-            let mut all_schemas_same = true;
-
-            // The scope a later head could already see, kept so the finished
-            // group can answer under it rather than under a second one.
-            let mut anchor_scope: Option<crate::names::ScopeId> = None;
-
-            for (idx, cte) in group.iter().enumerate() {
-                let resolved_expr = resolver.resolve_cte_expression(
-                    cte.authority.resolution_owner.clone(),
-                    cte.expression.clone(),
-                )?;
-                let expr_schema = extract_cpr_schema(&resolved_expr);
-
-                // After first head, register the CTE so recursive heads can reference it
-                if idx == 0 {
-                    let mut base_schema = expr_schema.clone();
-                    base_schema = transform_schema_table_names(
-                        base_schema,
-                        name,
-                        cte.authority.origin,
-                        crate::names::CteRole::Recursive,
-                        &resolver.identities(),
-                    );
-                    anchor_scope = Some(base_schema);
-                    resolver.register_cte(name.clone(), base_schema);
-                }
-
-                if !schemas.is_empty() {
-                    if validate_union_compatible_schemas(
-                        schemas[0],
-                        expr_schema,
-                        &resolver.identities(),
-                    )
-                    .is_err()
-                    {
-                        all_schemas_same = false;
-                    }
-                }
-
-                schemas.push(expr_schema);
-                operands.push(resolved_expr);
-            }
-
-            let operator = if all_schemas_same {
-                ast_resolved::SetOperator::UnionAllPositional
-            } else {
-                ast_resolved::SetOperator::UnionCorresponding
-            };
-
-            // The clauses accumulate as a SEQUENCE of binary steps, so each
-            // step publishes the heading its own two operands make. The
-            // group's heading is the last step's — for a positional
-            // accumulation that is the first clause's throughout, and for a
-            // corresponding one the left-to-right merge, which is the order
-            // the arms are written in.
-            let mut step_schemas = Vec::with_capacity(schemas.len());
-            let mut accumulated = schemas[0].clone();
-            for schema in &schemas[1..] {
-                accumulated = match operator {
-                    ast_resolved::SetOperator::UnionCorresponding => build_corresponding_schema(
-                        &[accumulated, schema.clone()],
-                        &resolver.identities(),
-                    )?,
-                    _ => accumulated,
-                };
-                step_schemas.push(accumulated.clone());
-            }
-            let final_schema = accumulated;
-
-            // A later head that referenced the name reached the anchor's
-            // scope, so the finished group has to answer under that same one:
-            // minting a second scope for the union strands the reference on a
-            // table no WITH clause binds, which is how a recursive member ends
-            // up naming `c_2`. The anchor can only answer for the group when
-            // the heads agree on a heading — a corresponding union publishes
-            // one the anchor does not have, and there the anchor was never a
-            // reference target either, because a self-reference forces
-            // agreement.
-            let published = match anchor_scope.filter(|_| all_schemas_same) {
-                Some(scope) => scope,
-                None => transform_schema_table_names(
-                    final_schema,
-                    name,
-                    group.first().map(|c| c.authority.origin).unwrap_or_default(),
-                    crate::names::CteRole::Recursive,
-                    &resolver.identities(),
-                ),
-            };
-            resolver.register_cte(name.clone(), published);
-
-            let mut operands = operands.into_iter();
-            let mut union_expr = operands.next().expect("a CTE group has a first clause");
-            for (arm, schema) in operands.zip(step_schemas) {
-                union_expr = union_expr.bag_op(operator, arm, None, schema);
-            }
-            let recursion = decide_recursion(
-                &union_expr,
-                published,
-                anchor_scope.as_ref().map_or(&[][..], std::slice::from_ref),
-                &resolver.identities(),
-            );
-
-            resolved_ctes.push(ast_resolved::CteBinding {
-                expression: union_expr,
-                // The authored spelling and effect declaration end here:
-                // the binding IS its scope from this point on. The head and
-                // provenance were spent above; the phase deletes their slot.
-                subject: published,
-                authority: (),
-                recursion,
-            });
+        if !horizon.is_all() {
+            self.env.push_horizon(horizon);
         }
+        let resolved = self
+            .resolve_relational(expr)
+            .map(|resolved| resolved.into_body());
+        if !horizon.is_all() {
+            self.env.pop_horizon();
+        }
+        resolved
     }
 
-    Ok(resolved_ctes)
+    fn register_query_local(
+        &mut self,
+        registration: crate::defuse::environment::QueryLocalRegistration,
+    ) {
+        self.env.register_query_local(registration);
+    }
+
+    fn crossing_carriers(&self) -> &[crate::relation::PortId] {
+        &self.crossing_carriers
+    }
+
+    fn register_frontier(
+        &mut self,
+        frontier: crate::defuse::FrontierGroup,
+        relation: crate::relation::SemanticRelation,
+    ) {
+        frontier.register(self.env, relation);
+    }
+
+    fn identities(&self) -> &crate::relation::Planning {
+        self.core.identities
+    }
 }
 
-/// Resolve a full Query (which may contain CTEs)
+/// Resolve a full Query (which may contain CTEs) at the SESSION — the use
+/// world rooted at `scope_fq` (`home` at the prompt; the namespace a
+/// consulted goal is a form of).
 ///
 /// Returns the resolved query along with connection routing information.
 /// If tables from multiple connections are referenced, returns an error.
@@ -1007,61 +411,86 @@ pub fn resolve_query(
     schema: &dyn DatabaseSchema,
     system: Option<&crate::system::DelightQLSystem>,
     config: &ResolutionConfig,
-    identities: std::rc::Rc<crate::names::Registry>,
+    identities: &crate::relation::Planning,
+    scope_fq: &str,
 ) -> Result<ResolvedQueryResult> {
-    // Create EntityRegistry from the schema (with optional system for namespace resolution)
-    let mut registry = if let Some(sys) = system {
-        crate::resolution::EntityRegistry::new_with_system(schema, sys, identities)
+    let mut core = if let Some(sys) = system {
+        crate::resolution::ResolverCore::new_with_system(schema, sys, identities)
     } else {
-        crate::resolution::EntityRegistry::new(schema, identities)
+        crate::resolution::ResolverCore::new(schema, identities)
     };
-    // Definitions are spent at their call sites during resolution — the
-    // borrowed and query-scoped roads alike — so nothing pre-expands here.
-
-    // All relational resolution goes through the fold. The fold delegates to
-    // existing free functions; later steps absorb them.
-    let mut fold = ResolverFold::new(&mut registry, config.clone(), None, None);
-
-    let ast_unresolved::Query { cfes, ctes, body } = query;
-
-    // A definition is registered as authored and spent at its call sites
-    // during resolution; no carrier survives to later phases. Registered
-    // before any CTE resolves, so a binding's body can call it.
-    for cfe in cfes {
-        refuse_empty_explicit_context(&cfe)?;
-        fold.registry.query_local.register_scoped_cfe(cfe);
-    }
-
-    let resolved_ctes = if ctes.is_empty() {
-        Vec::new()
-    } else {
-        let (cte_groups, cte_order) = group_ctes(ctes)?;
-        resolve_cte_bindings(cte_groups, &cte_order, &mut fold)?
-    };
-
-    // Now resolve the body with all CTEs in registry
-    let (resolved_body, _) = fold.resolve_relational(body)?;
-
-    let resolved_query = ast_resolved::Query {
-        cfes: (),
-        ctes: resolved_ctes,
-        body: resolved_body,
-    };
+    // THE USE WORLD: one owned value, built for this compilation and never
+    // handed to a body.
+    let mut env = crate::defuse::environment::Environment::Use(
+        crate::defuse::environment::UseEnvironment::session(&core.consult, scope_fq)?,
+    );
+    let mut fold = ResolverFold::new(&mut core, &mut env, config.clone());
+    let mut resolved_query = resolve_query_with(&mut fold, query)?.into_query();
 
     // Validate that all resolved tables belong to the same connection
-    let connection_id = fold.registry.validate_single_connection()?;
+    let connection_id = core.validate_single_connection()?;
 
     // THE INCHOATE LAW, applied over the whole resolved tree: an unaccessed
     // inchoate occurrence yields zero rows under its opaque displayed
     // heading, a name reaching a latent dimension refuses, and a positional
     // reach was its activation.
-    let mut resolved_query = resolved_query;
-    apply_inchoate_law(&mut resolved_query, &fold.registry.identities)?;
+    apply_inchoate_law(&mut resolved_query, identities)?;
 
     Ok(ResolvedQueryResult {
         query: resolved_query,
         connection_id,
     })
+}
+
+/// THE ONE ROAD FROM A QUERY TO ITS RESOLUTION, in whatever world the fold
+/// stands in. Query-scoped definitions are registered as authored and spent
+/// at their call sites; the bindings resolve in order; the body resolves
+/// with every binding registered. A body world's fold is constructed only
+/// by the definition-use authority, so this road cannot be entered with a
+/// consulted body beside a world the authority did not choose.
+pub(crate) fn resolve_query_with(
+    fold: &mut ResolverFold,
+    query: ast_unresolved::Query,
+) -> Result<ResolvedQuery> {
+    let ast_unresolved::Query { locals, body } = query;
+    // THE BLOCK ARRIVES WHOLE. Its claims were minted by the same act that
+    // stamped these bindings' horizons — the authored construction, or the
+    // absorption an internal expansion moved it through — so there is
+    // nothing here to reconstruct and nothing that could be reconstructed:
+    // separated per-kind collections no longer record which name was
+    // written before which.
+    let (names, cfes, hos, ctes) = locals.spend();
+
+    fold.env.push_query_names(names);
+
+    let resolved = (|| {
+        for cfe in cfes {
+            refuse_empty_explicit_context(&cfe)?;
+            fold.env.register_query_local(
+                crate::defuse::environment::QueryLocalRegistration::Value(cfe),
+            );
+        }
+        for ho in hos {
+            fold.env.register_query_local(
+                crate::defuse::environment::QueryLocalRegistration::HigherOrder(ho),
+            );
+        }
+
+        let resolved_ctes = if ctes.is_empty() {
+            Vec::new()
+        } else {
+            crate::pipeline::bindings::resolve_cte_bindings(ctes, fold)?
+        };
+
+        Ok(fold.resolve_relational(body)?.into_query(|body| {
+            ast_resolved::Query::binding(
+                crate::pipeline::asts::core::QueryLocals::spent(resolved_ctes),
+                body,
+            )
+        }))
+    })();
+    fold.env.pop_query_names();
+    resolved
 }
 
 /// THE INCHOATE LOWERING's resolution half (RULINGS sitting 26, amended by
@@ -1076,7 +505,7 @@ pub fn resolve_query(
 /// heading spells the mints of dimensions nobody named.
 fn apply_inchoate_law(
     query: &mut ast_resolved::Query,
-    identities: &std::rc::Rc<crate::names::Registry>,
+    identities: &crate::relation::Planning,
 ) -> Result<()> {
     use crate::pipeline::ast_visit::{walk_visit_query, AstVisit, Descent};
 
@@ -1086,11 +515,12 @@ fn apply_inchoate_law(
     }
     impl AstVisit<crate::pipeline::asts::core::Resolved> for Unaccessed<'_> {
         fn enter_relational(&mut self, chain: &ast_resolved::Chain) -> Result<Descent> {
-            use crate::pipeline::asts::core::{Access, Continuation, Grelex, Relation};
-            let Grelex::Reference(Relation::Ground { cpr_schema, .. }) = &chain.head else {
+            use crate::pipeline::asts::core::{Access, Continuation, Relation};
+            let GroundForm::Reference(Relation::Ground { .. }) = chain.head().form() else {
                 return Ok(Descent::Continue);
             };
-            let mut steps = chain.continuations.iter();
+            let result = chain.head().result();
+            let mut steps = chain.forms();
             let Some(Continuation::Access {
                 access: Access::Unasked,
                 ..
@@ -1105,16 +535,16 @@ fn apply_inchoate_law(
                 return Ok(Descent::Continue);
             }
             // A positional reach activated it where the ordinal resolved.
-            if self.identities.ordinal_reached(*cpr_schema) {
+            if self.identities.ordinal_reached(result.scope()) {
                 return Ok(Descent::Continue);
             }
             // Only an enumerable heading has dimensions to depublish; an
             // opaque passthrough keeps its own contract.
-            if matches!(
-                self.identities.heading(*cpr_schema),
-                crate::names::HeadingKnowledge::Known(_)
-            ) {
-                self.latent.insert(*cpr_schema);
+            if !crate::relation::any_interface_opaque(
+                self.identities,
+                std::slice::from_ref(result),
+            )? {
+                self.latent.insert(result.scope());
             }
             Ok(Descent::Continue)
         }
@@ -1137,7 +567,7 @@ fn apply_inchoate_law(
     struct NameReach<'r> {
         identities: &'r crate::names::Registry,
         latent: &'r std::collections::HashSet<crate::names::ScopeId>,
-        reached: Option<crate::names::ColId>,
+        reached: Option<crate::relation::PortId>,
     }
     impl AstVisit<crate::pipeline::asts::core::Resolved> for NameReach<'_> {
         fn enter_domain(&mut self, expression: &ast_resolved::DomainExpression) -> Result<Descent> {
@@ -1148,7 +578,7 @@ fn apply_inchoate_law(
             {
                 if self
                     .latent
-                    .contains(&self.identities.scope_of(occurrence.column))
+                    .contains(&crate::relation::owner(self.identities, occurrence.column)?)
                 {
                     self.reached.get_or_insert(occurrence.column);
                 }
@@ -1165,7 +595,7 @@ fn apply_inchoate_law(
     if let Some(column) = names.reached {
         let mut text = String::new();
         identities.describe(
-            self_scope_of(identities, column),
+            crate::relation::owner(identities, column)?,
             &mut crate::names::Teaching(&mut text),
         );
         return Err(DelightQLError::validation_error_categorized(
@@ -1196,10 +626,12 @@ fn apply_inchoate_law(
 fn republish_latent_terminals(
     query: &mut ast_resolved::Query,
     latent: &std::collections::HashSet<crate::names::ScopeId>,
-    identities: &std::rc::Rc<crate::names::Registry>,
+    identities: &crate::relation::Planning,
 ) {
-    for cte in &mut query.ctes {
-        republish_latent_terminal_chain(&mut cte.expression, latent, identities);
+    for cte in query.locals.ctes_mut() {
+        for part in cte.parts_mut() {
+            republish_latent_terminal_chain(part, latent, identities);
+        }
     }
     republish_latent_terminal_chain(&mut query.body, latent, identities);
 }
@@ -1207,138 +639,42 @@ fn republish_latent_terminals(
 fn republish_latent_terminal_chain(
     chain: &mut ast_resolved::Chain,
     latent: &std::collections::HashSet<crate::names::ScopeId>,
-    identities: &std::rc::Rc<crate::names::Registry>,
+    identities: &crate::relation::Planning,
 ) {
-    use crate::pipeline::asts::core::{
-        Access, ColumnOccurrence, Continuation, Grelex, NamedReference, Reference, Relation,
-    };
-    let Grelex::Reference(Relation::Ground { cpr_schema, .. }) = &chain.head else {
+    use crate::pipeline::asts::core::{Access, Continuation, Relation};
+    let GroundForm::Reference(Relation::Ground { .. }) = chain.head().form() else {
         return;
     };
-    let scope = *cpr_schema;
-    if !latent.contains(&scope) {
+    let scope = *chain.head().result();
+    if !latent.contains(&scope.scope()) {
         return;
     }
+    let forms: Vec<&Continuation<_>> = chain.forms().collect();
     let [Continuation::Access {
         access: Access::Unasked,
         ..
-    }] = chain.continuations.as_slice()
+    }] = forms.as_slice()
     else {
         return;
     };
-    let crate::names::HeadingKnowledge::Known(columns) = identities.heading(scope) else {
+    let Ok(columns) = crate::relation::published_ports(identities, &scope) else {
         return;
     };
-    let nee = identities.mint_scope(
-        crate::names::ScopeOrigin::UserAlias { of: scope },
-        crate::names::Hint::None,
-        None,
-    );
-    let items: Vec<ast_resolved::OutItem> = columns
-        .into_iter()
-        .map(|column| {
-            let published = identities.republish_column(
-                column,
-                nee,
-                crate::names::Republish::Passthrough,
-                None,
-                crate::names::Addressing::Bare,
-                |_| {},
-            );
-            ast_resolved::OutItem::One(ast_resolved::OneOut {
-                expr: ast_resolved::OutValue::Domain(ast_resolved::DomainExpression::Reference(
-                    Reference::Named(NamedReference(ColumnOccurrence {
-                        column,
-                        explicit_qualifier: false,
-                    })),
-                )),
-                naming: None,
-                output: Some(published),
-            })
-        })
-        .collect();
-    chain.continuations.push(Continuation::Pipe {
-        operator: ast_resolved::PipeOp::Project(
-            crate::pipeline::asts::vocabulary::Vec1::try_from_vec(items)
-                .expect("the boundary projection publishes at least one column"),
-        ),
-        named: (),
-        cpr_schema: nee,
-    });
-}
-
-fn self_scope_of(
-    identities: &crate::names::Registry,
-    column: crate::names::ColId,
-) -> crate::names::ScopeId {
-    identities.scope_of(column)
-}
-
-/// Resolve a Query using an existing registry context.
-///
-/// Used by view expansion to resolve view bodies (including CTEs)
-/// within the outer query's resolution context. Unlike `resolve_query()`,
-/// this takes an existing `EntityRegistry` instead of creating a new one,
-/// so CTEs and tables visible in the outer context remain accessible.
-pub(crate) fn resolve_query_inline(
-    query: ast_unresolved::Query,
-    registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[crate::names::ColId]>,
-    config: &ResolutionConfig,
-    grounding: Option<&ast_unresolved::GroundedPath>,
-) -> Result<(ast_resolved::Query, BubbledState)> {
-    // THE EXTENT IS THE ENTRANCE'S. Every complete inline query resolves
-    // inside its own lexical binding extent: the bindings it introduces —
-    // CTE registrations, a recursive rule's self-registration, and CFE
-    // definitions — end when it returns, resolved and refused alike, so a
-    // body's binding can never replace or outlive its caller's. No
-    // unscoped implementation exists beside this one; a caller that
-    // wanted bindings to escape would need a differently named operation
-    // nobody has written.
-    registry.with_binding_extent(|registry| {
-        let ast_unresolved::Query { cfes, ctes, body } = query;
-
-        // A definition is registered as authored and spent at its call sites
-        // during resolution; no carrier survives to later phases. Registered
-        // before any CTE resolves, so a binding's body can call it.
-        for cfe in cfes {
-            refuse_empty_explicit_context(&cfe)?;
-            registry.query_local.register_scoped_cfe(cfe);
-        }
-
-        let resolved_ctes = if ctes.is_empty() {
-            Vec::new()
-        } else {
-            let (cte_groups, cte_order) = group_ctes(ctes)?;
-
-            // Resolve CTEs using the InlineCteResolver wrapper
-            let mut inline_resolver = InlineCteResolver {
-                registry: &mut *registry,
-                outer_context,
-                config,
-                grounding,
-            };
-            resolve_cte_bindings(cte_groups, &cte_order, &mut inline_resolver)?
-        };
-
-        // Resolve the body with all CTEs registered
-        let (resolved_body, bubbled) = resolve_relational_expression_with_registry(
-            body,
-            registry,
-            outer_context,
-            config,
-            grounding,
-        )?;
-
-        Ok((
-            ast_resolved::Query {
-                cfes: (),
-                ctes: resolved_ctes,
-                body: resolved_body,
-            },
-            bubbled,
-        ))
-    })
+    // The export and the projection that names its positions are ONE act:
+    // every item carries the occurrence the export just minted for it.
+    let Ok(published) = identities.authority().extend(
+        std::mem::replace(chain, ast_resolved::Chain::ground(chain.head().clone())),
+        crate::relation::builder::StepOp::Republish {
+            of: crate::relation::builder::Republishing::Export(crate::relation::form::ExportSpec {
+                input: scope,
+                why: crate::relation::form::ExportWhy::EmissionAlias,
+            }),
+            sources: columns,
+        },
+    ) else {
+        return;
+    };
+    *chain = published;
 }
 
 /// `..{}` declares a capture of nothing, which is a regular definition
@@ -1377,12 +713,16 @@ fn refuse_empty_explicit_context(cfe: &ast_unresolved::CfeDefinition) -> Result<
 /// SCOPE-LOCAL: walks this scope's Filter spine and reaches each EXISTS's own
 /// innermost source. It does not descend into arbitrary nested subquery scopes,
 /// and it resolves nothing.
-fn collect_exists_table_columns_in_scope(
+/// The relations sibling truth witnesses have already established on this
+/// source. Interdependent existence — `+orders(...), +order_items(,
+/// orders.id = order_items.order_id)` — addresses a sibling witness BY
+/// NAME, so each one has to enter the correlation as a qualifier scope and
+/// not merely as a bag of loose columns.
+fn exists_witness_relations(
     expr: &ast_resolved::Chain,
-    identities: &crate::names::Registry,
-    context: &mut Vec<crate::names::ColId>,
-) -> Result<()> {
-    for continuation in &expr.continuations {
+    found: &mut Vec<crate::relation::SemanticRelation>,
+) {
+    for continuation in expr.forms() {
         match continuation {
             ast_resolved::Continuation::Restrict { condition, .. } => {
                 if let ast_resolved::TruthExpression::Existence(Existence {
@@ -1390,16 +730,17 @@ fn collect_exists_table_columns_in_scope(
                     ..
                 }) = condition
                 {
-                    let source = resolved_innermost_source(subquery);
-                    let scope = helpers::extraction::extract_cpr_schema(&source);
-                    context.extend(identities.known_heading(scope)?);
+                    let relation = resolved_innermost_source(subquery).semantic_relation();
+                    if !found.contains(&relation) {
+                        found.push(relation);
+                    }
                 }
             }
             ast_resolved::Continuation::Member { rhs, .. } => {
-                collect_exists_table_columns_in_scope(rhs, identities, context)?;
+                exists_witness_relations(rhs, found);
             }
             ast_resolved::Continuation::BagOp { arm, .. } => {
-                collect_exists_table_columns_in_scope(arm, identities, context)?;
+                exists_witness_relations(arm, found);
             }
             ast_resolved::Continuation::Access { .. }
             | ast_resolved::Continuation::Bound { .. }
@@ -1412,7 +753,6 @@ fn collect_exists_table_columns_in_scope(
             }
         }
     }
-    Ok(())
 }
 
 /// The innermost source of a resolved subquery: peel `Filter` only, and stop at
@@ -1421,33 +761,19 @@ fn collect_exists_table_columns_in_scope(
 /// reason — a `Pipe` publishes its own heading, so descending past one would
 /// answer with a heading the subquery's table does not have.
 fn resolved_innermost_source(expr: &ast_resolved::Chain) -> ast_resolved::Chain {
-    let mut peeled = expr.continuations.as_slice();
-    while let Some((
-        ast_resolved::Continuation::Restrict { .. }
-        | ast_resolved::Continuation::Bound { .. }
-        | ast_resolved::Continuation::Destructure { .. },
-        rest,
-    )) = peeled.split_last()
-    {
+    let mut peeled = expr.continuations();
+    while let Some((last, rest)) = peeled.split_last() {
+        if !matches!(
+            last.form(),
+            ast_resolved::Continuation::Restrict { .. }
+                | ast_resolved::Continuation::Bound { .. }
+                | ast_resolved::Continuation::Destructure { .. }
+        ) {
+            break;
+        }
         peeled = rest;
     }
-    ast_resolved::Chain {
-        head: expr.head.clone(),
-        continuations: peeled.to_vec(),
-    }
-}
-
-/// Resolves a relational expression via `EntityRegistry`.
-///
-/// Thin wrapper: delegates to `ResolverFold::resolve_relational_impl`.
-fn resolve_relational_expression_with_registry(
-    expr: ast_unresolved::Chain,
-    registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[crate::names::ColId]>,
-    config: &ResolutionConfig,
-    grounding: Option<&ast_unresolved::GroundedPath>,
-) -> Result<(ast_resolved::Chain, BubbledState)> {
-    resolve_interior_expression(expr, registry, outer_context, config, grounding, None)
+    expr.prefix(peeled.len())
 }
 
 /// Which dequalifying run a correlation is answering, borrowed for the call.
@@ -1458,80 +784,18 @@ pub(crate) enum CorrelatingRun<'a> {
 }
 
 /// The same, owned, while the interior is resolved and the access is spent.
-enum OwnedCorrelatingRun {
+pub(super) enum OwnedCorrelatingRun {
     Named(Vec<delightql_types::SqlIdentifier>),
     All,
 }
 
 impl OwnedCorrelatingRun {
-    fn borrow(&self) -> CorrelatingRun<'_> {
+    pub(super) fn borrow(&self) -> CorrelatingRun<'_> {
         match self {
             OwnedCorrelatingRun::Named(columns) => CorrelatingRun::Named(columns),
             OwnedCorrelatingRun::All => CorrelatingRun::All,
         }
     }
-}
-
-/// Same entry, carrying the self-name of the access whose interior this
-/// is. Only `resolve_inner_relation` has one to pass.
-fn resolve_interior_expression(
-    expr: ast_unresolved::Chain,
-    registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[crate::names::ColId]>,
-    config: &ResolutionConfig,
-    grounding: Option<&ast_unresolved::GroundedPath>,
-    interior_self: Option<crate::names::Sym>,
-) -> Result<(ast_resolved::Chain, BubbledState)> {
-    // LOOKING LEFT REACHES THE ENCLOSING ROW. A dequalifying access on the
-    // interior's OWN head has nothing to its left inside, so the lvar it
-    // renames onto is the outer one and the step is a correlation. Any other
-    // position keeps its claimant: a member's dequalify is the join's USING,
-    // and the pipe carrier correlates on its own road.
-    // BOTH SPELLINGS OF THE RUN. `.(cols)` names the shared columns and `.*`
-    // asks for every one there is; they are one step with two spellings, so
-    // one reaching this road and the other not is the run answering
-    // differently for the same query.
-    let correlating = outer_context.and_then(|outer| {
-        if !matches!(
-            expr.head,
-            ast_unresolved::Grelex::Reference(ast_unresolved::Relation::Ground { .. })
-        ) {
-            return None;
-        }
-        match expr.head_access()? {
-            ast_unresolved::Access::Dequalify(columns) => {
-                Some((OwnedCorrelatingRun::Named(columns.clone()), outer.to_vec()))
-            }
-            ast_unresolved::Access::DequalifyAll => {
-                Some((OwnedCorrelatingRun::All, outer.to_vec()))
-            }
-            ast_unresolved::Access::Unasked
-            | ast_unresolved::Access::All
-            | ast_unresolved::Access::Slots(_) => None,
-        }
-    });
-    let mut expr = expr;
-    if correlating.is_some() {
-        if let Some(ast_unresolved::Continuation::Access { access, .. }) =
-            expr.continuations.first_mut()
-        {
-            *access = ast_unresolved::Access::All;
-        }
-    }
-
-    let mut fold = ResolverFold::new(
-        registry,
-        config.clone(),
-        outer_context.map(|c| c.to_vec()),
-        grounding.cloned(),
-    );
-    fold.interior_self = interior_self;
-    let (resolved, bubbled) = fold.resolve_relational(expr)?;
-    let resolved = match &correlating {
-        Some((run, outer)) => fold.correlate_using(resolved, run.borrow(), outer)?,
-        None => resolved,
-    };
-    Ok((resolved, bubbled))
 }
 
 // ============================================================================
@@ -1572,63 +836,112 @@ pub(crate) fn er_chain_context(
     })
 }
 
-/// The edge-selection failure, in two teachings: an unknown context is
-/// its own error (the edge set per context is finite and declared); a
-/// known context without the requested pair enumerates what IS declared.
-fn er_edge_miss_error(
-    registry: &crate::resolution::EntityRegistry,
-    context_name: &str,
-    left_spelling: &str,
-    right_spelling: &str,
-) -> DelightQLError {
-    let known = registry
-        .consult
-        .er_context_known(context_name)
-        .unwrap_or(false);
-    if !known {
-        let contexts = registry.consult.list_er_contexts().unwrap_or_default();
-        let listing = if contexts.is_empty() {
-            "no contexts have declared edges in the enlisted scope".to_string()
-        } else {
-            format!(
-                "contexts with declared edges: {}",
-                contexts
-                    .iter()
-                    .map(|c| format!("::{c}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        return DelightQLError::validation_error_categorized(
-            "grounding/er/unknown_context",
-            format!("unknown context '::{context_name}' — {listing}"),
-            "a context exists exactly where an edge declares it",
-        );
-    }
-    let edges = registry
-        .consult
-        .lookup_er_rules_in_context(context_name)
-        .unwrap_or_default();
-    let listing = edges
-        .iter()
-        .map(|(l, r, _)| format!("{l} & {r}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    DelightQLError::validation_error_categorized(
-        "grounding/er/edge_miss",
-        format!(
-            "no edge declared for {left_spelling} & {right_spelling} in \
-             '::{context_name}' — a term selects an edge by its exact canonical \
-             spelling, and emptiness by absent declaration is an error, not a \
-             result. Declared edges: {listing}"
-        ),
-        "restriction is downstream: select a declared edge, then filter its \
-         relation",
+/// The endpoint's (table name, user alias) — the alias is OUTSIDE the
+/// term: selection used the spelling, exports answer to the alias.
+/// Whether an authored edge peer carries the outer mark on its access.
+fn er_peer_outer(read: &ast_unresolved::Chain) -> bool {
+    matches!(
+        read.as_read_relation(),
+        Some(ast_unresolved::Relation::Ground { outer: true, .. })
     )
 }
 
-/// The endpoint's (table name, user alias) — the alias is OUTSIDE the
-/// term: selection used the spelling, exports answer to the alias.
+/// Mark the edge body's own read of the stated endpoint outer, so the
+/// authored `?` on the peer keeps every left row through the expanded join.
+/// The mark rides the ACCESS, and the body's access of the endpoint is the
+/// one place the expanded join can honor it.
+pub(crate) fn mark_er_endpoint_outer(
+    mut expr: ast_unresolved::Chain,
+    endpoint: &str,
+) -> Result<ast_unresolved::Chain> {
+    fn marked_relation(
+        rel: ast_unresolved::Relation,
+        endpoint: &str,
+        marked: &mut usize,
+    ) -> ast_unresolved::Relation {
+        match rel {
+            ast_unresolved::Relation::Ground {
+                mention:
+                    ast_unresolved::GroundMention::Named {
+                        identifier,
+                        alias,
+                        mutation_target,
+                        passthrough,
+                    },
+                ..
+            } if delightql_types::SqlIdentifier::str_eq(identifier.name.as_str(), endpoint) => {
+                *marked += 1;
+                ast_unresolved::Relation::Ground {
+                    mention: ast_unresolved::GroundMention::Named {
+                        identifier,
+                        alias,
+                        mutation_target,
+                        passthrough,
+                    },
+                    outer: true,
+                }
+            }
+            other => other,
+        }
+    }
+    let mut marked = 0usize;
+    *expr.continuations_mut() = std::mem::take(expr.continuations_mut())
+        .into_iter()
+        .map(|step| {
+            ast_unresolved::Step::authored(match step.into_form() {
+                ast_unresolved::Continuation::Member {
+                    mut rhs,
+                    correlation,
+                    join_type,
+                } => {
+                    if rhs.as_read_relation().is_some() {
+                        *rhs.head_mut() =
+                            ast_unresolved::Grelex::authored(match rhs.head_mut().form().clone() {
+                                ast_unresolved::GroundForm::Reference(rel) => {
+                                    ast_unresolved::GroundForm::Reference(marked_relation(
+                                        rel,
+                                        endpoint,
+                                        &mut marked,
+                                    ))
+                                }
+                                literal => literal,
+                            });
+                    }
+                    ast_unresolved::Continuation::Member {
+                        rhs,
+                        correlation,
+                        join_type,
+                    }
+                }
+                other => other,
+            })
+        })
+        .collect();
+    if marked == 0 {
+        *expr.head_mut() = ast_unresolved::Grelex::authored(match expr.head_mut().form().clone() {
+            ast_unresolved::GroundForm::Reference(rel) => {
+                ast_unresolved::GroundForm::Reference(marked_relation(rel, endpoint, &mut marked))
+            }
+            literal => literal,
+        });
+    }
+    match marked {
+        1 => Ok(expr),
+        0 => Err(DelightQLError::validation_error_categorized(
+            "grounding/er/outer_endpoint",
+            format!(
+                "the outer mark reaches the edge body's read of '{endpoint}',                  and this body does not read it directly"
+            ),
+            "an edge peer's `?` marks the body's own access of that endpoint",
+        )),
+        _ => Err(DelightQLError::validation_error_categorized(
+            "grounding/er/outer_endpoint",
+            format!("the edge body reads '{endpoint}' more than once, so the outer mark is ambiguous"),
+            "an edge peer's `?` marks the body's own access of that endpoint",
+        )),
+    }
+}
+
 fn er_endpoint(read: &ast_unresolved::Chain) -> (String, Option<delightql_types::SqlIdentifier>) {
     match read.as_read_relation() {
         Some(ast_unresolved::Relation::Ground {
@@ -1661,47 +974,6 @@ fn er_endpoint(read: &ast_unresolved::Chain) -> (String, Option<delightql_types:
 /// hop tries to pair on the shared endpoint and finds nothing answering to it.
 /// The scope a column was born in is what tells the two apart; the scope it
 /// sits in now is shared by both and tells them apart from nothing.
-/// Stand the edge's boundary over its resolved body: one projection, built
-/// from the occurrences the export selected, publishing the boundary scope.
-///
-/// Built resolved rather than appended as `|> (a.*, b.*)` before resolution.
-/// The written form makes the compiler author `a(*) … |> (a.*) |> (a.*)`
-/// whenever the body already projected — the one shape the language refuses —
-/// and then needs a qualifier to survive a projection so its own output can
-/// compile. Which occurrence belongs to which endpoint is a fact the arena
-/// holds; asking it directly costs no licence.
-fn er_boundary_projection(
-    expr: ast_resolved::Chain,
-    exported: &[crate::names::ColId],
-    identities: &crate::names::Registry,
-) -> ast_resolved::Chain {
-    let Some(scope) = identities.common_scope(exported) else {
-        return expr;
-    };
-    let items = exported
-        .iter()
-        .map(|column| {
-            ast_resolved::OutItem::plain(
-                ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                    ColumnOccurrence {
-                        column: *column,
-                        explicit_qualifier: false,
-                    },
-                ))),
-                Some(*column),
-            )
-        })
-        .collect();
-    // An edge exports its endpoints, so the empty case is unreachable; it
-    // answers with the body unchanged rather than an itemless projection.
-    let Some(items) = crate::pipeline::asts::vocabulary::Vec1::try_from_vec(items) else {
-        return expr;
-    };
-    ast_resolved::Chain::pipe_builder(expr, scope)
-        .with_projection(items)
-        .build()
-}
-
 /// An edge whose body does not publish one of its endpoints, taught as the
 /// pair-set violation it is rather than as whatever the narrowing tripped on.
 fn er_pair_schema_error(missing: &str, context: &str, subject: String) -> DelightQLError {
@@ -1720,10 +992,72 @@ fn er_pair_schema_error(missing: &str, context: &str, subject: String) -> Deligh
     )
 }
 
-fn er_export_endpoints(
-    bubbled: &mut BubbledState,
+/// Which of a path's endpoints one published port answers for.
+///
+/// ONE question, asked wherever an ER composition needs it. The
+/// construction-recorded semantic owner is the endpoint's published schema; a
+/// derived endpoint may legitimately name its columns differently from its
+/// storage source, so that owner wins. Where a projection consumed the
+/// lexical qualifier while carrying the exact port, the recorded ancestry
+/// says which earlier port reached this output — a rename is excluded because
+/// it changed the published spelling, not because a value search failed.
+fn er_endpoint_of(
+    identities: &crate::relation::Planning,
+    input: &crate::relation::SemanticRelation,
+    column: crate::relation::PortId,
+    endpoints: &[crate::names::Sym],
+) -> Option<crate::names::Sym> {
+    let authority = identities.authority();
+    if let Some(answer) = authority
+        .owner(column)
+        .ok()
+        .and_then(|scope| identities.answers_to(scope))
+    {
+        if endpoints.contains(&answer) {
+            return Some(answer);
+        }
+    }
+    // The ANSWERS are compared, not the ancestors: a port carried through
+    // several boundaries has several ancestors, and every one of them
+    // naming the same endpoint is agreement rather than ambiguity. Two
+    // DIFFERENT endpoints is the ambiguity, and it refuses.
+    let mut answers: Vec<_> = authority
+        .ancestors_into(input, column)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|ancestor| {
+            identities.published_sym(ancestor.column()) == identities.published_sym(column.column())
+        })
+        .filter_map(|ancestor| {
+            authority
+                .owner(ancestor)
+                .ok()
+                .and_then(|scope| identities.answers_to(scope))
+        })
+        .filter(|endpoint| endpoints.contains(endpoint))
+        .collect();
+    answers.sort_unstable();
+    answers.dedup();
+    match answers.as_slice() {
+        [endpoint] => Some(*endpoint),
+        [] | [..] => None,
+    }
+}
+
+/// Whether a relation publishes a column for every named endpoint.
+///
+/// An edge is a PAIR-SET: its body derives the pairs freely, but its final
+/// heading has to carry both endpoints, because that heading IS the edge's
+/// published schema. A body that renamed or projected an endpoint away
+/// publishes no column born under it, and there is nothing to export.
+///
+/// A CHECK ONLY. The composed-path road already stands on its own boundary
+/// and asks this of it; deriving a second one there would publish a
+/// qualifier scope the chain does not carry.
+fn er_missing_endpoint(
     published: &[String],
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
+    input: crate::relation::SemanticRelation,
 ) -> Option<String> {
     let mut endpoints = Vec::with_capacity(published.len());
     for name in published {
@@ -1732,49 +1066,100 @@ fn er_export_endpoints(
         };
         endpoints.push(endpoint);
     }
-    let endpoint_of = |column: crate::names::ColId| {
-        // The current answering reach is the endpoint's own published schema.
-        // A derived endpoint may legitimately name its columns differently
-        // from their catalog progenitors, so that boundary wins.
-        if let Some(answer) = identities.answering_reach(column) {
-            if endpoints.contains(&answer) {
-                return Some(answer);
-            }
-        }
-
-        // A projection may consume that qualifier while retaining the
-        // endpoint column unchanged. Fall back to catalog birth only in that
-        // case. A rename publishes something of the body's own making and is
-        // not part of the endpoint schema.
-        let progenitor = identities.progenitor(column);
-        if identities.published_sym(column) != identities.published_sym(progenitor) {
-            return None;
-        }
-        let birth = identities.scope_of(progenitor);
-        let matches: Vec<_> = endpoints
-            .iter()
-            .copied()
-            .filter(|endpoint| identities.answers_to(birth) == Some(*endpoint))
-            .collect();
-        match matches.as_slice() {
-            [endpoint] => Some(*endpoint),
-            [] | [..] => None,
-        }
+    let Ok(provided) = crate::relation::published_ports(identities, &input) else {
+        return published.first().cloned();
     };
-
-    // An edge is a PAIR-SET: its body derives the pairs freely, but its final
-    // heading has to carry both endpoints, because that heading IS the edge's
-    // published schema. A body that renamed or projected an endpoint away
-    // publishes no column born under it, and there is nothing to export.
     for (name, endpoint) in published.iter().zip(&endpoints) {
-        if !bubbled
-            .i_provide
-            .iter()
-            .any(|column| endpoint_of(*column) == Some(*endpoint))
-        {
+        if !provided.iter().any(|column| {
+            er_endpoint_of(identities, &input, *column, &endpoints) == Some(*endpoint)
+        }) {
             return Some(name.clone());
         }
     }
+    None
+}
+
+/// STAND THE EDGE'S BOUNDARY OVER ITS RESOLVED BODY.
+///
+/// The exports are decided, the boundary is derived from them, and the
+/// projection that carries each endpoint into the position that derivation
+/// minted is built in the SAME act — so the boundary relation is never a
+/// value standing beside a projection somebody else wrote.
+///
+/// Built resolved rather than appended as `|> (a.*, b.*)` before
+/// resolution. The written form makes the compiler author
+/// `a(*) … |> (a.*) |> (a.*)` whenever the body already projected — the one
+/// shape the language refuses — and then needs a qualifier to survive a
+/// projection so its own output can compile. Which occurrence belongs to
+/// which endpoint is a fact the arena holds; asking it directly costs no
+/// licence.
+///
+/// `Err` is an endpoint the body publishes nothing for; `Ok` is the body
+/// with its boundary over it.
+fn er_export_endpoints(
+    resolved: ResolvedRelation,
+    published: &[String],
+    aliases: &[Option<delightql_types::SqlIdentifier>],
+    identities: &crate::relation::Planning,
+    missing: &mut Option<String>,
+) -> Result<ResolvedRelation> {
+    // AN ENDPOINT EXPORT REPUBLISHES: schema(A) + schema(B) is a new
+    // publication the prior spellings do not reach around, so what answers
+    // over the result is derived from the boundary this writes.
+    resolved.republished_as_er_boundary(identities, |expr| {
+        er_export_endpoints_chain(published, aliases, identities, expr, missing)
+    })
+}
+
+fn er_export_endpoints_chain(
+    published: &[String],
+    aliases: &[Option<delightql_types::SqlIdentifier>],
+    identities: &crate::relation::Planning,
+    expr: ast_resolved::Chain,
+    missing: &mut Option<String>,
+) -> Result<(ast_resolved::Chain, Vec<crate::relation::form::ErExport>)> {
+    let input = expr.semantic_relation();
+    if let Some(absent) = er_missing_endpoint(published, identities, input) {
+        *missing = Some(absent);
+        return Ok((expr, Vec::new()));
+    }
+    let mut endpoints = Vec::with_capacity(published.len());
+    for name in published {
+        let Some(endpoint) = identities.known_sym(name, false) else {
+            *missing = Some(name.clone());
+            return Ok((expr, Vec::new()));
+        };
+        endpoints.push(endpoint);
+    }
+    // THE ALIAS IS THE ENDPOINT'S NEW ANSWER, AND THE BOUNDARY IS WHERE IT
+    // LANDS. An alias written outside the term names the EDGE's endpoint, not
+    // the base table the body read: the body is resolved against the declared
+    // spellings, and the boundary is the first relation the caller addresses.
+    // Threading the alias afterwards has nothing to rename — the boundary is a
+    // wrap and answers to no name at all — so the answering channel each
+    // position already carries is the one the alias replaces.
+    let answers: Vec<crate::names::Sym> = endpoints
+        .iter()
+        .zip(aliases.iter().chain(std::iter::repeat(&None)))
+        .map(|(endpoint, alias)| match alias {
+            Some(alias) => {
+                identities.canonical(identities.intern(alias.as_str(), alias.is_stropped()))
+            }
+            None => *endpoint,
+        })
+        .collect();
+    let endpoint_of =
+        |column: crate::relation::PortId| er_endpoint_of(identities, &input, column, &endpoints);
+    let answer_for = |endpoint: crate::names::Sym| {
+        endpoints
+            .iter()
+            .position(|declared| *declared == endpoint)
+            .map_or(endpoint, |position| answers[position])
+    };
+    let Ok(provided) = crate::relation::published_ports(identities, &input) else {
+        *missing = published.first().cloned();
+        return Ok((expr, Vec::new()));
+    };
     // ONE boundary, because an edge publishes ONE heading: schema(A) +
     // schema(B). Minting a boundary per input scope leaves the two endpoints'
     // columns with no scope in common, so nothing downstream can name the
@@ -1785,68 +1170,40 @@ fn er_export_endpoints(
     // likes. Only the endpoints' columns cross, which is what "the boundary
     // exports those columns and hides the rest" means — the rest are dropped
     // by not being republished.
-    let exported: Vec<_> = bubbled
-        .i_provide
+    let exports: Vec<_> = provided
         .iter()
-        .copied()
-        .filter(|column| endpoint_of(*column).is_some())
-        .collect();
-    let input = identities.scope_of(exported[0]);
-    let boundary = identities.mint_derived_scope(
-        crate::names::ScopeOrigin::Wrap {
-            input,
-            why: crate::names::WrapReason::Projection,
-        },
-        crate::names::Hint::None,
-    );
-    let inputs: Vec<_> = {
-        let mut seen = Vec::new();
-        for column in &exported {
-            let scope = identities.scope_of(*column);
-            if !seen.contains(&scope) {
-                seen.push(scope);
-            }
-        }
-        seen
-    };
-    let carried: Vec<_> = exported
-        .iter()
-        .map(|column| {
-            // The endpoint is a qualifier, not a name: `depts.id` is how the
-            // chain's exports are written, and `id` is still what the column
-            // is called. Answering to the endpoint INSTEAD would make every
-            // column of one endpoint answer to one name — all of them
-            // ambiguous under it, and none reachable by its own.
-            let addressing = endpoint_of(*column)
-                .map(crate::names::Addressing::BareAnswering)
-                .unwrap_or_else(|| identities.addressing(*column));
-            identities.republish_column(
-                *column,
-                boundary,
-                crate::names::Republish::BoundaryExport,
-                identities.published(*column),
-                addressing,
-                |_| {},
-            )
+        .filter_map(|column| {
+            endpoint_of(*column).map(|endpoint| crate::relation::form::ErExport {
+                source: *column,
+                endpoint: answer_for(endpoint),
+            })
         })
         .collect();
-    for column in &mut bubbled.i_provide {
-        if let Some(position) = exported.iter().position(|source| source == column) {
-            *column = carried[position];
-        }
+    // An edge exports its endpoints, so the empty case is unreachable; it
+    // answers with the body unchanged rather than an itemless projection.
+    if exports.is_empty() {
+        return Ok((expr, Vec::new()));
     }
-    for scope in &mut bubbled.qualifier_scope {
-        if inputs.contains(scope) {
-            *scope = boundary;
-        }
-    }
-    bubbled
-        .i_provide
-        .retain(|column| endpoint_of(*column).is_some());
-    None
+    let sources: Vec<crate::relation::PortId> =
+        exports.iter().map(|export| export.source).collect();
+    let bounded = identities.authority().extend(
+        expr,
+        crate::relation::builder::StepOp::Republish {
+            of: crate::relation::builder::Republishing::ErBoundary(
+                crate::relation::form::ErBoundarySpec {
+                    input,
+                    exports: &exports,
+                },
+            ),
+            sources,
+        },
+    )?;
+    Ok((bounded, exports))
 }
 
-fn er_table_name(read: &ast_unresolved::Chain) -> Result<delightql_types::SqlIdentifier> {
+pub(crate) fn er_table_name(
+    read: &ast_unresolved::Chain,
+) -> Result<delightql_types::SqlIdentifier> {
     match read.as_read_relation() {
         Some(ast_unresolved::Relation::Ground {
             mention: ast_unresolved::GroundMention::Named { identifier, .. },
@@ -1873,12 +1230,9 @@ fn expand_er_join_chain(
     relations: Vec<ast_unresolved::Chain>,
     spellings: &[String],
     context: &ast_unresolved::ErContextSpec,
-    registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[crate::names::ColId]>,
-    config: &ResolutionConfig,
-    grounding: Option<&ast_unresolved::GroundedPath>,
+    fold: &mut ResolverFold,
     endpoints_only: Option<Vec<String>>,
-) -> Result<(ast_resolved::Chain, BubbledState)> {
+) -> Result<ResolvedRelation> {
     if relations.len() < 2 || spellings.len() != relations.len() {
         return Err(DelightQLError::validation_error(
             "ER-join chain requires at least two relations",
@@ -1915,244 +1269,114 @@ fn expand_er_join_chain(
         }
     }
 
+    // An outer-marked peer keeps every left row across ONE edge; a longer
+    // walk has no ruled composition for the mark yet.
+    if relations.len() > 2 && relations.iter().any(er_peer_outer) {
+        return Err(DelightQLError::validation_error_categorized(
+            "grounding/er/outer_endpoint",
+            "an outer-marked peer stands in an edge chain; the mark composes              across one edge only",
+            "mark the peer of a single edge, or join the marked access              separately",
+        ));
+    }
+
     // The alias is OUTSIDE the term: selection used the spellings;
     // exports answer to the endpoint aliases, threaded after resolution.
     let (left_endpoint_name, left_endpoint_alias) = er_endpoint(&relations[0]);
     let (right_endpoint_name, right_endpoint_alias) =
         er_endpoint(relations.last().expect("len checked"));
 
-    // If no resolution_namespace is set, use enlisted-scope edge lookup only.
-    // Edges from non-enlisted namespaces are NOT visible at the call site —
-    // the caller must enlist!() the namespace that declares them.
-    // (When resolution_namespace IS set, lookup_er_rule_for_namespace handles scoping.)
-    let effective_config: std::borrow::Cow<'_, ResolutionConfig>;
-    if config.resolution_namespace.is_none() {
-        let engaged_rule =
-            registry
-                .consult
-                .lookup_er_rule(&context.context_name, &spellings[0], &spellings[1])?;
-        if let Some(rule) = engaged_rule {
-            effective_config = std::borrow::Cow::Owned(ResolutionConfig {
-                resolution_namespace: Some(rule.namespace.clone()),
-                ..config.clone()
-            });
-        } else {
-            effective_config = std::borrow::Cow::Borrowed(config);
-        }
-    } else {
-        effective_config = std::borrow::Cow::Borrowed(config);
-    }
-    let config = &*effective_config;
+    // THE TERMS OF THE PATH: each term's canonical spelling selects an
+    // edge rule; the table its read names is the endpoint a composed chain
+    // shares with its neighbor. One value per term, so an edge never
+    // stands beside terms other than the ones that selected it.
+    let terms: Vec<crate::defuse::er::ErTerm> = relations
+        .iter()
+        .zip(spellings)
+        .map(|(read, spelling)| {
+            crate::defuse::er::ErTerm::of(
+                spelling,
+                delightql_types::SqlIdentifier::new(er_endpoint(read).0),
+            )
+        })
+        .collect();
 
     // For the simple pair case (A & B), just expand the single rule body
     if relations.len() == 2 {
-        let (resolved_expr, mut bubbled) = expand_single_er_pair(
-            &spellings[0],
-            &spellings[1],
+        let resolved_expr = expand_single_er_pair(
+            terms[0].clone(),
+            terms[1].clone(),
             context,
-            registry,
-            outer_context,
-            config,
-            grounding,
+            fold,
+            er_peer_outer(&relations[1]).then_some(right_endpoint_name.as_str()),
         )?;
-        if let Some(published) = &endpoints_only {
-            if let Some(missing) =
-                er_export_endpoints(&mut bubbled, published, &registry.identities)
-            {
-                return Err(er_pair_schema_error(
-                    &missing,
-                    &context.context_name,
-                    format!("the edge body for ({}, {})", spellings[0], spellings[1]),
-                ));
-            }
-        }
         // The boundary stands BEFORE the aliases are threaded: an alias a
         // caller wrote outside the term names the EDGE, and threading it into
         // a body with no boundary over it renames the base table instead.
-        let resolved_expr = if endpoints_only.is_some() {
-            er_boundary_projection(resolved_expr, &bubbled.i_provide, &registry.identities)
-        } else {
-            resolved_expr
-        };
-        let (resolved_expr, bubbled) = er_thread_endpoint_aliases(
-            resolved_expr,
-            bubbled,
-            (&left_endpoint_name, &left_endpoint_alias),
-            (&right_endpoint_name, &right_endpoint_alias),
-            &registry.identities,
-        );
-        return Ok((resolved_expr, bubbled));
-    }
-
-    // For chains (A & B & C & ...), combine all pair bodies into one expression.
-    //
-    // Each pair's body is something like: `A(*), B(*), A.id = B.aid`
-    // For chains, consecutive pairs share an intermediate table (B appears in both
-    // (A,B) and (B,C) bodies). We flatten all bodies, deduplicate the shared tables,
-    // and build one combined expression that resolves cleanly through the pipeline.
-    let mut all_relations: Vec<ast_unresolved::Chain> = Vec::new();
-    let mut all_conditions: Vec<ast_unresolved::TruthExpression> = Vec::new();
-    let mut seen_table_names: std::collections::HashSet<delightql_types::SqlIdentifier> =
-        std::collections::HashSet::new();
-
-    for i in 0..relations.len() - 1 {
-        let left_name = spellings[i].clone();
-        let right_name = spellings[i + 1].clone();
-
-        let body_query = parse_er_rule_body(
-            &left_name,
-            &right_name,
-            context,
-            registry,
-            grounding,
-            config.resolution_namespace.as_deref(),
-        )?;
-
-        // Extract the relational expression from the query
-        let body_expr = match body_query.into_bare_body() {
-            Ok(expr) => expr,
-            Err(_) => return Err(DelightQLError::validation_error(
-                format!(
-                    "ER-rule body for ({}, {}) in context '{}' contains CTEs (not supported in chains)",
-                    left_name, right_name, context.context_name,
-                ),
-                "Invalid ER-rule body",
-            )),
-        };
-
-        // Flatten the body into relations and conditions
-        let pair_desc = format!("{left_name} & {right_name} in '::{}'", context.context_name);
-        let (body_rels, body_conds) = flatten_unresolved_body(body_expr, &pair_desc)?;
-
-        // Merge relations. Adjacent bodies share EXACTLY their common
-        // endpoint (this body's left term, introduced by the previous
-        // body): that one occurrence deduplicates, once. Any OTHER
-        // repeat — a self-join inside a body, a helper relation used by
-        // two bodies, a cyclic chain revisiting an endpoint — cannot be
-        // aliased apart during composition, and dropping it silently
-        // rewrites the join, so it refuses.
-        // The spelling carries the term shape ("components(*)"); the
-        // shared occurrence is keyed by the endpoint's TABLE name.
-        let shared_table = delightql_types::SqlIdentifier::new(er_endpoint(&relations[i]).0);
-        let mut shared_endpoint_budget = if i > 0 { 1usize } else { 0 };
-        for read in body_rels {
-            if let Ok(name) = er_table_name(&read) {
-                if seen_table_names.insert(name.clone()) {
-                    all_relations.push(read);
-                } else if shared_endpoint_budget > 0 && name == shared_table {
-                    shared_endpoint_budget -= 1;
-                } else {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "grounding/er/chain_shared_repeat",
-                        format!(
-                            "composing the chain repeats relation '{name}' beyond \
-                             the shared endpoint — the edge body for {pair_desc} \
-                             reintroduces it after an earlier body (or the same \
-                             body) already did. Adjacent edge bodies share only \
-                             their common endpoint; other repeats cannot be \
-                             aliased apart during composition. Restructure the \
-                             bodies, or call the edges directly with &"
-                        ),
-                        "a chain merges adjacent bodies on their shared endpoint only",
-                    ));
-                }
-            } else {
-                // Non-Ground relation — keep it unconditionally
-                all_relations.push(read);
-            }
-        }
-
-        // Keep all conditions (conditions from different pairs don't duplicate)
-        all_conditions.extend(body_conds);
-    }
-
-    // Rebuild a single unresolved expression from the combined parts
-    let combined_expr = rebuild_flat_expression(all_relations, all_conditions)?;
-
-    // Add self-aliases and resolve through the pipeline (same path as single-pair)
-    let combined_query =
-        add_self_aliases_to_query(ast_unresolved::Query::relational(combined_expr));
-
-    // Determine effective grounding (same logic as expand_single_er_pair)
-    // Use the first pair's rule to determine the namespace for grounding.
-    let first_rule = if let Some(ns) = &config.resolution_namespace {
-        registry.consult.lookup_er_rule_for_namespace(
-            &context.context_name,
-            &spellings[0],
-            &spellings[1],
-            ns,
-        )?
-    } else {
-        registry
-            .consult
-            .lookup_er_rule(&context.context_name, &spellings[0], &spellings[1])?
-    }
-    .ok_or_else(|| {
-        er_edge_miss_error(
-            registry,
-            &context.context_name,
-            &spellings[0],
-            &spellings[1],
-        )
-    })?;
-    let rule_ns = first_rule.namespace.clone();
-    let auto_grounding = registry
-        .consult
-        .get_namespace_default_data_ns(&rule_ns)
-        .and_then(|data_ns_fq| {
-            let data_ns = ast_unresolved::NamespacePath::from_fq_string(&data_ns_fq).ok()?;
-            let grounded_ns = ast_unresolved::NamespacePath::from_fq_string(&rule_ns).ok()?;
-            Some(ast_unresolved::GroundedPath {
-                data_ns,
-                grounded_ns: vec![grounded_ns],
-            })
-        });
-    let effective_grounding = auto_grounding.as_ref().or(grounding);
-
-    let (resolved_query, body_bubbled) = resolve_query_inline(
-        combined_query,
-        registry,
-        outer_context,
-        config,
-        effective_grounding,
-    )
-    .map_err(|e| {
-        DelightQLError::database_error(
-            format!(
-                "Error resolving ER-chain body in context '{}': {}",
-                context.context_name, e
-            ),
-            e.to_string(),
-        )
-    })?;
-
-    match resolved_query.into_bare_body() {
-        Ok(expr) => {
-            let mut body_bubbled = body_bubbled;
-            if let Some(published) = &endpoints_only {
-                if let Some(missing) =
-                    er_export_endpoints(&mut body_bubbled, published, &registry.identities)
-                {
+        let resolved_expr = match &endpoints_only {
+            Some(published) => {
+                let mut missing = None;
+                let bounded = er_export_endpoints(
+                    resolved_expr,
+                    published,
+                    &[left_endpoint_alias.clone(), right_endpoint_alias.clone()],
+                    &fold.core.identities,
+                    &mut missing,
+                )?;
+                if let Some(missing) = missing {
                     return Err(er_pair_schema_error(
                         &missing,
                         &context.context_name,
-                        "the composed chain".to_string(),
+                        format!("the edge body for ({}, {})", spellings[0], spellings[1]),
                     ));
                 }
+                bounded
             }
-            let expr = if endpoints_only.is_some() {
-                er_boundary_projection(expr, &body_bubbled.i_provide, &registry.identities)
-            } else {
-                expr
+            None => resolved_expr,
+        };
+        return er_thread_endpoint_aliases(
+            resolved_expr,
+            (&left_endpoint_name, &left_endpoint_alias),
+            (&right_endpoint_name, &right_endpoint_alias),
+            &fold.core.identities,
+        );
+    }
+
+    // For chains (A & B & C & ...), the authority admits and opens EVERY
+    // consecutive pair's rule, links the admitted edges (adjacency and the
+    // shared endpoint derived from the terms each edge carries), merges
+    // the opened bodies — the ER consumer's own law — and resolves the
+    // combined body under the first pair's declared grounding.
+    let resolved_query = crate::defuse::er::use_er_chain(fold, &context.context_name, &terms)?;
+
+    match resolved_query.into_relational_body() {
+        Ok(expr) => {
+            let expr = match &endpoints_only {
+                Some(published) => {
+                    let mut missing = None;
+                    let bounded = er_export_endpoints(
+                        expr,
+                        published,
+                        &[left_endpoint_alias.clone(), right_endpoint_alias.clone()],
+                        &fold.core.identities,
+                        &mut missing,
+                    )?;
+                    if let Some(missing) = missing {
+                        return Err(er_pair_schema_error(
+                            &missing,
+                            &context.context_name,
+                            "the composed chain".to_string(),
+                        ));
+                    }
+                    bounded
+                }
+                None => expr,
             };
-            let (expr, body_bubbled) = er_thread_endpoint_aliases(
+            er_thread_endpoint_aliases(
                 expr,
-                body_bubbled,
                 (&left_endpoint_name, &left_endpoint_alias),
                 (&right_endpoint_name, &right_endpoint_alias),
-                &registry.identities,
-            );
-            Ok((expr, body_bubbled))
+                &fold.core.identities,
+            )
         }
         Err(_) => Err(DelightQLError::validation_error(
             format!(
@@ -2164,43 +1388,28 @@ fn expand_er_join_chain(
     }
 }
 
-/// The transformer reads the pipe node's OWN schema, not the bubbled
-/// state — after stamping and alias-threading, the endpoints-only
-/// pipe's schema syncs from the threaded columns so both agree.
-fn er_sync_pipe_schema(
-    expr: ast_resolved::Chain,
-    bubbled: &BubbledState,
-    identities: &crate::names::Registry,
-) -> ast_resolved::Chain {
-    let mut expr = expr;
-    if let Some(ast_resolved::Continuation::Pipe { cpr_schema, .. }) = expr.continuations.last_mut()
-    {
-        *cpr_schema = identities
-            .common_scope(&bubbled.i_provide)
-            .expect("an ER endpoint projection has one heading");
-    }
-    expr
-}
-
 /// Rename endpoint tables to their user aliases throughout a resolved
 /// ER result (exports answer to the alias; selection already happened
 /// by spelling).
 fn er_thread_endpoint_aliases(
-    mut expr: ast_resolved::Chain,
-    mut bubbled: BubbledState,
+    resolved: ResolvedRelation,
     left: (&str, &Option<delightql_types::SqlIdentifier>),
     right: (&str, &Option<delightql_types::SqlIdentifier>),
-    identities: &crate::names::Registry,
-) -> (ast_resolved::Chain, BubbledState) {
-    if let (name, Some(alias)) = left {
-        expr = rename_in_resolved_expr(expr, name, alias, identities);
-        rename_bubbled_columns(&mut bubbled, name, alias, identities);
-    }
-    if let (name, Some(alias)) = right {
-        expr = rename_in_resolved_expr(expr, name, alias, identities);
-        rename_bubbled_columns(&mut bubbled, name, alias, identities);
-    }
-    (expr, bubbled)
+    identities: &crate::relation::Planning,
+) -> Result<ResolvedRelation> {
+    // The renames touch the base tables INSIDE the chain; the boundary
+    // standing outermost — and the endpoint routes bound on it, already
+    // spelled with the aliases the exports were derived under — publish
+    // nothing new, so what answers over the result stays what answered.
+    resolved.republished_within(None, identities, |mut expr| {
+        if let (name, Some(alias)) = left {
+            expr = rename_in_resolved_expr(expr, name, alias, identities)?;
+        }
+        if let (name, Some(alias)) = right {
+            expr = rename_in_resolved_expr(expr, name, alias, identities)?;
+        }
+        Ok(expr)
+    })
 }
 
 /// `&&` composes RELATIONS, not syntax: each hop
@@ -2213,40 +1422,47 @@ fn er_thread_endpoint_aliases(
 fn compose_er_chain_relational(
     path: &[String],
     hop_tables: &[String],
+    endpoint_aliases: (
+        &Option<delightql_types::SqlIdentifier>,
+        &Option<delightql_types::SqlIdentifier>,
+    ),
     context: &ast_unresolved::ErContextSpec,
-    registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[crate::names::ColId]>,
-    config: &ResolutionConfig,
-    grounding: Option<&ast_unresolved::GroundedPath>,
-) -> Result<(ast_resolved::Chain, BubbledState)> {
+    fold: &mut ResolverFold,
+) -> Result<ResolvedRelation> {
     use ast_resolved::Chain as RE;
-    let identity_arena = std::rc::Rc::clone(&registry.identities);
+    let identity_arena = fold.core.identities;
     // Reads the name, never interns it: this asks a question per column per
-    // hop, and interning appends a spelling every time it is asked.
-    let belongs_to = |column: crate::names::ColId, table: &str| {
+    // hop, and interning appends a spelling every time it is asked. The
+    // question itself is `er_endpoint_of`'s — the same one the edge boundary
+    // asks — so a path and its own hops cannot disagree about which endpoint
+    // a column belongs to.
+    let belongs_to = |column: crate::relation::PortId,
+                      relation: &crate::relation::SemanticRelation,
+                      table: &str| {
         let Some(endpoint) = identity_arena.known_sym(table, false) else {
             return false;
         };
-        matches!(
-            identity_arena.addressing(column),
-            crate::names::Addressing::AnsweringTo(answer)
-                | crate::names::Addressing::BareAnswering(answer)
-                if answer == endpoint
-        )
+        er_endpoint_of(&identity_arena, relation, column, &[endpoint]).is_some()
     };
     let mut composed: Option<RE> = None;
-    let mut all_columns: Vec<crate::names::ColId> = Vec::new();
-    let mut chain_scope: Option<crate::names::ScopeId> = None;
+    let mut all_columns: Vec<crate::relation::PortId> = Vec::new();
+    let mut all_relation: Option<crate::relation::SemanticRelation> = None;
 
     for i in 0..path.len() - 1 {
-        let (hop_expr, mut hop_bubbled) = expand_single_er_pair(
-            &path[i],
-            &path[i + 1],
+        let hop_expr = expand_single_er_pair(
+            crate::defuse::er::ErTerm::of(
+                &path[i],
+                delightql_types::SqlIdentifier::new(hop_tables[i].clone()),
+            ),
+            crate::defuse::er::ErTerm::of(
+                &path[i + 1],
+                delightql_types::SqlIdentifier::new(hop_tables[i + 1].clone()),
+            ),
             context,
-            registry,
-            outer_context,
-            config,
-            grounding,
+            fold,
+            // A transitive walk's peers cannot carry the mark; the
+            // normalizer refuses the spelling before this road runs.
+            None,
         )?;
         // The answering channel is the pairing key: stamp each hop's
         // columns with their endpoint names (the len==2 road's caller
@@ -2258,10 +1474,10 @@ fn compose_er_chain_relational(
         // the un-narrowed, un-stamped body and carry a path whose outer
         // endpoint quietly went missing — a wrong answer where the same edge
         // written directly is a refusal.
-        if let Some(missing) = er_export_endpoints(
-            &mut hop_bubbled,
+        if let Some(missing) = er_missing_endpoint(
             &[hop_tables[i].clone(), hop_tables[i + 1].clone()],
-            &registry.identities,
+            &fold.core.identities,
+            hop_expr.semantic_relation(),
         ) {
             return Err(er_pair_schema_error(
                 &missing,
@@ -2273,54 +1489,28 @@ fn compose_er_chain_relational(
                 ),
             ));
         }
-        let source_scope = registry
-            .identities
-            .common_scope(&hop_bubbled.i_provide)
-            .unwrap_or_else(|| {
-                registry.identities.mint_scope(
-                    crate::names::ScopeOrigin::AnonRelation,
-                    crate::names::Hint::None,
-                    None,
-                )
-            });
-        let chain = *chain_scope.get_or_insert(source_scope);
-        let hop_scope = registry.identities.mint_derived_scope(
-            crate::names::ScopeOrigin::ErHop {
-                chain,
-                hop: i as u16,
-            },
-            crate::names::Hint::Prefix("_er_hop"),
-        );
-        hop_bubbled.i_provide = hop_bubbled
-            .i_provide
-            .into_iter()
-            .map(|column| {
-                registry.identities.republish_column(
-                    column,
-                    hop_scope,
-                    crate::names::Republish::Rename,
-                    registry.identities.published(column),
-                    registry.identities.addressing(column),
-                    |_| {},
-                )
-            })
-            .collect();
-        let hop_rel = RE::relation(ast_resolved::Relation::InnerRelation {
-            pattern: ast_resolved::InnerRelationPattern::UncorrelatedDerivedTable {
-                identifier: ast_resolved::QualifiedName {
-                    namespace_path: ast_resolved::NamespacePath::empty(),
-                    name: hop_tables[i].clone().into(),
+        // The hop stands on the body it just resolved. Exporting a later hop
+        // over the FIRST body's relation would publish the first hop's
+        // positions under every hop's name, so the path's far endpoint would
+        // have no column to keep.
+        let hop_rel = RE::ground(fold.core.identities.authority().exporting_head(
+            GroundForm::Reference(ast_resolved::Relation::InnerRelation {
+                pattern: ast_resolved::InnerRelationPattern::UncorrelatedDerivedTable {
+                    identifier: ast_resolved::QualifiedName {
+                        namespace_path: ast_resolved::NamespacePath::empty(),
+                        name: hop_tables[i].clone().into(),
+                    },
+                    subquery: Box::new(hop_expr.into_body()),
+                    is_consulted_view: false,
                 },
-                subquery: Box::new(hop_expr),
-                is_consulted_view: false,
-            },
-            preminted_scope: Some(hop_scope),
-            alias: None,
-            outer: false,
-            cpr_schema: hop_scope,
-        });
+                alias: None,
+                outer: false,
+            }),
+            crate::relation::form::ExportWhy::ErHop { hop: i as u16 },
+        )?);
+        let hop_scope = hop_rel.semantic_relation();
 
-        let hop_columns = hop_bubbled.i_provide.clone();
+        let hop_columns = crate::relation::published_ports(&fold.core.identities, &hop_scope)?;
 
         if let Some(acc) = composed.take() {
             let shared = &hop_tables[i];
@@ -2328,15 +1518,15 @@ fn compose_er_chain_relational(
             for right in hop_columns
                 .iter()
                 .copied()
-                .filter(|column| belongs_to(*column, shared))
+                .filter(|column| belongs_to(*column, &hop_scope, shared))
             {
-                let name = registry.identities.published_sym(right);
+                let name = fold.core.identities.published_sym(right.column());
                 let matches: Vec<_> = all_columns
                     .iter()
                     .copied()
                     .filter(|column| {
-                        belongs_to(*column, shared)
-                            && registry.identities.published_sym(*column) == name
+                        all_relation.is_some_and(|acc| belongs_to(*column, &acc, shared))
+                            && fold.core.identities.published_sym(column.column()) == name
                     })
                     .collect();
                 let [left] = matches.as_slice() else {
@@ -2352,9 +1542,9 @@ fn compose_er_chain_relational(
                             crate::probe::probe!(
                                 er,
                                 "  acc {column:?} published={:?} addressing={:?} answers_to={}",
-                                registry.identities.published_sym(*column),
-                                registry.identities.addressing(*column),
-                                belongs_to(*column, shared)
+                                fold.core.identities.published_sym(column.column()),
+                                fold.core.identities.addressing(column.column()),
+                                all_relation.is_some_and(|acc| belongs_to(*column, &acc, shared))
                             );
                         }
                     });
@@ -2365,10 +1555,7 @@ fn compose_er_chain_relational(
                 };
                 let reference = |column| {
                     Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
-                        NamedReference(ColumnOccurrence {
-                            column,
-                            explicit_qualifier: false,
-                        }),
+                        NamedReference(ColumnOccurrence::engine(column)),
                     )))
                 };
                 conditions.push(ast_resolved::TruthExpression::Comparison(Comparison {
@@ -2377,109 +1564,106 @@ fn compose_er_chain_relational(
                     right: reference(right),
                 }));
             }
-            let join_scope = registry.identities.mint_derived_scope(
-                crate::names::ScopeOrigin::Wrap {
-                    input: registry
-                        .identities
-                        .common_scope(&all_columns)
-                        .expect("accumulated ER chain has one heading"),
-                    why: crate::names::WrapReason::Projection,
+            let authority = fold.core.identities.authority();
+            let left_relation = acc.semantic_relation();
+            let right_relation = hop_rel.semantic_relation();
+            let _ = left_relation;
+            let mut joined_expr = authority.extend(
+                acc,
+                crate::relation::builder::StepOp::Join {
+                    rhs: hop_rel,
+                    // The hop pairing is attached as restrictions just
+                    // below; the step itself merges nothing.
+                    correlation: ast_resolved::MemberCorrelation::Cartesian(()),
+                    join_type: None,
+                    right: right_relation,
+                    kind: crate::relation::form::JoinKind::Inner,
+                    merged: &[],
                 },
-                crate::names::Hint::None,
-            );
-            let mut joined = Vec::new();
-            for column in all_columns.iter().chain(&hop_columns) {
-                joined.push(registry.identities.republish_column(
-                    *column,
-                    join_scope,
-                    crate::names::Republish::Passthrough,
-                    registry.identities.published(*column),
-                    registry.identities.addressing(*column),
-                    |_| {},
-                ));
-            }
-            let mut joined_expr = acc.then(ast_resolved::Continuation::Member {
-                rhs: hop_rel,
-                correlation: None,
-                join_type: None,
-                cpr_schema: join_scope,
-            });
+            )?;
+            let join_scope = joined_expr.semantic_relation();
             for condition in conditions {
-                joined_expr = joined_expr.then(ast_resolved::Continuation::Restrict {
-                    condition: condition,
+                joined_expr = joined_expr.transparently(ast_resolved::Transparent::Restrict {
+                    condition,
                     origin: crate::pipeline::asts::core::FilterOrigin::Generated,
-                    cpr_schema: join_scope,
                 });
             }
-            all_columns = joined;
+            all_columns = crate::relation::published_ports(&fold.core.identities, &join_scope)?;
+            all_relation = Some(join_scope);
             composed = Some(joined_expr);
         } else {
             all_columns = hop_columns;
+            all_relation = Some(hop_scope);
             composed = Some(hop_rel);
         }
     }
 
     let expr = composed.expect("path has at least two spellings");
+    let composed_relation = all_relation.expect("a composed path stands on a relation");
     let first_table = &hop_tables[0];
     let last_table = hop_tables.last().expect("nonempty");
-    let kept: Vec<_> = all_columns
-        .iter()
-        .copied()
-        .filter(|column| belongs_to(*column, first_table) || belongs_to(*column, last_table))
-        .collect();
-    let output_scope = registry.identities.mint_derived_scope(
-        crate::names::ScopeOrigin::Wrap {
-            input: registry
+    // The composed path publishes the OUTER endpoints only, and each kept
+    // position keeps answering to the endpoint it belongs to — the same
+    // boundary law a direct edge exports under, so a path and a pair reach
+    // their columns the same way.
+    let endpoint_named = |table: &str| {
+        identity_arena.known_sym(table, false).filter(|endpoint| {
+            all_columns.iter().any(|column| {
+                er_endpoint_of(&identity_arena, &composed_relation, *column, &[*endpoint]).is_some()
+            })
+        })
+    };
+    let mut exports = Vec::new();
+    let mut kept = Vec::new();
+    for (table, alias) in [
+        (first_table, endpoint_aliases.0),
+        (last_table, endpoint_aliases.1),
+    ] {
+        let Some(endpoint) = endpoint_named(table) else {
+            continue;
+        };
+        // THE ALIAS IS THE ENDPOINT'S NEW ANSWER. A path's boundary is the
+        // first relation the caller addresses, so an alias written outside
+        // the term replaces the answering channel here; there is no scope
+        // afterwards for a rename to land on.
+        let answer = match alias {
+            Some(alias) => fold
+                .core
                 .identities
-                .common_scope(&all_columns)
-                .expect("composed ER chain has one heading"),
-            why: crate::names::WrapReason::Projection,
-        },
-        crate::names::Hint::None,
-    );
-    let published: Vec<_> = kept
-        .iter()
-        .map(|column| {
-            registry.identities.republish_column(
-                *column,
-                output_scope,
-                crate::names::Republish::Passthrough,
-                registry.identities.published(*column),
-                registry.identities.addressing(*column),
-                |_| {},
-            )
-        })
-        .collect();
+                .canonical(identity_arena.intern(alias.as_str(), alias.is_stropped())),
+            None => endpoint,
+        };
+        for column in all_columns.iter().copied() {
+            if er_endpoint_of(&identity_arena, &composed_relation, column, &[endpoint]).is_none() {
+                continue;
+            }
+            if kept.contains(&column) {
+                continue;
+            }
+            kept.push(column);
+            exports.push(crate::relation::form::ErExport {
+                source: column,
+                endpoint: answer,
+            });
+        }
+    }
+    let input = expr.semantic_relation();
     // Each kept endpoint column republishes itself: the composed chain names
-    // nothing anew, so every item carries the occurrence just minted for it.
-    let projection: Vec<ast_resolved::OutItem> = kept
-        .iter()
-        .zip(published.iter())
-        .map(|(column, output)| {
-            ast_resolved::OutItem::plain(
-                ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                    ColumnOccurrence {
-                        column: *column,
-                        explicit_qualifier: false,
-                    },
-                ))),
-                Some(*output),
-            )
-        })
-        .collect();
-    let expr = expr.then(ast_resolved::Continuation::Pipe {
-        operator: ast_resolved::PipeOp::Project(
-            crate::pipeline::asts::vocabulary::Vec1::try_from_vec(projection)
-                .expect("the boundary projection publishes at least one column"),
-        ),
-        named: (),
-        cpr_schema: output_scope,
-    });
-
-    Ok((
+    // nothing anew, so every item carries the occurrence just minted for it —
+    // and the boundary and its projection are derived in ONE act.
+    let expr = fold.core.identities.authority().extend(
         expr,
-        BubbledState::resolved(published, &registry.identities),
-    ))
+        crate::relation::builder::StepOp::Republish {
+            of: crate::relation::builder::Republishing::ErBoundary(
+                crate::relation::form::ErBoundarySpec {
+                    input,
+                    exports: &exports,
+                },
+            ),
+            sources: kept,
+        },
+    )?;
+    ResolvedRelation::er_boundary(expr, &exports, &fold.core.identities)
 }
 
 /// Flatten an unresolved relational expression into a list of relations and conditions.
@@ -2489,7 +1673,7 @@ fn compose_er_chain_relational(
 /// stage, a set operation, a nested edge call — cannot be merged without
 /// discarding its semantics; it refuses instead (dropped semantics or a
 /// downstream panic is not an admissible fallback).
-fn flatten_unresolved_body(
+pub(crate) fn flatten_unresolved_body(
     expr: ast_unresolved::Chain,
     pair_desc: &str,
 ) -> Result<(
@@ -2525,13 +1709,13 @@ fn flatten_unresolved_body_inner(
         )
     };
 
-    if !matches!(expr.head, ast_unresolved::Grelex::Reference(_)) {
+    if !matches!(expr.head().form(), ast_unresolved::GroundForm::Reference(_)) {
         return Err(refuse("an anonymous table"));
     }
     let (read, steps) = expr.split_read();
     reads.push(read);
     for continuation in steps {
-        match continuation {
+        match continuation.into_form() {
             ast_unresolved::Continuation::Member { rhs, .. } => {
                 flatten_unresolved_body_inner(rhs, reads, conditions, pair_desc)?;
             }
@@ -2582,7 +1766,7 @@ fn flatten_unresolved_body_inner(
 /// Rebuild a flat unresolved expression from a list of relations and conditions.
 /// Produces a left-deep Join tree of all relations, then wraps with Filter layers
 /// for each condition.
-fn rebuild_flat_expression(
+pub(crate) fn rebuild_flat_expression(
     reads: Vec<ast_unresolved::Chain>,
     conditions: Vec<ast_unresolved::TruthExpression>,
 ) -> Result<ast_unresolved::Chain> {
@@ -2597,169 +1781,55 @@ fn rebuild_flat_expression(
         )
     })?;
     for read in iter {
-        expr = expr.then(ast_unresolved::Continuation::Member {
+        expr = expr.then(Step::authored(ast_unresolved::Continuation::Member {
             rhs: read,
             correlation: None,
             join_type: None,
-            cpr_schema: (),
-        });
+        }));
     }
 
     // Wrap with filter layers for each condition
     for cond in conditions {
-        expr = expr.then(ast_unresolved::Continuation::Restrict {
+        expr = expr.then(Step::authored(ast_unresolved::Continuation::Restrict {
             condition: cond,
             origin: crate::pipeline::asts::core::FilterOrigin::UserWritten,
-            cpr_schema: (),
-        });
+        }));
     }
 
     Ok(expr)
 }
 
-/// Look up an ER-rule for a pair and parse its body into an unresolved Query.
-/// Shared between `expand_single_er_pair` and the chain expansion in `expand_er_join_chain`.
-fn parse_er_rule_body(
-    left_name: &str,
-    right_name: &str,
+/// Expand a single ER pair (A, B) by looking up the rule and compiling its body.
+fn expand_single_er_pair(
+    left: crate::defuse::er::ErTerm,
+    right: crate::defuse::er::ErTerm,
     context: &ast_unresolved::ErContextSpec,
-    registry: &mut crate::resolution::EntityRegistry,
-    grounding: Option<&ast_unresolved::GroundedPath>,
-    resolution_namespace: Option<&str>,
-) -> Result<ast_unresolved::Query> {
-    let rule = if let Some(ns) = resolution_namespace {
-        registry.consult.lookup_er_rule_for_namespace(
-            &context.context_name,
-            left_name,
-            right_name,
-            ns,
-        )?
-    } else {
-        registry
-            .consult
-            .lookup_er_rule(&context.context_name, left_name, right_name)?
-    }
-    .ok_or_else(|| er_edge_miss_error(registry, &context.context_name, left_name, right_name))?;
-
-    let rule_ns = rule.namespace.clone();
-
-    let auto_grounding = registry
-        .consult
-        .get_namespace_default_data_ns(&rule_ns)
-        .and_then(|data_ns_fq| {
-            let data_ns = ast_unresolved::NamespacePath::from_fq_string(&data_ns_fq).ok()?;
-            let grounded_ns = ast_unresolved::NamespacePath::from_fq_string(&rule_ns).ok()?;
-            Some(ast_unresolved::GroundedPath {
-                data_ns,
-                grounded_ns: vec![grounded_ns],
-            })
-        });
-
-    let effective_grounding = auto_grounding.as_ref().or(grounding);
-
-    if let Some(grounding) = effective_grounding {
-        grounding::expand_consulted_view(&rule.definition, grounding).map_err(|e| {
+    fold: &mut ResolverFold,
+    outer_endpoint: Option<&str>,
+) -> Result<ResolvedRelation> {
+    let left_name = left.spelling.clone();
+    let right_name = right.spelling.clone();
+    let left_name = left_name.as_str();
+    let right_name = right_name.as_str();
+    // ONE ADMITTED edge use: the body opens, composes (self-aliases so
+    // qualified references like `users_t.id` keep working; the outer
+    // endpoint mark), and RESOLVES inside the authority under the
+    // declaration's own grounding.
+    let body_bubbled = crate::defuse::er::use_er_edge(fold, &context.context_name, left, right)?
+        .compose_standard(outer_endpoint)?
+        .resolve(fold, |e| {
             DelightQLError::database_error(
                 format!(
-                    "Error expanding ER-rule body for ({}, {}) in context '{}': {}",
-                    left_name, right_name, context.context_name, e
-                ),
-                e.to_string(),
-            )
-        })
-    } else {
-        let group = crate::ddl::reconstruct::group(&rule.definition).map_err(|e| {
-            DelightQLError::database_error(
-                format!(
-                    "Error parsing ER-rule body for ({}, {}) in context '{}': {}",
+                    "Error resolving ER-rule body for ({}, {}) in context '{}': {}",
                     left_name, right_name, context.context_name, e
                 ),
                 e.to_string(),
             )
         })?;
-        let mut clauses = group.spend_heads()?;
-        let clause = clauses.remove(0);
-        clause.into_query().ok_or_else(|| {
-            DelightQLError::parse_error(format!(
-                "ER-rule body for ({}, {}) in context '{}' is not a relational expression",
-                left_name, right_name, context.context_name,
-            ))
-        })
-    }
-}
-
-/// Expand a single ER pair (A, B) by looking up the rule and compiling its body.
-fn expand_single_er_pair(
-    left_name: &str,
-    right_name: &str,
-    context: &ast_unresolved::ErContextSpec,
-    registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[crate::names::ColId]>,
-    config: &ResolutionConfig,
-    grounding: Option<&ast_unresolved::GroundedPath>,
-) -> Result<(ast_resolved::Chain, BubbledState)> {
-    // Parse the rule body into an unresolved AST
-    let query = parse_er_rule_body(
-        left_name,
-        right_name,
-        context,
-        registry,
-        grounding,
-        config.resolution_namespace.as_deref(),
-    )?;
-
-    // Add self-aliases to Ground relations in the body (e.g., users_t(*) → users_t(*) as users_t).
-    // Without this, ConsultedView expansion assigns auto-generated aliases (t0, t1...)
-    // which break qualified references like `users_t.id` in the body's predicates.
-    let query = add_self_aliases_to_query(query);
-
-    // Determine effective grounding for resolution
-    let rule = if let Some(ns) = &config.resolution_namespace {
-        registry.consult.lookup_er_rule_for_namespace(
-            &context.context_name,
-            left_name,
-            right_name,
-            ns,
-        )?
-    } else {
-        registry
-            .consult
-            .lookup_er_rule(&context.context_name, left_name, right_name)?
-    }
-    .ok_or_else(|| er_edge_miss_error(registry, &context.context_name, left_name, right_name))?;
-    let rule_ns = rule.namespace.clone();
-    let auto_grounding = registry
-        .consult
-        .get_namespace_default_data_ns(&rule_ns)
-        .and_then(|data_ns_fq| {
-            let data_ns = ast_unresolved::NamespacePath::from_fq_string(&data_ns_fq).ok()?;
-            let grounded_ns = ast_unresolved::NamespacePath::from_fq_string(&rule_ns).ok()?;
-            Some(ast_unresolved::GroundedPath {
-                data_ns,
-                grounded_ns: vec![grounded_ns],
-            })
-        });
-    let effective_grounding = auto_grounding.as_ref().or(grounding);
-
-    // Resolve the parsed body through the pipeline.
-    // The body is a complete relational expression (e.g., a join with conditions).
-    // We inline the resolved expression directly — no ConsultedView wrapper needed.
-    let (resolved_query, body_bubbled) =
-        resolve_query_inline(query, registry, outer_context, config, effective_grounding).map_err(
-            |e| {
-                DelightQLError::database_error(
-                    format!(
-                        "Error resolving ER-rule body for ({}, {}) in context '{}': {}",
-                        left_name, right_name, context.context_name, e
-                    ),
-                    e.to_string(),
-                )
-            },
-        )?;
 
     // Extract the relational expression from the resolved query.
-    match resolved_query.into_bare_body() {
-        Ok(expr) => Ok((expr, body_bubbled)),
+    match body_bubbled.into_relational_body() {
+        Ok(resolved) => Ok(resolved),
         Err(_) => Err(DelightQLError::validation_error(
             format!(
                 "ER-rule body for ({}, {}) in context '{}' resolved to a non-relational query (CTEs in ER-rule bodies are not supported)",
@@ -2774,7 +1844,7 @@ fn expand_single_er_pair(
 /// Transforms `table(*)` into `table(*) as table`. This ensures ConsultedView expansion
 /// preserves the original table name as the SQL alias, so qualified references
 /// (like `table.col`) in predicates continue to resolve correctly.
-fn add_self_aliases_to_query(mut query: ast_unresolved::Query) -> ast_unresolved::Query {
+pub(crate) fn add_self_aliases_to_query(mut query: ast_unresolved::Query) -> ast_unresolved::Query {
     query.body = add_self_aliases_to_expr(query.body);
     query
 }
@@ -2791,11 +1861,11 @@ fn add_self_aliases_to_expr(mut expr: ast_unresolved::Chain) -> ast_unresolved::
     // The head's own access is not a step: it says what the read asks for,
     // so the run reaches past it to the relation it names.
     let span = expr.head_span();
-    let stop = expr.continuations[span..]
+    let stop = expr.continuations()[span..]
         .iter()
-        .rposition(|continuation| {
+        .rposition(|step| {
             !matches!(
-                continuation,
+                step.form(),
                 ast_unresolved::Continuation::Member { .. }
                     | ast_unresolved::Continuation::Restrict { .. }
                     | ast_unresolved::Continuation::Bound { .. }
@@ -2804,28 +1874,31 @@ fn add_self_aliases_to_expr(mut expr: ast_unresolved::Chain) -> ast_unresolved::
         })
         .map_or(span, |index| span + index + 1);
     let reached_head = stop == span;
-    expr.continuations = std::mem::take(&mut expr.continuations)
+    *expr.continuations_mut() = std::mem::take(expr.continuations_mut())
         .into_iter()
         .enumerate()
-        .map(|(index, continuation)| match continuation {
-            ast_unresolved::Continuation::Member {
-                rhs,
-                correlation,
-                join_type,
-                cpr_schema,
-            } if index >= stop => ast_unresolved::Continuation::Member {
-                rhs: add_self_aliases_to_expr(rhs),
-                correlation,
-                join_type,
-                cpr_schema,
-            },
-            other => other,
+        .map(|(index, step)| {
+            ast_unresolved::Step::authored(match step.into_form() {
+                ast_unresolved::Continuation::Member {
+                    rhs,
+                    correlation,
+                    join_type,
+                } if index >= stop => ast_unresolved::Continuation::Member {
+                    rhs: add_self_aliases_to_expr(rhs),
+                    correlation,
+                    join_type,
+                },
+                other => other,
+            })
         })
         .collect();
     if reached_head {
-        if let ast_unresolved::Grelex::Reference(rel) = expr.head {
-            expr.head = ast_unresolved::Grelex::Reference(add_self_alias_to_relation(rel));
-        }
+        *expr.head_mut() = ast_unresolved::Grelex::authored(match expr.head_mut().form().clone() {
+            ast_unresolved::GroundForm::Reference(rel) => {
+                ast_unresolved::GroundForm::Reference(add_self_alias_to_relation(rel))
+            }
+            literal => literal,
+        });
     }
     expr
 }
@@ -2841,7 +1914,6 @@ fn add_self_alias_to_relation(rel: ast_unresolved::Relation) -> ast_unresolved::
                     passthrough,
                 },
             outer,
-            cpr_schema,
         } => ast_unresolved::Relation::Ground {
             mention: ast_unresolved::GroundMention::Named {
                 alias: Some(identifier.name.clone()),
@@ -2850,7 +1922,6 @@ fn add_self_alias_to_relation(rel: ast_unresolved::Relation) -> ast_unresolved::
                 passthrough,
             },
             outer,
-            cpr_schema,
         },
         other => other,
     }
@@ -2868,34 +1939,31 @@ mod self_alias_tests {
                     name: name.into(),
                 }),
                 outer: false,
-                cpr_schema: (),
             },
             ast_unresolved::Access::All,
-            (),
         )
     }
 
     fn member(chain: ast_unresolved::Chain, rhs: ast_unresolved::Chain) -> ast_unresolved::Chain {
-        chain.then(ast_unresolved::Continuation::Member {
+        chain.then(Step::authored(ast_unresolved::Continuation::Member {
             rhs,
             correlation: None,
             join_type: None,
-            cpr_schema: (),
-        })
+        }))
     }
 
     fn qualify(chain: ast_unresolved::Chain) -> ast_unresolved::Chain {
-        chain.then(ast_unresolved::Continuation::Access {
+        chain.then(Step::authored(ast_unresolved::Continuation::Access {
             access: ast_unresolved::Access::All,
-            cpr_schema: (),
-        })
+            named: None,
+        }))
     }
 
     /// The aliases the walk baptized, head first, `None` where it left the
     /// relation unnamed.
     fn aliases(expr: &ast_unresolved::Chain) -> Vec<Option<String>> {
-        let mut out = vec![head_alias(&expr.head)];
-        for continuation in &expr.continuations {
+        let mut out = vec![head_alias(&expr.head())];
+        for continuation in expr.forms() {
             if let ast_unresolved::Continuation::Member { rhs, .. } = continuation {
                 out.extend(aliases(rhs));
             }
@@ -2904,9 +1972,10 @@ mod self_alias_tests {
     }
 
     fn head_alias(head: &ast_unresolved::Grelex) -> Option<String> {
-        match head {
-            ast_unresolved::Grelex::Reference(ast_unresolved::Relation::Ground {
-                mention, ..
+        match head.form() {
+            ast_unresolved::GroundForm::Reference(ast_unresolved::Relation::Ground {
+                mention,
+                ..
             }) => mention.alias().map(|alias| alias.to_string()),
             _ => None,
         }
@@ -2944,10 +2013,10 @@ mod self_alias_tests {
     #[test]
     fn an_authored_alias_survives() {
         let mut written = ground("a");
-        if let ast_unresolved::Grelex::Reference(ast_unresolved::Relation::Ground {
+        if let ast_unresolved::GroundForm::Reference(ast_unresolved::Relation::Ground {
             mention: ast_unresolved::GroundMention::Named { alias, .. },
             ..
-        }) = &mut written.head
+        }) = written.head_mut().form_mut()
         {
             *alias = Some("mine".into());
         }
@@ -2967,11 +2036,8 @@ fn expand_er_transitive_join(
     left_spelling: &str,
     right_spelling: &str,
     context: &ast_unresolved::ErContextSpec,
-    registry: &mut crate::resolution::EntityRegistry,
-    outer_context: Option<&[crate::names::ColId]>,
-    config: &ResolutionConfig,
-    grounding: Option<&ast_unresolved::GroundedPath>,
-) -> Result<(ast_resolved::Chain, BubbledState)> {
+    fold: &mut ResolverFold,
+) -> Result<ResolvedRelation> {
     // Extract table names (and alias/access) from endpoints
     let (left_name, left_alias) = match left.as_read_relation() {
         Some(ast_unresolved::Relation::Ground {
@@ -3007,61 +2073,16 @@ fn expand_er_transitive_join(
     // Build graph from all ER-rules in context (scoped to namespace if qualified).
     // ER-rules from non-enlisted namespaces are NOT visible at the call site —
     // the caller must enlist!() the namespace to access its ER-rules.
-    let (rules, effective_config) = if let Some(ns) = &config.resolution_namespace {
-        let r = registry
-            .consult
-            .lookup_er_rules_in_context_for_namespace(&context.context_name, ns)?;
-        (r, std::borrow::Cow::Borrowed(config))
-    } else {
-        let r = registry
-            .consult
-            .lookup_er_rules_in_context(&context.context_name)?;
-        if r.is_empty() {
-            return Err(er_edge_miss_error(
-                registry,
-                &context.context_name,
-                left_spelling,
-                right_spelling,
-            ));
-        }
-        // Check for cross-namespace ambiguity
-        let namespaces: std::collections::HashSet<&str> = r
-            .iter()
-            .map(|(_, _, entity)| entity.namespace.as_str())
-            .collect();
-        if namespaces.len() > 1 {
-            let ns_list: Vec<&str> = namespaces.into_iter().collect();
-            return Err(DelightQLError::validation_error(
-                format!(
-                    "Ambiguous ER-context '{}': rules found in multiple namespaces ({}). \
-                     Engage exactly one namespace or use qualified access (ns.view(*)).",
-                    context.context_name,
-                    ns_list.join(", "),
-                ),
-                "Ambiguous ER-context across namespaces",
-            ));
-        }
-        // Single namespace — scope all downstream lookups to it
-        let discovered_ns = r[0].2.namespace.clone();
-        let scoped_config = ResolutionConfig {
-            resolution_namespace: Some(discovered_ns),
-            ..config.clone()
-        };
-        (r, std::borrow::Cow::Owned(scoped_config))
-    };
-
-    if rules.is_empty() {
-        return Err(er_edge_miss_error(
-            registry,
-            &context.context_name,
-            left_spelling,
-            right_spelling,
-        ));
-    }
+    let rules = crate::defuse::er::er_context_edges(
+        fold,
+        &context.context_name,
+        left_spelling,
+        right_spelling,
+    )?;
 
     // Build adjacency list (undirected graph — rules are symmetric)
     let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
-    for (left_t, right_t, _) in &rules {
+    for (left_t, right_t) in &rules {
         adjacency
             .entry(left_t.clone())
             .or_default()
@@ -3100,10 +2121,8 @@ fn expand_er_transitive_join(
                         name: head.into(),
                     }),
                     outer: false,
-                    cpr_schema: (),
                 },
                 ast_unresolved::Access::All,
-                (),
             )
         })
         .collect();
@@ -3124,19 +2143,17 @@ fn expand_er_transitive_join(
                     .to_string()
             })
             .collect();
-        let (expr, mut bubbled) = compose_er_chain_relational(
+        let expr = compose_er_chain_relational(
             &path,
             &hop_tables,
+            (&left_alias, &right_alias),
             context,
-            registry,
-            outer_context,
-            &effective_config,
-            grounding,
+            fold,
         )?;
-        if let Some(missing) = er_export_endpoints(
-            &mut bubbled,
+        if let Some(missing) = er_missing_endpoint(
             &[left_name.clone(), right_name.clone()],
-            &registry.identities,
+            &fold.core.identities,
+            expr.semantic_relation(),
         ) {
             return Err(er_pair_schema_error(
                 &missing,
@@ -3144,25 +2161,20 @@ fn expand_er_transitive_join(
                 "the composed chain".to_string(),
             ));
         }
-        let (expr, bubbled) = er_thread_endpoint_aliases(
+        let expr = er_thread_endpoint_aliases(
             expr,
-            bubbled,
             (&left_name, &left_alias),
             (&right_name, &right_alias),
-            &registry.identities,
-        );
-        let expr = er_sync_pipe_schema(expr, &bubbled, &registry.identities);
-        return Ok((expr, bubbled));
+            &fold.core.identities,
+        )?;
+        return Ok(expr);
     }
     // Adjacent pair: the direct road, endpoints only.
     expand_er_join_chain(
         chain_relations,
         &path,
         context,
-        registry,
-        outer_context,
-        &effective_config,
-        grounding,
+        fold,
         Some(vec![left_name.clone(), right_name.clone()]),
     )
 }
@@ -3171,18 +2183,18 @@ fn expand_er_transitive_join(
 /// expression tree. Takes ownership and returns the modified expression.
 /// Used to apply user aliases from `&&` endpoints after the chain is resolved.
 fn rename_in_resolved_expr(
-    mut expr: ast_resolved::Chain,
+    expr: ast_resolved::Chain,
     old_name: &str,
     new_name: &delightql_types::SqlIdentifier,
-    identities: &crate::names::Registry,
-) -> ast_resolved::Chain {
+    identities: &crate::relation::Planning,
+) -> Result<ast_resolved::Chain> {
     // Renaming reaches the conjoined relations and stops where the chain
     // stops being a plain conjunction: past a pipe the heading is the
     // pipe's own, and nothing there answers to the old name.
     let mut reached_head = true;
     let mut prefix_len = 0;
-    for (index, continuation) in expr.continuations.iter().enumerate().rev() {
-        match continuation {
+    for (index, continuation) in expr.continuations().iter().enumerate().rev() {
+        match continuation.form() {
             ast_resolved::Continuation::Member { .. }
             | ast_resolved::Continuation::Restrict { .. } => {}
             _ => {
@@ -3192,208 +2204,61 @@ fn rename_in_resolved_expr(
             }
         }
     }
-    for continuation in expr.continuations[prefix_len..].iter_mut() {
-        match continuation {
-            ast_resolved::Continuation::Member {
-                rhs, cpr_schema, ..
-            } => {
-                // The placeholder stands in the slot for one statement while
-                // the relation is rewritten and put back. The member already
-                // carries what that slot publishes, so the placeholder says
-                // the same thing rather than inventing a relation.
-                let moved_schema = *cpr_schema;
-                let renamed = rename_in_resolved_expr(
-                    std::mem::replace(
-                        rhs,
-                        ast_resolved::Chain::ground(placeholder_head(moved_schema)),
-                    ),
-                    old_name,
-                    new_name,
-                    identities,
-                );
-                *rhs = renamed;
-                *cpr_schema = rename_schema(*cpr_schema, old_name, new_name, identities);
-            }
-            ast_resolved::Continuation::Restrict { cpr_schema, .. } => {
-                *cpr_schema = rename_schema(*cpr_schema, old_name, new_name, identities);
-            }
-            _ => {}
-        }
-    }
+    let old = identities.canonical(identities.intern(old_name, false));
+    let answer = identities.intern(new_name.as_str(), new_name.is_stropped());
+    let authority = identities.authority();
+    let expr = authority.realias_tail(expr, prefix_len, old, answer, |form| {
+        let ast_resolved::Continuation::Member {
+            rhs,
+            correlation,
+            join_type,
+        } = form
+        else {
+            unreachable!("only a member is handed here")
+        };
+        Ok(ast_resolved::Continuation::Member {
+            rhs: rename_in_resolved_expr(rhs, old_name, new_name, identities)?,
+            correlation,
+            join_type,
+        })
+    })?;
+    let mut expr = expr;
     if reached_head {
-        if let ast_resolved::Grelex::Reference(rel) = expr.head {
-            expr.head = ast_resolved::Grelex::Reference(match rel {
-                ast_resolved::Relation::Ground {
-                    mention,
-                    outer,
-                    cpr_schema,
-                } => ast_resolved::Relation::Ground {
-                    mention,
-                    outer,
-                    cpr_schema: rename_schema(cpr_schema, old_name, new_name, identities),
-                },
-                ast_resolved::Relation::ConsultedView {
-                    body,
-                    scoped,
-                    outer,
-                } => {
-                    let old = identities.canonical(identities.intern(old_name, false));
-                    let answers_to_old =
-                        identities
-                            .heading(scoped)
-                            .columns_seen()
-                            .into_iter()
-                            .any(|column| {
-                                matches!(
-                                    identities.addressing(column),
-                                    crate::names::Addressing::AnsweringTo(answer)
-                                        | crate::names::Addressing::BareAnswering(answer)
-                                        if answer == old
-                                )
-                            });
-                    if answers_to_old {
-                        ast_resolved::Relation::ConsultedView {
-                            body,
-                            scoped: rename_schema(scoped, old_name, new_name, identities),
-                            outer,
-                        }
-                    } else {
-                        ast_resolved::Relation::ConsultedView {
-                            body,
-                            scoped,
-                            outer,
-                        }
-                    }
-                }
-                ast_resolved::Relation::InnerRelation {
+        let renames_head = match expr.head().form() {
+            ast_resolved::GroundForm::Reference(ast_resolved::Relation::Ground { .. }) => true,
+            ast_resolved::GroundForm::Reference(ast_resolved::Relation::ConsultedView {
+                ..
+            }) => identities.answers_to(expr.head().result().scope()) == Some(old),
+            ast_resolved::GroundForm::Reference(ast_resolved::Relation::InnerRelation {
+                alias,
+                ..
+            }) => alias.as_ref().map(|a| a.to_string()).unwrap_or_default() == old_name,
+            ast_resolved::GroundForm::Reference(ast_resolved::Relation::FunctorCall { .. })
+            | ast_resolved::GroundForm::Literal(_) => false,
+        };
+        if renames_head {
+            let renamed = match expr.head().form().clone() {
+                ast_resolved::GroundForm::Reference(ast_resolved::Relation::InnerRelation {
                     pattern,
-                    preminted_scope,
-                    alias,
+                    alias: _,
                     outer,
-                    cpr_schema,
-                } => {
-                    let current = alias.as_ref().map(|a| a.to_string()).unwrap_or_default();
-                    if current == old_name {
-                        ast_resolved::Relation::InnerRelation {
-                            pattern,
-                            preminted_scope,
-                            alias: Some(new_name.clone()),
-                            outer,
-                            cpr_schema: rename_schema(cpr_schema, old_name, new_name, identities),
-                        }
-                    } else {
-                        ast_resolved::Relation::InnerRelation {
-                            pattern,
-                            preminted_scope,
-                            alias,
-                            outer,
-                            cpr_schema,
-                        }
-                    }
-                }
-                other => other,
-            });
+                }) => Some(ast_resolved::GroundForm::Reference(
+                    ast_resolved::Relation::InnerRelation {
+                        pattern,
+                        alias: Some(new_name.clone()),
+                        outer,
+                    },
+                )),
+                _ => None,
+            };
+            authority.realias_head(&mut expr, renamed, old, answer)?;
         }
     }
-    expr
+    Ok(expr)
 }
 
 /// A stand-in head used only while a member's chain is moved out for
 /// rewriting; it never survives the statement that creates it.
-fn placeholder_head(scope: crate::names::ScopeId) -> ast_resolved::Grelex {
-    ast_resolved::Grelex::Reference(ast_resolved::Relation::ground(false, scope))
-}
-
-/// Rename table references in a relation's published scope.
-fn rename_schema(
-    input: crate::names::ScopeId,
-    old_name: &str,
-    new_name: &delightql_types::SqlIdentifier,
-    identities: &crate::names::Registry,
-) -> crate::names::ScopeId {
-    let old = identities.canonical(identities.intern(old_name, false));
-    if identities.answers_to(input) != Some(old) {
-        return input;
-    }
-    let spelling = identities.intern(new_name.as_str(), new_name.is_stropped());
-    let output = identities.mint_derived_scope(
-        crate::names::ScopeOrigin::UserAlias { of: input },
-        crate::names::Hint::User(spelling),
-    );
-    identities.republish_heading(input, output, crate::names::Republish::Rename);
-    output
-}
-
-/// Rename table references in both halves of the bubbled lexical state.
-fn rename_bubbled_columns(
-    bubbled: &mut BubbledState,
-    old_name: &str,
-    new_name: &delightql_types::SqlIdentifier,
-    identities: &crate::names::Registry,
-) {
-    let old = identities.canonical(identities.intern(old_name, false));
-    let spelling = identities.intern(new_name.as_str(), new_name.is_stropped());
-    let mut scopes = Vec::new();
-    for column in &bubbled.i_provide {
-        let scope = identities.scope_of(*column);
-        let answering = matches!(
-            identities.addressing(*column),
-            crate::names::Addressing::AnsweringTo(answer)
-                | crate::names::Addressing::BareAnswering(answer)
-                if answer == old
-        );
-        if (identities.answers_to(scope) == Some(old) || answering) && !scopes.contains(&scope) {
-            scopes.push(scope);
-        }
-    }
-    let new = identities.canonical(spelling);
-    for input in scopes {
-        // The rename rides each column's ANSWERING channel, never the scope:
-        // both endpoints share one boundary heading, so a scope answering to
-        // the alias would put the other endpoint's columns under it too, and
-        // the second endpoint's rename would shadow the first's entirely.
-        // Only a column answering the old endpoint name changes its answer;
-        // its neighbors keep theirs.
-        let output = identities.mint_derived_scope(
-            crate::names::ScopeOrigin::UserAlias { of: input },
-            crate::names::Hint::None,
-        );
-        let old_heading = identities.heading(input).columns_seen();
-        let new_heading: Vec<_> = old_heading
-            .iter()
-            .map(|&column| {
-                let addressing = match identities.addressing(column) {
-                    crate::names::Addressing::AnsweringTo(answer) if answer == old => {
-                        crate::names::Addressing::AnsweringTo(new)
-                    }
-                    crate::names::Addressing::BareAnswering(answer) if answer == old => {
-                        crate::names::Addressing::BareAnswering(new)
-                    }
-                    other => other,
-                };
-                identities.republish_column(
-                    column,
-                    output,
-                    crate::names::Republish::Rename,
-                    identities.published(column),
-                    addressing,
-                    |_| {},
-                )
-            })
-            .collect();
-        for column in &mut bubbled.i_provide {
-            if let Some(position) = old_heading.iter().position(|old| old == column) {
-                *column = new_heading[position];
-            }
-        }
-        for scope in &mut bubbled.qualifier_scope {
-            if *scope == input {
-                *scope = output;
-            }
-        }
-    }
-}
-
 /// Path-finding in the ER graph: enumerate ALL simple paths between the
 /// endpoints. Exactly one → that path; zero → no-path error; two or
 /// more → the ambiguity error, regardless of relative length — the
@@ -3494,10 +2359,18 @@ fn bfs_path(adjacency: &HashMap<String, Vec<String>>, from: &str, to: &str) -> R
 /// excludes rather than enumerates. Those shapes yield nothing here, and the
 /// pivot refuses for want of a matching predicate rather than silently
 /// dropping the columns they would have omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PivotInWitness {
+    ColumnNames(Vec<String>),
+    UnnameableValues,
+}
+
+pub(crate) type PivotInWitnesses = HashMap<crate::names::Sym, PivotInWitness>;
+
 fn extract_in_predicate_values_from_resolved(
     source: &ast_resolved::Chain,
-    identities: &crate::names::Registry,
-) -> HashMap<crate::names::Sym, Vec<String>> {
+    identities: &crate::relation::Planning,
+) -> PivotInWitnesses {
     let mut result = HashMap::new();
     scan_resolved_for_in_predicates(source, &mut result, identities);
     result
@@ -3506,10 +2379,10 @@ fn extract_in_predicate_values_from_resolved(
 #[stacksafe::stacksafe]
 fn scan_resolved_for_in_predicates(
     expr: &ast_resolved::Chain,
-    result: &mut HashMap<crate::names::Sym, Vec<String>>,
-    identities: &crate::names::Registry,
+    result: &mut PivotInWitnesses,
+    identities: &crate::relation::Planning,
 ) {
-    for continuation in &expr.continuations {
+    for continuation in expr.forms() {
         match continuation {
             ast_resolved::Continuation::Restrict { condition, .. } => {
                 extract_in_from_resolved_boolean(condition, result, identities);
@@ -3536,8 +2409,8 @@ fn scan_resolved_for_in_predicates(
 #[stacksafe::stacksafe]
 fn extract_in_from_resolved_boolean(
     expr: &ast_resolved::TruthExpression,
-    result: &mut HashMap<crate::names::Sym, Vec<String>>,
-    identities: &crate::names::Registry,
+    result: &mut PivotInWitnesses,
+    identities: &crate::relation::Planning,
 ) {
     match expr {
         // ONE construct, one carrier: `in` is the same relational membership
@@ -3565,8 +2438,8 @@ fn extract_in_from_resolved_boolean(
                 let inner = unwrap_resolved_pipe(subquery.as_ref());
                 if let Some(rows) = extract_literal_rows_from_resolved(&inner) {
                     if !rows.is_empty() {
-                        if let Some(name) = identities.published_sym(column) {
-                            result.insert(name, rows);
+                        if let Some(name) = identities.published_sym(column.column()) {
+                            result.insert(name, PivotInWitness::ColumnNames(rows));
                         }
                     }
                 }
@@ -3593,9 +2466,9 @@ fn extract_in_from_resolved_boolean(
             };
             // A pivot's heading witness is a one-column IN, so only the rows
             // that carry exactly one ground value contribute.
-            let values: Vec<String> = rows
+            let values = rows
                 .iter()
-                .filter_map(|row| match row.0.clone().into_vec().as_slice() {
+                .map(|row| match row.0.clone().into_vec().as_slice() {
                     [ast_resolved::DomainExpression::Application(
                         ast_resolved::FunctionApplication::Ground(
                             ast_resolved::LiteralValue::String(text),
@@ -3603,12 +2476,15 @@ fn extract_in_from_resolved_boolean(
                     )] => Some(text.clone()),
                     _ => None,
                 })
-                .collect();
-            if values.is_empty() {
-                return;
-            }
-            if let Some(name) = identities.published_sym(*column) {
-                result.insert(name, values);
+                .collect::<Vec<_>>();
+            if let Some(name) = identities.published_sym(column.column()) {
+                let witness = values
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .filter(|values| !values.is_empty())
+                    .map(PivotInWitness::ColumnNames)
+                    .unwrap_or(PivotInWitness::UnnameableValues);
+                result.insert(name, witness);
             }
         }
         ast_resolved::TruthExpression::Conjunction(parts) => {
@@ -3636,14 +2512,14 @@ fn extract_in_from_resolved_boolean(
 
 /// The chain with its trailing pipes peeled: the relation the pipes shaped.
 fn unwrap_resolved_pipe(expr: &ast_resolved::Chain) -> ast_resolved::Chain {
-    let mut peeled = expr.continuations.as_slice();
-    while let Some((ast_resolved::Continuation::Pipe { .. }, rest)) = peeled.split_last() {
+    let mut peeled = expr.continuations();
+    while let Some((step, rest)) = peeled.split_last() {
+        if !matches!(step.form(), ast_resolved::Continuation::Pipe { .. }) {
+            break;
+        }
         peeled = rest;
     }
-    ast_resolved::Chain {
-        head: expr.head.clone(),
-        continuations: peeled.to_vec(),
-    }
+    expr.prefix(peeled.len())
 }
 
 /// Classifications of pipe operators in the chain before a DML terminal.
@@ -3682,37 +2558,31 @@ fn classify_single_dml_op(op: &ast_unresolved::PipeOp) -> DmlPipeKind {
 fn insert_filters_at_base(
     expr: ast_resolved::Chain,
     filters: Vec<ast_resolved::TruthExpression>,
+    identities: &crate::relation::Planning,
 ) -> Result<ast_resolved::Chain> {
     if filters.is_empty() {
         return Ok(expr);
     }
     // Filters land BELOW the pipes: a pipe publishes its own heading, so a
     // filter written against the base cannot address what the pipe made.
-    let mut expr = expr;
-    let mut trailing = Vec::new();
-    while matches!(
-        expr.continuations.last(),
-        Some(ast_resolved::Continuation::Pipe { .. })
-    ) {
-        trailing.push(expr.continuations.pop().expect("just matched"));
-    }
-    // A filter publishes what it filters. Every resolved relation carries
-    // a scope, so a base that cannot say what it publishes is an error and
-    // not a relation to invent a schema for.
-    let schema = extract_cpr_schema(&expr);
+    let (mut expr, trailing) = expr
+        .peel_while(|form| matches!(form, ast_resolved::Continuation::Pipe { .. }))
+        .into_parts();
+    // A filter publishes what it filters, so the pipes that came off still
+    // stand on the relation they stood on.
+
     for filter in filters {
-        expr = expr.then(ast_resolved::Continuation::Restrict {
+        expr = expr.transparently(ast_resolved::Transparent::Restrict {
             condition: filter,
             origin: ast_resolved::FilterOrigin::Generated,
-            cpr_schema: schema,
         });
     }
-    expr.continuations.extend(trailing.into_iter().rev());
-    Ok(expr)
+    identities.authority().reland_all(expr, trailing)
 }
 
 fn extract_literal_rows_from_resolved(expr: &ast_resolved::Chain) -> Option<Vec<String>> {
-    if let (ast_resolved::Grelex::Literal(anon), true) = (&expr.head, expr.continuations.is_empty())
+    if let (ast_resolved::GroundForm::Literal(anon), true) =
+        (expr.head().form(), expr.continuations().is_empty())
     {
         let rows = &anon.table.body.rows;
         let values: Vec<String> = rows

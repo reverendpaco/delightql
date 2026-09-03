@@ -26,6 +26,7 @@ pub fn create_temp_table_from_manifest(
     bootstrap_conn: &Connection,
     internal_ns_id: i32,
     entity_name: &str,
+    bin_registry: std::sync::Arc<crate::bin_cartridge::registry::BinCartridgeRegistry>,
 ) -> Result<Option<ManifestCreateResult>> {
     let schema_rows = manifest::read_schema(bootstrap_conn, internal_ns_id, entity_name)?;
     if schema_rows.is_empty() {
@@ -43,14 +44,14 @@ pub fn create_temp_table_from_manifest(
     let (resolved, identities) = resolver::resolve(unresolved)?;
     let sql_ast = transformer::transform(resolved, &identities)?;
     Ok(Some(ManifestCreateResult {
-        create_sql: generator::generate(&sql_ast, &identities)?,
+        create_sql: generator::generate(&sql_ast, &identities, bin_registry)?,
         schema_rows,
     }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::asts::{ColumnDef, CreateTableDef, DdlConstraint, DdlDefault};
+    use super::asts::{ColumnDef, CreateTableDef, DdlConstraint};
     use super::*;
 
     /// Helper: run the pipeline from a pre-built `CreateTableDef<Unresolved>` (test-only).
@@ -59,7 +60,11 @@ mod tests {
     ) -> Result<String> {
         let (resolved, identities) = resolver::resolve(def)?;
         let sql_ast = transformer::transform(resolved, &identities)?;
-        generator::generate(&sql_ast, &identities)
+        let mut registry = crate::bin_cartridge::registry::BinCartridgeRegistry::new();
+        registry.register_cartridge(crate::bin_cartridge::prelude::create_prelude_cartridge());
+        registry
+            .register_cartridge(crate::bin_cartridge::predicates::create_predicates_cartridge());
+        generator::generate(&sql_ast, &identities, std::sync::Arc::new(registry))
     }
 
     #[test]
@@ -175,10 +180,12 @@ mod tests {
         generate_create_table_from_def(def).unwrap()
     }
 
-    /// The two equalities are distinct operators and must stay distinct
-    /// through DDL lowering. `=` is null-safe everywhere but a join, so a
-    /// CHECK written with it rejects null; `==` is SQL equality, whose
-    /// answer on null is unknown, which a CHECK admits.
+    /// DelightQL's `=` is null-safe everywhere but a join, so a CHECK written
+    /// with it rejects null. The engine's own equality is the prelude
+    /// predicate `+sql_eq(@, v)`: it lowers to SQL `=` through the same
+    /// predicate identity the query road uses, and a CHECK OBSERVES it — a
+    /// positive sigma application collapses UNKNOWN — so the two are distinct
+    /// all the way to the emitted text.
     ///
     /// Collapsing them makes every equality CHECK more permissive than the
     /// language says, and makes `@ = null` a constraint that cannot fire.
@@ -191,12 +198,24 @@ mod tests {
         );
     }
 
+    /// A CHECK REJECTS ONLY FALSE. The positive proof reaches the constraint
+    /// as itself, so `state = 5` against a null answers UNKNOWN and the row
+    /// lands — which is what the author asked for by writing the target's own
+    /// equality instead of `=`. Presence is a separate constraint.
     #[test]
-    fn test_e2e_eqeq_lowers_sql_equality() {
-        let sql = check_text("@ == 5");
+    fn test_e2e_sql_eq_lowers_unobserved_sql_equality() {
+        let sql = check_text("+sql_eq(@, 5)");
         assert!(
             sql.contains("CHECK(state = 5)"),
-            "`==` must lower to SQL equality, got: {sql}"
+            "`+sql_eq` must lower to the bare SQL equality, got: {sql}"
+        );
+        assert!(
+            !sql.contains("IS TRUE"),
+            "a CHECK does not filter for TRUE: {sql}"
+        );
+        assert!(
+            !sql.contains("DISTINCT"),
+            "`+sql_eq` must never be null-safe: {sql}"
         );
     }
 
@@ -212,11 +231,33 @@ mod tests {
     }
 
     #[test]
-    fn test_e2e_nene_lowers_sql_inequality() {
-        let sql = check_text("@ !== 5");
+    fn test_e2e_sql_ne_lowers_unobserved_sql_inequality() {
+        let sql = check_text("+sql_ne(@, 5)");
         assert!(
             sql.contains("CHECK(state != 5)"),
-            "`!==` must lower to SQL inequality, got: {sql}"
+            "`+sql_ne` must lower to the bare SQL inequality, got: {sql}"
+        );
+        assert!(
+            !sql.contains("IS TRUE"),
+            "a CHECK does not filter for TRUE: {sql}"
+        );
+        assert!(
+            !sql.contains("DISTINCT"),
+            "`+sql_ne` must never be null-safe: {sql}"
+        );
+    }
+
+    /// NEGATIVE POLARITY KEEPS ITS OWN TWO-VALUED MEANING in a CHECK — "not
+    /// proven TRUE", spelled `IS NOT TRUE`. It does not become the target's
+    /// `NOT`, which would preserve UNKNOWN and answer a different question,
+    /// and the CHECK does not drop the observation the way it does for a
+    /// positive proof: there is nothing three-valued left to carry.
+    #[test]
+    fn a_negative_sigma_check_keeps_is_not_true() {
+        let sql = check_text("\\+sql_eq(@, 5)");
+        assert!(
+            sql.contains("CHECK((state = 5) IS NOT TRUE)"),
+            "`\\+sql_eq` must keep its two-valued observation, got: {sql}"
         );
     }
 
@@ -228,14 +269,14 @@ mod tests {
             "`@ != null` must promote to NOT NULL, got: {null_safe}"
         );
 
-        let sql_inequality = check_text("@ !== null");
+        let sql_inequality = check_text("+sql_ne(@, null)");
         assert!(
             sql_inequality.contains("CHECK(state != NULL)"),
-            "`@ !== null` must remain an SQL inequality CHECK, got: {sql_inequality}"
+            "`+sql_ne(@, null)` must remain an SQL inequality CHECK, got: {sql_inequality}"
         );
         assert!(
             !sql_inequality.contains("\"state\" INTEGER NOT NULL"),
-            "`@ !== null` must admit null rather than promote to NOT NULL, got: {sql_inequality}"
+            "`+sql_ne(@, null)` must not promote to NOT NULL, got: {sql_inequality}"
         );
     }
 

@@ -18,9 +18,7 @@ use super::{gap, Deferred, Normalizer};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::operators::{ColumnAlias, ColumnNameTemplate};
 use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
-use crate::pipeline::asts::core::OutValue;
 use crate::pipeline::asts::core::Reference;
-use crate::pipeline::asts::core::TruthAsValue;
 use crate::pipeline::asts::core::{
     DelegateSpec, DomainExpression, FunctionApplication, Glob, GroupSpec, MetadataGroup,
     MetadataOut, MetadataTarget, NameTarget, NamedOutItem, OneOut, OrderDirection, OrderingSpec,
@@ -116,8 +114,10 @@ impl<'t> Normalizer<'t> {
                 let function = self.callable(callable)?;
                 let selector = self.require(cover.selector(), "an embed cover has a selector")?;
                 let selector = self.selector(selector)?;
+                // The naming rides behind `as`, the same act as the rename
+                // cover's; the keyword itself is punctuation and is not read.
                 let alias_template = cover
-                    .child()
+                    .naming()
                     .map(|template| self.name_template(template))
                     .transpose()?
                     .map(ColumnAlias::Template);
@@ -159,6 +159,18 @@ impl<'t> Normalizer<'t> {
         }
     }
 
+    /// A written `as` naming, ADMITTED as a published name: the position
+    /// law runs (exact `_` and bare reserved words refuse; a strop stays an
+    /// exact name), and admission reserves the spelling against the
+    /// compilation's invented names.
+    fn published_naming(&self, naming: Option<cst::Naming<'t>>) -> Result<Option<SqlIdentifier>> {
+        let Some(naming) = naming else {
+            return Ok(None);
+        };
+        let name = self.require(naming.name(), "a naming carries a name")?;
+        Ok(Some(self.admit_published(self.identifier(name))?))
+    }
+
     fn rename_pair(&mut self, node: cst::RenamePair<'t>) -> Result<RenameSpec<Unresolved>> {
         let source = self.require(node.source(), "a rename names its source")?;
         let from = match source {
@@ -173,7 +185,8 @@ impl<'t> Normalizer<'t> {
         let target = self.require(node.target(), "a rename names its target")?;
         let to = match target {
             cst::NameTarget::Identifier(name) => {
-                NameTarget::Identifier(self.identifier(name).as_str().to_string())
+                let name = self.admit_rename(self.identifier(name))?;
+                NameTarget::Identifier(name.as_str().to_string())
             }
             cst::NameTarget::AsNameTemplate(template) => {
                 NameTarget::Template(ColumnAlias::Template(self.name_template(template)?))
@@ -218,12 +231,7 @@ impl<'t> Normalizer<'t> {
         // address case-sensitive, so folding either here would address a
         // column nobody named.
         let target = self.authored_column(target)?;
-        Ok(NamedOutItem {
-            expr,
-            naming: target.name,
-            qualifier: target.qualifier,
-            output: (),
-        })
+        Ok(NamedOutItem::authored(expr, target.name, target.qualifier))
     }
 
     /// Read `~>` as AND: the keys on the left are DISTINCTED ON, the right is
@@ -286,18 +294,8 @@ impl<'t> Normalizer<'t> {
                     }
                 }
                 let expr = self.require(value, "a group key has a value")?;
-                let naming = match naming {
-                    Some(naming) => {
-                        let name = self.require(naming.name(), "a naming carries a name")?;
-                        Some(self.identifier(name))
-                    }
-                    None => None,
-                };
-                Ok(OutItem::One(OneOut {
-                    expr,
-                    naming,
-                    output: (),
-                }))
+                let naming = self.published_naming(naming)?;
+                Ok(OutItem::one(OneOut::authored(expr, naming)))
             }
             cst::GroupKey::Spread(spread) => Ok(OutItem::Many(self.spread(spread)?)),
         }
@@ -344,11 +342,7 @@ impl<'t> Normalizer<'t> {
             // one column here, and nowhere else does it stand at all.
             cst::ReductionItem::MetadataGroup(group) => {
                 let (group, naming) = self.metadata_group(group)?;
-                Ok(Reduction::Metadata(MetadataOut {
-                    group,
-                    naming,
-                    output: (),
-                }))
+                Ok(Reduction::Metadata(MetadataOut::authored(group, naming)))
             }
         }
     }
@@ -387,18 +381,13 @@ impl<'t> Normalizer<'t> {
                 MetadataTarget::Group(Box::new(self.metadata_group(nested)?.0))
             }
         };
-        let naming = match naming {
-            Some(naming) => {
-                let name = self.require(naming.name(), "a naming carries a name")?;
-                Some(self.identifier(name))
-            }
-            None => None,
-        };
+        let naming = self.published_naming(naming)?;
         Ok((
             MetadataGroup {
                 key,
                 target,
                 cte_requirements: None,
+                summary: false,
             },
             naming,
         ))
@@ -423,18 +412,8 @@ impl<'t> Normalizer<'t> {
                     }
                 }
                 let expr = self.require(value, "an out item has a value")?;
-                let naming = match naming {
-                    Some(naming) => {
-                        let name = self.require(naming.name(), "a naming carries a name")?;
-                        Some(self.identifier(name))
-                    }
-                    None => None,
-                };
-                Ok(OutItem::One(OneOut {
-                    expr,
-                    naming,
-                    output: (),
-                }))
+                let naming = self.published_naming(naming)?;
+                Ok(OutItem::one(OneOut::authored(expr, naming)))
             }
             // Naming on a spread refuses by construction, in the grammar and
             // again in the type: `Many` has no naming to set.
@@ -442,51 +421,15 @@ impl<'t> Normalizer<'t> {
         }
     }
 
-    /// A PUBLISHED value, in the carrier the position admits: a domain
-    /// value, or the licensed crossing.
-    ///
-    /// The crossing is BUILT here, where it is written. Reading it back as a
-    /// domain expression and wrapping the result would put every published
-    /// truth behind the broad value carrier again, and the position's type
-    /// would be saying something the tree did not.
-    pub(crate) fn out_value(&mut self, node: cst::OutValue<'t>) -> Result<OutValue<Unresolved>> {
-        match node {
-            cst::OutValue::DomainExpression(expression) => {
-                // The pre-carved existence spelling is this position's
-                // crossing under its own surface — one occurrence, one
-                // carrier — so it is read as a crossing before the value
-                // road is taken.
-                if let Some(existence) = super::value::pre_carved_existence_value(expression) {
-                    return Ok(OutValue::Truth(TruthAsValue(
-                        self.exists_as_column(existence)?,
-                    )));
-                }
-                Ok(OutValue::Domain(self.domain_expression(expression)?))
-            }
-            cst::OutValue::TruthAsValue(truth) => Ok(OutValue::Truth(TruthAsValue(
-                self.truth_as_value_truth(truth)?,
-            ))),
-        }
-    }
-
-    /// WHAT A FORM COMPUTES, when the form names ONE value: a value rule's
-    /// body, and a case arm's result. Both admit the crossing for the same
-    /// reason an out item does — each names the one value its form denotes,
-    /// and the pre-carved existence spelling is written there.
-    ///
-    /// `f:( … ) : +orders(, … )` is that spelling; the grammar carves it out
-    /// precisely because these are value positions and a truth has no other
-    /// way in.
-    pub(crate) fn computed_value(
+    /// A PUBLISHED value: the one value the position computes, read through
+    /// the value spine. A crossed truth arrives as an ordinary value.
+    pub(crate) fn out_value(
         &mut self,
-        node: cst::DomainExpression<'t>,
-    ) -> Result<OutValue<Unresolved>> {
-        if let Some(existence) = super::value::pre_carved_existence_value(node) {
-            return Ok(OutValue::Truth(TruthAsValue(
-                self.exists_as_column(existence)?,
-            )));
+        node: cst::OutValue<'t>,
+    ) -> Result<DomainExpression<Unresolved>> {
+        match node {
+            cst::OutValue::DomainExpression(expression) => self.domain_expression(expression),
         }
-        Ok(OutValue::Domain(self.domain_expression(node)?))
     }
 
     /// ONE selector carrier: the items as written, each already classified
@@ -528,9 +471,9 @@ impl<'t> Normalizer<'t> {
                 Ok(vec![Continuation::Structural(StructuralStep {
                     form: StructuralForm::Ordering {
                         specs: self.ordering_specs(ordering)?,
+                        bound: None,
                     },
                     named: Default::default(),
-                    cpr_schema: (),
                 })])
             }
             cst::PipeStructural::Reposition(reposition) => {
@@ -547,7 +490,6 @@ impl<'t> Normalizer<'t> {
                 Ok(vec![Continuation::Structural(StructuralStep {
                     form: StructuralForm::Reposition { moves },
                     named: Default::default(),
-                    cpr_schema: (),
                 })])
             }
             // Payload only: the same expansion drill performs, then a
@@ -575,7 +517,6 @@ impl<'t> Normalizer<'t> {
                             )))),
                         )),
                         named: None,
-                        cpr_schema: (),
                     },
                 ])
             }
@@ -590,7 +531,6 @@ impl<'t> Normalizer<'t> {
                         schema: (),
                     },
                     named: Default::default(),
-                    cpr_schema: (),
                 })])
             }
         }
@@ -607,7 +547,6 @@ impl<'t> Normalizer<'t> {
             cst::PostfixOperator::Meta(_) => Ok(Continuation::Structural(StructuralStep {
                 form: StructuralForm::Meta,
                 named: Default::default(),
-                cpr_schema: (),
             })),
             cst::PostfixOperator::Witness(witness) => {
                 let polarity = self.require(witness.child(), "a witness carries a polarity")?;
@@ -616,14 +555,12 @@ impl<'t> Normalizer<'t> {
                         polarity: self.polarity(polarity)?,
                     },
                     named: Default::default(),
-                    cpr_schema: (),
                 }))
             }
             cst::PostfixOperator::SignedWitness(_) => {
                 Ok(Continuation::Structural(StructuralStep {
                     form: StructuralForm::SignedWitness,
                     named: Default::default(),
-                    cpr_schema: (),
                 }))
             }
             // `*` and `.(…)` are a dequalifying RUN, and a run is an access
@@ -718,9 +655,6 @@ impl<'t> Normalizer<'t> {
                             columns.push("_".to_string());
                             groundings.push((position.to_string(), value));
                         }
-                        cst::Slot::ConstraintTerm(cst::ConstraintTerm::TruthAsValue(_)) => {
-                            return Err(interior_slot_refusal(&column))
-                        }
                         cst::Slot::RenamedSlot(renamed) => {
                             return Err(self.renamed_slot_refusal(renamed))
                         }
@@ -739,7 +673,6 @@ impl<'t> Normalizer<'t> {
                     },
                 },
                 named: Default::default(),
-                cpr_schema: (),
             },
         ))
     }

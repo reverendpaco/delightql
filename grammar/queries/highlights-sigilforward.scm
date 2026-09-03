@@ -2,6 +2,7 @@
 (star_sigil) @variable.parameter
 (comma_sigil)@punctuation.delimiter
 (ho_rule "("@keyword")"@keyword )
+(ho_cte "("@keyword")"@keyword )
 (definition_neck) @punctuation.delimiter
 (metadata_sigil)@punctuation.special
 (effect_marker)@punctuation.special
@@ -10,7 +11,7 @@
 (separator) @punctuation.delimiter
 (comma_continuation (comma_sigil)@punctuation.special)
 (arrow) @punctuation.special
-(function_pipe_first) @punctuation.special
+(function_pipe_operator) @punctuation.special
 (goal_marker) @punctuation.special.directive
 (reduction_sigil) @punctuation.special
 (corresponding_union_sigil) @punctuation.special
@@ -24,7 +25,6 @@
 
 (existence (polarity)@keyword.special)
 (outer_marker)@keyword.special
-(exists_as_column (polarity)@keyword.special)
 (record_pattern ("{") @module.builtin (#set! "priority" 120)("}") @module.builtin(#set! "priority" 120))
 (induced_member
     (tuple "[" @module.builtin (#set! "priority" 120)"]" @module.builtin(#set! "priority" 120)))

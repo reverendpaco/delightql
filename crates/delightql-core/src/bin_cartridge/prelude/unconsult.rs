@@ -91,7 +91,9 @@ impl EffectExecutable for UnconsultPredicate {
 
 fn extract_string_literal(expr: &DomainExpression, param_name: &str) -> Result<String> {
     match expr {
-        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => Ok(s.clone()),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
+            Ok(s.clone())
+        }
         _ => Err(DelightQLError::database_error(
             format!(
                 "unconsult!() expects '{}' to be a string literal, got: {:?}",

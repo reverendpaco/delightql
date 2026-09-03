@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Definitions — a subject, a head, a neck, and a body.
+//! Definitions — a subject, a head, and a body.
 //!
 //! What leaves here is one CLAUSE per authored definition. Grouping clauses by
 //! subject and running the arity, name-offer, Ground-Position and heading
@@ -15,10 +15,10 @@
 use super::Normalizer;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::definitions::{
-    name_conflict, HeadItem, HeadItems, HoParam, Neck, Offered,
+    name_conflict, Fixpoint, HeadItem, HeadItems, HoParam, Offered, ResidualMode, ResidualSignature,
 };
 use crate::pipeline::asts::core::{
-    AnonRelation, AnonTable, Chain, ContextMode, DomainExpression, FunctionApplication, Grelex,
+    AnonRelation, AnonTable, Chain, ContextMode, DomainExpression, FunctionApplication, GroundForm,
     HeaderItem, Query, TabularBody, TabularRow, Unresolved,
 };
 use crate::pipeline::asts::core::{NamedReference, Reference};
@@ -43,24 +43,36 @@ impl<'t> Normalizer<'t> {
     // Rules
     // -----------------------------------------------------------------
 
+    /// A definition's subject name, ADMITTED: a defining head is a naming
+    /// position, so the position law runs (exact `_` and bare reserved
+    /// words refuse; a strop stays an exact name) and the spelling is
+    /// reserved against the compilation's invented names.
+    fn definition_subject(
+        &self,
+        node: cst::PredicateIdentifier<'t>,
+    ) -> Result<crate::pipeline::asts::core::QualifiedName> {
+        let mut name = self.qualified_name(node)?;
+        name.name = self.admit_definition(name.name)?;
+        Ok(name)
+    }
+
     fn rule_form(&mut self, node: cst::RuleForm<'t>) -> Result<ClauseDecl> {
         match node {
             cst::RuleForm::FoRule(rule) => {
                 let name = self.require(rule.name(), "a rule names its subject")?;
                 let head = self.require(rule.head(), "a rule has a head")?;
                 let body = self.require(rule.body(), "a rule has a body")?;
-                let name = self.qualified_name(name)?;
+                let name = self.definition_subject(name)?;
                 let heading = self.heading(head.into())?;
-                self.fixpoint_badge(heading.badged)?;
+                let fixpoint = heading.fixpoint;
                 let head = heading.head;
                 let query = self.relex_query(body)?;
                 let doc = self.doc_slot(rule.children().filter_map(doc_slot_of))?;
-                let neck = self.neck_of(rule.children().filter_map(neck_of))?;
                 Ok(self.clause(
                     DefKind::View,
                     DefSubject::Named(name.name.clone()),
                     head,
-                    neck,
+                    fixpoint,
                     DdlBody::Relational(query),
                     self.text(rule),
                     doc,
@@ -97,12 +109,11 @@ impl<'t> Normalizer<'t> {
                     Ok(DdlBody::Relational(n.relex_query(body)?))
                 })?;
                 let doc = self.doc_slot(rule.children().filter_map(ho_rule_doc))?;
-                let neck = self.neck_of(rule.children().filter_map(ho_rule_neck))?;
                 Ok(self.clause(
                     DefKind::HoView,
-                    DefSubject::Named(self.qualified_name(name)?.name.clone()),
+                    DefSubject::Named(self.definition_subject(name)?.name.clone()),
                     head,
-                    neck,
+                    Fixpoint::Bag,
                     relational,
                     self.text(rule),
                     doc,
@@ -149,15 +160,14 @@ impl<'t> Normalizer<'t> {
                 let parameterized = !params.is_empty();
                 let head = Head::signature(params).with_context(context);
                 let scalar = self.deferrable(parameterized, self.text(body), |n| {
-                    Ok(DdlBody::Scalar(n.computed_value(body)?))
+                    Ok(DdlBody::Scalar(n.domain_expression(body)?))
                 })?;
                 let doc = self.doc_slot(rule.children().filter_map(function_rule_doc))?;
-                let neck = self.neck_of(rule.children().filter_map(function_rule_neck))?;
                 Ok(self.clause(
                     DefKind::Function,
-                    DefSubject::Named(self.qualified_name(name)?.name.clone()),
+                    DefSubject::Named(self.definition_subject(name)?.name.clone()),
                     head,
-                    neck,
+                    Fixpoint::Bag,
                     scalar,
                     self.text(rule),
                     doc,
@@ -168,14 +178,13 @@ impl<'t> Normalizer<'t> {
             cst::RuleForm::ConstantRule(rule) => {
                 let name = self.require(rule.name(), "a constant names its subject")?;
                 let body = self.require(rule.body(), "a constant has a body")?;
-                let expression = self.computed_value(body)?;
+                let expression = self.domain_expression(body)?;
                 let doc = self.doc_slot(rule.children().filter_map(constant_doc))?;
-                let neck = self.neck_of(rule.children().filter_map(constant_neck))?;
                 Ok(self.clause(
                     DefKind::Function,
                     DefSubject::Named(self.identifier(name)),
                     Head::signature(Vec::new()),
-                    neck,
+                    Fixpoint::Bag,
                     DdlBody::Scalar(expression),
                     self.text(rule),
                     doc,
@@ -199,12 +208,11 @@ impl<'t> Normalizer<'t> {
                     }
                 }
                 let doc = self.doc_slot(rule.children().filter_map(sigma_doc))?;
-                let neck = self.neck_of(rule.children().filter_map(sigma_neck))?;
                 Ok(self.clause(
                     DefKind::Sigma,
-                    DefSubject::Named(self.qualified_name(name)?.name.clone()),
+                    DefSubject::Named(self.definition_subject(name)?.name.clone()),
                     Head::signature(params),
-                    neck,
+                    Fixpoint::Bag,
                     DdlBody::Truth(condition),
                     self.text(rule),
                     doc,
@@ -234,10 +242,11 @@ impl<'t> Normalizer<'t> {
                     // BinPseudoPredicate convention, `consult!` — so the
                     // `foo`/`foo!` collision rule and every demand that names a
                     // directive read the same bytes.
-                    DefSubject::Named(delightql_types::SqlIdentifier::new(self.effect_subject_name(name)?)),
+                    DefSubject::Named(delightql_types::SqlIdentifier::new(
+                        self.effect_subject_name(name)?,
+                    )),
                     head,
-                    // An effect rule's neck is spelled `:-` and nothing else.
-                    Neck::Bind,
+                    Fixpoint::Bag,
                     relational,
                     self.text(rule),
                     doc,
@@ -291,10 +300,75 @@ impl<'t> Normalizer<'t> {
     }
 
     /// A parameter a signature BAPTIZES. A ground constant is the clause's
-    /// member of the enumeration domain, and its AUTHORED token is the match
-    /// key — which is why a mention canonicalizes on the way in.
-    fn ho_param(&mut self, node: cst::HoParam<'t>) -> Result<HoParam> {
+    /// input-side match pattern, and its AUTHORED token is the match key —
+    /// which is why a mention canonicalizes on the way in.
+    pub(crate) fn ho_param(&mut self, node: cst::HoParam<'t>) -> Result<HoParam> {
         match node {
+            cst::HoParam::RuleParam(param) => {
+                let name = self.require(param.name(), "a rule parameter has a name")?;
+                let mut remaining = Vec::new();
+                for child in param.children() {
+                    let cst::RuleParamChild::RuleModeParam(mode) = child else {
+                        continue;
+                    };
+                    remaining.push(match mode {
+                        cst::RuleModeParam::OpenRelationParam(param) => {
+                            let name = self
+                                .require(param.name(), "a residual relation position has a name")?;
+                            ResidualMode::Relation {
+                                name: self.identifier(name),
+                                cols: HeadItems::Glob,
+                            }
+                        }
+                        cst::RuleModeParam::DeclaredRelationParam(param) => {
+                            let name = self
+                                .require(param.name(), "a residual relation position has a name")?;
+                            let cols = param
+                                .children()
+                                .filter_map(|child| match child {
+                                    cst::DeclaredRelationParamChild::Identifier(column) => {
+                                        Some(HeadItem::plumb(self.identifier(column)))
+                                    }
+                                    cst::DeclaredRelationParamChild::CommaSigil(_) => None,
+                                })
+                                .collect();
+                            ResidualMode::Relation {
+                                name: self.identifier(name),
+                                cols: HeadItems::Listed(cols),
+                            }
+                        }
+                        cst::RuleModeParam::ScalarParam(param) => {
+                            let name = self
+                                .require(param.child(), "a residual scalar position has a name")?;
+                            ResidualMode::Scalar {
+                                name: self.identifier(name),
+                            }
+                        }
+                    });
+                }
+                let mut output = Vec::new();
+                let mut glob = false;
+                for item in param.head() {
+                    match item {
+                        cst::RuleParamHead::Identifier(name) => {
+                            output.push(HeadItem::plumb(self.identifier(name)))
+                        }
+                        cst::RuleParamHead::Glob(_) => glob = true,
+                        cst::RuleParamHead::CommaSigil(_) => {}
+                    }
+                }
+                Ok(HoParam::Rule {
+                    name: self.identifier(name),
+                    signature: ResidualSignature {
+                        remaining,
+                        output: if glob {
+                            HeadItems::Glob
+                        } else {
+                            HeadItems::Listed(output)
+                        },
+                    },
+                })
+            }
             cst::HoParam::OpenRelationParam(param) => {
                 let name = self.require(param.name(), "a relation parameter has a name")?;
                 Ok(HoParam::Relation {
@@ -416,15 +490,15 @@ impl<'t> Normalizer<'t> {
             cst::FactLike::FactForm(fact) => {
                 let name = self.require(fact.name(), "a fact names its subject")?;
                 let body = self.require(fact.body(), "a fact has a body")?;
-                let subject_ident = self.qualified_name(name)?.name.clone();
+                let subject_ident = self.definition_subject(name)?.name.clone();
                 let subject = subject_ident.as_str().to_string();
                 let (table, row_offers) = self.fact_body(&subject, body)?;
                 let mut decl = self.clause(
                     DefKind::Fact,
                     DefSubject::Named(subject_ident),
                     Head::glob(),
-                    Neck::Assign,
-                    DdlBody::Relational(Query::relational(Chain::ground(Grelex::Literal(
+                    Fixpoint::Bag,
+                    DdlBody::Relational(Query::relational(Chain::authored(GroundForm::Literal(
                         AnonRelation::plain(table),
                     )))),
                     self.text(fact),
@@ -451,7 +525,7 @@ impl<'t> Normalizer<'t> {
                     }
                 }
                 let items = self.fact_header_items(body)?;
-                let subject_ident = self.qualified_name(name)?.name.clone();
+                let subject_ident = self.definition_subject(name)?.name.clone();
                 let subject = subject_ident.as_str().to_string();
                 let (table, row_offers) = self.fact_body(&subject, body)?;
                 // A parameterized fact's heading lives in its header; a datum
@@ -473,8 +547,8 @@ impl<'t> Normalizer<'t> {
                     DefKind::HoView,
                     DefSubject::Named(subject_ident),
                     Head::higher_order(params, items),
-                    Neck::Assign,
-                    DdlBody::Relational(Query::relational(Chain::ground(Grelex::Literal(
+                    Fixpoint::Bag,
+                    DdlBody::Relational(Query::relational(Chain::authored(GroundForm::Literal(
                         AnonRelation::plain(table),
                     )))),
                     self.text(fact),
@@ -564,7 +638,6 @@ impl<'t> Normalizer<'t> {
                     header: column_headers,
                     rows,
                 },
-                cpr_schema: (),
             },
             unconsumed,
         ))
@@ -637,12 +710,13 @@ impl<'t> Normalizer<'t> {
             Vec1::try_from_vec(node.outputs().map(|out| self.identifier(out)).collect()),
             "a fact function declares an output",
         )?;
-        let subject = self.qualified_name(name)?.name.clone();
+        let subject = self.definition_subject(name)?.name.clone();
         // A DECLARED NAME IS DECLARED ONCE, OVER THE WHOLE HEADING. The
-        // relational face publishes the inputs followed by the outputs as ONE
-        // heading, so the two lists are not two namespaces: a name repeated
-        // anywhere in them occupies two positions of that heading, and on the
-        // callable side leaves either a binder or a pick with two answers.
+        // finite relational face publishes the inputs followed by the outputs
+        // as ONE heading, so the two lists are not two namespaces: a name
+        // repeated anywhere in them occupies two positions of that heading,
+        // and on the callable side leaves either a binder or a pick with two
+        // answers.
         unique_heading(&subject, &inputs, &outputs)?;
 
         let mut arms = Vec::new();
@@ -670,7 +744,12 @@ impl<'t> Normalizer<'t> {
                     for result in node.outputs() {
                         produced.push(self.fact_function_output(&inputs, result)?);
                     }
-                    width(&subject, "default output row", outputs.len(), produced.len())?;
+                    width(
+                        &subject,
+                        "default output row",
+                        outputs.len(),
+                        produced.len(),
+                    )?;
                     default =
                         Some(self.require(Vec1::try_from_vec(produced), "a default produces")?);
                 }
@@ -684,13 +763,15 @@ impl<'t> Normalizer<'t> {
             DefKind::FactFunction,
             DefSubject::Named(subject),
             Head::glob(),
-            Neck::Assign,
-            DdlBody::FactFunction(FactFunctionMode {
-                inputs,
-                outputs,
-                arms,
-                default,
-            }),
+            Fixpoint::Bag,
+            DdlBody::FactFunction(
+                crate::pipeline::asts::core::FactFunctionDefinition::assemble(FactFunctionMode {
+                    inputs,
+                    outputs,
+                    arms,
+                    default,
+                }),
+            ),
             self.text(node),
             None,
         ))
@@ -700,11 +781,10 @@ impl<'t> Normalizer<'t> {
     ///
     /// INPUTS DETERMINE OUTPUTS is what the `->` declares, so the names it
     /// declares on the left are exactly the names an output cell may read.
-    /// They are the only ones: there is no enclosing row here — in the
-    /// relational face these cells are a fact's data, and in the callable
-    /// face the supplied argument row is all there is — so any other name
-    /// addresses nothing, and a qualifier addresses a relation that does not
-    /// exist.
+    /// They are the only ones: there is no enclosing row here — in a finite
+    /// relational face these cells are a fact's data, and in the callable face
+    /// the supplied argument row is all there is — so any other name addresses
+    /// nothing, and a qualifier addresses a relation that does not exist.
     ///
     /// The two faces stay one meaning because the binding is spent the same
     /// way in both: the relational face substitutes each arm's own ground
@@ -767,12 +847,11 @@ impl<'t> Normalizer<'t> {
         let right_spelling = crate::term_spec::canonicalize_term(self.text(right))?;
         let query = self.relex_query(body)?;
         let doc = self.doc_slot(node.children().filter_map(edge_doc))?;
-        let neck = self.neck_of(node.children().filter_map(edge_neck))?;
         Ok(self.clause(
             DefKind::Edge,
             DefSubject::edge(left_spelling, right_spelling, context),
             Head::glob(),
-            neck,
+            Fixpoint::Bag,
             DdlBody::Relational(query),
             self.text(node),
             doc,
@@ -783,13 +862,16 @@ impl<'t> Normalizer<'t> {
     // Shared clause assembly
     // -----------------------------------------------------------------
 
+    /// `fixpoint` is the flavor the AUTHORED head badged. Only a relational
+    /// rule head has a badge position — recursion is relation-form only — so
+    /// every other form states `Bag`, which is what an absent badge claims.
     #[allow(clippy::too_many_arguments)]
-    fn clause(
+    pub(crate) fn clause(
         &self,
         kind: DefKind,
         subject: DefSubject,
         head: Head,
-        neck: Neck,
+        fixpoint: Fixpoint,
         body: DdlBody,
         full_source: &str,
         doc: Option<String>,
@@ -798,21 +880,9 @@ impl<'t> Normalizer<'t> {
             kind,
             subject,
             head,
+            fixpoint,
         }
-        .into_clause_decl(neck, body, full_source.to_string(), doc)
-    }
-
-    /// A definition IS its neck; no pass may search text for one. `:-` binds
-    /// a session rule, `:=` assigns materialized data.
-    fn neck_of(&self, mut necks: impl Iterator<Item = cst::DefinitionNeck<'t>>) -> Result<Neck> {
-        let neck = self.require(necks.next(), "a definition has a neck")?;
-        match self.text(neck) {
-            ":-" => Ok(Neck::Bind),
-            ":=" => Ok(Neck::Assign),
-            other => Err(DelightQLError::parse_error(format!(
-                "'{other}' is not a definition neck"
-            ))),
-        }
+        .into_clause_decl(body, full_source.to_string(), doc)
     }
 
     /// The doc slot after a neck, read WHOLE: the clause's documentation, and
@@ -918,23 +988,9 @@ fn doc_slot_of(child: cst::FoRuleChild<'_>) -> Option<cst::DocSlot<'_>> {
     }
 }
 
-fn neck_of(child: cst::FoRuleChild<'_>) -> Option<cst::DefinitionNeck<'_>> {
-    match child {
-        cst::FoRuleChild::DefinitionNeck(neck) => Some(neck),
-        cst::FoRuleChild::DocSlot(_) => None,
-    }
-}
-
 fn ho_rule_doc(child: cst::HoRuleChild<'_>) -> Option<cst::DocSlot<'_>> {
     match child {
         cst::HoRuleChild::DocSlot(slot) => Some(slot),
-        _ => None,
-    }
-}
-
-fn ho_rule_neck(child: cst::HoRuleChild<'_>) -> Option<cst::DefinitionNeck<'_>> {
-    match child {
-        cst::HoRuleChild::DefinitionNeck(neck) => Some(neck),
         _ => None,
     }
 }
@@ -946,13 +1002,6 @@ fn function_rule_doc(child: cst::FunctionRuleChild<'_>) -> Option<cst::DocSlot<'
     }
 }
 
-fn function_rule_neck(child: cst::FunctionRuleChild<'_>) -> Option<cst::DefinitionNeck<'_>> {
-    match child {
-        cst::FunctionRuleChild::DefinitionNeck(neck) => Some(neck),
-        _ => None,
-    }
-}
-
 fn constant_doc(child: cst::ConstantRuleChild<'_>) -> Option<cst::DocSlot<'_>> {
     match child {
         cst::ConstantRuleChild::DocSlot(slot) => Some(slot),
@@ -960,23 +1009,9 @@ fn constant_doc(child: cst::ConstantRuleChild<'_>) -> Option<cst::DocSlot<'_>> {
     }
 }
 
-fn constant_neck(child: cst::ConstantRuleChild<'_>) -> Option<cst::DefinitionNeck<'_>> {
-    match child {
-        cst::ConstantRuleChild::DefinitionNeck(neck) => Some(neck),
-        cst::ConstantRuleChild::DocSlot(_) => None,
-    }
-}
-
 fn sigma_doc(child: cst::SigmaRuleChild<'_>) -> Option<cst::DocSlot<'_>> {
     match child {
         cst::SigmaRuleChild::DocSlot(slot) => Some(slot),
-        _ => None,
-    }
-}
-
-fn sigma_neck(child: cst::SigmaRuleChild<'_>) -> Option<cst::DefinitionNeck<'_>> {
-    match child {
-        cst::SigmaRuleChild::DefinitionNeck(neck) => Some(neck),
         _ => None,
     }
 }
@@ -995,13 +1030,6 @@ fn edge_doc(child: cst::EdgeDeclarationChild<'_>) -> Option<cst::DocSlot<'_>> {
     }
 }
 
-fn edge_neck(child: cst::EdgeDeclarationChild<'_>) -> Option<cst::DefinitionNeck<'_>> {
-    match child {
-        cst::EdgeDeclarationChild::DefinitionNeck(neck) => Some(neck),
-        _ => None,
-    }
-}
-
 /// A DECLARED WIDTH IS A DECLARED WIDTH. The head's two lists say how wide
 /// every match row and every output row is; a row that disagrees is refused
 /// where it was written.
@@ -1011,9 +1039,7 @@ fn width(subject: &str, position: &str, declared: usize, written: usize) -> Resu
     }
     Err(DelightQLError::validation_error_categorized(
         "fact_function/width",
-        format!(
-            "'{subject}' declares {declared} for its {position}, and one row writes {written}"
-        ),
+        format!("'{subject}' declares {declared} for its {position}, and one row writes {written}"),
         "every arm's match row is as wide as the declared inputs, and every output row \
          as wide as the declared outputs",
     ))
@@ -1037,10 +1063,7 @@ fn unique_heading(
     for (position, (role, name)) in declared.iter().enumerate() {
         // Exact identifier agreement, stropping included: two spellings that
         // differ are two names, and two that agree are one.
-        let Some((earlier, _)) = declared[..position]
-            .iter()
-            .find(|(_, seen)| seen == name)
-        else {
+        let Some((earlier, _)) = declared[..position].iter().find(|(_, seen)| seen == name) else {
             continue;
         };
         let collision = if earlier == role {
@@ -1072,6 +1095,18 @@ fn first_unbound_reference(
         unbound: Option<String>,
     }
     impl AstVisit<Unresolved> for Found<'_> {
+        /// A NESTED RELATION IS ITS OWN SCOPE. The names inside a scalarized
+        /// relation, an existence, or a relational membership address that
+        /// relation's columns first, and resolution — not this walk — is
+        /// what says which of them correlate outward. The cell's own reads
+        /// are the references standing outside every interior.
+        fn enter_relational(
+            &mut self,
+            _: &crate::pipeline::asts::core::Chain<Unresolved>,
+        ) -> Result<Descent> {
+            Ok(Descent::SkipSubtree)
+        }
+
         fn enter_domain(&mut self, e: &DomainExpression<Unresolved>) -> Result<Descent> {
             if self.unbound.is_none() {
                 if let DomainExpression::Reference(Reference::Named(NamedReference(column))) = e {

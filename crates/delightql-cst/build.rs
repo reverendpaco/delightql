@@ -17,6 +17,7 @@
 #[path = "generator/typed_cst.rs"]
 mod typed_cst;
 
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -118,6 +119,71 @@ fn main() {
     let generated = typed_cst::generate(&json);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     std::fs::write(out_dir.join("typed_cst.rs"), generated).expect("writing the typed CST");
+
+    let facts = minted_facts(&workspace_root, &parser_c, &node_types);
+    std::fs::write(out_dir.join("minted_facts.rs"), facts).expect("writing the minted facts");
+}
+
+/// The build identity the parser evidence records: the grammar fingerprint
+/// and the parser-runtime spelling, as `pub const` items.
+///
+/// The fingerprint is SHA-256 over both generated artifacts with unambiguous
+/// length framing — each artifact contributes its byte length as 8 big-endian
+/// bytes, then its content, `parser.c` first — so no concatenation of two
+/// different artifact pairs can collide by shifting bytes across the seam.
+///
+/// The runtime spelling comes from the lockfile's resolved
+/// `tree-sitter-c2rust` version — the exact runtime this build links — with
+/// the workspace manifest's pin as the fallback for a lockless checkout.
+fn minted_facts(workspace_root: &Path, parser_c: &Path, node_types: &Path) -> String {
+    let mut hasher = Sha256::new();
+    for artifact in [parser_c, node_types] {
+        let bytes = std::fs::read(artifact).expect("generated artifact for fingerprinting");
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(&bytes);
+    }
+    let fingerprint: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace_root.join("Cargo.lock").display()
+    );
+    let runtime_version = std::fs::read_to_string(workspace_root.join("Cargo.lock"))
+        .ok()
+        .and_then(|lock| {
+            let mut lines = lock.lines();
+            while let Some(line) = lines.next() {
+                if line.trim() == "name = \"tree-sitter-c2rust\"" {
+                    return lines
+                        .next()
+                        .and_then(|v| v.trim().strip_prefix("version = \"")?.strip_suffix('"').map(str::to_string));
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|| {
+            let manifest = std::fs::read_to_string(workspace_root.join("Cargo.toml"))
+                .expect("the workspace manifest pins the parser runtime");
+            manifest
+                .lines()
+                .find(|l| l.contains("tree-sitter-c2rust"))
+                .and_then(|l| l.split("version = \"").nth(1))
+                .and_then(|rest| rest.split('"').next())
+                .expect("the workspace manifest names the tree-sitter-c2rust version")
+                .to_string()
+        });
+
+    format!(
+        "/// SHA-256 over the length-framed generated `parser.c` and\n\
+         /// `node-types.json` — the identity of the grammar this build parses with.\n\
+         pub const GRAMMAR_FINGERPRINT: &str = \"{fingerprint}\";\n\
+         /// The parser runtime this build links, as resolved by the lockfile.\n\
+         pub const PARSER_RUNTIME: &str = \"tree-sitter-c2rust {runtime_version}\";\n"
+    )
 }
 
 /// Regenerate when the derived output is absent or older than any authored

@@ -18,14 +18,14 @@
 //! peer joins. That is why a DML form appears only in the pipe alternative — a
 //! mutation source exists solely to be fed to its terminal.
 
-use super::relex::two_landings;
 use super::Normalizer;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::definitions::Head;
 use crate::pipeline::asts::core::operators::HoArgument;
+use crate::pipeline::asts::core::Step;
 use crate::pipeline::asts::core::{
-    Access, Chain, Continuation, CteBinding, FunctorCall, GroundMention, PipeOp, Query, Relation,
-    SealedCall, SetOperator, Unresolved,
+    Access, Chain, Continuation, FunctorCall, GroundMention, PipeOp, Query, Relation, SealedCall,
+    SetOperator, Unresolved,
 };
 use crate::pipeline::syntax::cst;
 use delightql_types::SqlIdentifier;
@@ -42,18 +42,26 @@ use delightql_types::SqlIdentifier;
 ///
 /// A NON-BUILT-IN DECLARES NOTHING HERE: a user effect rule's parameters live
 /// on its own definition, and resolution judges them against it.
-fn judge_authored_arguments(name: &str, arguments: &[HoArgument<Unresolved>]) -> Result<()> {
+fn judge_authored_arguments(
+    reference: &crate::pipeline::asts::vocabulary::Ref,
+    arguments: &[HoArgument<Unresolved>],
+) -> Result<()> {
     use crate::pipeline::asts::effects::DirectiveParamKind;
-    let Some(descriptor) = crate::pipeline::asts::effects::descriptor(name) else {
+    let Some(descriptor) = crate::pipeline::asts::effects::descriptor_for_reference(reference)
+    else {
         return Ok(());
     };
-    let bare = name.strip_suffix('!').unwrap_or(name);
+    let name = reference.name_text();
+    let bare = name.strip_suffix('!').unwrap_or(&name);
     for (position, argument) in arguments.iter().enumerate() {
         let Some(declared) = descriptor.params.get(position) else {
             continue;
         };
-        if !matches!(argument, HoArgument::Relation(_))
-            || declared.kind == DirectiveParamKind::RelationTarget
+        if !matches!(argument, HoArgument::Relation(_) | HoArgument::Rule(_))
+            || matches!(
+                declared.kind,
+                DirectiveParamKind::RelationTarget | DirectiveParamKind::RuleValue
+            )
         {
             continue;
         }
@@ -76,28 +84,30 @@ fn judge_authored_arguments(name: &str, arguments: &[HoArgument<Unresolved>]) ->
 /// input fills, so an argument written there leaves the pipe nowhere to land —
 /// the law's own second clause, "no parameters at all".
 ///
-/// The two exemptions are declared, not named: a directive that packages an
-/// OTHER relation says so with its receipt payload, and its argument is that
-/// relation rather than an occupant of the input slot; and a mutation's source
-/// follows the target it is written to, which is the landing classification
-/// this judgment stands beside.
+/// A LANDING MARK IS NOT AN ARGUMENT: `@` names where the pipe goes, so a row
+/// holding nothing else still leaves the slot free. The one exemption is
+/// declared, not named — a directive that packages an OTHER relation says so
+/// with its receipt payload, and its argument is that relation rather than an
+/// occupant of the input slot.
 fn judge_landing(
-    name: &str,
+    reference: &crate::pipeline::asts::vocabulary::Ref,
     arguments: &[HoArgument<Unresolved>],
-    target_reads_first: bool,
 ) -> Result<()> {
     use crate::pipeline::asts::effects::ReceiptPayload;
-    let Some(descriptor) = crate::pipeline::asts::effects::descriptor(name) else {
+    let Some(descriptor) = crate::pipeline::asts::effects::descriptor_for_reference(reference)
+    else {
         return Ok(());
     };
-    if target_reads_first
-        || descriptor.receipt_payload == ReceiptPayload::OtherRelation
+    let name = reference.name_text();
+    if descriptor.receipt_payload == ReceiptPayload::OtherRelation
         || !descriptor.params.is_empty()
-        || arguments.is_empty()
+        || arguments
+            .iter()
+            .all(|argument| matches!(argument, HoArgument::Landing(_)))
     {
         return Ok(());
     }
-    let bare = name.strip_suffix('!').unwrap_or(name);
+    let bare = name.strip_suffix('!').unwrap_or(&name);
     Err(DelightQLError::validation_error_categorized(
         "effect/landing/nowhere",
         format!(
@@ -111,7 +121,7 @@ fn judge_landing(
 /// What rides an effect chain after its call: pure material, or an
 /// annotation decorating the position it stands in. They interleave, so the
 /// order they were written in is the order they are applied.
-enum Step<'t> {
+enum EffectToken<'t> {
     Continuation(cst::Continuation<'t>),
     Annotation(cst::Annotation<'t>),
 }
@@ -137,35 +147,48 @@ impl<'t> Normalizer<'t> {
                 cst::EffectChainSource::EffectChain(chain) => self.effect_chain(chain)?,
                 cst::EffectChainSource::DmlForm(dml) => self.dml_form(dml)?,
             };
-            let mut chain = self.post_pipe_effrelex(terminal, Some(source))?;
+            let mut chain = match terminal {
+                cst::EffectChainTerminal::PostPipeEffrelex(terminal) => {
+                    self.post_pipe_effrelex(terminal, Some(source))?
+                }
+                // The unwrap pipe's right side need not be an effect: the
+                // equivalence pipes the source into the callable and reads
+                // its `returned` payload, whoever produced it.
+                cst::EffectChainTerminal::PureInvocation(invocation) => {
+                    self.pure_invocation(invocation, source)?
+                }
+            };
             if unwraps {
                 // THE UNWRAP PIPE: `Q !> S ≡ Q |> S |> .returned(*)`. It is a
                 // PIPE FORM, never a boundary, so it lowers into the same two
                 // continuations the long spelling writes.
                 chain = chain
-                    .then(crate::pipeline::asts::core::Continuation::Structural(
-                        crate::pipeline::asts::core::StructuralStep {
-                            form: crate::pipeline::asts::core::StructuralForm::Drill {
-                                drill: crate::pipeline::asts::core::operators::AuthoredDrill {
-                                    column: "returned".to_string(),
-                                    glob: true,
-                                    columns: Vec::new(),
-                                    groundings: Vec::new(),
+                    .then(Step::authored(
+                        crate::pipeline::asts::core::Continuation::Structural(
+                            crate::pipeline::asts::core::StructuralStep {
+                                form: crate::pipeline::asts::core::StructuralForm::Drill {
+                                    drill: crate::pipeline::asts::core::operators::AuthoredDrill {
+                                        column: "returned".to_string(),
+                                        glob: true,
+                                        columns: Vec::new(),
+                                        groundings: Vec::new(),
+                                    },
                                 },
+                                named: Default::default(),
                             },
-                            named: Default::default(),
-                            cpr_schema: (),
-                        },
+                        ),
                     ))
-                    .pipe(PipeOp::Project(crate::pipeline::asts::vocabulary::Vec1::new(
-                        crate::pipeline::asts::core::OutItem::Many(
-                            crate::pipeline::asts::core::Spread::Glob(
-                                crate::pipeline::asts::core::Glob::qualified(SqlIdentifier::new(
-                                    "returned",
-                                )),
+                    .pipe(PipeOp::Project(
+                        crate::pipeline::asts::vocabulary::Vec1::new(
+                            crate::pipeline::asts::core::OutItem::Many(
+                                crate::pipeline::asts::core::Spread::Glob(
+                                    crate::pipeline::asts::core::Glob::qualified(
+                                        SqlIdentifier::new("returned"),
+                                    ),
+                                ),
                             ),
                         ),
-                    )));
+                    ));
             }
             return Ok(chain);
         }
@@ -194,13 +217,13 @@ impl<'t> Normalizer<'t> {
                     chain = Some(self.effect_chain(inner)?)
                 }
                 cst::EffectChainChild::Continuation(continuation) => {
-                    steps.push(Step::Continuation(continuation))
+                    steps.push(EffectToken::Continuation(continuation))
                 }
                 // An annotation DECORATES the position it stands in, so it is
                 // read where it stands — with the chain built SO FAR as its
                 // anchor, exactly as in every other chain.
                 cst::EffectChainChild::Annotation(annotation) => {
-                    steps.push(Step::Annotation(annotation))
+                    steps.push(EffectToken::Annotation(annotation))
                 }
                 cst::EffectChainChild::PipeOperator(_)
                 | cst::EffectChainChild::UnwrapPipeOperator(_) => {}
@@ -209,10 +232,10 @@ impl<'t> Normalizer<'t> {
         let mut chain = self.require(chain, "an effect chain contains an effect call")?;
         for step in steps {
             match step {
-                Step::Continuation(continuation) => {
+                EffectToken::Continuation(continuation) => {
                     chain = self.continuation(continuation, chain)?
                 }
-                Step::Annotation(annotation) => self.annotation(annotation, &chain)?,
+                EffectToken::Annotation(annotation) => self.annotation(annotation, &chain)?,
             }
         }
         Ok(chain)
@@ -227,24 +250,23 @@ impl<'t> Normalizer<'t> {
         let sigil = self.require(connective.child(), "a connective has a sigil")?;
         Ok(match sigil {
             cst::BinaryConnectiveChild::CommaSigil(_) => {
-                chain.then(Continuation::Member {
+                chain.then(Step::authored(Continuation::Member {
                     rhs: arm,
                     correlation: None,
                     join_type: None,
-                    cpr_schema: (),
-                })
+                }))
             }
             cst::BinaryConnectiveChild::CorrespondingUnionSigil(_) => {
-                chain.bag_op(SetOperator::UnionCorresponding, arm, (), ())
+                chain.bag_op(SetOperator::UnionCorresponding, arm, ())
             }
             cst::BinaryConnectiveChild::SmartUnionSigil(_) => {
-                chain.bag_op(SetOperator::SmartUnionAll, arm, (), ())
+                chain.bag_op(SetOperator::SmartUnionAll, arm, ())
             }
             cst::BinaryConnectiveChild::PositionalUnionSigil(_) => {
-                chain.bag_op(SetOperator::UnionAllPositional, arm, (), ())
+                chain.bag_op(SetOperator::UnionAllPositional, arm, ())
             }
             cst::BinaryConnectiveChild::MinusSigil(_) => {
-                chain.bag_op(SetOperator::MinusCorresponding, arm, (), ())
+                chain.bag_op(SetOperator::MinusCorresponding, arm, ())
             }
         })
     }
@@ -353,56 +375,30 @@ impl<'t> Normalizer<'t> {
         source: Option<Chain<Unresolved>>,
     ) -> Result<Chain<Unresolved>> {
         let reference = self.effect_reference(name)?;
-        // A DML terminal's authored argument is its TARGET — where to write —
-        // and its piped relation is the SOURCE. The roles are the callee's,
-        // declared in the directive table, so the classification is read from
-        // the descriptor rather than from the argument's shape: a relation in
-        // the first group means one thing for `insert!` and another for every
-        // pure functor.
-        let dml = matches!(
-            crate::pipeline::asts::effects::directive_category(&reference.name_text()),
-            crate::pipeline::asts::effects::DirectiveCategory::Dml(_)
-        );
+        if let Some(descriptor) =
+            crate::pipeline::asts::effects::descriptor_for_reference(&reference)
+        {
+            if matches!(
+                descriptor.category,
+                crate::pipeline::asts::effects::DirectiveCategory::Dml(_)
+            ) {
+                descriptor.judge_invocation(arguments.len(), source.is_some(), &access)?;
+            }
+        }
         // THE ARGUMENT ROW IS THE DESCRIPTOR'S, read before the pipe's
         // relation joins it: what the author wrote is judged against what the
         // callee declares, and the landing is spent below.
-        judge_authored_arguments(&reference.name_text(), &arguments)?;
-        let mut landing = None;
+        judge_authored_arguments(&reference, &arguments)?;
         if let Some(source) = source {
-            let landings: Vec<usize> = arguments
-                .iter()
-                .enumerate()
-                .filter(|(_, argument)| matches!(argument, HoArgument::Landing(_)))
-                .map(|(index, _)| index)
-                .collect();
-            let landed_at = match landings.len() {
-                0 => {
-                    // THE TARGET READS FIRST. A mutation source is the
-                    // relation being written FROM; it follows the destination
-                    // it is written to — the descriptor's formals put the
-                    // target at the first position and the source after it.
-                    let target_reads_first = dml || source_is_mutation(&source);
-                    judge_landing(&reference.name_text(), &arguments, target_reads_first)?;
-                    if target_reads_first {
-                        arguments.push(HoArgument::Relation(source));
-                        arguments.len() - 1
-                    } else {
-                        arguments.insert(0, HoArgument::Relation(source));
-                        0
-                    }
-                }
-                1 => {
-                    arguments[landings[0]] = HoArgument::Relation(source);
-                    landings[0]
-                }
-                count => return Err(two_landings(count)),
-            };
-            landing = Some(landed_at);
+            // THE PIPED RELATION LANDS LAST, here as everywhere. A mutation's
+            // destination and every other directive's configuration are
+            // written arguments; the relation the effect consumes follows
+            // them. There is no per-category layout to consult, so no
+            // directive can acquire a landing of its own.
+            judge_landing(&reference, &arguments)?;
+            super::landing::land_relation(&mut arguments, source)?;
         }
-        let mut call = FunctorCall::written(reference, arguments);
-        if let Some(part) = call.arguments.ho_mut() {
-            part.landing = landing;
-        }
+        let call = FunctorCall::written(reference, arguments);
         // THE RECEIPT STANDS IN THE EFFECT POSITION — after the call, where a
         // relational access stands. It is the ordinary access, read by the
         // ordinary reader; call identity carries no receipt field.
@@ -410,10 +406,8 @@ impl<'t> Normalizer<'t> {
             Relation::FunctorCall {
                 alias: None,
                 call: SealedCall::authored(call),
-                cpr_schema: (),
             },
             access,
-            (),
         ))
     }
 
@@ -468,16 +462,14 @@ impl<'t> Normalizer<'t> {
         Ok(Chain::read(
             Relation::Ground {
                 mention: GroundMention::Named {
-                    identifier: self.qualified_name(name)?,
+                    identifier: self.qualified_reference_name(name)?,
                     alias: None,
                     mutation_target: true,
                     passthrough: false,
                 },
                 outer: false,
-                cpr_schema: (),
             },
             Access::All,
-            (),
         ))
     }
 
@@ -490,8 +482,9 @@ impl<'t> Normalizer<'t> {
     pub(crate) fn effect_cte(
         &mut self,
         node: cst::EffectCte<'t>,
-    ) -> Result<CteBinding<Unresolved>> {
+    ) -> Result<super::relex::LetBinding> {
         let (expression, name, head) = match node {
+            cst::EffectCte::EffectHoCte(ho) => return self.effect_ho_cte(ho),
             cst::EffectCte::EffectLabelCte(label) => {
                 let body = self.require(label.body(), "a label binds a body")?;
                 let name = self.require(label.name(), "a label carries a name")?;
@@ -542,12 +535,71 @@ impl<'t> Normalizer<'t> {
                 "effect mark on a pure binding",
             ));
         }
-        Ok(self.binding(
+        self.binding(
             expression,
             name,
             head,
+            // An effect binding's head has no badge position: recursion is
+            // relation-form only.
+            crate::pipeline::asts::vocabulary::Fixpoint::Bag,
             crate::pipeline::asts::core::CteEffectDeclaration::DemandsDirective,
-        ))
+        )
+        .map(super::relex::LetBinding::Relation)
+    }
+
+    /// `name!(params)(*) : body` — one clause of the EFFECT MIRROR of a
+    /// common higher-order expression: a query-local parameterized effect
+    /// rule. Its body normalizes now, as an effect rule's does — the demand
+    /// walk binds its relation formal to the piped input and its scalar
+    /// formals through the invocation's frame — and the `!` is the same
+    /// assertion it is on every effect binding.
+    fn effect_ho_cte(&mut self, node: cst::EffectHoCte<'t>) -> Result<super::relex::LetBinding> {
+        use crate::pipeline::asts::core::definitions::HoParam;
+        use crate::pipeline::asts::ddl::{DdlBody, DefKind, DefSubject};
+
+        let name = self.require(node.name(), "a head names its subject")?;
+        let body = self.require(node.body(), "a binding has a body")?;
+        let subject = self.effect_subject(name)?;
+        let name = self.admit_cte(subject)?;
+        let params: Vec<HoParam> = node
+            .children()
+            .filter_map(|child| match child {
+                cst::EffectHoCteChild::HoParam(param) => Some(param),
+                cst::EffectHoCteChild::Glob(_) | cst::EffectHoCteChild::CommaSigil(_) => None,
+            })
+            .map(|param| self.ho_param(param))
+            .collect::<Result<_>>()?;
+        let expression = match body {
+            cst::EffectHoCteBody::LetFreeRelex(relex) => self.let_free_relex(relex)?,
+            cst::EffectHoCteBody::EffectChain(chain) => self.effect_chain(chain)?,
+        };
+        if !crate::pipeline::asts::effects::expression_demands_directive(&expression) {
+            return Err(DelightQLError::validation_error_categorized(
+                "effect/cte/pure_mark",
+                format!(
+                    "the binding '{name}' is marked '!' but its body demands no directive. \
+                     The mark asserts that the body is effectful; it cannot make it so. \
+                     Drop the mark, or give the body the directive it claims to have."
+                ),
+                "effect mark on a pure binding",
+            ));
+        }
+        // THE SUBJECT CARRIES THE MARK, as a consulted effect rule's does:
+        // the demand that opens it names `p!`.
+        let decl = self.clause(
+            DefKind::Effect,
+            DefSubject::Named(SqlIdentifier::new(format!("{}!", name.as_str()))),
+            Head::signature(params),
+            crate::pipeline::asts::vocabulary::Fixpoint::Bag,
+            DdlBody::Relational(Query::relational(expression)),
+            self.text(node),
+            None,
+        );
+        Ok(super::relex::LetBinding::HigherOrder {
+            name,
+            effect: crate::pipeline::asts::core::CteEffectDeclaration::DemandsDirective,
+            decl,
+        })
     }
 
     /// The subject a `!`-marked head names. The mark is the SUBJECT's, and
@@ -564,22 +616,4 @@ impl<'t> Normalizer<'t> {
             "an effect identifier has a predicate identifier",
         ))
     }
-}
-
-/// A mutation source is fed to its terminal, never joined: the `!!` on its
-/// head is what says the argument is one.
-fn source_is_mutation(chain: &Chain<Unresolved>) -> bool {
-    matches!(
-        match &chain.head {
-            crate::pipeline::asts::core::Grelex::Reference(relation) => Some(relation),
-            crate::pipeline::asts::core::Grelex::Literal(_) => None,
-        },
-        Some(Relation::Ground {
-            mention: GroundMention::Named {
-                mutation_target: true,
-                ..
-            },
-            ..
-        })
-    )
 }

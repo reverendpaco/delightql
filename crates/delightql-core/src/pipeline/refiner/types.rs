@@ -4,6 +4,7 @@
 //
 // These types enforce the classification system and laws.
 
+pub use super::settled::Settled;
 use crate::names::ScopeId;
 use crate::pipeline::asts::resolved;
 use std::collections::HashSet;
@@ -43,8 +44,8 @@ pub struct AnalyzedPredicate {
     /// The classification of this predicate
     pub class: PredicateClass,
 
-    /// The original expression
-    pub expr: resolved::TruthExpression,
+    /// The expression, with every comparison leaf's equality class settled
+    pub expr: Settled,
 
     /// Which operator this predicate modifies
     pub operator_ref: OperatorRef,
@@ -71,11 +72,4 @@ pub enum OperatorRef {
 
     /// Top-level (Fx predicates)
     TopLevel,
-}
-
-/// Lvar binding for positional unification
-#[derive(Debug, Clone)]
-pub struct LvarBinding {
-    /// Which table it comes from
-    pub table: ScopeId,
 }

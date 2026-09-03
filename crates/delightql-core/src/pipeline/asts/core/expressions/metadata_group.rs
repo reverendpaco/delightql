@@ -24,6 +24,10 @@ pub struct MetadataGroup<P: Phase = Unresolved> {
     /// What the reduction lowering owes this level. `None` until the
     /// tree-group analysis has decided.
     pub cte_requirements: Option<CteRequirements<P>>,
+    /// Whether the target SUMMARIZES its group — every constructed member
+    /// reduces — so each key holds one object rather than an array of the
+    /// group's rows. Decided at resolution, where reductions are known.
+    pub summary: bool,
 }
 
 /// `meta_target = enclyph_like | metadata_group` — the levels chain, and the

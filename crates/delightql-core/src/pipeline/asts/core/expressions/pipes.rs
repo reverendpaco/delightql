@@ -14,7 +14,7 @@ pub struct DestructureMapping {
     /// Key in the JSON object (used in json_extract path)
     pub json_key: String,
     /// Output column occurrence for this extracted value.
-    pub column: crate::names::ColId,
+    pub column: crate::relation::PortId,
 }
 
 impl ToLispy for DestructureMapping {

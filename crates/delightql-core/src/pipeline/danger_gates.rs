@@ -33,6 +33,11 @@ const KNOWN_DANGERS: &[(&str, DangerState, bool)] = &[
         DangerState::Off,
         false,
     ), // semantic — inline-only
+    // TWO LIVE SCOPES NEVER SHARE A NAME: acknowledging admits the
+    // ambiguous co-activation. Guardrail class — it changes what the
+    // session permits, not what an operator means — so CLI override is
+    // allowed.
+    ("delightql-danger://scope/duplicate", DangerState::Off, true),
 ];
 
 /// A map of danger URIs to their current states. A gate is named exactly:
@@ -158,10 +163,7 @@ pub fn parse_cli_danger_spec(input: &str) -> crate::error::Result<DangerSpec> {
         },
     };
 
-    Ok(DangerSpec {
-        uri,
-        state,
-    })
+    Ok(DangerSpec { uri, state })
 }
 
 #[cfg(test)]

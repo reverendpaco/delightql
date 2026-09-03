@@ -18,13 +18,9 @@ fn registry() -> Rc<crate::names::Registry> {
 
 /// Normalize a bare query through the utility entrance.
 pub fn query(source: &str) -> Query<Unresolved> {
-    let mut normalized = queries(source);
-    assert_eq!(
-        normalized.queries.len(),
-        1,
-        "expected one query from {source:?}"
-    );
-    normalized.queries.remove(0).query
+    let mut goals = queries(source).into_queries();
+    assert_eq!(goals.len(), 1, "expected one query from {source:?}");
+    goals.remove(0).query
 }
 
 pub fn queries(source: &str) -> Normalized {
@@ -51,13 +47,9 @@ pub fn file(source: &str) -> Normalized {
 }
 
 pub fn definition(source: &str) -> ClauseDecl {
-    let mut normalized = file(source);
-    assert_eq!(
-        normalized.definitions.len(),
-        1,
-        "expected one definition from {source:?}"
-    );
-    normalized.definitions.remove(0)
+    let mut decls = file(source).into_definitions();
+    assert_eq!(decls.len(), 1, "expected one definition from {source:?}");
+    decls.remove(0)
 }
 
 /// A clause's relational body, rendered. `""` for a body that is not

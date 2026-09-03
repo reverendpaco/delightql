@@ -134,7 +134,7 @@ impl EffectExecutable for CompilePredicate {
                 })
                 .collect();
             let source = AnonRelation::plain(
-                AnonTable::from_values(Some(headers), vec![null_row], ())
+                AnonTable::from_values(Some(headers), vec![null_row])
                     .expect("compile's empty relation has a heading and a row"),
             );
             let lit = |n: &str| {
@@ -142,17 +142,18 @@ impl EffectExecutable for CompilePredicate {
                     LiteralValue::Number(n.to_string()),
                 )))
             };
-            let empty = Chain::ground(Grelex::Literal(source)).then(Continuation::Restrict {
-                condition: TruthExpression::Comparison(Comparison {
-                    operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
-                    left: lit("1"),
-                    right: lit("0"),
-                }),
-                origin: crate::pipeline::asts::core::FilterOrigin::default(),
-                cpr_schema: (),
-            });
+            let empty = Chain::authored(GroundForm::Literal(source)).then(Step::authored(
+                Continuation::Restrict {
+                    condition: TruthExpression::Comparison(Comparison {
+                        operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+                        left: lit("1"),
+                        right: lit("0"),
+                    }),
+                    origin: crate::pipeline::asts::core::FilterOrigin::default(),
+                },
+            ));
             let identifier = alias.as_deref().unwrap_or("compile");
-            return Ok(EntityResult::Relation(Grelex::Reference(Relation::InnerRelation {
+            return Ok(EntityResult::Relation(GroundForm::Reference(Relation::InnerRelation {
                 pattern:
                     crate::pipeline::asts::core::expressions::relational::InnerRelationPattern::Indeterminate {
                         identifier:
@@ -163,31 +164,28 @@ impl EffectExecutable for CompilePredicate {
                             },
                         subquery: Box::new(empty),
                     },
-                preminted_scope: None,
                 alias: alias.map(Into::into),
                 outer: false,
-                cpr_schema: (),
             })));
         }
         let mut all_rows = Vec::new();
         let mut headers = None;
         for row in rows {
             let EntityResult::Relation(head) = self.execute(row, alias.clone(), system)?;
-            if let Grelex::Literal(AnonRelation { table, .. }) = head {
+            if let GroundForm::Literal(AnonRelation { table, .. }) = head {
                 if headers.is_none() {
                     headers = table.body.header;
                 }
                 all_rows.extend(table.body.rows.into_vec());
             }
         }
-        Ok(EntityResult::Relation(Grelex::Literal(AnonRelation {
+        Ok(EntityResult::Relation(GroundForm::Literal(AnonRelation {
             table: AnonTable {
                 body: TabularBody {
                     header: headers,
                     rows: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(all_rows)
                         .expect("a nonempty lift produces a row per input"),
                 },
-                cpr_schema: (),
             },
             alias: alias.map(|s| s.into()),
             outer: false,
@@ -265,7 +263,7 @@ fn build_compile_result(
     representation: Option<String>,
     error: Option<(String, String)>,
     alias: Option<String>,
-) -> Grelex {
+) -> GroundForm {
     let headers = vec![
         DomainExpression::lvar_builder("stage".to_string()).build(),
         DomainExpression::lvar_builder("query".to_string()).build(),
@@ -289,8 +287,8 @@ fn build_compile_result(
             None => null_literal(),
         },
     ];
-    Grelex::Literal(AnonRelation {
-        table: AnonTable::from_values(Some(headers), vec![row], ())
+    GroundForm::Literal(AnonRelation {
+        table: AnonTable::from_values(Some(headers), vec![row])
             .expect("compile publishes one nonempty row"),
         alias: alias.map(|s| s.into()),
         outer: false,
@@ -332,7 +330,7 @@ mod purity_tests {
     #[test]
     fn deep_stage_refuses_session_directive_demand() {
         let mut system = fresh_system();
-        let err = compile_to_stage(&mut system, "sql", r#"enlist!("std::string")"#)
+        let err = compile_to_stage(&mut system, "sql", r#"enlist!("std::string")(*)"#)
             .expect_err("compiling a session directive to sql must refuse");
         let msg = err.to_string();
         assert!(msg.contains("compile is pure"), "{msg}");
@@ -350,8 +348,12 @@ mod purity_tests {
     #[test]
     fn shallow_stage_inspects_the_same_source() {
         let mut system = fresh_system();
-        let repr = compile_to_stage(&mut system, "ast-unresolved", r#"enlist!("std::string")"#)
-            .expect("ast-unresolved never enters the effect executor");
+        let repr = compile_to_stage(
+            &mut system,
+            "ast-unresolved",
+            r#"enlist!("std::string")(*)"#,
+        )
+        .expect("ast-unresolved never enters the effect executor");
         assert!(repr.contains("enlist"), "{repr}");
     }
 

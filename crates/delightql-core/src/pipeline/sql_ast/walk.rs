@@ -15,7 +15,6 @@
 
 use super::expressions::DomainExpression;
 use super::query::{QueryExpression, SelectStatement};
-use super::select_items::SelectItem;
 use super::statements::{Cte, SqlStatement};
 use super::table::{JoinCondition, TableExpression};
 
@@ -93,7 +92,9 @@ pub fn visit_tables_mut(stmt: &mut SqlStatement, f: &mut dyn FnMut(&mut TableExp
 fn visit_ctes(ctes: &mut Option<Vec<Cte>>, v: &mut dyn SqlVisitorMut) {
     if let Some(ctes) = ctes {
         for cte in ctes {
-            visit_query(cte.query_mut(), v);
+            for part in cte.parts_mut() {
+                visit_query(part, v);
+            }
         }
     }
 }
@@ -117,7 +118,9 @@ pub fn visit_query(query: &mut QueryExpression, v: &mut dyn SqlVisitorMut) {
         }
         QueryExpression::WithCte { ctes, query } => {
             for cte in ctes {
-                visit_query(cte.query_mut(), v);
+                for part in cte.parts_mut() {
+                    visit_query(part, v);
+                }
             }
             visit_query(query, v);
         }
@@ -127,7 +130,7 @@ pub fn visit_query(query: &mut QueryExpression, v: &mut dyn SqlVisitorMut) {
 
 fn visit_select(select: &mut SelectStatement, v: &mut dyn SqlVisitorMut) {
     for item in &mut select.select_list {
-        if let SelectItem::Expression { expr, .. } = item {
+        if let Some(expr) = item.expr_mut() {
             visit_expr(expr, v);
         }
     }
@@ -178,7 +181,7 @@ fn visit_table(table: &mut TableExpression, v: &mut dyn SqlVisitorMut) {
             visit_table(right, v);
             match join_condition {
                 JoinCondition::On(e) => visit_expr(e, v),
-                JoinCondition::Using(_) | JoinCondition::Natural => {}
+                JoinCondition::Merge(_) | JoinCondition::Cartesian => {}
             }
         }
     }

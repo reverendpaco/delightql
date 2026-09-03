@@ -41,6 +41,42 @@ fn connection_error(msg: String) -> ServerTerm {
 }
 
 impl<'a, T: Transport> RelayParty<'a, T> {
+    fn observe_assertion_verdict(
+        &mut self,
+        verdict: verdict::Verdict,
+        run_id: &str,
+    ) -> Result<(), String> {
+        self.system
+            .record_assertion_verdict(&verdict, run_id)
+            .map_err(|error| error.to_string())?;
+        if let Some(ref mut hook) = self.hooks.on_verdict {
+            hook(&verdict);
+        }
+        Ok(())
+    }
+
+    /// Assertion observation is part of the directive contract. If the
+    /// bootstrap ledger cannot accept a verdict, the run cannot report
+    /// success and the session health becomes uncertain until reset. A
+    /// failing assertion still keeps its primary assertion identity; its
+    /// message reports the latched observation incident.
+    fn quarantine_assertion_observation(&mut self, failure: String) {
+        self.system
+            .quarantine_session("assertion verdict observation", failure);
+    }
+
+    fn session_health_error(&self) -> ServerTerm {
+        let error = self
+            .system
+            .require_healthy()
+            .expect_err("session-health error requested while healthy");
+        ServerTerm::Error {
+            kind: ErrorKind::Connection,
+            identity: error.error_uri().into_bytes(),
+            message: error.to_string().into_bytes(),
+        }
+    }
+
     /// Play a `CompiledPlan` start to finish (the pump, plan §3.2).
     ///
     /// Behavior, each piece pinned by the named test in
@@ -108,6 +144,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // entry loop with no gating and no exit machinery.
         match &plan.typed {
             Some(typed) => {
+                let run_id = format!("effect:{}", self.next_effect_run_id);
+                self.next_effect_run_id += 1;
                 // D5: per-step outcomes, tracked in memory and
                 // materialized once at the boundary — best-effort,
                 // because bookkeeping never outranks the run. The
@@ -116,7 +154,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 // ("running") when the walk stops.
                 let mut trace: Vec<Option<(&'static str, Option<String>)>> =
                     vec![None; typed.steps.len()];
-                let term = self.play_typed(plan, typed, &mut trace);
+                let term = self.play_typed(plan, typed, &mut trace, &run_id);
                 let is_error = matches!(term, ServerTerm::Error { .. });
                 let err_msg = match &term {
                     ServerTerm::Error { message, .. } => {
@@ -156,8 +194,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         plan: &CompiledPlan,
         typed: &crate::pipeline::compiled_query::TypedEffectPlan,
         trace: &mut [Option<(&'static str, Option<String>)>],
+        run_id: &str,
     ) -> ServerTerm {
-        use crate::pipeline::compiled_query::EffectAction;
+        use crate::pipeline::compiled_query::{AbortProvenance, EffectAction, TerminalAction};
         self.last_run_exited = false;
         let mut open_bracket: Option<Option<i64>> = None;
         let mut final_response: Option<ServerTerm> = None;
@@ -218,64 +257,125 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         }
                     }
                 }
-                // Annotation steps in the typed program —
-                // the same verdict/abort and notify-never-abort contracts
-                // as the untyped entries (play_entries below).
-                EffectAction::Assertion {
+                EffectAction::Check {
                     statement, refusal, ..
-                } => {
-                    match self.execute_sql_routed(&statement.sql, statement.connection_id) {
-                        Ok((_cols, rows)) => {
-                            let passed = super::cell_says_yes(rows.first());
-                            if let Some(ref mut hook) = self.hooks.on_verdict {
-                                let v = verdict::Verdict {
-                                    outcome: if passed {
-                                        verdict::VerdictOutcome::Pass
-                                    } else {
-                                        verdict::VerdictOutcome::Fail
-                                    },
-                                    identity: verdict::VerdictIdentity {
-                                        name: None,
-                                        body_text: statement.sql.clone(),
-                                    },
-                                    detail: if passed {
-                                        None
-                                    } else {
-                                        Some(format!("Assertion failed\n  SQL: {}", statement.sql))
-                                    },
-                                };
-                                hook(&v);
-                            }
-                            if !passed {
-                                // A compiler-written check reports the
-                                // refusal it stands for; a program's own
-                                // assertion reports an assertion failure.
-                                let (identity, message) = match refusal {
-                                    Some(refusal) => (
-                                        format!("delightql-error://{}", refusal.identity),
-                                        refusal.message.clone(),
-                                    ),
-                                    None => (
-                                        "delightql-error://runtime/assertion".to_string(),
-                                        format!("Assertion failed\n  SQL: {}", statement.sql),
-                                    ),
-                                };
-                                trace[idx] = Some(("error", Some(message.clone())));
-                                self.rollback_open_bracket(&mut open_bracket);
-                                return ServerTerm::Error {
-                                    kind: ErrorKind::Permission,
-                                    identity: identity.into_bytes(),
-                                    message: message.into_bytes(),
-                                };
-                            }
-                        }
-                        Err(msg) => {
-                            trace[idx] = Some(("error", Some(msg.clone())));
+                } => match self.execute_sql_routed(&statement.sql, statement.connection_id) {
+                    Ok((_cols, rows)) => {
+                        let passed = super::cell_says_yes(rows.first());
+                        if !passed {
+                            let (identity, message) = match refusal {
+                                Some(refusal) => (
+                                    format!("delightql-error://{}", refusal.identity),
+                                    refusal.message.clone(),
+                                ),
+                                None => (
+                                    "delightql-error://runtime/obligation".to_string(),
+                                    format!("Compiler obligation failed\n  SQL: {}", statement.sql),
+                                ),
+                            };
+                            trace[idx] = Some(("error", Some(message.clone())));
                             self.rollback_open_bracket(&mut open_bracket);
-                            return connection_error(msg);
+                            return ServerTerm::Error {
+                                kind: ErrorKind::Permission,
+                                identity: identity.into_bytes(),
+                                message: message.into_bytes(),
+                            };
                         }
                     }
-                }
+                    Err(msg) => {
+                        trace[idx] = Some(("error", Some(msg.clone())));
+                        self.rollback_open_bracket(&mut open_bracket);
+                        return connection_error(msg);
+                    }
+                },
+                EffectAction::Terminal(terminal) => match terminal {
+                    TerminalAction::Exit { statements } => {
+                        for st in statements {
+                            if let Err(msg) = self.execute_sql_routed(&st.sql, st.connection_id) {
+                                trace[idx] = Some(("error", Some(msg.clone())));
+                                self.rollback_open_bracket(&mut open_bracket);
+                                return connection_error(msg);
+                            }
+                        }
+                    }
+                    TerminalAction::Abort {
+                        statements,
+                        probe,
+                        provenance,
+                    } => {
+                        for st in statements {
+                            if let Err(msg) = self.execute_sql_routed(&st.sql, st.connection_id) {
+                                trace[idx] = Some(("error", Some(msg.clone())));
+                                self.rollback_open_bracket(&mut open_bracket);
+                                return connection_error(msg);
+                            }
+                        }
+                        let (identity, label) = match provenance {
+                            AbortProvenance::Authored { identity, label } => {
+                                (identity.as_str(), label.as_str())
+                            }
+                            AbortProvenance::Assertion { label } => {
+                                ("runtime/assertion", label.as_str())
+                            }
+                        };
+                        match self.execute_sql_routed(&probe.sql, probe.connection_id) {
+                            Ok((_columns, rows)) if rows.is_empty() => {
+                                if matches!(provenance, AbortProvenance::Assertion { .. }) {
+                                    let observed = self.observe_assertion_verdict(
+                                        verdict::Verdict {
+                                            outcome: verdict::VerdictOutcome::Pass,
+                                            identity: verdict::VerdictIdentity {
+                                                name: Some(label.to_string()),
+                                                body_text: probe.sql.clone(),
+                                            },
+                                            detail: None,
+                                        },
+                                        run_id,
+                                    );
+                                    if let Err(failure) = observed {
+                                        trace[idx] = Some(("error", Some(failure.clone())));
+                                        self.rollback_open_bracket(&mut open_bracket);
+                                        self.quarantine_assertion_observation(failure);
+                                        return self.session_health_error();
+                                    }
+                                }
+                            }
+                            Ok((_columns, _rows)) => {
+                                let mut detail = format!("{label}\n  abort input was nonempty");
+                                self.rollback_open_bracket(&mut open_bracket);
+                                if matches!(provenance, AbortProvenance::Assertion { .. }) {
+                                    if let Err(failure) = self.observe_assertion_verdict(
+                                        verdict::Verdict {
+                                            outcome: verdict::VerdictOutcome::Fail,
+                                            identity: verdict::VerdictIdentity {
+                                                name: Some(label.to_string()),
+                                                body_text: probe.sql.clone(),
+                                            },
+                                            detail: Some(detail.clone()),
+                                        },
+                                        run_id,
+                                    ) {
+                                        self.quarantine_assertion_observation(failure.clone());
+                                        detail.push_str(&format!(
+                                            "\n  assertion observation failed; session quarantined: {failure}"
+                                        ));
+                                    }
+                                }
+                                trace[idx] = Some(("error", Some(detail.clone())));
+                                return ServerTerm::Error {
+                                    kind: ErrorKind::Permission,
+                                    identity: format!("delightql-error://{identity}").into_bytes(),
+                                    message: detail.into_bytes(),
+                                };
+                            }
+                            Err(msg) => {
+                                trace[idx] = Some(("error", Some(msg.clone())));
+                                self.rollback_open_bracket(&mut open_bracket);
+                                return connection_error(msg);
+                            }
+                        }
+                    }
+                },
                 EffectAction::Cleanup(stmts) => {
                     if exited {
                         trace[idx] = Some((
@@ -332,7 +432,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
 
         // The connection of the currently open bracket, if any.
         let mut open_bracket: Option<Option<i64>> = None;
-        let mut assertion_no = 0usize;
         // Set when the final shipped entry is buffered eagerly because
         // entries after it still have to run.
         let mut final_response: Option<ServerTerm> = None;
@@ -434,65 +533,35 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     }
                 }
 
-                PlanEntry::Assertion {
-                    statement, name, ..
-                } => {
-                    assertion_no += 1;
-                    // The verdict's identity IS the message's source: the
-                    // authored name says WHICH assertion failed (the ordinal
-                    // is the fallback, not the answer) and the body text is
-                    // what ran.
-                    let identity = verdict::VerdictIdentity {
-                        name: name.clone(),
-                        body_text: statement.sql.clone(),
-                    };
-                    let failure = || {
-                        format!(
-                            "Assertion {} failed\n  SQL: {}",
-                            match &identity.name {
-                                Some(name) => format!("'{name}'"),
-                                None => assertion_no.to_string(),
-                            },
-                            identity.body_text
-                        )
-                    };
+                PlanEntry::Check { statement, refusal } => {
                     match self.execute_sql_routed(&statement.sql, statement.connection_id) {
                         Ok((_cols, rows)) => {
                             let passed = super::cell_says_yes(rows.first());
-
-                            if let Some(ref mut hook) = self.hooks.on_verdict {
-                                let v = verdict::Verdict {
-                                    outcome: if passed {
-                                        verdict::VerdictOutcome::Pass
-                                    } else {
-                                        verdict::VerdictOutcome::Fail
-                                    },
-                                    detail: if passed { None } else { Some(failure()) },
-                                    identity: identity.clone(),
-                                };
-                                hook(&v);
-                            }
-
                             if !passed {
+                                let (identity, message) = match refusal {
+                                    Some(refusal) => (
+                                        format!("delightql-error://{}", refusal.identity),
+                                        refusal.message.clone(),
+                                    ),
+                                    None => (
+                                        "delightql-error://runtime/obligation".to_string(),
+                                        format!(
+                                            "Compiler obligation failed\n  SQL: {}",
+                                            statement.sql
+                                        ),
+                                    ),
+                                };
                                 self.rollback_open_bracket(&mut open_bracket);
                                 return ServerTerm::Error {
                                     kind: ErrorKind::Permission,
-                                    identity: b"delightql-error://runtime/assertion".to_vec(),
-                                    message: failure().into_bytes(),
+                                    identity: identity.into_bytes(),
+                                    message: message.into_bytes(),
                                 };
                             }
                         }
                         Err(msg) => {
                             self.rollback_open_bracket(&mut open_bracket);
-                            return ServerTerm::Error {
-                                kind: ErrorKind::Permission,
-                                identity: b"delightql-error://runtime/assertion".to_vec(),
-                                message: format!(
-                                    "Assertion {} execution error: {}",
-                                    assertion_no, msg
-                                )
-                                .into_bytes(),
-                            };
+                            return connection_error(msg);
                         }
                     }
                 }

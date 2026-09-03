@@ -4,6 +4,7 @@
 // Each module handles a specific category of unary relational operators
 
 mod aggregation;
+pub(crate) use aggregation::attach_record_interior;
 pub(in crate::pipeline::resolver) mod helpers;
 pub(in crate::pipeline::resolver) mod ordering;
 mod projection;
@@ -22,20 +23,21 @@ use crate::pipeline::{ast_resolved, ast_unresolved};
 pub(in crate::pipeline::resolver) fn resolve_operator_via_fold(
     fold: &mut ResolverFold,
     operator: ast_unresolved::PipeOp,
-    available: &[crate::names::ColId],
-    pivot_in_values: &std::collections::HashMap<crate::names::Sym, Vec<String>>,
-) -> Result<(ast_resolved::PipeOp, Vec<crate::names::ColId>)> {
+    available: &[crate::relation::PortId],
+    input: crate::relation::SemanticRelation,
+    pivot_in_values: &super::super::PivotInWitnesses,
+) -> Result<(ast_resolved::Step, Vec<crate::relation::PortId>)> {
     match operator {
         ast_unresolved::PipeOp::Project(items) => {
-            projection::resolve_general_via_fold(fold, items, available)
+            projection::resolve_general_via_fold(fold, items, available, input)
         }
 
         ast_unresolved::PipeOp::Embed(items) => {
-            projection::resolve_embed_via_fold(fold, items, available)
+            projection::resolve_embed_via_fold(fold, items, available, input)
         }
 
         ast_unresolved::PipeOp::Group(spec) => {
-            aggregation::resolve_group_via_fold(fold, spec, available, pivot_in_values)
+            aggregation::resolve_group_via_fold(fold, spec, available, input, pivot_in_values)
         }
 
         // An authored cover carries no cells yet; resolution mints them.
@@ -44,20 +46,20 @@ pub(in crate::pipeline::resolver) fn resolve_operator_via_fold(
             selector,
             guard,
             cells: _,
-        }) => {
-            transformation::resolve_map_cover_via_fold(fold, callable, selector, guard, available)
-        }
+        }) => transformation::resolve_map_cover_via_fold(
+            fold, callable, selector, guard, available, input,
+        ),
 
         ast_unresolved::PipeOp::ProjectOut(selector) => {
-            schema_ops::resolve_project_out(fold, selector, available)
+            schema_ops::resolve_project_out(fold, selector, available, input)
         }
 
         ast_unresolved::PipeOp::Rename(specs) => {
-            schema_ops::resolve_rename_cover(fold, specs, available)
+            schema_ops::resolve_rename_cover(fold, specs, available, input)
         }
 
         ast_unresolved::PipeOp::Transform { items, guard } => {
-            transformation::resolve_transform_via_fold(fold, items, guard, available)
+            transformation::resolve_transform_via_fold(fold, items, guard, available, input)
         }
 
         ast_unresolved::PipeOp::EmbedMapCover(EmbedMapCover {
@@ -66,7 +68,7 @@ pub(in crate::pipeline::resolver) fn resolve_operator_via_fold(
             selector,
             cells: _,
         }) => transformation::resolve_embed_map_cover_via_fold(
-            fold, callable, selector, naming, available,
+            fold, callable, selector, naming, available, input,
         ),
     }
 }

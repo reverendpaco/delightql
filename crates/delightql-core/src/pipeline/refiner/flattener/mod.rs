@@ -13,6 +13,7 @@ mod rewrite;
 mod types;
 
 // Re-export public types
+pub use predicates::extract_value_references;
 pub use types::{
     AnonymousTableData, FlatOperator, FlatOperatorKind, FlatPredicate, FlatSegment, FlatTable,
     TvfData,
@@ -26,9 +27,11 @@ use std::collections::HashSet;
 /// Main entry point - flatten a resolved expression
 pub fn flatten(
     expr: resolved::Chain,
-    identities: std::rc::Rc<crate::names::Registry>,
+    operand: crate::relation::SemanticRelation,
+    identities: &crate::relation::Planning,
 ) -> Result<FlatSegment> {
     let mut segment = FlatSegment {
+        operand,
         tables: Vec::new(),
         predicates: Vec::new(),
         operators: Vec::new(),

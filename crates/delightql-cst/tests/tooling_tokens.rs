@@ -59,15 +59,13 @@ fn every_meaningful_token_has_a_named_node_and_a_span() {
 
     addressable!("users(*) |> (a)", PipeOperator, "|>");
     addressable!("users(*) !> log!(*)", UnwrapPipeOperator, "!>");
-    addressable!("users(*) |*>", Materialize, "|*>");
-    addressable!("users(*) |> (a /-> f:(@))", FunctionPipeFirst, "/->");
-    addressable!("users(*) |> (a /->> f:(@))", FunctionPipeLast, "/->>");
+    addressable!("users(*) |> (a /-> f:(@))", FunctionPipeOperator, "/->");
 
     addressable!("users(*) ~> count:(*) as n", ReductionSigil, "~>");
     addressable!("users(*), doc ~= {a}", DestructureSigil, "~=");
     addressable!("users(*) |> %( ~> c:~> {a})", MetadataSigil, ":~>");
     addressable!(file "sq(a -> b @ 1 -> 1)", Arrow, "->");
-    addressable!("users(*) |> (sum:(a) <~ %(b))", WindowSigil, "<~");
+    addressable!("users(*) |> (sum:(a <~ %(b)))", WindowSigil, "<~");
 
     addressable!("users(*) |> %(a)", PercentSigil, "%");
     // Reached through the companion COLUMN, never by writing the selector:
@@ -99,7 +97,6 @@ fn every_meaningful_token_has_a_named_node_and_a_span() {
     addressable!("users(*), +o(, a = 1)", Polarity, "+");
     addressable!("users(*), #<3", BoundOp, "#<");
     addressable!(file "a(*) :- b(*)", DefinitionNeck, ":-");
-    addressable!(file "a(*) := b(*)", DefinitionNeck, ":=");
     addressable!(file "?- users(*)", GoalMarker, "?-");
     // The utility header is the one token an EDITOR must find before anything
     // else: it is what says which world the file is in.

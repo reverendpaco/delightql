@@ -9,19 +9,20 @@
 //! produces one. Value-position existence reaches the same carrier through the
 //! truth-to-value crossing.
 //!
-//! **CROSSING LAW — one adapter, one direction.** Truth enters value position
-//! at three enumerated places (an out item's value, an argument, a slot
-//! constraint) and value never enters truth position: a bare value where a
-//! predicate stands has no derivation, so nothing here has to refuse one.
+//! **CROSSING LAW — one carrier, one direction.** A truth enters value
+//! position wherever a value stands, through the one crossing minted here;
+//! value never enters truth position: a bare value where a predicate stands
+//! has no derivation, so nothing here has to refuse one.
 
 use super::{value::comparison_operator, Normalizer};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::{
-    Comparison, Existence, Membership, Polarity, Probe, ProbeAddressing, RelationalMembership,
-    SigmaApplication, TruthExpression, Unresolved, ValueRow, WholeHeading,
+    Comparison, Crossing, DomainExpression, Existence, FunctionApplication, Membership, Polarity,
+    Probe, ProbeAddressing, RelationalMembership, SigmaApplication, TruthExpression, Unresolved,
+    ValueRow, WholeHeading,
 };
 use crate::pipeline::asts::vocabulary::{Vec1, Vec2};
-use crate::pipeline::syntax::cst;
+use crate::pipeline::syntax::{cst, TypedNode};
 
 type Truth = TruthExpression<Unresolved>;
 
@@ -72,12 +73,24 @@ impl<'t> Normalizer<'t> {
         }
     }
 
-    /// The crossing's TRUTH. Every position that admits a crossing carries it
-    /// in that position's own type, so this hands back the truth and never a
-    /// value wrapping one.
-    pub(crate) fn truth_as_value_truth(&mut self, node: cst::TruthAsValue<'t>) -> Result<Truth> {
+    /// THE ONE MINT. A truth written where a value stands is read as the
+    /// truth it is and crossed HERE, once, into the ordinary value family.
+    /// Every value position reaches this through the value spine, so no
+    /// position has a crossing of its own and nothing downstream decides
+    /// that a truth is a value.
+    pub(crate) fn crossed_truth(
+        &mut self,
+        node: cst::CrossedTruth<'t>,
+    ) -> Result<DomainExpression<Unresolved>> {
         let inner = self.require(node.child(), "the crossing carries a truth")?;
-        self.truth_expression(inner)
+        let truth = self.require(
+            <cst::TruthExpression<'t> as TypedNode<'t>>::cast(inner.node()),
+            "the crossing carries a truth",
+        )?;
+        let truth = self.truth_expression(truth)?;
+        Ok(DomainExpression::Application(FunctionApplication::Crossed(
+            Crossing::originate(super::CrossingPermit::grant(), truth),
+        )))
     }
 
     fn comparison(&mut self, node: cst::Comparison<'t>) -> Result<Truth> {
@@ -354,17 +367,6 @@ impl<'t> Normalizer<'t> {
         self.existence_carrier(callee, node.ho_part(), interior, polarity)
     }
 
-    /// `exists_as_column` is the crossing's one pre-carved special case: the
-    /// SAME truth carrier, reached from value position. The position that
-    /// admits it wraps it in that position's own crossing.
-    pub(crate) fn exists_as_column(&mut self, node: cst::ExistsAsColumn<'t>) -> Result<Truth> {
-        let polarity = self.require(node.child(), "existence carries a polarity")?;
-        let polarity = self.polarity(polarity)?;
-        let callee = self.require(node.callee(), "existence names a relation")?;
-        let interior = self.require(node.interior(), "existence has an interior")?;
-        self.existence_carrier(callee, node.ho_part(), interior, polarity)
-    }
-
     fn existence_carrier(
         &mut self,
         callee: cst::RelationName<'t>,
@@ -413,7 +415,8 @@ impl<'t> Normalizer<'t> {
             }
         }
         let polarity = self.require(polarity, "a sigma application carries a polarity")?;
-        let call = crate::pipeline::asts::core::FunctorCall::scalar_application(reference, arguments);
+        let call =
+            crate::pipeline::asts::core::FunctorCall::scalar_application(reference, arguments);
         Ok(TruthExpression::Sigma(SigmaApplication::applied(
             polarity,
             self.seal_pure(call)?,

@@ -440,6 +440,46 @@ impl ConnectionManager {
 /// it self-less makes that separation explicit: a `&self` method that
 /// ignores `self` reads as if a manager fed the handle.
 pub fn open_handle() -> Result<Box<dyn delightql_core::api::DqlHandle>> {
+    open_handle_with_namespace().map(|(handle, _)| handle)
+}
+
+/// The same, reporting whether `repl::*` is installed on the handle. The
+/// client database is mounted in EVERY mode; a failed install is degraded
+/// client diagnostics, said once, never a reason to refuse the handle.
+pub fn open_handle_with_namespace() -> Result<(Box<dyn delightql_core::api::DqlHandle>, bool)> {
+    open_handle_over(crate::client::context::process_database())
+}
+
+/// The same over a NAMED client database (`None`: no client database at
+/// all). The one road every handle takes; the process form above and the
+/// interactive state both come through here.
+pub fn open_handle_over(
+    client: Option<std::sync::Arc<crate::client::database::ClientDatabase>>,
+) -> Result<(Box<dyn delightql_core::api::DqlHandle>, bool)> {
+    let Some(client) = client else {
+        return open_bare_handle().map(|handle| (handle, false));
+    };
+    let mut handle = crate::client::mount::open_client_handle(&client)?;
+    let installed = match crate::client::mount::install_repl_namespace(&mut *handle) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::client::incident::warning(
+                "namespace",
+                crate::client::incident::hierarchy::NAMESPACE_INSTALL,
+                format!(
+                    "the repl::* namespace could not be installed ({e}); \
+                     repl::* will be unavailable until the next session reset"
+                ),
+            );
+            false
+        }
+    };
+    Ok((handle, installed))
+}
+
+/// A handle with no client database behind it: the road when the in-memory
+/// engine refused to open one.
+fn open_bare_handle() -> Result<Box<dyn delightql_core::api::DqlHandle>> {
     let factory = Box::new(crate::connection_factory::CliConnectionFactory);
     // Second factory (types-level) powers mount!/import! of URI-scheme
     // databases (postgres://, delightql-siso://, …). Same unit struct, both

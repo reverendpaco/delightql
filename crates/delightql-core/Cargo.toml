@@ -51,6 +51,8 @@ insta = "1.0"
 similar = "2.4.0"
 colored = "2.0"
 proptest = "1.4"
-syn = { version = "2", features = ["full"] }
+# `visit` is what lets a source fence ask whether a match arm is a
+# wildcard instead of grepping for characters that appear in patterns too.
+syn = { version = "2", features = ["full", "visit"] }
 rusqlite.workspace = true  # For tests only
 

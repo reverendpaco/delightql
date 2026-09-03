@@ -3,7 +3,7 @@
 // bare_join.rs — Legalize condition-less joins for dialects that reject them.
 //
 // A DQL join with no join predicate (a cartesian product) lowers to
-// `JoinCondition::Natural`, which renders as `A INNER JOIN B` with no ON
+// `JoinCondition::Cartesian`, which renders as `A INNER JOIN B` with no ON
 // clause. SQLite and MySQL accept that spelling (implicit cross join);
 // postgres, duckdb and sqlserver reject it as a syntax error. A legal
 // equivalent always exists — CROSS JOIN for inner joins, ON TRUE for outer
@@ -32,7 +32,7 @@ pub fn legalize_bare_joins(mut stmt: SqlStatement) -> SqlStatement {
             ..
         } = table
         {
-            if matches!(join_condition, JoinCondition::Natural) {
+            if matches!(join_condition, JoinCondition::Cartesian) {
                 match join_type {
                     JoinType::Inner => *join_type = JoinType::Cross,
                     // CROSS JOIN takes no condition — already legal.
@@ -54,11 +54,10 @@ pub fn legalize_bare_joins(mut stmt: SqlStatement) -> SqlStatement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::names::{Addressing, ColumnOrigin, Hint, Registry, ScopeOrigin, ValueFacts};
+    use crate::names::{Addressing, Registry};
     use crate::pipeline::sql_ast::{QueryExpression, SelectItem, SelectStatement};
 
     struct Fixture {
-        identities: Registry,
         a: crate::names::ScopeId,
         b: crate::names::ScopeId,
         t: crate::names::ScopeId,
@@ -71,30 +70,14 @@ mod tests {
             let make_scope = |name: &str| {
                 let spelling = identities.intern(name, false);
                 let entity = identities.mint_entity(spelling);
-                identities.mint_scope(
-                    ScopeOrigin::Resolution { of: entity },
-                    Hint::User(spelling),
-                    None,
-                )
+                identities.resolved_access_scope(entity, spelling)
             };
             let a = make_scope("a");
             let b = make_scope("b");
             let t = make_scope("t");
             let spelling = identities.intern("x", false);
-            let x = identities.mint_column(
-                a,
-                ColumnOrigin::Bound { position: 0 },
-                Some(spelling),
-                Addressing::Published,
-                ValueFacts::default(),
-            );
-            Self {
-                identities,
-                a,
-                b,
-                t,
-                x,
-            }
+            let x = identities.sql_column(a, Some(spelling), Addressing::Published);
+            Self { a, b, t, x }
         }
 
         fn bare_join(&self, join_type: JoinType) -> TableExpression {
@@ -102,26 +85,19 @@ mod tests {
                 left: Box::new(TableExpression::Scope(self.a)),
                 right: Box::new(TableExpression::Scope(self.b)),
                 join_type,
-                join_condition: JoinCondition::Natural,
+                join_condition: JoinCondition::Cartesian,
             }
         }
     }
 
     /// A fixture's statements go through the same door production's do. A
     /// star names nothing, so the heading it publishes is empty.
-    fn select_from(
-        from: TableExpression,
-        at: crate::names::ScopeId,
-        identities: &Registry,
-    ) -> SelectStatement {
-        crate::pipeline::transformer::builder::publish_at(
-            at,
-            [],
-            SelectStatement::builder()
-                .select(SelectItem::star_over_nothing())
-                .from_tables(vec![from]),
-            identities,
-        )
+    fn select_from(from: TableExpression, at: crate::names::ScopeId) -> SelectStatement {
+        (SelectStatement::builder()
+            .select(SelectItem::star_over_nothing())
+            .from_tables(vec![from]))
+        .standing_at(at)
+        .map_err(crate::error::DelightQLError::parse_error)
         .expect("a star publishes no heading of its own")
     }
 
@@ -163,14 +139,10 @@ mod tests {
     #[test]
     fn inner_bare_join_becomes_cross() {
         let f = Fixture::new();
-        let stmt = legalize_bare_joins(query_stmt(select_from(
-            f.bare_join(JoinType::Inner),
-            f.t,
-            &f.identities,
-        )));
+        let stmt = legalize_bare_joins(query_stmt(select_from(f.bare_join(JoinType::Inner), f.t)));
         let (join_type, condition) = first_join(&stmt);
         assert_eq!(join_type, &JoinType::Cross);
-        assert_eq!(condition, &JoinCondition::Natural);
+        assert_eq!(condition, &JoinCondition::Cartesian);
     }
 
     #[test]
@@ -185,7 +157,6 @@ mod tests {
                 join_condition: on.clone(),
             },
             f.t,
-            &f.identities,
         )));
         let (join_type, condition) = first_join(&stmt);
         assert_eq!(join_type, &JoinType::Inner);
@@ -195,11 +166,7 @@ mod tests {
     #[test]
     fn bare_left_join_gets_on_true() {
         let f = Fixture::new();
-        let stmt = legalize_bare_joins(query_stmt(select_from(
-            f.bare_join(JoinType::Left),
-            f.t,
-            &f.identities,
-        )));
+        let stmt = legalize_bare_joins(query_stmt(select_from(f.bare_join(JoinType::Left), f.t)));
         let (join_type, condition) = first_join(&stmt);
         assert_eq!(join_type, &JoinType::Left);
         assert_eq!(
@@ -211,19 +178,16 @@ mod tests {
     #[test]
     fn nested_join_is_reached() {
         let f = Fixture::new();
-        let inner = select_from(f.bare_join(JoinType::Inner), f.t, &f.identities);
-        let outer = crate::pipeline::transformer::builder::publish_at(
-            f.t,
-            [],
-            SelectStatement::builder()
-                .select(SelectItem::star_over_nothing())
-                .from_tables(vec![TableExpression::Scope(f.t)])
-                .where_clause(DomainExpression::Exists {
-                    not: false,
-                    query: Box::new(QueryExpression::Select(Box::new(inner))),
-                }),
-            &f.identities,
-        )
+        let inner = select_from(f.bare_join(JoinType::Inner), f.t);
+        let outer = (SelectStatement::builder()
+            .select(SelectItem::star_over_nothing())
+            .from_tables(vec![TableExpression::Scope(f.t)])
+            .where_clause(DomainExpression::Exists {
+                not: false,
+                query: Box::new(QueryExpression::Select(Box::new(inner))),
+            }))
+        .standing_at(f.t)
+        .map_err(crate::error::DelightQLError::parse_error)
         .expect("a star publishes no heading of its own");
         let stmt = legalize_bare_joins(query_stmt(outer));
         let SqlStatement::Query {

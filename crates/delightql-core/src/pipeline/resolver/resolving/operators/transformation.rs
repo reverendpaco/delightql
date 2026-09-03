@@ -2,47 +2,23 @@
 // Copyright 2026 Daniel Eklund
 
 use crate::error::{DelightQLError, Result};
-use crate::names::{Addressing, ColId, ColumnOrigin, Computation, Republish, ValueFacts};
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
-use super::super::column_extraction::mint_projection_scope;
 use super::super::helpers::{build_concat_chain_with_placeholders, convert_column_alias};
 use super::helpers::emit_validation_warning;
 use crate::pipeline::asts::core::{NamedReference, Reference};
-use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
-
-fn expression_column(expression: &ast_resolved::DomainExpression) -> Option<ColId> {
-    match expression {
-        ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-            ColumnOccurrence { column, .. },
-        ))) => Some(*column),
-        _ => None,
-    }
-}
-
-/// Whether a cover hands a slot back its own column.
-///
-/// The one shape that writes nothing: the same value, under the same name.
-/// Every other expression — a literal, another column, a computation — is a
-/// new value standing in the slot.
-fn gives_back_the_same_column(
-    expression: &ast_resolved::DomainExpression,
-    covered: ColId,
-    identities: &crate::names::Registry,
-) -> bool {
-    expression_column(expression).is_some_and(|column| identities.same_value(column, covered))
-}
 
 pub(super) fn resolve_map_cover_via_fold(
     fold: &mut ResolverFold,
     function: ast_unresolved::Callable,
     columns: Vec<ast_unresolved::SelectorItem>,
     conditioned_on: Option<Box<ast_unresolved::TruthExpression>>,
-    available: &[ColId],
-) -> Result<(ast_resolved::PipeOp, Vec<ColId>)> {
+    available: &[crate::relation::PortId],
+    input: crate::relation::SemanticRelation,
+) -> Result<(ast_resolved::Step, Vec<crate::relation::PortId>)> {
     let (columns, covered) =
         super::super::domain_expressions::projection::resolve_selector_via_fold(
             fold, columns, available, true,
@@ -62,23 +38,18 @@ pub(super) fn resolve_map_cover_via_fold(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    // A map cover replaces each selected slot's value with the function
-    // applied to it — the same act `$$` performs, spelled over a selection.
-    for column in covered {
-        fold.registry.identities.mark_written_by_a_cover(column);
-    }
     let conditioned_on = conditioned_on
         .map(|condition| fold.transform_boolean(*condition).map(Box::new))
         .transpose()?;
-    Ok((
-        ast_resolved::PipeOp::MapCover(MapCover {
-            callable: (),
+    fold.core
+        .identities
+        .authority()
+        .bind(crate::relation::pending::Pending::MapCover {
+            input,
             selector: columns,
             guard: conditioned_on,
             cells,
-        }),
-        available.to_vec(),
-    ))
+        })
 }
 
 /// THE COVER'S APPLYING POSITION, at resolution: apply the authored
@@ -89,22 +60,20 @@ pub(super) fn resolve_map_cover_via_fold(
 fn apply_callable_to_cell(
     fold: &mut ResolverFold,
     callable: &ast_unresolved::Callable,
-    column: ColId,
+    column: crate::relation::PortId,
 ) -> Result<ast_resolved::DomainExpression> {
     let cell = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-        ColumnOccurrence {
-            column,
-            explicit_qualifier: false,
-        },
+        ColumnOccurrence::engine(column),
     )));
-    let with_cell = |fold: &mut ResolverFold,
-                     resolve: &mut dyn FnMut(&mut ResolverFold) -> Result<ast_resolved::DomainExpression>|
-     -> Result<ast_resolved::DomainExpression> {
-        let prior = fold.cover_cell.replace(cell.clone());
-        let resolved = resolve(fold);
-        fold.cover_cell = prior;
-        resolved
-    };
+    let with_cell =
+        |fold: &mut ResolverFold,
+         resolve: &mut dyn FnMut(&mut ResolverFold) -> Result<ast_resolved::DomainExpression>|
+         -> Result<ast_resolved::DomainExpression> {
+            let prior = fold.cover_cell.replace(cell.clone());
+            let resolved = resolve(fold);
+            fold.cover_cell = prior;
+            resolved
+        };
     match callable {
         // The slot is spent in the body, at every depth — a selection arm,
         // a scalarized relation's interior.
@@ -118,13 +87,11 @@ fn apply_callable_to_cell(
         }),
         ast_unresolved::Callable::Functor(application) => {
             // A mention of a value DEFINITION applies per cell: the cell
-            // lands in the definition's first parameter, exactly as an
-            // authored lambda's slot.
-            if let Some(applied) = crate::pipeline::resolver::grounding::cover_functor_apply_cell(
-                fold,
-                application,
-                cell.clone(),
-            )? {
+            // takes the definition's final parameter, exactly as an
+            // authored lambda's slot takes the flowing value.
+            if let Some(applied) =
+                crate::defuse::callable::cover_functor_apply_cell(fold, application, cell.clone())?
+            {
                 return Ok(applied);
             }
             // `@` anywhere in the call — arguments or window — is the slot,
@@ -136,21 +103,26 @@ fn apply_callable_to_cell(
                     ))
                 });
             }
-            // No slot written: the cell lands as the IMPLICIT FIRST
-            // argument — for a window function only when no argument was
-            // written, since its own arguments already say what it reads.
-            // The landing is spelled as the slot itself, prepended on the
-            // AUTHORED call, so the one signature authority judges the
-            // rebuilt invocation exactly as it judges an authored spelling.
+            // No slot written: the cell takes the DEFAULT LANDING, the
+            // argument row's final place — for a window function only when
+            // no argument was written, since its own arguments already say
+            // what it reads. A cover applies a callable to a cell the way a
+            // pipe applies one to a flowing value, so it spends the same
+            // judgment; were it to choose its own position, `$(f:(a))(x)`
+            // and `x /-> f:(a)` would be two different applications of one
+            // spelling. The landing is written as the slot itself, placed
+            // on the AUTHORED call, so the one signature authority judges
+            // the rebuilt invocation exactly as it judges an authored
+            // spelling.
             use crate::pipeline::asts::core::operators::{CallArguments, ScalarArgument};
             let mut rebuilt = application.clone();
-            let prepend = match (&rebuilt.window, &rebuilt.call.call().arguments) {
+            let lands = match (&rebuilt.window, &rebuilt.call.call().arguments) {
                 (Some(_), CallArguments::Scalar(members)) => members.is_empty(),
                 (Some(_), CallArguments::None) => true,
                 (None, CallArguments::Scalar(_)) | (None, CallArguments::None) => true,
                 (_, CallArguments::HigherOrder(_)) => false,
             };
-            if prepend {
+            if lands {
                 let slot = ScalarArgument::plain(ast_unresolved::DomainExpression::Application(
                     ast_unresolved::FunctionApplication::Open(
                         crate::pipeline::asts::core::DomainHole::CompositionInput,
@@ -158,10 +130,13 @@ fn apply_callable_to_cell(
                 ));
                 let arguments = &mut rebuilt.call.call_mut().arguments;
                 match arguments {
-                    CallArguments::Scalar(members) => members.insert(0, slot),
+                    CallArguments::Scalar(members) => {
+                        let written = std::mem::take(members);
+                        *members = crate::pipeline::normalize::land_final(slot, written);
+                    }
                     CallArguments::None => *arguments = CallArguments::Scalar(vec![slot]),
                     CallArguments::HigherOrder(_) => {
-                        unreachable!("prepend is not chosen for a higher-order group")
+                        unreachable!("the landing is not placed in a higher-order group")
                     }
                 }
             }
@@ -203,11 +178,7 @@ fn functor_mentions_slot(application: &ast_unresolved::StandardApplication) -> b
         let _ = crate::pipeline::ast_visit::walk_visit_domain(&mut finder, expr);
         finder.0
     }
-    let args_mention = application
-        .call()
-        .arguments
-        .value_domains()
-        .any(in_expr);
+    let args_mention = application.call().arguments.value_domains().any(in_expr);
     let window_mentions = application.window.as_ref().is_some_and(|window| {
         window.partition.iter().any(in_expr)
             || window.ordering.iter().any(|spec| in_expr(&spec.column))
@@ -215,22 +186,17 @@ fn functor_mentions_slot(application: &ast_unresolved::StandardApplication) -> b
     args_mention || window_mentions
 }
 
-
 pub(super) fn resolve_transform_via_fold(
     fold: &mut ResolverFold,
     transformations: crate::pipeline::asts::vocabulary::Vec1<ast_unresolved::NamedOutItem>,
     conditioned_on: Option<Box<ast_unresolved::TruthExpression>>,
-    available: &[ColId],
-) -> Result<(ast_resolved::PipeOp, Vec<ColId>)> {
+    available: &[crate::relation::PortId],
+    input: crate::relation::SemanticRelation,
+) -> Result<(ast_resolved::Step, Vec<crate::relation::PortId>)> {
     let mut resolved = Vec::new();
     let mut targets = Vec::new();
     for item in transformations.into_vec() {
-        let ast_unresolved::NamedOutItem {
-            expr,
-            naming,
-            qualifier,
-            output: (),
-        } = item;
+        let (expr, naming, qualifier) = (item.expr, item.naming, item.qualifier);
         let expression = Some(
             super::super::domain_expressions::projection::resolve_out_value_via_fold(
                 fold, expr, available,
@@ -242,32 +208,27 @@ pub(super) fn resolve_transform_via_fold(
         // AS WRITTEN, both halves: a strop is what makes an address
         // case-sensitive, and a folded target addresses a column nobody named.
         let alias_spelling = fold
-            .registry
+            .core
             .identities
             .intern(naming.as_str(), naming.is_stropped());
-        let alias_sym = fold.registry.identities.canonical(alias_spelling);
+        let alias_sym = fold.core.identities.canonical(alias_spelling);
         let qualifier_sym = qualifier.as_ref().map(|qualifier| {
             let spelling = fold
-                .registry
+                .core
                 .identities
                 .intern(qualifier.as_str(), qualifier.is_stropped());
-            fold.registry.identities.canonical(spelling)
+            fold.core.identities.canonical(spelling)
         });
-        let by_name: Vec<_> = available
-            .iter()
-            .copied()
-            .filter(|column| fold.registry.identities.published_sym(*column) == Some(alias_sym))
-            .collect();
-        // A transform target is addressed, so it reaches under the tiers every
-        // qualified address uses — `u.email` here and `u.email` in a projection
-        // are the same two words and must find the same column. Asking only
-        // whether the owning scope answers to `u` is a reach of its own, and it
-        // finds nothing across a join: the columns stand in the join scope,
-        // which answers to no name.
-        let matches = match qualifier_sym {
-            Some(qualifier) => fold.registry.identities.qualified_glob(qualifier, &by_name),
-            None => crate::names::Candidates::from_vec(by_name),
-        };
+        let mut witness = crate::pipeline::resolver::Witness::default();
+        let matches = vec![fold.lexical.address(
+            crate::pipeline::resolver::unification::ColumnReference::Named {
+                name: naming.clone(),
+                qualifier: qualifier.clone(),
+            },
+            false,
+            &mut witness,
+            &fold.core.identities,
+        )?];
         // Two different failures wore one message, and neither of them was a
         // parse failure. A target that reaches nothing is an unresolved
         // column — under its WRITTEN spelling, qualifier included — and a
@@ -278,73 +239,58 @@ pub(super) fn resolve_transform_via_fold(
             Some(qualifier) => format!("{qualifier}.{naming}"),
             None => naming.to_string(),
         };
-        if matches.is_empty() {
-            return Err(DelightQLError::column_not_found_error(
-                spelled,
-                "as a transform target",
-            ));
-        }
-        if matches.len() > 1 {
-            return Err(DelightQLError::validation_error_categorized(
-                "resolution/ambiguous",
-                format!(
-                    "Ambiguous transform target '{spelled}': {} columns of the operand \
-                     publish that name. Qualify the target with the relation whose \
-                     column is being written.",
-                    matches.len()
-                ),
-                "as a transform target",
-            ));
-        }
+        let covered = match matches.into_iter().next().expect("one target was asked") {
+            crate::pipeline::resolver::unification::UnificationResult::Resolved(occurrence) => {
+                occurrence.column
+            }
+            crate::pipeline::resolver::unification::UnificationResult::Unresolved(_) => {
+                return Err(DelightQLError::column_not_found_error(
+                    spelled,
+                    "as a transform target",
+                ));
+            }
+            crate::pipeline::resolver::unification::UnificationResult::Ambiguous { .. } => {
+                return Err(DelightQLError::validation_error_categorized(
+                    "resolution/ambiguous",
+                    format!("Ambiguous transform target '{spelled}'"),
+                    "as a transform target",
+                ));
+            }
+            crate::pipeline::resolver::unification::UnificationResult::Opaque => {
+                return Err(crate::pipeline::resolver::opaque_reference_refusal());
+            }
+            crate::pipeline::resolver::unification::UnificationResult::Refused(refusal) => {
+                return Err(refusal.into_error());
+            }
+        };
         if targets.contains(&(alias_sym, qualifier_sym)) {
             return Err(DelightQLError::parse_error(format!(
                 "Duplicate transform target '{naming}'"
             )));
         }
         targets.push((alias_sym, qualifier_sym));
-        // A cover keeps the slot's identity, so nothing downstream could tell
-        // from the value chain that what stands there is now a value being
-        // WRITTEN. That is recorded here, at the one place the cover is
-        // resolved, and travels with the value from then on.
-        //
-        // A cover that hands the slot back its own column writes nothing: it
-        // is the same value under the same name, and an update whose only
-        // cover is that one has nothing to change.
-        let covered = matches
-            .to_vec()
-            .first()
-            .copied()
-            .expect("exactly one match was just established");
-        // A crossing never gives back the column it writes into: it computes
-        // a new value, so the cover is always a write.
-        let unchanged = expression.domain().is_some_and(|value| {
-            gives_back_the_same_column(value, covered, &fold.registry.identities)
-        });
-        if !unchanged {
-            fold.registry.identities.mark_written_by_a_cover(covered);
-        }
         // THE TARGET IS THE OUTPUT. Resolution found the one column this item
         // writes; the lowering reads that decision instead of re-addressing
         // the same two words against a later heading.
-        resolved.push(ast_resolved::NamedOutItem {
+        resolved.push(crate::relation::pending::TransformItem {
             expr: expression,
             naming,
             qualifier,
-            output: Some(covered),
+            covered,
         });
     }
 
     let conditioned_on = conditioned_on
         .map(|condition| fold.transform_boolean(*condition).map(Box::new))
         .transpose()?;
-    Ok((
-        ast_resolved::PipeOp::Transform {
-            items: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(resolved)
-                .expect("one transform item resolves to one item"),
+    fold.core
+        .identities
+        .authority()
+        .bind(crate::relation::pending::Pending::Transform {
+            input,
+            items: resolved,
             guard: conditioned_on,
-        },
-        available.to_vec(),
-    ))
+        })
 }
 
 pub(super) fn resolve_embed_map_cover_via_fold(
@@ -352,60 +298,21 @@ pub(super) fn resolve_embed_map_cover_via_fold(
     function: ast_unresolved::Callable,
     selector: Vec<ast_unresolved::SelectorItem>,
     alias_template: Option<ast_unresolved::ColumnAlias>,
-    available: &[ColId],
-) -> Result<(ast_resolved::PipeOp, Vec<ColId>)> {
+    available: &[crate::relation::PortId],
+    input: crate::relation::SemanticRelation,
+) -> Result<(ast_resolved::Step, Vec<crate::relation::PortId>)> {
     let (resolved_selector, selected) =
         super::super::domain_expressions::projection::resolve_selector_via_fold(
             fold, selector, available, true,
         )?;
 
-    let output_scope = mint_projection_scope(&fold.registry.identities, available);
-    let mut output = available
-        .iter()
-        .map(|source| {
-            fold.registry.identities.republish_column(
-                *source,
-                output_scope,
-                Republish::Passthrough,
-                fold.registry.identities.published(*source),
-                fold.registry.identities.addressing(*source),
-                |_| {},
-            )
-        })
-        .collect::<Vec<_>>();
-
-    for (offset, source) in selected.iter().enumerate() {
-        let published = match &alias_template {
-            Some(ast_unresolved::ColumnAlias::Template(template)) => fold
-                .registry
-                .identities
-                .expand_template(*source, &template.template, available.len() + offset + 1),
-            Some(ast_unresolved::ColumnAlias::Literal(name)) => {
-                Some(fold.registry.identities.intern(name, false))
-            }
-            None => None,
-        };
-        output.push(fold.registry.identities.mint_column(
-            output_scope,
-            ColumnOrigin::Computed {
-                via: Computation::Function,
-            },
-            published,
-            if published.is_some() {
-                Addressing::Published
-            } else {
-                Addressing::Hygienic
-            },
-            ValueFacts::default(),
-        ));
-    }
     if selected.is_empty() && !available.is_empty() {
         emit_validation_warning("EmbedMapCover pattern matched no columns - no columns added");
     }
 
     // THE COVER IS THE APPLYING POSITION for the embed spelling too: one
     // closed resolved expression per covered cell, appended beside the
-    // operand's heading under the resolved output identities minted above.
+    // operand's heading under the naming the authority expands.
     let cells = selected
         .iter()
         .map(|column| {
@@ -415,13 +322,13 @@ pub(super) fn resolve_embed_map_cover_via_fold(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((
-        ast_resolved::PipeOp::EmbedMapCover(EmbedMapCover {
-            callable: (),
+    fold.core
+        .identities
+        .authority()
+        .bind(crate::relation::pending::Pending::EmbedMapCover {
+            input,
             naming: convert_column_alias(alias_template),
             selector: resolved_selector,
             cells,
-        }),
-        output,
-    ))
+        })
 }

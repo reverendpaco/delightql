@@ -20,6 +20,10 @@ pub enum Reference<P: Phase = Unresolved> {
     /// reference carries, so the payload is uninhabited after it.
     #[lispy("reference:ordinal")]
     Ordinal(P::ColumnOrdinal),
+    /// A physical SQL slot introduced only while lowering a refined tree.
+    /// It is not semantic lookup evidence and no resolver constructs it.
+    #[lispy("reference:physical")]
+    Physical(P::PhysicalColumn),
 }
 
 /// The one node that names a column. What it HOLDS is the phase's answer:
@@ -33,14 +37,16 @@ impl<P: Phase> NamedReference<P> {
     pub fn column(&self) -> &P::Col {
         &self.0
     }
-
-    pub fn into_column(self) -> P::Col {
-        self.0
-    }
 }
 
 impl<P: Phase> Reference<P> {
     pub fn named(column: P::Col) -> Self {
         Self::Named(NamedReference(column))
+    }
+}
+
+impl Reference<crate::pipeline::asts::core::Refined> {
+    pub(crate) fn physical(column: crate::names::ColId) -> Self {
+        Self::Physical(column)
     }
 }

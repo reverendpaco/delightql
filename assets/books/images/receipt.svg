@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" xmlns:xl="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg" xmlns:dc="http://purl.org/dc/elements/1.1/" viewBox="386.98537 706.0206 509.26463 46.711486" width="509.26463" height="46.711486">
+  <defs/>
+  <g id="Canvas_6" fill="none" stroke-dasharray="none" fill-opacity="1" stroke-opacity="1" stroke="none">
+    <title>Canvas 6</title>
+    <g id="Canvas_6_Layer_1">
+      <title>Layer 1</title>
+      <g id="Group_2">
+        <g id="Graphic_24">
+          <rect x="387.23537" y="734.1744" width="127.19116" height="18.307657" fill="#d9e6e1"/>
+          <rect x="387.23537" y="734.1744" width="127.19116" height="18.307657" stroke="#8c8c8c" stroke-linecap="round" stroke-linejoin="round" stroke-width=".5"/>
+          <text transform="translate(392.23537 734.3282)" fill="#697271">
+            <tspan font-family="Menlo" font-size="15" fill="#697271" x="54.0802" y="14" xml:space="preserve">1</tspan>
+          </text>
+        </g>
+        <g id="Graphic_23">
+          <rect x="641.6177" y="715.86675" width="127.19116" height="18.307657" fill="#b8c4c4"/>
+          <rect x="641.6177" y="715.86675" width="127.19116" height="18.307657" stroke="#8c8c8c" stroke-linecap="round" stroke-linejoin="round" stroke-width=".5"/>
+          <text transform="translate(646.6177 715.5206)" fill="black">
+            <tspan font-family="Menlo" font-size="16" fill="black" x="53.779175" y="15" xml:space="preserve">…</tspan>
+          </text>
+        </g>
+        <g id="Graphic_22">
+          <rect x="387.23537" y="715.86675" width="127.19116" height="18.307657" fill="#b8c4c4"/>
+          <rect x="387.23537" y="715.86675" width="127.19116" height="18.307657" stroke="#8c8c8c" stroke-linecap="round" stroke-linejoin="round" stroke-width=".5"/>
+          <text transform="translate(392.23537 715.5206)" fill="black">
+            <tspan font-family="Menlo" font-size="16" fill="black" x="24.880737" y="15" xml:space="preserve">success</tspan>
+          </text>
+        </g>
+        <g id="Graphic_21">
+          <rect x="641.6177" y="734.1744" width="127.19116" height="18.307657" fill="#d9e6e1"/>
+          <rect x="641.6177" y="734.1744" width="127.19116" height="18.307657" stroke="#8c8c8c" stroke-linecap="round" stroke-linejoin="round" stroke-width=".5"/>
+        </g>
+        <g id="Graphic_7">
+          <rect x="768.8088" y="715.86675" width="127.19116" height="18.307657" fill="#b8c4c4"/>
+          <rect x="768.8088" y="715.86675" width="127.19116" height="18.307657" stroke="#8c8c8c" stroke-linecap="round" stroke-linejoin="round" stroke-width=".5"/>
+          <text transform="translate(773.8088 715.5206)" fill="black">
+            <tspan font-family="Menlo" font-size="16" fill="black" x="53.779175" y="15" xml:space="preserve">…</tspan>
+          </text>
+        </g>
+        <g id="Graphic_6">
+          <rect x="768.8088" y="734.1744" width="127.19116" height="18.307657" fill="#d9e6e1"/>
+          <rect x="768.8088" y="734.1744" width="127.19116" height="18.307657" stroke="#8c8c8c" stroke-linecap="round" stroke-linejoin="round" stroke-width=".5"/>
+        </g>
+        <g id="Graphic_5">
+          <rect x="514.4265" y="715.86675" width="127.19116" height="18.307657" fill="#b8c4c4"/>
+          <rect x="514.4265" y="715.86675" width="127.19116" height="18.307657" stroke="#8c8c8c" stroke-linecap="round" stroke-linejoin="round" stroke-width=".5"/>
+          <text transform="translate(519.4265 715.5206)" fill="black">
+            <tspan font-family="Menlo" font-size="16" fill="black" x="15.247925" y="15" xml:space="preserve">operation</tspan>
+          </text>
+        </g>
+        <g id="Graphic_4">
+          <rect x="514.4265" y="734.1744" width="127.19116" height="18.307657" fill="#d9e6e1"/>
+          <rect x="514.4265" y="734.1744" width="127.19116" height="18.307657" stroke="#8c8c8c" stroke-linecap="round" stroke-linejoin="round" stroke-width=".5"/>
+          <text transform="translate(519.4265 734.3282)" fill="#697271">
+            <tspan font-family="Menlo" font-size="15" fill="#697271" x="31.503296" y="14" xml:space="preserve">mount!</tspan>
+          </text>
+        </g>
+      </g>
+    </g>
+  </g>
+</svg>

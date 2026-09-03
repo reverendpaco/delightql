@@ -40,16 +40,16 @@ pub mod truth;
 pub use access::{Access, Slot};
 pub use chain::{
     AnonRelation, AnonTable, BagCorrelation, Chain, Continuation, CorrPred, Correspondence, Datum,
-    ErJoinStep, Grelex, HeaderItem, MemberCorrelation, StructuralForm, StructuralStep, TabularBody,
-    TabularRow, WholeHeading,
+    ErJoinStep, Grelex, GroundForm, HeaderItem, MemberCorrelation, Peel, RunForm, Standing, Step,
+    StructuralForm, StructuralStep, TabularBody, TabularRow, Transparent, WholeHeading,
 };
-pub use domain::{DomainExpression, DomainHole};
-pub use enclyph::{Enclyph, Record, RecordMember, Tuple};
+pub use domain::{DomainExpression, DomainHole, FormalHole};
+pub use enclyph::{Enclyph, Record, RecordMember, Tuple, TupleElement};
 pub use functions::{
-    Callable, CaseExpression, FactFunctionArm, FactFunctionMode, FieldSelect, FunctionApplication,
-    FunctorCall, InfixApplication, Lambda, MatchArm, ModeWitness, PureCall, ScalarRelation,
-    Scalarization, ScalarizedRelation, SealedCall, SearchedArm, StandardApplication, ValueTemplate,
-    ValueTemplatePart, WindowSpec,
+    Callable, CaseExpression, Crossing, FactFunctionArm, FactFunctionDefinition, FactFunctionMode,
+    FieldSelect, FunctionApplication, FunctorCall, InfixApplication, Lambda, MatchArm, ModeWitness,
+    PureCall, ScalarRelation, Scalarization, ScalarizedRelation, SealedCall, SearchedArm,
+    StandardApplication, ValueTemplate, ValueTemplatePart, WindowSpec,
 };
 pub use helpers::QualifiedName;
 pub use metadata_group::{MetadataGroup, MetadataTarget};
@@ -67,7 +67,7 @@ pub use references::{NamedReference, Reference};
 pub use relational::{GroundMention, InnerRelationPattern, Relation};
 pub use spreads::{Glob, RegexSelector, RenameSource, SelectorItem, Spread};
 pub use truth::{
-    ArgumentValue, Comparison, Existence, Membership, MembershipSource, OutValue, Polarity, Probe,
-    ProbeAddressing, RelationalMembership, SigmaApplication, SlotConstraint, TruthAsValue,
-    TruthExpression, ValueRow,
+    ArgumentValue, Comparison, Existence, Membership, MembershipSource, Polarity, Probe,
+    ProbeAddressing, RelationalMembership, SigmaApplication, TruthConsumer, TruthExpression,
+    ValueRow,
 };

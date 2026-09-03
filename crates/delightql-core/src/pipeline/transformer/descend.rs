@@ -27,32 +27,51 @@ use super::TransformCtx;
 /// before returning — every `descend()` call returns the same type.
 #[stacksafe::stacksafe]
 pub(super) fn descend(
-    mut expr: ast_refined::Chain,
+    expr: ast_refined::Chain,
     names: &NameGenerator,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
+    let output_relation = expr.semantic_relation();
     // The last STEP is the one this level lowers; everything before it is
     // the operand it consumes. The base is the chain's read: the relation
     // and the access it was read under.
-    let Some(last) = expr.pop_step() else {
-        let (head, access, _) = expr.split_head_access();
-        return match head {
-            ast_refined::Grelex::Reference(rel) => {
-                relational::r_lower_read(rel, access, names, ctx)
-            }
-            ast_refined::Grelex::Literal(anon) => relational::r_lower_anon_table(anon, names, ctx),
-        };
+    let peeled = match expr.peel() {
+        Err(expr) => {
+            let (head, access, _) = expr.split_head_access();
+            let read = *head.result();
+            return match head.into_form() {
+                ast_refined::GroundForm::Reference(rel) => {
+                    relational::r_lower_read(rel, access, read, names, ctx)
+                }
+                ast_refined::GroundForm::Literal(anon) => {
+                    relational::r_lower_anon_table(anon, read, names, ctx)
+                }
+            }?
+            .bind_relation(output_relation, &ctx.relations);
+        }
+        Ok(peeled) => peeled,
     };
-    match last {
+    // Pipes, bag operations and the structural forms produce Projected; the
+    // step travels WHOLE to that road rather than being taken apart here.
+    if !matches!(
+        peeled.last().form(),
+        ast_refined::Continuation::Restrict { .. }
+            | ast_refined::Continuation::Bound { .. }
+            | ast_refined::Continuation::Destructure { .. }
+            | ast_refined::Continuation::Member { .. }
+    ) {
+        return descend_as_query(peeled.rejoin(), names, ctx)?
+            .demote()?
+            .bind_relation(output_relation, &ctx.relations);
+    }
+    let (expr, last) = peeled.split();
+    let result = *last.result();
+    let form = last.into_form();
+    let lowered = match form {
         // Restriction: lower the operand, then add WHERE.
-        ast_refined::Continuation::Restrict {
-            condition,
-            origin,
-            cpr_schema,
-        } => {
-            let _ = cpr_schema;
+        ast_refined::Continuation::Restrict { condition, origin } => {
             let child = descend(expr, names, ctx)?;
-            relational::r_lower_filter(child, condition, origin, ctx)
+            relational::r_lower_filter(child, condition, origin, result, ctx)
         }
 
         ast_refined::Continuation::Bound { bound, .. } => {
@@ -65,12 +84,9 @@ pub(super) fn descend(
             pattern,
             mode,
             schema,
-            cpr_schema,
         } => {
             let child = descend(expr, names, ctx)?;
-            relational::r_lower_destructure(
-                child, *source, mode, &pattern, &schema, cpr_schema, ctx,
-            )
+            relational::r_lower_destructure(child, *source, mode, &pattern, &schema, result, ctx)
         }
 
         // Member: lower both sides (forking names for the right), then
@@ -81,26 +97,47 @@ pub(super) fn descend(
             rhs,
             correlation,
             join_type,
-            cpr_schema,
         } => {
             // Normalize RIGHT JOIN to LEFT JOIN by swapping operands
-            let (left, right, join_type) = if join_type == Some(ast_refined::JoinType::RightOuter) {
+            let emitted_swapped = join_type == Some(ast_refined::JoinType::RightOuter);
+            let (left, right, join_type) = if emitted_swapped {
                 (rhs, expr, Some(ast_refined::JoinType::LeftOuter))
             } else {
                 (expr, rhs, join_type)
             };
             let left_builder = descend(left, names, ctx)?;
-            let right_anon = match (&right.head, right.continuations.is_empty()) {
-                (ast_refined::Grelex::Literal(anon), true) => Some(anon.clone()),
+            // A zero-width anonymous table rides this road too: its one
+            // continuation is the unasked access that narrows the read to
+            // no columns, and the join's own result already publishes that
+            // width. The grid still lowers against the READ's relation, so
+            // its cells stay addressable to the predicates that read them.
+            let zero_width_anon = matches!(
+                right.continuations(),
+                [step] if matches!(
+                    step.form(),
+                    ast_refined::Continuation::Access {
+                        access: ast_refined::Access::Unasked,
+                        ..
+                    }
+                )
+            );
+            let right_anon = match (
+                right.head().form(),
+                right.continuations().is_empty() || zero_width_anon,
+            ) {
+                (ast_refined::GroundForm::Literal(anon), true) => {
+                    Some((anon.clone(), *right.head().result()))
+                }
                 _ => None,
             };
-            if let Some(anon) = right_anon {
+            if let Some((anon, anon_relation)) = right_anon {
                 relational::r_lower_join_anonymous(
                     left_builder,
                     anon,
+                    anon_relation,
                     correlation,
                     join_type,
-                    cpr_schema,
+                    result,
                     names,
                     ctx,
                 )
@@ -111,7 +148,8 @@ pub(super) fn descend(
                     right_builder,
                     correlation,
                     join_type,
-                    cpr_schema,
+                    result,
+                    emitted_swapped,
                     ctx,
                 )
             }
@@ -119,8 +157,9 @@ pub(super) fn descend(
 
         // Pipes and bag operations produce Projected; demote for a uniform
         // return type.
-        last => descend_as_query(expr.then(last), names, ctx)?.demote(),
-    }
+        _ => unreachable!("the four operand-consuming steps were just matched"),
+    }?;
+    lowered.bind_relation(output_relation, &ctx.relations)
 }
 
 /// Lower a `Chain` as a complete query (with projection).
@@ -153,6 +192,7 @@ fn descend_as_query_with(
     ctx: &TransformCtx,
     hygiene: PassthroughHygiene,
 ) -> Result<Builder<Projected>> {
+    let output_relation = expr.semantic_relation();
     // The trailing run: already Projected, so no demotion is needed. An
     // access lowers in the same run its neighbouring pipes do.
     //
@@ -165,37 +205,35 @@ fn descend_as_query_with(
     let mut expr = expr;
     let mut segments = Vec::new();
     while let Some(step) = expr.pop_run_step() {
-        use crate::pipeline::asts::core::expressions::chain::RunStep;
-        match step {
+        use crate::pipeline::asts::core::expressions::chain::RunForm;
+        let result = *step.result();
+        match step.into_form() {
             // Not a discard: at this phase the `named` slot holds `()`,
             // so there is no spelling here to have thrown away. The
             // stage answers to its scope, and that is what lowering
             // addresses.
-            RunStep::Pipe {
+            RunForm::Pipe {
                 operator,
                 named: (),
-                cpr_schema,
             } => segments.push(PipeSegment {
                 step: relational::PipeStep::Operator(operator),
-                cpr_schema,
+                result,
             }),
-            RunStep::Access { cpr_schema, .. } => segments.push(PipeSegment {
+            RunForm::Access { .. } => segments.push(PipeSegment {
                 step: relational::PipeStep::Access,
-                cpr_schema,
+                result,
             }),
-            RunStep::Structural(step) => {
-                let cpr_schema = step.cpr_schema;
-                segments.push(PipeSegment {
-                    step: relational::PipeStep::Structural(step),
-                    cpr_schema,
-                });
-            }
+            RunForm::Structural(step) => segments.push(PipeSegment {
+                step: relational::PipeStep::Structural(step),
+                result,
+            }),
         }
     }
     if !segments.is_empty() {
         segments.reverse();
         let base_builder = descend(expr, names, ctx)?;
-        return relational::r_lower_pipe(base_builder, segments, names, ctx);
+        return relational::r_lower_pipe(base_builder, segments, names, ctx)?
+            .bind_relation(output_relation, &ctx.relations);
     }
 
     // A trailing bag RUN lowers as one operation over its arms: the run is
@@ -204,21 +242,27 @@ fn descend_as_query_with(
     // neighbour. `trailing_bag_run` is the same reader the refiner wrote
     // those indices against.
     if let Some(run) = expr.trailing_bag_run() {
-        let steps = expr.continuations.split_off(run.base);
-        let mut operands = vec![descend_as_query(expr, names, ctx)?];
+        let steps = expr.split_run(run);
+        // ONE LOWERED ARM, from ONE chain. The statement and the relation
+        // it emits are read from the same expression, so there is no
+        // moment at which a caller holds them apart.
+        let mut operands = vec![relational::SetArm::lower(expr, names, ctx)?];
         let mut correlations = Vec::new();
-        let mut output = None;
+        // ONE RESULT PER OPERATOR, innermost first. A run is a sequence of
+        // binary steps while SQL stacks one branch per arm, and these are
+        // what relate the two: step `j` merges what step `j - 1` produced
+        // with arm `j + 1`. Keeping only the outermost would leave the
+        // physical binding to rediscover the nesting from the arms.
+        let mut run_steps = Vec::new();
         for (step, continuation) in steps.into_iter().enumerate() {
+            let published = *continuation.result();
             let ast_refined::Continuation::BagOp {
-                arm,
-                correlation,
-                cpr_schema,
-                ..
-            } = continuation
+                arm, correlation, ..
+            } = continuation.into_form()
             else {
                 unreachable!("the run's steps are bag steps")
             };
-            operands.push(descend_as_query(arm, names, ctx)?);
+            operands.push(relational::SetArm::lower(arm, names, ctx)?);
             if let Some(correlation) = correlation {
                 correlations.push(relational::ArmCorrelation {
                     left: correlation.with_arm.value() as usize,
@@ -237,28 +281,29 @@ fn descend_as_query_with(
             }
             // The run publishes the LAST step's heading: each step merges
             // its own two operands, so the outermost is the whole run's.
-            output = Some(cpr_schema);
+            run_steps.push(published);
         }
-        let cpr_schema = output.expect("a run has at least one step");
-        return if correlations.is_empty() {
-            relational::r_lower_set_op(operands, run.operator, cpr_schema, ctx)
+        return (if correlations.is_empty() {
+            relational::r_lower_set_op(operands, run.operator, &run_steps, ctx)
         } else {
             relational::r_lower_correlated_set_op(
                 operands,
                 run.operator,
                 correlations,
-                cpr_schema,
+                &run_steps,
                 ctx,
             )
-        };
+        })?
+        .bind_relation(output_relation, &ctx.relations);
     }
 
     // Everything else: descend to Unprojected, then passthrough projection —
     // the one road the hygiene choice reaches.
-    match hygiene {
+    let lowered = match hygiene {
         PassthroughHygiene::Drop => descend(expr, names, ctx)?.project_all(),
         PassthroughHygiene::Carry => descend(expr, names, ctx)?.project_all_carrying_hygiene(),
-    }
+    }?;
+    lowered.bind_relation(output_relation, &ctx.relations)
 }
 
 /// Lower a complete query whose caller still reads its hygienic carriers.

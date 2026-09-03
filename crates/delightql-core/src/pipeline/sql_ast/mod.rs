@@ -59,5 +59,5 @@ pub use operators::{BinaryOperator, UnaryOperator};
 pub use ordering::{OrderDirection, OrderTerm};
 pub use query::{QueryExpression, SelectStatement, SetOperator};
 pub use select_items::{Publishes, SelectItem};
-pub use statements::{Cte, SqlStatement};
-pub use table::{JoinCondition, JoinType, TableExpression, TvfArgument};
+pub use statements::{Cte, CteBody, SqlStatement};
+pub use table::{JoinCondition, JoinType, MergedSlots, TableExpression, TvfArgument};

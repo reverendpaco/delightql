@@ -46,15 +46,95 @@ pub struct AuthoredColumn {
 }
 
 /// The column a reference names, once something has bound it.
-#[derive(Debug, Clone, PartialEq, ToLispy)]
-#[lispy("column:occurrence")]
+///
+/// CONSTRUCTED ONLY THROUGH ITS OWN DOORS. A resolved reference is one of
+/// two things, and the door says which: the lexical frontier's terminal
+/// answer to an AUTHORED spelling ([`ColumnOccurrence::addressed`], which
+/// only that authority can present the proof for), or a position the
+/// ENGINE derived from a port it minted or carried
+/// ([`ColumnOccurrence::engine`]). Nothing holding a port identity can
+/// state that an author addressed it: that statement is a lookup, and the
+/// frontier is the one road a lookup takes.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnOccurrence {
-    pub column: crate::names::ColId,
+    pub column: crate::relation::PortId,
     /// Whether the source reference contained an explicit qualifier.
     ///
     /// Resolution erases qualifier characters, but later ambiguity laws
     /// still distinguish explicit references from bare ones.
     pub explicit_qualifier: bool,
+    /// The door this occurrence came through. Private, so no struct
+    /// literal outside this module can build one.
+    minted: Minted,
+}
+
+/// The mark of a door. Zero-sized, private: its only value is that a
+/// struct literal elsewhere cannot supply it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Minted;
+
+impl ColumnOccurrence {
+    /// THE FRONTIER'S TERMINAL ANSWER to an authored spelling: which live
+    /// occurrence the reference addresses, and whether the author qualified
+    /// it. The proof is minted by the lexical authority alone, at the
+    /// judgment, so an addressed occurrence cannot be forged from a port.
+    pub(crate) fn addressed(
+        column: crate::relation::PortId,
+        explicit_qualifier: bool,
+        _judged: crate::pipeline::resolver::Terminal,
+    ) -> Self {
+        Self {
+            column,
+            explicit_qualifier,
+            minted: Minted,
+        }
+    }
+
+    /// A POSITION THE ENGINE DERIVED — a port the construction authority
+    /// minted or carried, referenced by the compiler's own rewrite. Never
+    /// the answer to an authored spelling: no spelling was searched.
+    pub fn engine(column: crate::relation::PortId) -> Self {
+        Self {
+            column,
+            explicit_qualifier: false,
+            minted: Minted,
+        }
+    }
+
+    /// An engine-derived position the lowering must SPELL qualified — a
+    /// correlation between two operands' ports, where a bare spelling
+    /// would be ambiguous in the emitted statement. Qualification here is
+    /// a rendering fact about the engine's own reference; it is not an
+    /// authored qualifier and grants no addressing.
+    pub fn engine_qualified(column: crate::relation::PortId) -> Self {
+        Self {
+            column,
+            explicit_qualifier: true,
+            minted: Minted,
+        }
+    }
+
+    /// THE SAME REFERENCE, standing on another port: a republication moved
+    /// the position and the reference follows it, keeping whether the
+    /// author qualified it. Continuity of an occurrence already judged,
+    /// never a new judgment.
+    pub fn rebound(&self, column: crate::relation::PortId) -> Self {
+        Self {
+            column,
+            explicit_qualifier: self.explicit_qualifier,
+            minted: Minted,
+        }
+    }
+}
+
+impl crate::lispy::ToLispy for ColumnOccurrence {
+    fn to_lispy(&self) -> String {
+        format!(
+            "(column:occurrence (column {}) (explicit_qualifier {}))",
+            self.column.to_lispy(),
+            self.explicit_qualifier.to_lispy()
+        )
+    }
 }
 
 /// The name a caller-pattern slot offers, as authored.
@@ -93,9 +173,7 @@ pub struct ContextMarker;
 #[cfg(test)]
 mod lifecycle {
     use super::*;
-    use crate::pipeline::asts::core::{
-        DomainExpression, Phase, Refined, Resolved, Slot, Unresolved,
-    };
+    use crate::pipeline::asts::core::{Phase, Refined, Resolved, Slot, Unresolved};
 
     /// The authored column is a SPELLING and nothing else. A pass that has
     /// already chosen a column does not get to say so here.
@@ -121,21 +199,26 @@ mod lifecycle {
         });
         assert!(matches!(authored, Slot::Bind(_)), "a bare name binds");
 
-        let registry = crate::names::Registry::new(&[]);
-        let scope = registry.mint_scope(
-            crate::names::ScopeOrigin::AnonRelation,
-            crate::names::Hint::None,
-            None,
-        );
-        let column = registry.mint_column(
-            scope,
-            crate::names::ColumnOrigin::Bound { position: 0 },
-            Some(registry.intern("x", false)),
-            crate::names::Addressing::Published,
-            crate::names::ValueFacts::default(),
-        );
-        let bound: Slot<Resolved> = Slot::Bind(column);
-        assert_eq!(bound.binder().copied(), Some(column));
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+        let named = registry.intern("x", false);
+        let relation = registry
+            .authority()
+            .derive(crate::relation::RelForm::Anonymous(
+                crate::relation::form::AnonymousSpec {
+                    shape: crate::relation::form::AnonymousShape::Tabular,
+                    slots: &[crate::relation::form::AnonymousSlot::Binder {
+                        position: 0,
+                        named,
+                        declared_type: None,
+                        shape: crate::names::ValueShape::Unknown,
+                    }],
+                    answers_to: None,
+                },
+            ))
+            .unwrap();
+        let port = crate::relation::published_ports(&registry, &relation).unwrap()[0];
+        let bound: Slot<Resolved> = Slot::Bind(port);
+        assert_eq!(bound.binder().copied(), Some(port));
     }
 
     /// A qualified name REUSES somebody else's column: it addresses the
@@ -151,7 +234,7 @@ mod lifecycle {
         assert!(matches!(slot, Slot::Reuse(_)));
         assert!(slot.binder().is_none());
         assert!(slot.reuse().is_some());
-        assert!(slot.constraint_spec().is_none());
+        assert!(slot.constraint().is_none());
     }
 
     /// `@` has two meanings and two carriers, and only one is a value leaf.
@@ -170,20 +253,26 @@ mod lifecycle {
         // ...and after resolution its payload is uninhabited, so no resolved
         // or refined argument row can hold one. These bindings compile only
         // because `Never` is what each phase selects.
-        fn landing_is_impossible<P: Phase<Placeholder = crate::pipeline::asts::vocabulary::Never>>() {}
+        fn landing_is_impossible<
+            P: Phase<Placeholder = crate::pipeline::asts::vocabulary::Never>,
+        >() {
+        }
         landing_is_impossible::<Resolved>();
         landing_is_impossible::<Refined>();
 
         // The context marker is spent at instantiation the same way.
-        fn marker_is_impossible<P: Phase<ContextMarker = crate::pipeline::asts::vocabulary::Never>>() {}
+        fn marker_is_impossible<
+            P: Phase<ContextMarker = crate::pipeline::asts::vocabulary::Never>,
+        >() {
+        }
         marker_is_impossible::<Resolved>();
         marker_is_impossible::<Refined>();
 
-        // The open leaf is spent by the position that applies its body,
-        // AT RESOLUTION: no closed phase can carry one — not an unapplied
-        // hole, none.
+        // The open leaf is spent by the invocation that applies its body:
+        // no REFINED phase can carry one — not an unapplied hole, none.
+        // (The resolved phase carries the closed-callable FormalHole,
+        // substituted before refinement.)
         fn leaf_is_impossible<P: Phase<OpenLeaf = crate::pipeline::asts::vocabulary::Never>>() {}
-        leaf_is_impossible::<Resolved>();
         leaf_is_impossible::<Refined>();
     }
 }

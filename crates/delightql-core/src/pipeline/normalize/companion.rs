@@ -87,7 +87,11 @@ pub fn default_cell(tree: &SyntaxTree, registry: Rc<crate::names::Registry>) -> 
                     name,
                     ..
                 }))) => DdlDefault::Value {
-                    expr: DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::String(name.as_str().to_string()))),
+                    expr: DomainExpression::Application(
+                        crate::pipeline::asts::core::FunctionApplication::Ground(
+                            LiteralValue::String(name.as_str().to_string()),
+                        ),
+                    ),
                 },
                 expr => DdlDefault::Value { expr },
             })
@@ -140,7 +144,7 @@ fn foreign_key(expr: &TruthExpression<Unresolved>) -> Option<DdlConstraint> {
     };
     let mut columns = Vec::new();
     for argument in call.call().arguments.scalar_members() {
-        let ScalarArgument::Value(ArgumentValue::Domain {
+        let ScalarArgument::Value(ArgumentValue {
             value:
                 DomainExpression::Reference(Reference::Named(NamedReference(AuthoredColumn {
                     name,

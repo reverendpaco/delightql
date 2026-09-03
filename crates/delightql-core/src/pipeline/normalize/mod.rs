@@ -31,9 +31,7 @@
 //! bytes — so nothing here guesses.
 
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::asts::core::{
-    AssertionSpec, CteBinding, DangerSpec, InlineDdlSpec, OptionSpec, Query, Unresolved,
-};
+use crate::pipeline::asts::core::{DangerSpec, InlineDdlSpec, OptionSpec, Query, Unresolved};
 use crate::pipeline::asts::ddl::ClauseDecl;
 use crate::pipeline::query_features::{FeatureCollector, HoParamBindings};
 use crate::pipeline::syntax::{cst, SyntaxTree, TypedNode};
@@ -45,6 +43,12 @@ pub(crate) use definitions::awaits_substitution;
 mod effects;
 mod ground;
 mod landing;
+/// THE SUBSTITUTION LAW's one exported judgment: the cover applies a
+/// callable to a cell the way a pipe applies one to a flowing value, so it
+/// spends this rather than choosing a position of its own. The refusals stay
+/// inside — the landing is spent here and nowhere later, so no other
+/// position has one to refuse.
+pub(crate) use landing::land_final;
 pub(crate) mod names;
 mod relex;
 mod spec;
@@ -56,6 +60,21 @@ pub mod companion;
 #[cfg(test)]
 mod tests;
 
+/// THE PERMIT TO ORIGINATE A CROSSING.
+///
+/// A truth stands in value position only where the surface put one, and
+/// normalization is the one authority that reads the surface. The field is
+/// private to this module tree, so nothing outside normalization can make
+/// one — and so nothing outside normalization can take a loose truth and
+/// decide it is a value.
+pub struct CrossingPermit(());
+
+impl CrossingPermit {
+    pub(in crate::pipeline::normalize) fn grant() -> Self {
+        CrossingPermit(())
+    }
+}
+
 /// What one form DECLARED about itself.
 ///
 /// An annotation decorates a POSITION, so what it says belongs to the form it
@@ -64,7 +83,6 @@ mod tests;
 /// is the fact a per-query road needs and cannot reconstruct.
 #[derive(Debug, Default)]
 pub struct Sidecars {
-    pub assertions: Vec<AssertionSpec>,
     pub dangers: Vec<DangerSpec>,
     pub options: Vec<OptionSpec>,
     pub ddl_blocks: Vec<InlineDdlSpec>,
@@ -76,38 +94,110 @@ pub struct Sidecars {
 impl Sidecars {
     /// Whether the form declared anything at all.
     pub fn is_empty(&self) -> bool {
-        self.assertions.is_empty()
-            && self.dangers.is_empty()
+        self.dangers.is_empty()
             && self.options.is_empty()
             && self.ddl_blocks.is_empty()
             && self.expected_error.is_none()
     }
 }
 
-/// One goal and what it declared.
+/// Which world a goal's body belongs to, taken from the PRODUCTION the
+/// grammar admitted it under and never re-derived from the built tree.
+///
+/// The two branches are disjoint by construction: a `relex` admits no
+/// directive, and an `effrelex` is headed by one. What each means at load
+/// differs completely — a relational goal is a read-only YES/NO witness, an
+/// effect goal is a session directive with a receipt — so the distinction
+/// travels rather than being asked of the AST later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalCategory {
+    /// `?- users(*)` — a relation to prove.
+    Relational,
+    /// `?- enlist!("lib::x")(*)` — a directive to execute.
+    Effectual,
+}
+
+/// One goal, what it declared, and what it is.
 #[derive(Debug)]
 pub struct Goal {
     pub query: Query<Unresolved>,
     pub declared: Sidecars,
+    pub category: GoalCategory,
+    /// The goal body AS AUTHORED, trimmed — the bytes between `?-` and the
+    /// end of the form. Provenance: the liminal ledger names a goal by its
+    /// spelling so a ledger scan knows which goal was which.
+    pub spelling: String,
+}
+
+/// One TOP-LEVEL FORM of a submission.
+///
+/// A subordinate `(~~ddl ~~)` block is not one: it declares a block the
+/// enclosing consultation processes, and it lands in `declared` with every
+/// other file-level declaration.
+#[derive(Debug)]
+pub enum TopLevelForm {
+    /// One clause of a definition or fact. Grouping clauses by subject and
+    /// assembling them is the catalog's job, not normalization's: the
+    /// assembler is the one place a subject's clauses meet.
+    Definition(ClauseDecl),
+    /// A `?-` goal in a canonical file, or a bare statement in a utility
+    /// sequence.
+    Goal(Goal),
 }
 
 /// Everything one submission yields.
 ///
-/// Queries and definitions travel TOGETHER because a canonical file may hold
-/// both, in authored order.
+/// ONE ORDERED SEQUENCE. A canonical file holds definitions and goals
+/// interleaved, and the liminal ledger is one row per top-level form in
+/// FILE-APPEARANCE order — an order two independently filled vectors cannot
+/// state and no later pass can recover without reading the source again.
 #[derive(Debug, Default)]
 pub struct Normalized {
-    /// Goals in authored order. A query sequence's bare queries and a
-    /// definition file's `?-` goals reach the same vector.
-    pub queries: Vec<Goal>,
-    /// One clause per authored definition, in authored order. Grouping
-    /// clauses by subject and assembling them is the catalog's job, not
-    /// normalization's: the assembler is the one place a subject's clauses
-    /// meet.
-    pub definitions: Vec<ClauseDecl>,
+    /// The submission's top-level forms, in authored order.
+    pub forms: Vec<TopLevelForm>,
     /// What no GOAL claimed: a definition's own declarations, and anything a
     /// canonical file states outside a goal. A goal's own travel on the goal.
     pub declared: Sidecars,
+}
+
+impl Normalized {
+    /// The goals, in authored order.
+    pub fn queries(&self) -> impl Iterator<Item = &Goal> {
+        self.forms.iter().filter_map(|form| match form {
+            TopLevelForm::Goal(goal) => Some(goal),
+            TopLevelForm::Definition(_) => None,
+        })
+    }
+
+    /// The goals, taken.
+    pub fn into_queries(self) -> Vec<Goal> {
+        self.forms
+            .into_iter()
+            .filter_map(|form| match form {
+                TopLevelForm::Goal(goal) => Some(goal),
+                TopLevelForm::Definition(_) => None,
+            })
+            .collect()
+    }
+
+    /// One clause per authored definition, in authored order.
+    pub fn definitions(&self) -> impl Iterator<Item = &ClauseDecl> {
+        self.forms.iter().filter_map(|form| match form {
+            TopLevelForm::Definition(clause) => Some(clause),
+            TopLevelForm::Goal(_) => None,
+        })
+    }
+
+    /// The definition clauses, taken.
+    pub fn into_definitions(self) -> Vec<ClauseDecl> {
+        self.forms
+            .into_iter()
+            .filter_map(|form| match form {
+                TopLevelForm::Definition(clause) => Some(clause),
+                TopLevelForm::Goal(_) => None,
+            })
+            .collect()
+    }
 }
 
 /// The canonical entrance: definitions and explicit `?-` goals. A naked query
@@ -117,6 +207,29 @@ pub fn definition_file(
     registry: Rc<crate::names::Registry>,
 ) -> Result<Normalized> {
     Normalizer::new(tree, registry).run(Entrance::DefinitionFile)
+}
+
+/// The STORED-SOURCE definition entrance (`ddl::reconstruct`): the text was
+/// admitted when it was authored, so re-materializing it runs no authored
+/// admission — a companion operation head must not refuse at use time.
+pub fn stored_definition_file(
+    tree: &SyntaxTree,
+    registry: Rc<crate::names::Registry>,
+) -> Result<Normalized> {
+    let mut normalizer = Normalizer::new(tree, registry);
+    normalizer.stored_source = true;
+    normalizer.run(Entrance::DefinitionFile)
+}
+
+/// The stored-source entrance with a call site's bindings in hand.
+pub fn stored_bound_definition_file(
+    tree: &SyntaxTree,
+    registry: Rc<crate::names::Registry>,
+    bindings: HoParamBindings,
+) -> Result<Normalized> {
+    let mut normalizer = Normalizer::bound(tree, registry, bindings);
+    normalizer.stored_source = true;
+    normalizer.run(Entrance::DefinitionFile)
 }
 
 /// The utility entrance: bare queries executed in order.
@@ -152,14 +265,6 @@ pub fn submission(tree: &SyntaxTree, registry: Rc<crate::names::Registry>) -> Re
 /// Walking a built tree to rewrite them would have to re-decide, from the
 /// AST, which positions were formals — the question this boundary already
 /// answered.
-pub fn bound_definition_file(
-    tree: &SyntaxTree,
-    registry: Rc<crate::names::Registry>,
-    bindings: HoParamBindings,
-) -> Result<Normalized> {
-    Normalizer::bound(tree, registry, bindings).run(Entrance::DefinitionFile)
-}
-
 pub fn bound_query_sequence(
     tree: &SyntaxTree,
     registry: Rc<crate::names::Registry>,
@@ -180,10 +285,19 @@ pub(crate) struct Normalizer<'t> {
     tree: &'t SyntaxTree,
     registry: Rc<crate::names::Registry>,
     features: FeatureCollector,
-    /// Whether the walk is inside an assertion body. `equals` is assertion
-    /// SYNTAX, not a view: outside that context, building it would silently
-    /// discard the comparison, so the position has to be known.
-    in_assertion: bool,
+    /// Whether the walk is inside a DDL block addressed to a system-owned
+    /// `_`-child namespace (the companion road). The subjects there —
+    /// `schema`, `defaults`, `constraints`, `imprinting` — are OPERATIONS of
+    /// the companion vocabulary, selected by name from the manifest reader;
+    /// they are not authored entity names, so the authored-name admission
+    /// law does not judge them.
+    pub(crate) system_child_block: bool,
+    /// Whether the walk reads STORED definition source (`ddl::reconstruct`).
+    /// Admission is an authoring-time judgment: the text was admitted when
+    /// it was authored, and re-materializing it at a call site is not a
+    /// naming position — a companion operation head or a pre-law stored
+    /// spelling must not refuse at use time.
+    pub(crate) stored_source: bool,
     /// Whether the walk is inside a COMPANION CELL. THE TWO-ANAPHOR LAW: `@`
     /// is the composition input in a query and the COLUMN SELF-REFERENCE in a
     /// companion sigil — one glyph, two carriers, and position classifies. The
@@ -210,7 +324,7 @@ pub(crate) struct Normalizer<'t> {
     /// but a source builds a CHAIN, and only the form around it builds the
     /// query the bindings belong to. They travel here rather than being
     /// rebuilt from the tree by whoever notices them.
-    hoisted_ctes: Vec<CteBinding<Unresolved>>,
+    hoisted_ctes: Vec<relex::LetBinding>,
     out: Normalized,
 }
 
@@ -220,7 +334,8 @@ impl<'t> Normalizer<'t> {
             features: FeatureCollector::new(),
             tree,
             registry,
-            in_assertion: false,
+            system_child_block: false,
+            stored_source: false,
             pending_error: None,
             last_term: None,
             building: None,
@@ -245,6 +360,88 @@ impl<'t> Normalizer<'t> {
         self.features.ho_bindings.as_ref()
     }
 
+    /// Admit an authored `as` name for a stage, member, head, or relation.
+    /// On the stored-source road the law already ran when the text was
+    /// authored; the spelling is still reserved against invented names.
+    pub(crate) fn admit_stage(
+        &self,
+        name: delightql_types::SqlIdentifier,
+    ) -> Result<delightql_types::SqlIdentifier> {
+        if self.stored_source {
+            self.registry
+                .reserve_authored(name.as_str(), name.is_stropped());
+            return Ok(name);
+        }
+        Ok(crate::names::StageName::admit(name, &self.registry)?.into_spelling())
+    }
+
+    /// Admit a relation name before it becomes a lookup key. Stored source
+    /// was admitted at authorship and only reserves the same bytes again.
+    pub(crate) fn admit_reference(
+        &self,
+        name: delightql_types::SqlIdentifier,
+    ) -> Result<delightql_types::SqlIdentifier> {
+        if self.stored_source {
+            self.registry
+                .reserve_authored(name.as_str(), name.is_stropped());
+            return Ok(name);
+        }
+        Ok(crate::names::ReferenceName::admit(name, &self.registry)?.into_spelling())
+    }
+
+    /// Admit an authored published-column name; same stored-source rule.
+    pub(crate) fn admit_published(
+        &self,
+        name: delightql_types::SqlIdentifier,
+    ) -> Result<delightql_types::SqlIdentifier> {
+        if self.stored_source {
+            self.registry
+                .reserve_authored(name.as_str(), name.is_stropped());
+            return Ok(name);
+        }
+        Ok(crate::names::PublishedName::admit(name, &self.registry)?.into_spelling())
+    }
+
+    /// Admit an authored rename target; same stored-source rule.
+    pub(crate) fn admit_rename(
+        &self,
+        name: delightql_types::SqlIdentifier,
+    ) -> Result<delightql_types::SqlIdentifier> {
+        if self.stored_source {
+            self.registry
+                .reserve_authored(name.as_str(), name.is_stropped());
+            return Ok(name);
+        }
+        Ok(crate::names::RenameName::admit(name, &self.registry)?.into_spelling())
+    }
+
+    /// Admit an authored binding (CTE) name; same stored-source rule.
+    pub(crate) fn admit_cte(
+        &self,
+        name: delightql_types::SqlIdentifier,
+    ) -> Result<delightql_types::SqlIdentifier> {
+        if self.stored_source {
+            self.registry
+                .reserve_authored(name.as_str(), name.is_stropped());
+            return Ok(name);
+        }
+        Ok(crate::names::CteName::admit(name, &self.registry)?.into_spelling())
+    }
+
+    /// Admit an authored definition or fact subject; skipped for the
+    /// companion vocabulary's operation heads and on the stored-source road.
+    pub(crate) fn admit_definition(
+        &self,
+        name: delightql_types::SqlIdentifier,
+    ) -> Result<delightql_types::SqlIdentifier> {
+        if self.stored_source || self.system_child_block {
+            self.registry
+                .reserve_authored(name.as_str(), name.is_stropped());
+            return Ok(name);
+        }
+        Ok(crate::names::DefinitionName::admit(name, &self.registry)?.into_spelling())
+    }
+
     /// The authored bytes under a node. Spans survive the grammar for exactly
     /// this reason: a spelling that normalization drops is still readable.
     pub(crate) fn text<T: TypedNode<'t>>(&self, node: T) -> &'t str {
@@ -254,11 +451,6 @@ impl<'t> Normalizer<'t> {
             Some(range) => &source[range],
             None => "",
         }
-    }
-
-    /// A node's authored span, for a diagnostic that wants to point.
-    pub(crate) fn span<T: TypedNode<'t>>(&self, node: T) -> Option<(usize, usize)> {
-        self.tree.byte_range(node).map(|r| (r.start, r.end))
     }
 
     pub(crate) fn features(&mut self) -> &mut FeatureCollector {
@@ -307,7 +499,6 @@ impl<'t> Normalizer<'t> {
         let fresh = FeatureCollector::inheriting_ho_bindings(&self.features);
         let mut collector = std::mem::replace(&mut self.features, fresh);
         Sidecars {
-            assertions: collector.take_assertions(),
             dangers: collector.take_dangers(),
             options: collector.take_options(),
             ddl_blocks: collector.take_ddl_blocks(),
@@ -315,9 +506,14 @@ impl<'t> Normalizer<'t> {
         }
     }
 
-    fn push_goal(&mut self, query: Query<Unresolved>) {
+    fn push_goal(&mut self, query: Query<Unresolved>, category: GoalCategory, spelling: String) {
         let declared = self.drain();
-        self.out.queries.push(Goal { query, declared });
+        self.out.forms.push(TopLevelForm::Goal(Goal {
+            query,
+            declared,
+            category,
+            spelling,
+        }));
     }
 
     /// A definition's declarations are the FILE's: a definition is itself a
@@ -325,7 +521,6 @@ impl<'t> Normalizer<'t> {
     /// goal, which did not write them.
     fn absorb_file_level(&mut self) {
         let declared = self.drain();
-        self.out.declared.assertions.extend(declared.assertions);
         self.out.declared.dangers.extend(declared.dangers);
         self.out.declared.options.extend(declared.options);
         self.out.declared.ddl_blocks.extend(declared.ddl_blocks);
@@ -344,12 +539,12 @@ impl<'t> Normalizer<'t> {
             match child {
                 cst::DefinitionFileChild::EntityDefinition(definition) => {
                     let clause = self.entity_definition(definition)?;
-                    self.out.definitions.push(clause);
+                    self.out.forms.push(TopLevelForm::Definition(clause));
                     self.absorb_file_level();
                 }
                 cst::DefinitionFileChild::TopLevelGoal(goal) => {
-                    let query = self.top_level_goal(goal)?;
-                    self.push_goal(query);
+                    let (query, category, spelling) = self.top_level_goal(goal)?;
+                    self.push_goal(query, category, spelling);
                 }
                 // A subordinate block belongs to the FILE, so it lands where
                 // every other file-level declaration lands. It is not a goal
@@ -384,22 +579,48 @@ impl<'t> Normalizer<'t> {
                 cst::QuerySequenceChild::Relex(relex) => self.tree.byte_range(relex),
                 cst::QuerySequenceChild::Effrelex(effrelex) => self.tree.byte_range(effrelex),
             };
-            let query = match child {
-                cst::QuerySequenceChild::Relex(relex) => self.relex_query(relex)?,
-                cst::QuerySequenceChild::Effrelex(effrelex) => self.effrelex_query(effrelex)?,
+            let (query, category, spelling) = match child {
+                cst::QuerySequenceChild::Relex(relex) => (
+                    self.relex_query(relex)?,
+                    GoalCategory::Relational,
+                    self.text(relex).trim().to_string(),
+                ),
+                cst::QuerySequenceChild::Effrelex(effrelex) => (
+                    self.effrelex_query(effrelex)?,
+                    GoalCategory::Effectual,
+                    self.text(effrelex).trim().to_string(),
+                ),
             };
-            self.push_goal(query);
+            self.push_goal(query, category, spelling);
             self.building = None;
         }
         Ok(())
     }
 
-    /// `?- body` ≡ `_ :- body`: the goal marker names the category and
+    /// `?-` is the sole top-level-goal marker: it names the category and
     /// carries nothing into the AST.
-    fn top_level_goal(&mut self, goal: cst::TopLevelGoal<'t>) -> Result<Query<Unresolved>> {
+    ///
+    /// Which WORLD the body belongs to is the production the grammar
+    /// admitted it under, read here and carried; a later pass asking the
+    /// built tree whether its head happens to be a directive would be a
+    /// second authority over a fact the parse already settled.
+    fn top_level_goal(
+        &mut self,
+        goal: cst::TopLevelGoal<'t>,
+    ) -> Result<(Query<Unresolved>, GoalCategory, String)> {
         match self.require(goal.goal(), "a top-level goal has a body")? {
-            cst::TopLevelGoalGoal::Relex(relex) => self.relex_query(relex),
-            cst::TopLevelGoalGoal::Effrelex(effrelex) => self.effrelex_query(effrelex),
+            cst::TopLevelGoalGoal::Relex(relex) => {
+                let spelling = self.text(relex).trim().to_string();
+                Ok((self.relex_query(relex)?, GoalCategory::Relational, spelling))
+            }
+            cst::TopLevelGoalGoal::Effrelex(effrelex) => {
+                let spelling = self.text(effrelex).trim().to_string();
+                Ok((
+                    self.effrelex_query(effrelex)?,
+                    GoalCategory::Effectual,
+                    spelling,
+                ))
+            }
         }
     }
 
@@ -599,10 +820,7 @@ impl Deferred {
 #[cfg(test)]
 impl Deferred {
     /// Every deferral, so a test can enumerate them rather than restate them.
-    pub const ALL: &'static [Deferred] = &[
-        Deferred::DequalifyOrdinal,
-        Deferred::OperatorOrdinal,
-    ];
+    pub const ALL: &'static [Deferred] = &[Deferred::DequalifyOrdinal, Deferred::OperatorOrdinal];
 }
 
 /// A form the consolidated grammar admits, the law allows, and the surviving

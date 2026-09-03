@@ -15,8 +15,8 @@ use crate::pipeline::refiner::types::*;
 pub(super) fn create_anonymous_table_join_predicates(
     analyzed_predicates: &mut Vec<AnalyzedPredicate>,
     flat: &FlatSegment,
-    identities: &crate::names::Registry,
-) {
+    identities: &crate::relation::Planning,
+) -> crate::error::Result<()> {
     log::debug!(
         "create_anonymous_table_join_predicates called with {} tables",
         flat.tables.len()
@@ -34,15 +34,15 @@ pub(super) fn create_anonymous_table_join_predicates(
                 log::debug!("Anonymous table has {} headers", headers.len());
                 // Process each header - create constraints for all non-pure-Lvar expressions
                 for (col_idx, item) in headers.iter().enumerate() {
-                    let header = item.term().expect("an anonymous header has a domain term");
+                    // `_` is the disregarded slot: consumed, constrained by
+                    // nothing.
+                    let Some(header) = item.term() else { continue };
                     log::debug!("Processing header {} : {:?}", col_idx, header);
 
-                    let anon_column = identities
-                        .known_heading(table.identity)
+                    let anon_column = crate::relation::published_ports(identities, &table.relation)
                         .expect("an anonymous table publishes what it was written with")
-                        .in_order()
+                        .into_iter()
                         .nth(col_idx)
-                        .copied()
                         .expect("anonymous headers and their structural heading agree");
                     let should_create_constraint = !matches!(
                         &header,
@@ -53,35 +53,40 @@ pub(super) fn create_anonymous_table_join_predicates(
                     // Create constraint for any non-pure-Lvar expression
                     if should_create_constraint {
                         let left = resolved::DomainExpression::Reference(Reference::Named(
-                            NamedReference(ColumnOccurrence {
-                                column: anon_column,
-                                explicit_qualifier: false,
-                            }),
+                            NamedReference(ColumnOccurrence::engine(anon_column)),
                         ));
 
                         let right = header.clone();
+                        // MINTED AS THE LANGUAGE'S EQUALITY, and settled with
+                        // every other leaf below: a ground header term
+                        // narrows the anonymous relation's own cell, and only
+                        // a term reading ANOTHER relation makes rows multiply.
+                        // Minting the target's equality here said "join" for
+                        // `_(x, null)`, which then matched nothing.
                         let predicate = resolved::TruthExpression::Comparison(Comparison {
-                            operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+                            operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
                             left: Box::new(left),
                             right: Box::new(right),
                         });
 
-                        let referenced_table = match &header {
-                            resolved::DomainExpression::Reference(Reference::Named(
-                                NamedReference(ColumnOccurrence { column, .. }),
-                            )) => Some(identities.scope_of(*column)),
-                            _ => None,
-                        };
+                        let referenced_table =
+                            foreign_owner(&header, table.relation.scope(), identities);
 
-                        let class = if let Some(referenced_table) = referenced_table {
-                            PredicateClass::FJC {
-                                left: referenced_table,
-                                right: table.identity,
+                        // A header term that reads the table's OWN scope —
+                        // a repeated binder's equality — is a filter, not a
+                        // join condition: both operands stand in one table.
+                        let class = match referenced_table {
+                            Some(referenced_table)
+                                if referenced_table != table.relation.scope() =>
+                            {
+                                PredicateClass::FJC {
+                                    left: referenced_table,
+                                    right: table.relation.scope(),
+                                }
                             }
-                        } else {
-                            PredicateClass::F {
-                                table: table.identity,
-                            }
+                            _ => PredicateClass::F {
+                                table: table.relation.scope(),
+                            },
                         };
 
                         // Find the join operator position
@@ -95,7 +100,9 @@ pub(super) fn create_anonymous_table_join_predicates(
 
                         analyzed_predicates.push(AnalyzedPredicate {
                             class,
-                            expr: predicate,
+                            expr: crate::pipeline::refiner::settled::settle_equality_classes(
+                                predicate, flat, identities,
+                            )?,
                             operator_ref,
                             origin: resolved::FilterOrigin::Generated,
                         });
@@ -103,6 +110,53 @@ pub(super) fn create_anonymous_table_join_predicates(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// The first table OUTSIDE `own` that `expr` reads, walking through the
+/// scalar forms a header term can hold. A computed term reaches whatever
+/// its interior references reach: `upper:(description)` constrains against
+/// the table that owns `description`, so classifying by the outermost node
+/// alone read a join condition as a local filter and stranded it below the
+/// header's own narrowing.
+fn foreign_owner(
+    expr: &resolved::DomainExpression,
+    own: crate::names::ScopeId,
+    identities: &crate::relation::Planning,
+) -> Option<crate::names::ScopeId> {
+    use crate::pipeline::asts::core::FunctionApplication;
+    match expr {
+        resolved::DomainExpression::Reference(Reference::Named(NamedReference(
+            ColumnOccurrence { column, .. },
+        ))) => crate::relation::owner(identities, *column)
+            .ok()
+            .filter(|owner| *owner != own),
+        resolved::DomainExpression::Reference(_) => None,
+        resolved::DomainExpression::Application(FunctionApplication::Ground(_)) => None,
+        resolved::DomainExpression::Application(FunctionApplication::Standard(application)) => {
+            application
+                .call()
+                .arguments
+                .scalar_members()
+                .iter()
+                .find_map(|member| {
+                    member
+                        .scalar_domain()
+                        .and_then(|value| foreign_owner(value, own, identities))
+                })
+        }
+        resolved::DomainExpression::Application(FunctionApplication::Infix(infix)) => {
+            foreign_owner(&infix.left, own, identities)
+                .or_else(|| foreign_owner(&infix.right, own, identities))
+        }
+        resolved::DomainExpression::Application(FunctionApplication::JsonAccess(access)) => {
+            foreign_owner(&access.source, own, identities)
+        }
+        // Remaining scalar forms (records, subqueries, cases) keep the
+        // conservative answer: unclassified stays a local filter, exactly
+        // what every header term answered before this walk existed.
+        resolved::DomainExpression::Application(_) => None,
     }
 }
 
@@ -116,14 +170,14 @@ pub(super) fn create_anonymous_table_join_predicates(
 pub(super) fn process_glob_with_using(
     mut operators: Vec<FlatOperator>,
     tables: &[FlatTable],
-    identities: &crate::names::Registry,
-) -> Vec<FlatOperator> {
+    identities: &crate::relation::Planning,
+) -> crate::error::Result<Vec<FlatOperator>> {
     crate::probe::probing!(using, {
         for (i, table) in tables.iter().enumerate() {
             crate::probe::probe!(
                 using,
                 "table {i} {:?} spec={:?} names={:?}",
-                table.identity,
+                table.relation,
                 table.access,
                 published_names(table, identities)
             );
@@ -138,7 +192,7 @@ pub(super) fn process_glob_with_using(
         };
         log::debug!(
             "Found a dequalifying access on table {:?} with columns: {:?}",
-            tables[i].identity,
+            tables[i].relation,
             using_cols
         );
         // The join at position i-1 joins table[i-1] to table[i], and a
@@ -146,27 +200,56 @@ pub(super) fn process_glob_with_using(
         // in: `orders(*.(user_id))` means USING when joining TO orders.
         if i > 0 && i - 1 < operators.len() {
             log::debug!("Applying USING to join at position {}", i - 1);
+            let left: Vec<_> = tables
+                .iter()
+                .filter(|table| {
+                    operators[i - 1]
+                        .left_tables
+                        .contains(&table.relation.scope())
+                })
+                .flat_map(|table| {
+                    crate::relation::published_ports(identities, &table.relation)
+                        .unwrap_or_default()
+                })
+                .collect();
+            let right: Vec<_> = tables
+                .iter()
+                .filter(|table| {
+                    operators[i - 1]
+                        .right_tables
+                        .contains(&table.relation.scope())
+                })
+                .flat_map(|table| {
+                    crate::relation::published_ports(identities, &table.relation)
+                        .unwrap_or_default()
+                })
+                .collect();
+            let names = using_cols.iter().map(|name| {
+                let spelling = identities.intern(name.as_str(), name.is_stropped());
+                identities.canonical(spelling)
+            });
+            let exact = resolved::Correspondence::between(names, &left, &right, identities)?;
             let FlatOperatorKind::Join {
-                ref mut correspondence,
+                ref mut correlation,
             } = &mut operators[i - 1].kind;
-            *correspondence = Some(resolved::Correspondence::new(
-                using_cols
-                    .iter()
-                    .map(|name| {
-                        // Both pieces of the identifier: the strop decides
-                        // whether the join corresponds on `Name` or on any
-                        // casing of it, so a heading holding both publishes
-                        // two columns and only the spelling says which was
-                        // asked for.
-                        let spelling = identities.intern(name.as_str(), name.is_stropped());
-                        identities.canonical(spelling)
-                    })
-                    .collect(),
-            ));
+            // THE SEAT IS ALREADY TAKEN OR IT IS NOT. A member that stated
+            // its own condition holds the only correlation this join has;
+            // a correspondence merges the heading and a condition does not,
+            // so there is no combination of the two to write. Refuse rather
+            // than pick one and lose the other in silence.
+            if correlation.condition().is_some() {
+                return Err(crate::error::DelightQLError::validation_error_categorized(
+                    "join/using/stated_condition",
+                    "this join already carries a stated correlation, and a \
+dequalifying access asks it to merge headings as well",
+                    "write one correlation: either the shared names or the explicit condition",
+                ));
+            }
+            *correlation = resolved::MemberCorrelation::Correspond(exact);
         }
     }
 
-    operators
+    Ok(operators)
 }
 
 /// The names a table dequalifies onto, from whichever position holds them.
@@ -199,7 +282,7 @@ fn trailing_dequalifying_access(
     // already answered for, at a table this walk was handed for its pipes.
     let mut rest = expr.steps();
     while let Some((last, prefix)) = rest.split_last() {
-        match last {
+        match last.form() {
             resolved::Continuation::Access {
                 access: resolved::Access::Dequalify(columns),
                 ..
@@ -218,11 +301,15 @@ fn trailing_dequalifying_access(
 /// output takes, and two tables that share a name must agree on where it sits.
 fn published_names(
     table: &FlatTable,
-    identities: &crate::names::Registry,
+    identities: &crate::relation::Planning,
 ) -> Vec<crate::names::Sym> {
-    let scope = table.schema;
+    let scope = table.relation;
     let mut names = Vec::new();
-    for column in identities.heading(scope).columns_seen() {
+    for column in crate::relation::published_ports(identities, &scope)
+        .expect("a flattened table retains its authority-issued interface")
+        .into_iter()
+        .map(|port| port.column())
+    {
         if let Some(published) = identities.published_sym(column) {
             if !names.contains(&published) {
                 names.push(published);

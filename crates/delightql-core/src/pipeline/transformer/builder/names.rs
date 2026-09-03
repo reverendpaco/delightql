@@ -71,16 +71,49 @@ impl NameGenerator {
         &self.identities
     }
 
-    /// Mint the next unique alias. The only constructor of `FreshAlias`.
     pub(in crate::pipeline::transformer) fn fresh(
         &self,
-        origin: crate::names::ScopeOrigin,
+        identity: crate::names::ScopeId,
     ) -> FreshAlias {
-        FreshAlias {
-            identity: self
-                .identities
-                .mint_derived_scope(origin, crate::names::Hint::None),
-        }
+        FreshAlias { identity }
+    }
+
+    pub(in crate::pipeline::transformer) fn anonymous(&self) -> FreshAlias {
+        self.fresh(self.identities.anonymous_scope(None))
+    }
+
+    pub(in crate::pipeline::transformer) fn wrap(
+        &self,
+        input: crate::names::ScopeId,
+        why: crate::names::WrapReason,
+    ) -> FreshAlias {
+        self.fresh(self.identities.wrap_scope(input, why))
+    }
+
+    pub(in crate::pipeline::transformer) fn set_arm(
+        &self,
+        input: crate::names::ScopeId,
+        arm: u16,
+    ) -> FreshAlias {
+        self.fresh(self.identities.set_arm_scope(input, arm))
+    }
+
+    pub(in crate::pipeline::transformer) fn emission_alias(
+        &self,
+        input: crate::names::ScopeId,
+    ) -> FreshAlias {
+        self.fresh(self.identities.emission_alias_scope(input))
+    }
+
+    pub(in crate::pipeline::transformer) fn interior_emission(
+        &self,
+        owner: crate::names::ColId,
+    ) -> FreshAlias {
+        self.fresh(self.identities.interior_emission_scope(owner))
+    }
+
+    pub(in crate::pipeline::transformer) fn join(&self) -> FreshAlias {
+        self.fresh(self.identities.join_scope())
     }
 }
 
@@ -93,7 +126,7 @@ mod tests {
     }
 
     fn fresh(generator: &NameGenerator) -> FreshAlias {
-        generator.fresh(crate::names::ScopeOrigin::AnonRelation)
+        generator.anonymous()
     }
 
     #[test]

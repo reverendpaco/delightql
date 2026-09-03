@@ -31,16 +31,30 @@ pub enum QueryExpression {
 
 /// The one set operator this AST can spell.
 ///
-/// DelightQL's set operators are ALL-flavored by law, so the dedupliating
+/// DelightQL's set operators are ALL-flavored by law, so the deduplicating
 /// spellings — `UNION`, `INTERSECT`, `EXCEPT` — have no producer and no
 /// variant here: the multiset law is an ABSENT CAPABILITY, not a flag left
 /// false. Minus lowers as an anti-semijoin, which is what makes it
 /// bag-preserving and null-correct on every target; reintroducing
 /// `EXCEPT ALL` where a target offers it is a legalizer optimization over
 /// that shape, never a new way to build one.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// A FIXPOINT'S ACCUMULATION IS NOT ONE OF THESE. It is the shape of
+/// `CteBody::Fixpoint`, which keeps its anchor and members apart and carries
+/// its own flavor — so `UNION` is not a value anything can hold, place, or
+/// move.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SetOperator {
     UnionAll,
+}
+
+impl SetOperator {
+    /// The keyword this operator writes.
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            SetOperator::UnionAll => "UNION ALL",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,15 +62,6 @@ pub struct SelectStatement {
     /// The scope this SELECT produces. Column qualification compares a
     /// reference's owner with this lexical emission point.
     pub(super) at: crate::names::ScopeId,
-
-    /// Evidence that this statement's list was checked against the heading
-    /// it claims.
-    ///
-    /// It travels with the statement so a later rewrite has something to
-    /// carry rather than a convention to honour: reconstruction doors take
-    /// the evidence off the statement they are reshaping, and there is no
-    /// road that mints it outside the publication authority.
-    pub(super) checked: crate::pipeline::transformer::builder::publication::Checked,
 
     /// DISTINCT flag
     pub(super) distinct: bool,
@@ -133,30 +138,45 @@ impl SelectStatement {
             })
             .collect::<std::result::Result<Vec<_>, String>>()?;
 
-        for (item, rename) in self.select_list.iter_mut().zip(renamed) {
-            match item {
-                SelectItem::Expression {
-                    alias: Some(alias), ..
-                } => {
-                    *alias = rename[0];
+        let prior = std::mem::take(&mut self.select_list);
+        self.select_list = prior
+            .into_iter()
+            .zip(renamed)
+            .flat_map(|(item, rename)| match item {
+                SelectItem::Publishing { expr, .. } => {
+                    vec![SelectItem::Publishing {
+                        expr,
+                        slot: rename[0],
+                        printed: true,
+                    }]
                 }
-                SelectItem::Expression { expr, alias } if alias.is_none() => {
+                SelectItem::Scaffolding { expr, slot } => {
                     // A bare column reference publishes under its own name;
                     // republishing it means spelling the new one out.
-                    if let Some(target) = rename.first() {
-                        let _ = expr;
-                        *alias = Some(*target);
+                    match rename.first() {
+                        Some(target) => vec![SelectItem::Publishing {
+                            expr,
+                            slot: *target,
+                            printed: true,
+                        }],
+                        None => vec![SelectItem::Scaffolding { expr, slot }],
                     }
                 }
-                SelectItem::Expression { .. } => {}
-                SelectItem::Star { expansion } => *expansion = rename,
-            }
-        }
+                SelectItem::Star { reads, .. } if reads.is_empty() => {
+                    vec![SelectItem::star_over_nothing()]
+                }
+                SelectItem::Star { reads, .. } => reads
+                    .into_iter()
+                    .zip(rename)
+                    .map(|(source, target)| SelectItem::Publishing {
+                        expr: super::DomainExpression::Column(source),
+                        slot: target,
+                        printed: true,
+                    })
+                    .collect(),
+            })
+            .collect();
         self.at = into;
-        self.checked = crate::pipeline::transformer::builder::publication::Checked::of(
-            into,
-            &self.select_list,
-        );
         Ok(())
     }
 
