@@ -15,6 +15,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::{DirectiveBinding, Runtime};
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::*;
@@ -70,13 +71,12 @@ impl EffectExecutable for ConsultTreePredicate {
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
         if arguments.len() != 2 {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(DirectiveBinding::Arity {
+                message: format!(
                     "consult_tree!() expects 2 arguments (dir_path, root_namespace), got {}",
                     arguments.len()
                 ),
-                "Invalid argument count",
-            ));
+            }));
         }
 
         let dir_path = super::consult::extract_string_literal(&arguments[0], "dir_path")?;
@@ -84,23 +84,21 @@ impl EffectExecutable for ConsultTreePredicate {
             super::consult::extract_string_literal(&arguments[1], "root_namespace")?;
 
         if root_namespace.is_empty() {
-            return Err(DelightQLError::database_error(
-                "consult_tree!() root_namespace cannot be empty",
-                "Empty namespace name",
-            ));
+            return Err(DelightQLError::from(DirectiveBinding::Value {
+                message: "consult_tree!() root_namespace cannot be empty".to_string(),
+            }));
         }
 
         // Resolve relative path against session CWD (for test isolation).
         let resolved_dir = crate::session_cwd::resolve_path(&dir_path);
         let dir = resolved_dir.as_path();
         if !dir.exists() || !dir.is_dir() {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::Io {
+                message: format!(
                     "consult_tree!() directory '{}' does not exist or is not a directory",
                     dir_path
                 ),
-                "Invalid directory path",
-            ));
+            }));
         }
 
         // Collect all .dql files recursively
@@ -139,10 +137,10 @@ impl EffectExecutable for ConsultTreePredicate {
         }
 
         if returned_rows.is_empty() {
-            return Err(DelightQLError::database_error(
-                format!("consult_tree!() found no .dql files in '{}'", dir_path),
-                "Empty directory tree",
-            ));
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!("consult_tree!() found no .dql files in '{}'", dir_path),
+                details: "Empty directory tree".to_string(),
+            }));
         }
 
         Ok(EntityResult::Relation(super::descriptor_tree_receipt(
@@ -158,22 +156,20 @@ impl EffectExecutable for ConsultTreePredicate {
 /// Recursively collect all `.dql` files under a directory.
 fn collect_dql_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
-        DelightQLError::database_error(
-            format!(
+        DelightQLError::from(Runtime::Io {
+            message: format!(
                 "consult_tree!() failed to read directory '{}': {}",
                 dir.display(),
                 e
             ),
-            "Directory read error",
-        )
+        })
     })?;
 
     for entry in entries {
         let entry = entry.map_err(|e| {
-            DelightQLError::database_error(
-                format!("consult_tree!() directory entry error: {}", e),
-                "Directory read error",
-            )
+            DelightQLError::from(Runtime::Io {
+                message: format!("consult_tree!() directory entry error: {}", e),
+            })
         })?;
         let path = entry.path();
         if path.is_dir() {

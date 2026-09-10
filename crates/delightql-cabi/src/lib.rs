@@ -119,7 +119,7 @@ pub unsafe extern "C" fn dql_open(
     let mut handle: Box<dyn api::DqlHandle> = match api::open(factory, Some(mount_factory)) {
         Ok(h) => h,
         Err(e) => {
-            set_error(error_out, &e);
+            set_error(error_out, &e.to_string());
             return std::ptr::null_mut();
         }
     };
@@ -128,7 +128,7 @@ pub unsafe extern "C" fn dql_open(
     let session = match handle.session() {
         Ok(s) => s,
         Err(e) => {
-            set_error(error_out, &e);
+            set_error(error_out, &e.to_string());
             return std::ptr::null_mut();
         }
     };
@@ -213,7 +213,7 @@ pub unsafe extern "C" fn dql_query(
     })) {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            set_error(error_out, &e);
+            set_error(error_out, &e.to_string());
             return zero;
         }
         Err(_) => {
@@ -301,7 +301,7 @@ pub unsafe extern "C" fn dql_fetch(
     })) {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            set_error(error_out, &e);
+            set_error(error_out, &e.to_string());
             return zero;
         }
         Err(_) => {
@@ -419,7 +419,7 @@ pub unsafe extern "C" fn dql_close_query(
     match panic::catch_unwind(panic::AssertUnwindSafe(|| cabi.session.close(qh))) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) => {
-            set_error(error_out, &e);
+            set_error(error_out, &e.to_string());
             -1
         }
         Err(_) => {
@@ -555,7 +555,7 @@ pub unsafe extern "C" fn dql_split_queries(
             }
         }
         Ok(Err(e)) => {
-            set_error(error_out, &e);
+            set_error(error_out, &e.to_string());
             zero
         }
         Err(_) => {

@@ -27,26 +27,9 @@ pub enum UnificationResult {
     /// consumer surfaces unchanged rather than restating as "column not
     /// found". Treated as an absence by the widening a narrowed search does:
     /// what is missing HERE may still be answered outside.
-    Refused(Refusal),
-}
-
-/// A refusal decided by the addressing, carried whole to the caller that
-/// turns it into an error.
-#[derive(Debug, Clone)]
-pub struct Refusal {
-    pub subcategory: &'static str,
-    pub message: String,
-    pub context: &'static str,
-}
-
-impl Refusal {
-    pub fn into_error(self) -> crate::error::DelightQLError {
-        crate::error::DelightQLError::validation_error_categorized(
-            self.subcategory,
-            self.message,
-            self.context,
-        )
-    }
+    /// The refusal the addressing decided, carried whole: the typed
+    /// diagnostic itself.
+    Refused(crate::error::DelightQLError),
 }
 
 #[derive(Debug, Clone)]

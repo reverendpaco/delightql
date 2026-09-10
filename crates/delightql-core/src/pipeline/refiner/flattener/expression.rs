@@ -8,6 +8,7 @@ use super::types::{
     AnonymousTableData, FlatOperator, FlatOperatorKind, FlatPredicate, FlatSegment, FlatTable,
     TvfData,
 };
+use crate::diagnostic::{DelightQLError, ResolutionSetop};
 use crate::error::Result;
 use crate::pipeline::asts::resolved;
 
@@ -57,8 +58,9 @@ pub(super) fn flatten_expression(
             resolved::GroundForm::Literal(_)
         )
     {
-        let (prefix, _last) = peeled.split();
+        let (prefix, last) = peeled.split();
         let read_result = *prefix.head().result();
+        let narrowed = *last.result();
         let resolved::GroundForm::Literal(anon) = prefix
             .into_bare_head()
             .expect("a stepless prefix is a bare head")
@@ -75,6 +77,7 @@ pub(super) fn flatten_expression(
             access: resolved::Access::Unasked,
             outer,
             anonymous_data: Some(AnonymousTableData { body: table.body }),
+            narrowed: Some(narrowed),
             pipe_expr: None,
             _table_filters: vec![],
             tvf_data: None,
@@ -115,6 +118,7 @@ pub(super) fn flatten_expression(
             access: resolved::Access::All,
             outer: false,
             anonymous_data: None,
+            narrowed: None,
             pipe_expr: Some(Box::new(peeled.rejoin())),
             _table_filters: vec![],
             tvf_data: None,
@@ -128,17 +132,26 @@ pub(super) fn flatten_expression(
     let result = *last.result();
     let form = last.into_form();
     match form {
+        // A correlated restriction is evaluated at the enclosing join, never
+        // inside the interior: classification takes every one out of a
+        // join-position interior and spends it at the boundary, so one
+        // reaching a segment here was never hoisted and would name a row
+        // this level cannot see.
+        resolved::Continuation::Correlated(_) => {
+            return Err(crate::diagnostic::Internal::invariant(
+                "refiner::flattener",
+                "a correlated restriction reached the flattener unhoisted",
+            ));
+        }
         // A whole-heading correlation relates two ARMS of a set operation.
         // A chain standing on a bag step is opaque above, so reaching here
         // means there is no run for it to correlate.
         resolved::Continuation::Correlate { .. } => {
-            return Err(crate::error::DelightQLError::validation_error_categorized(
-                "resolution/setop/correlation_owner",
-                "a whole-heading correlation relates two operands of a set operation, \
-                 and this one stands on no set operation",
-                "correlate the arms of a `;`, `|;|`, `||` or `-` step: \
-                 `x(*) as a ; y(*) as b, a.* = b.*`",
-            ));
+            return Err(DelightQLError::from(ResolutionSetop::CorrelationOwner {
+                message: "a whole-heading correlation relates two operands of a set operation, \
+                 and this one stands on no set operation"
+                    .to_string(),
+            }));
         }
 
         resolved::Continuation::Member {
@@ -174,6 +187,7 @@ pub(super) fn flatten_expression(
             // back out of the predicate's references.
             segment.operators.push(FlatOperator {
                 position: ctx.position,
+                result,
                 kind: FlatOperatorKind::Join { correlation },
                 left_tables,
                 right_tables,
@@ -240,6 +254,7 @@ fn flatten_opaque(
         access: resolved::Access::All,
         outer: false,
         anonymous_data: None,
+        narrowed: None,
         pipe_expr: Some(Box::new(expr)),
         _table_filters: vec![],
         tvf_data: None,
@@ -291,6 +306,7 @@ fn flatten_read(
                 access: access.clone(),
                 outer,
                 anonymous_data: None,
+                narrowed: None,
                 pipe_expr: None,
                 _table_filters: vec![],
                 tvf_data: None,
@@ -363,6 +379,7 @@ fn flatten_read(
                 access: access.clone(),
                 outer: call.call().marks.outer(),
                 anonymous_data: None,
+                narrowed: None,
                 pipe_expr: None,
                 _table_filters: vec![],
                 tvf_data: Some(TvfData {
@@ -399,6 +416,7 @@ fn flatten_read(
                 access: resolved::Access::All,
                 outer,
                 anonymous_data: None,
+                narrowed: None,
                 subquery_segment: None,
                 pipe_expr: None,
                 _table_filters: vec![],
@@ -454,6 +472,7 @@ pub(super) fn flatten_anon_table(
         access: resolved::Access::All,
         outer,
         anonymous_data: Some(AnonymousTableData { body: table.body }),
+        narrowed: None,
         pipe_expr: None,
         _table_filters: vec![],
         tvf_data: None,

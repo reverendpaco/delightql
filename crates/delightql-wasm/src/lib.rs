@@ -23,13 +23,11 @@ use std::sync::{Arc, Mutex};
 
 use delightql_core::api;
 use delightql_protocol::{
-    ByteSeq, Cell, ClientTerm, Dimension, ErrorKind, Handle, Handler, MetaItem, Orientation,
-    Projection, ServerTerm, resolve_projection,
+    resolve_projection, ByteSeq, Cell, ClientTerm, Dimension, Handle, Handler, MetaItem,
+    Orientation, Projection, ServerTerm, WireError,
 };
-use delightql_types::{
-    DatabaseConnection, DbValue,
-    DelightQLError, Result,
-};
+use delightql_types::diagnostic::Sqlite;
+use delightql_types::{DatabaseConnection, DbValue, DelightQLError, Result};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
@@ -153,8 +151,6 @@ impl DatabaseConnection for WasmDatabaseConnection {
             None => Ok((vec![], vec![])),
         }
     }
-
-
 }
 
 // ============================================================================
@@ -195,6 +191,11 @@ pub struct WasmParty {
     next_handle_id: u64,
 }
 
+/// The one projection of a party diagnostic onto the wire.
+fn wire(diagnostic: Sqlite) -> ServerTerm {
+    ServerTerm::Error(WireError::of(&diagnostic.into()))
+}
+
 impl WasmParty {
     pub fn new(connection: Arc<Mutex<dyn DatabaseConnection>>) -> Self {
         WasmParty {
@@ -208,11 +209,9 @@ impl WasmParty {
         let sql = match String::from_utf8(text) {
             Ok(s) => s,
             Err(e) => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Syntax,
-                    identity: vec![],
-                    message: format!("invalid UTF-8: {}", e).into_bytes(),
-                }
+                return wire(Sqlite::ProtocolText {
+                    message: format!("invalid UTF-8: {}", e),
+                })
             }
         };
 
@@ -232,11 +231,9 @@ impl WasmParty {
                     (vec!["affected_rows".to_string()], rows)
                 }
                 Err(e) => {
-                    return ServerTerm::Error {
-                        kind: ErrorKind::Syntax,
-                        identity: vec![],
-                        message: format!("{}", e).into_bytes(),
-                    }
+                    return wire(Sqlite::Engine {
+                        message: format!("{}", e),
+                    })
                 }
             },
         };
@@ -255,10 +252,8 @@ impl WasmParty {
             })
             .collect();
 
-        self.handles.insert(
-            handle.clone(),
-            BufferedCursor { columns, rows },
-        );
+        self.handles
+            .insert(handle.clone(), BufferedCursor { columns, rows });
 
         ServerTerm::Header { handle, dimensions }
     }
@@ -272,13 +267,7 @@ impl WasmParty {
     ) -> ServerTerm {
         let state = match self.handles.get_mut(&handle) {
             Some(s) => s,
-            None => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: vec![],
-                    message: b"unknown handle".to_vec(),
-                }
-            }
+            None => return wire(Sqlite::UnknownHandle),
         };
 
         let count = count as usize;
@@ -296,11 +285,9 @@ impl WasmParty {
                 .map(|row| col_indices.iter().map(|&ci| row[ci].clone()).collect())
                 .collect(),
             Orientation::Columns => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: vec![],
-                    message: b"orientation Columns not supported".to_vec(),
-                }
+                return wire(Sqlite::Orientation {
+                    message: "orientation Columns not supported".to_string(),
+                })
             }
         };
 
@@ -309,17 +296,10 @@ impl WasmParty {
 
     fn handle_stat(&self, handle: Handle) -> ServerTerm {
         if !self.handles.contains_key(&handle) {
-            return ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: b"unknown handle".to_vec(),
-            };
+            return wire(Sqlite::UnknownHandle);
         }
         ServerTerm::Metadata {
-            items: vec![MetaItem::Backend(
-                b"wasm".to_vec(),
-                b"wasm-party".to_vec(),
-            )],
+            items: vec![MetaItem::Backend(b"wasm".to_vec(), b"wasm-party".to_vec())],
         }
     }
 
@@ -327,11 +307,7 @@ impl WasmParty {
         if self.handles.remove(&handle).is_some() {
             ServerTerm::Ok { count_hint: 0 }
         } else {
-            ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: b"unknown handle".to_vec(),
-            }
+            wire(Sqlite::UnknownHandle)
         }
     }
 }
@@ -352,11 +328,9 @@ impl Handler for WasmParty {
                     .filter(|o| supported.contains(o))
                     .collect();
                 if agreed.is_empty() {
-                    ServerTerm::Error {
-                        kind: ErrorKind::Connection,
-                        identity: vec![],
-                        message: b"no common orientation".to_vec(),
-                    }
+                    wire(Sqlite::Orientation {
+                        message: "no common orientation".to_string(),
+                    })
                 } else {
                     ServerTerm::Version {
                         max_message_size,
@@ -380,17 +354,13 @@ impl Handler for WasmParty {
 
             ClientTerm::Close { handle } => self.handle_close(handle),
 
-            ClientTerm::Prepare { .. } => ServerTerm::Error {
-                kind: ErrorKind::Permission,
-                identity: vec![],
-                message: b"Prepare not implemented in WasmParty".to_vec(),
-            },
+            ClientTerm::Prepare { .. } => wire(Sqlite::Unimplemented {
+                message: "Prepare not implemented in WasmParty".to_string(),
+            }),
 
-            ClientTerm::Offer { .. } => ServerTerm::Error {
-                kind: ErrorKind::Permission,
-                identity: vec![],
-                message: b"Offer not implemented in WasmParty".to_vec(),
-            },
+            ClientTerm::Offer { .. } => wire(Sqlite::Unimplemented {
+                message: "Offer not implemented in WasmParty".to_string(),
+            }),
         }
     }
 }
@@ -405,8 +375,7 @@ impl api::ConnectionFactory for WasmConnectionFactory {
     fn create(
         &self,
         _uri: &str,
-    ) -> std::result::Result<api::CreatedConnection, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> std::result::Result<api::CreatedConnection, delightql_types::DelightQLError> {
         let conn = WasmDatabaseConnection::new();
         let arc: Arc<Mutex<dyn DatabaseConnection>> = Arc::new(Mutex::new(conn));
 
@@ -453,7 +422,7 @@ pub fn init_delightql() -> std::result::Result<(), JsValue> {
     let factory = Box::new(WasmConnectionFactory);
     // No types-level mount factory: URI-scheme mounts (delightql-siso://, etc.)
     // are not available in the browser sandbox.
-    let handle = api::open(factory, None).map_err(|e| JsValue::from_str(&e))?;
+    let handle = api::open(factory, None).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     DQL_HANDLE.with(|h| {
         *h.borrow_mut() = Some(handle);
@@ -475,9 +444,11 @@ pub fn execute_dql(query: &str) -> std::result::Result<String, JsValue> {
 
         let mut session = handle
             .session()
-            .map_err(|e| JsValue::from_str(&e))?;
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        let result = session.query(query).map_err(|e| JsValue::from_str(&e))?;
+        let result = session
+            .query(query)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
 
@@ -485,7 +456,7 @@ pub fn execute_dql(query: &str) -> std::result::Result<String, JsValue> {
         loop {
             let fetch = session
                 .fetch(&result.handle, 1000)
-                .map_err(|e| JsValue::from_str(&e))?;
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
             all_rows.extend(fetch.rows);
             if fetch.finished {
                 break;

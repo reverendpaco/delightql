@@ -131,7 +131,7 @@ subtree(*) as s, node(*) as n, n.parent = s.id
 
 // But this fails:
 subtree(*) as s, node(*) as n, n.parent = s.id
-    ~> (s.id, sum:(n.value) as total) : subtree  // aggregation -- NOT ALLOWED
+    %( ~> (s.id, sum:(n.value) as total)) : subtree  // aggregation -- NOT ALLOWED
 ```
 
 

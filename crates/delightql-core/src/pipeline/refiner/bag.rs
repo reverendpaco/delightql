@@ -10,6 +10,7 @@
 //! owners — which is what made a three-arm correlation unrepresentable and
 //! a bare name silently pick the first arm that published it.
 
+use crate::diagnostic::{Internal, ResolutionSetop};
 use crate::pipeline::asts::core::ColumnOccurrence;
 
 use crate::error::{DelightQLError, Result};
@@ -34,7 +35,7 @@ impl RunArms {
     pub(super) fn of(expr: &resolved::Chain) -> Result<Self> {
         let run = expr
             .trailing_bag_run()
-            .ok_or_else(|| DelightQLError::parse_error("a bag run was expected here"))?;
+            .ok_or_else(|| Internal::invariant("refiner::bag", "a bag run was expected here"))?;
         let mut relations = Vec::with_capacity(run.arms());
         let mut results = Vec::with_capacity(run.steps);
         relations.push(arm_relation(&expr.prefix(run.base)));
@@ -218,13 +219,11 @@ pub(super) fn related(
     // conjunct whose every reference is shared names no arm at all and
     // stays what it always was — one condition over the finished relation.
     if shared && !named.is_empty() {
-        return Err(DelightQLError::validation_error_categorized(
-            "resolution/setop/correlation/shared",
-            "a set-operation correlation reads a value that is carried by \
-             more than one operand, so which arm it correlates is unstated",
-            "qualify the reference with the arm it means: \
-             `x(*) as a ; y(*) as b, a.k = b.k`",
-        ));
+        return Err(DelightQLError::from(ResolutionSetop::CorrelationShared {
+            message: "a set-operation correlation reads a value that is carried by \
+             more than one operand, so which arm it correlates is unstated"
+                .to_string(),
+        }));
     }
     if !all {
         return Ok(Related::Whole);
@@ -353,15 +352,12 @@ pub(super) fn conjoin(parts: Vec<resolved::TruthExpression>) -> Option<resolved:
 /// write, and keeping it above the run would silently make it a filter over
 /// a heading its references do not stand in. Refuse and say how to write it.
 pub(super) fn refuse_spanning_conjunct(arms: usize) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "resolution/setop/correlation_owner",
-        format!(
+    DelightQLError::from(ResolutionSetop::CorrelationOwner {
+        message: format!(
             "a set-operation correlation relates two operands, and this condition \
              names {arms} at once"
         ),
-        "write one condition per pair: `x(*) as a ; y(*) as b ; z(*) as c, \
-         a.k = b.k, b.k = c.k`",
-    )
+    })
 }
 
 /// A whole-heading correlation that names no pair of the run's arms.
@@ -370,12 +366,11 @@ pub(super) fn refuse_spanning_conjunct(arms: usize) -> DelightQLError {
 /// correlation with nothing to correlate. It refuses rather than becoming a
 /// filter over the finished relation, which is a different query.
 pub(super) fn refuse_unowned_whole_heading() -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "resolution/setop/correlation_owner",
-        "a whole-heading correlation names two operands of this set operation, \
-         and one of these names no operand of it",
-        "name the two arms: `x(*) as a ; y(*) as b, a.* = b.*`",
-    )
+    DelightQLError::from(ResolutionSetop::CorrelationOwner {
+        message: "a whole-heading correlation names two operands of this set operation, \
+         and one of these names no operand of it"
+            .to_string(),
+    })
 }
 
 /// Collect the arms a predicate names, answering whether the whole
@@ -540,12 +535,11 @@ pub(super) fn refuse_ambiguous_bare_reference(
         }
     });
     if ambiguous {
-        return Err(DelightQLError::validation_error_categorized(
-            "resolution/setop/correlation_owner",
-            "a bare set-operation correlation name is carried by more than one operand, \
-             so it names no single column",
-            "qualify the reference by the operand it reads",
-        ));
+        return Err(DelightQLError::from(ResolutionSetop::CorrelationOwner {
+            message: "a bare set-operation correlation name is carried by more than one operand, \
+             so it names no single column"
+                .to_string(),
+        }));
     }
     Ok(())
 }
@@ -634,11 +628,10 @@ pub(super) fn refuse_unqualified_correlation(predicate: &resolved::TruthExpressi
         return Ok(());
     }
     if is_unqualified(left) && is_unqualified(right) {
-        return Err(DelightQLError::validation_error_categorized(
-            "resolution/setop/correlation_owner",
-            "a set-operation correlation must say which operand each side reads",
-            "alias the operands and qualify both sides: `a(*) as x ; b(*) as y, x.col = y.col`",
-        ));
+        return Err(DelightQLError::from(ResolutionSetop::CorrelationOwner {
+            message: "a set-operation correlation must say which operand each side reads"
+                .to_string(),
+        }));
     }
     Ok(())
 }
@@ -666,11 +659,10 @@ pub(super) fn whole_tuple_correlation(
     identities: &crate::relation::Planning,
 ) -> Result<resolved::TruthExpression> {
     let anti_match = crate::relation::anti_match(identities, &result)?.ok_or_else(|| {
-        DelightQLError::validation_error_categorized(
-            crate::uri_registry::subcat::RESOLUTION_SETOP_MINUS_HEADING,
-            "a minus was refined without the exact pairing its construction proved",
-            "this is a compiler fault: report the query",
-        )
+        DelightQLError::from(ResolutionSetop::MinusHeading {
+            message: "a minus was refined without the exact pairing its construction proved"
+                .to_string(),
+        })
     })?;
     let comparisons = anti_match
         .pairs()
@@ -691,11 +683,9 @@ pub(super) fn whole_tuple_correlation(
         })
         .collect();
     resolved::TruthExpression::all(comparisons).ok_or_else(|| {
-        DelightQLError::validation_error_categorized(
-            crate::uri_registry::subcat::RESOLUTION_SETOP_MINUS_HEADING,
-            "minus has no columns to compare",
-            "both operands must publish at least one column",
-        )
+        DelightQLError::from(ResolutionSetop::MinusHeading {
+            message: "minus has no columns to compare".to_string(),
+        })
     })
 }
 
@@ -726,16 +716,16 @@ mod tests {
         let relation = registry
             .authority()
             .derive(crate::relation::RelForm::Anonymous(
-                crate::relation::form::AnonymousSpec {
-                    shape: crate::relation::form::AnonymousShape::Tabular,
-                    slots: &[crate::relation::form::AnonymousSlot::Binder {
+                crate::relation::form::AnonymousSpec::plain(
+                    crate::relation::form::AnonymousShape::Tabular,
+                    &[crate::relation::form::AnonymousSlot::Binder {
                         position: 0,
                         named,
                         declared_type: None,
                         shape: crate::names::ValueShape::Unknown,
                     }],
-                    answers_to: Some(answer),
-                },
+                    Some(answer),
+                ),
             ))
             .unwrap();
         crate::relation::published_ports(registry, &relation).unwrap()[0]

@@ -82,10 +82,6 @@ impl Registry {
         self.admit_scope(ScopeKind::SetArm { arm }, Hint::None, Some(input))
     }
 
-    pub(crate) fn er_hop_scope(&self, chain: ScopeId, hop: u16, prefix: &'static str) -> ScopeId {
-        self.admit_scope(ScopeKind::ErHop { hop }, Hint::Prefix(prefix), Some(chain))
-    }
-
     pub(crate) fn anonymous_scope(&self, answer: Option<Spelling>) -> ScopeId {
         self.admit_scope(
             ScopeKind::AnonRelation,

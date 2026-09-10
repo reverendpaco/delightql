@@ -10,7 +10,7 @@
 //! qualifiers, on every correspondence.
 
 use crate::pipeline::Pipeline;
-use crate::system::DelightQLSystem;
+use crate::system::ReadySystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 use std::sync::{Arc, Mutex};
@@ -31,7 +31,7 @@ impl DatabaseIntrospector for NoTables {
 }
 
 fn sql_of(source: &str) -> String {
-    let mut system = DelightQLSystem::new(
+    let mut system = ReadySystem::new(
         Arc::new(Mutex::new(MockDatabaseConnection::new())),
         Box::new(NoTables),
         "sqlite",

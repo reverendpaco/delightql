@@ -12,9 +12,10 @@
 //! them current for the statement's extent — so the reach records which
 //! NAMESPACES a world names, never which load declared them.
 
+use crate::diagnostic::Runtime;
 use std::collections::HashMap;
 
-use crate::error::{DelightQLError, Result};
+use crate::error::Result;
 
 /// One namespace as the reach captured it.
 #[derive(Debug, Clone)]
@@ -161,7 +162,7 @@ pub(in crate::defuse) fn capture_on(
     {
         let mut stmt = conn
             .prepare("SELECT n.id, n.fq_name, n.kind, n.default_data_ns FROM namespace n")
-            .map_err(|e| DelightQLError::database_error("prepare reach capture", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("prepare reach capture", e.to_string()))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -171,9 +172,9 @@ pub(in crate::defuse) fn capture_on(
                     row.get::<_, Option<String>>(3)?,
                 ))
             })
-            .map_err(|e| DelightQLError::database_error("run reach capture", e.to_string()))?
+            .map_err(|e| Runtime::catalog("run reach capture", e.to_string()))?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| DelightQLError::database_error("decode reach capture", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("decode reach capture", e.to_string()))?;
         for (id, fq, kind, default_data_ns) in rows {
             let Some(fq) = fq else {
                 continue;
@@ -244,12 +245,12 @@ pub(in crate::defuse) fn capture_on(
     let reached: Vec<i64> = {
         let mut stmt = conn
             .prepare(walk)
-            .map_err(|e| DelightQLError::database_error("prepare reach walk", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("prepare reach walk", e.to_string()))?;
         let rows = stmt
             .query_map([root.id], |row| row.get::<_, i64>(0))
-            .map_err(|e| DelightQLError::database_error("run reach walk", e.to_string()))?
+            .map_err(|e| Runtime::catalog("run reach walk", e.to_string()))?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| DelightQLError::database_error("decode reach walk", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("decode reach walk", e.to_string()))?;
         rows
     };
 
@@ -276,14 +277,14 @@ pub(in crate::defuse) fn capture_on(
         };
         let mut stmt = conn
             .prepare(&sql)
-            .map_err(|e| DelightQLError::database_error("prepare alias capture", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("prepare alias capture", e.to_string()))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
-            .map_err(|e| DelightQLError::database_error("run alias capture", e.to_string()))?
+            .map_err(|e| Runtime::catalog("run alias capture", e.to_string()))?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| DelightQLError::database_error("decode alias capture", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("decode alias capture", e.to_string()))?;
         let mut aliases = HashMap::new();
         for (alias, target_id) in rows {
             if let Some(facts) = catalog.values().find(|namespace| namespace.id == target_id) {

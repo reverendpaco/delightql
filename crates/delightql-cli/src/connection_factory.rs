@@ -9,6 +9,7 @@
 use delightql_core::api::{CreatedConnection, Handler};
 use delightql_sqlite_relay::siso::SisoParty;
 use delightql_sqlite_relay::SqlParty;
+use delightql_types::diagnostic::{DelightQLError, Mount};
 
 use crate::connection::ConnectionManager;
 
@@ -18,10 +19,7 @@ use crate::connection::ConnectionManager;
 pub struct CliConnectionFactory;
 
 impl delightql_core::api::ConnectionFactory for CliConnectionFactory {
-    fn create(
-        &self,
-        uri: &str,
-    ) -> std::result::Result<CreatedConnection, Box<dyn std::error::Error + Send + Sync>> {
+    fn create(&self, uri: &str) -> std::result::Result<CreatedConnection, DelightQLError> {
         // A `#schema` fragment is a client-side locator; strip it so the
         // engine only ever sees the base resource (Phase B). This API-level
         // door does not carry a schema (CreatedConnection has no such field);
@@ -72,10 +70,7 @@ impl delightql_types::ConnectionFactory for CliConnectionFactory {
     fn create(
         &self,
         uri: &str,
-    ) -> std::result::Result<
-        delightql_types::ConnectionComponents,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> std::result::Result<delightql_types::ConnectionComponents, DelightQLError> {
         // Phase B: strip the client-side `#schema` fragment before the base
         // reaches the engine (libpq / the DuckDB adapter never see it).
         let (base, schema) = crate::connection::split_schema_fragment(uri);
@@ -94,32 +89,35 @@ impl delightql_types::ConnectionFactory for CliConnectionFactory {
     fn create_tree(
         &self,
         uri: &str,
-    ) -> std::result::Result<
-        Vec<(String, delightql_types::ConnectionComponents)>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> std::result::Result<Vec<(String, delightql_types::ConnectionComponents)>, DelightQLError>
+    {
         // A fragment is meaningless here — mount_tree! mounts EVERY schema.
         let (base, schema) = crate::connection::split_schema_fragment(uri);
+        let locator = |message: &str| -> DelightQLError {
+            Mount::Locator {
+                message: message.to_string(),
+            }
+            .into()
+        };
         if schema.is_some() {
-            return Err("mount_tree! mounts every schema; drop the #schema fragment \
-                        (use mount! to bind a single schema)"
-                .into());
+            return Err(locator(
+                "mount_tree! mounts every schema; drop the #schema fragment \
+                 (use mount! to bind a single schema)",
+            ));
         }
         let conn_mgr = ConnectionManager::new_file(&base)?;
         match &conn_mgr {
             ConnectionManager::Fatboy(mgr) => {
-                Ok(crate::fatboy_exec::create_fatboy_tree_components(mgr)?)
+                crate::fatboy_exec::create_fatboy_tree_components(mgr)
             }
-            ConnectionManager::SQLite(_) => {
-                Err("SQLite has no schemas; use mount! (mount_tree! is for \
-                     Postgres and DuckDB targets)"
-                    .into())
-            }
-            ConnectionManager::Pipe(_) => Err(
+            ConnectionManager::SQLite(_) => Err(locator(
+                "SQLite has no schemas; use mount! (mount_tree! is for \
+                 Postgres and DuckDB targets)",
+            )),
+            ConnectionManager::Pipe(_) => Err(locator(
                 "mount_tree! is not supported over a siso pipe; mount the \
-                 Postgres/DuckDB resource directly"
-                    .into(),
-            ),
+                 Postgres/DuckDB resource directly",
+            )),
         }
     }
 }
@@ -130,7 +128,7 @@ impl delightql_types::ConnectionFactory for CliConnectionFactory {
 /// For Pipe: uses SisoParty (eager, buffered).
 pub fn make_handler(
     conn_mgr: &ConnectionManager,
-) -> Result<Box<dyn Handler + Send>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Box<dyn Handler + Send>, DelightQLError> {
     match conn_mgr {
         ConnectionManager::Pipe(_) => {
             let db_conn = conn_mgr.get_database_connection();
@@ -154,7 +152,7 @@ fn make_introspector_and_type(
         Box<dyn delightql_types::introspect::DatabaseIntrospector>,
         String,
     ),
-    Box<dyn std::error::Error + Send + Sync>,
+    DelightQLError,
 > {
     match conn_mgr {
         ConnectionManager::SQLite(sqlite_conn) => {
@@ -169,8 +167,7 @@ fn make_introspector_and_type(
             Ok((introspector, mgr.profile_name().to_string()))
         }
         ConnectionManager::Fatboy(mgr) => {
-            let introspector =
-                Box::new(crate::fatboy_exec::FatboyIntrospector::new(mgr.clone()));
+            let introspector = Box::new(crate::fatboy_exec::FatboyIntrospector::new(mgr.clone()));
             Ok((introspector, mgr.profile.clone()))
         }
     }

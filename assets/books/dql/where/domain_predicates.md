@@ -50,12 +50,12 @@ employee(*),
 
 **Null-safe vs Null-dangerous equality**.  Delightql reserves the `=`{.delightql .sigil}
 sigil for the SQL comparison operator `IS NOT DISTINCT FROM`{.sql}.  To use the
-traditional (dangerous) equality in SQL, use delightql's `==`{.delightql .sigil} sigil.
+traditional (dangerous) equality in SQL, use `+sql_eq(x,y)`.
 
 ```delightql
 employee(*), Salary > 50000,
     trim:(lower:(Department))="engineering",
-    LastName=="John"
+    +sql_eq(LastName,"John")
 ```
 
 ```sql
@@ -121,18 +121,16 @@ select * from employee
 
 If a programmer requires the use of the traditional Sql `=`
 they can use the named functor: `+sql_eq(left,right)`.
-Likewise, for SQL's `!=` there is `+sql_not_eq(left,right)`
+Likewise, for SQL's `!=` there is `+sql_ne(left,right)`
 
 > **The join-position exception**.
 >
 > The table above describes equality in *filter position* -- conditions
-> referencing columns from zero or one relation. In *join position* --
-> conditions correlating columns from two or more relations -- both `=`
-> and `==` compile to SQL `=`.
+> referencing columns from zero or one relation. In *join position*
+> conditions correlating columns from two or more relations compile to SQL `=`.
 >
-> This is the safe default for joins as `IS NOT DISTINCT FROM` in a join
-> condition would treat NULL as a matchable value. The NULL-by-NULL cartesian
-> product is almost never intended and can explode cardinality.
+> This is the only safe default for joins as `IS NOT DISTINCT FROM` in a join
+> condition would treat NULL as a matchable value and explode cardinality.
 >
 > Joins establish *structural correspondence* -- "these rows belong
 > together." NULL means absence, and absence

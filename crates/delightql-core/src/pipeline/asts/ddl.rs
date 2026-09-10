@@ -26,6 +26,7 @@ use super::core::{
     FunctionApplication, LiteralValue, NamedReference, Query, Reference, TabularBody, TabularRow,
     TruthExpression, Unresolved,
 };
+use crate::diagnostic::{Constraint, Ddl, DdlHead, Internal, Recursion};
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::GroundForm;
@@ -221,7 +222,8 @@ impl DefinitionGroup {
     /// The one door. `decls` are one subject's clauses in authored order.
     pub fn assemble(decls: Vec<ClauseDecl>) -> Result<DefinitionGroup> {
         let Some(first) = decls.first() else {
-            return Err(DelightQLError::parse_error(
+            return Err(Internal::invariant(
+                "asts::ddl",
                 "a definition group has at least one clause",
             ));
         };
@@ -235,16 +237,14 @@ impl DefinitionGroup {
         // one's name.
         for decl in decls.iter().skip(1) {
             if decl.front.subject != subject {
-                return Err(DelightQLError::validation_error_categorized(
-                    "ddl/group/mixed_subject",
-                    format!(
+                return Err(DelightQLError::from(Ddl::GroupMixedSubject {
+                    message: format!(
                         "definition group '{}': a later clause declares the subject \
                          '{}'. One group is one subject.",
                         name,
                         decl.front.name()
                     ),
-                    "mixed subjects in one definition",
-                ));
+                }));
             }
         }
 
@@ -261,9 +261,8 @@ impl DefinitionGroup {
         let fixpoint = first.front.fixpoint;
         for (idx, decl) in decls.iter().enumerate().skip(1) {
             if decl.front.fixpoint != fixpoint {
-                return Err(DelightQLError::validation_error_categorized(
-                    crate::uri_registry::subcat::RECURSION_MIXED_BADGE,
-                    format!(
+                return Err(DelightQLError::from(Recursion::MixedBadge {
+                    message: format!(
                         "definition '{}': clause {} is {} and clause 1 is {}. \
                          A fixpoint flavor is one claim about the target — \
                          every clause wears the same badge.",
@@ -272,8 +271,7 @@ impl DefinitionGroup {
                         decl.front.fixpoint.spelling(),
                         fixpoint.spelling()
                     ),
-                    "mixed fixpoint badges in one definition",
-                ));
+                }));
             }
         }
 
@@ -284,9 +282,8 @@ impl DefinitionGroup {
         for (idx, decl) in decls.iter().enumerate().skip(1) {
             let arity = decl.front.head.param_count();
             if arity != first_arity {
-                return Err(DelightQLError::validation_error_categorized(
-                    "ddl/head/param_arity",
-                    format!(
+                return Err(DelightQLError::from(DdlHead::ParamArity {
+                    message: format!(
                         "Disjunctive definition '{}': clause {} has {} parameter(s) but \
                          clause 1 has {}. All clauses must have the same arity.",
                         name,
@@ -294,8 +291,7 @@ impl DefinitionGroup {
                         arity,
                         first_arity
                     ),
-                    "mixed clause arity in one definition",
-                ));
+                }));
             }
         }
 
@@ -331,15 +327,13 @@ impl DefinitionGroup {
                     Some(HoParam::Rule { signature, .. }) if signature.same_shape(agreed)
                 );
                 if !agrees {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "ddl/head/rule_contract",
-                        format!(
+                    return Err(DelightQLError::from(DdlHead::RuleContract {
+    message: format!(
                             "Disjunctive definition '{name}': clause {} disagrees about the rule-valued contract at parameter position {}. Every clause must declare the same remaining roles and headings.",
                             ordinal + 1,
                             position + 1,
                         ),
-                        "one rule-valued position has one family-wide structural contract",
-                    ));
+}));
                 }
             }
         }
@@ -594,8 +588,10 @@ pub struct HoPositionInfo {
     pub ground_pattern: Option<HoGroundPattern>,
     /// Ground constant values (one per clause that has a ground param at this pos)
     pub ground_values: Vec<(usize, String)>, // (clause_ordinal, value)
-    /// Canonical column name from free-variable clauses, when any exist.
-    pub column_name: Option<String>,
+    /// The declared identifier at this position, from the first clause
+    /// that names it — strop and all, so the catalog and the issued
+    /// formal carry the identity the author wrote.
+    pub column_name: Option<delightql_types::SqlIdentifier>,
 }
 
 /// What kind of HO column this position carries, unified across all clauses.
@@ -604,7 +600,7 @@ pub enum HoColumnKind {
     /// T(*) in every clause
     TableGlob,
     /// T(x,y) in every clause
-    TableArgumentative(Vec<String>),
+    TableArgumentative(Vec<delightql_types::SqlIdentifier>),
     /// A closed pure relational rule value. The signature is the complete
     /// structural contract consumers admit; the hidden sealed-prefix count
     /// is deliberately not part of it.
@@ -714,9 +710,8 @@ impl Clause {
 fn declared_group_kind(name: &str, decls: &[ClauseDecl]) -> Result<DefKind> {
     let first = &decls[0];
     let mixed_kind = |idx: usize, kind: DefKind, first_kind: DefKind| {
-        DelightQLError::validation_error_categorized(
-            "ddl/head/mixed_kind",
-            format!(
+        DelightQLError::from(DdlHead::MixedKind {
+            message: format!(
                 "Disjunctive definition '{}': clause {} is a {} but clause 1 is a {}. \
                  All clauses must be the same kind.",
                 name,
@@ -724,8 +719,7 @@ fn declared_group_kind(name: &str, decls: &[ClauseDecl]) -> Result<DefKind> {
                 kind_name(kind),
                 kind_name(first_kind)
             ),
-            "mixed clause kinds in one definition",
-        )
+        })
     };
     if decls.iter().any(|d| d.front.kind == DefKind::Fact) {
         for (idx, decl) in decls.iter().enumerate() {
@@ -768,20 +762,22 @@ fn elaborate_fact_clause(subject: &str, decl: ClauseDecl) -> Result<Vec<ClauseDe
         fact_row_offers,
     } = decl;
     let DdlBody::Relational(query) = body else {
-        return Err(DelightQLError::parse_error(format!(
-            "fact '{subject}': a fact's body is its data table"
-        )));
+        return Err(DelightQLError::from(Constraint::General {
+            message: format!("fact '{subject}': a fact's body is its data table"),
+        }));
     };
     let chain = query.into_bare_body().map_err(|_| {
-        DelightQLError::parse_error(format!("fact '{subject}': a fact's body is its data table"))
+        DelightQLError::from(Constraint::General {
+            message: format!("fact '{subject}': a fact's body is its data table"),
+        })
     })?;
     let (GroundForm::Literal(anon), true) = (
         chain.head().form().clone(),
         chain.continuations().is_empty(),
     ) else {
-        return Err(DelightQLError::parse_error(format!(
-            "fact '{subject}': a fact's body is its data table"
-        )));
+        return Err(DelightQLError::from(Constraint::General {
+            message: format!("fact '{subject}': a fact's body is its data table"),
+        }));
     };
     let table = anon.table;
 
@@ -793,11 +789,9 @@ fn elaborate_fact_clause(subject: &str, decl: ClauseDecl) -> Result<Vec<ClauseDe
             let Some(DomainExpression::Reference(Reference::Named(NamedReference(column)))) =
                 item.term()
             else {
-                return Err(DelightQLError::validation_error_categorized(
-                    "ddl/head/fact_header",
-                    format!("fact '{subject}': a fact's header names its columns"),
-                    "a fact header item is a column name",
-                ));
+                return Err(DelightQLError::from(DdlHead::FactHeader {
+                    message: format!("fact '{subject}': a fact's header names its columns"),
+                }));
             };
             items.push(HeadItem::plumb(column.name.clone()));
         }
@@ -830,9 +824,9 @@ fn elaborate_fact_clause(subject: &str, decl: ClauseDecl) -> Result<Vec<ClauseDe
             let Datum::Value(DomainExpression::Application(FunctionApplication::Ground(value))) =
                 datum
             else {
-                return Err(DelightQLError::parse_error(format!(
-                    "fact '{subject}': a fact datum is a ground term"
-                )));
+                return Err(DelightQLError::from(Constraint::General {
+                    message: format!("fact '{subject}': a fact datum is a ground term"),
+                }));
             };
             items.push(HeadItem {
                 supply: Supply::Ground(value),
@@ -898,9 +892,9 @@ fn assembled_entity_type(kind: DefKind, decls: &[ClauseDecl]) -> Result<EntityTy
             let mut callable_only = false;
             for decl in decls {
                 let DdlBody::FactFunction(definition) = &decl.body else {
-                    return Err(DelightQLError::parse_error(
-                        "a fact-function family carries only declared modes",
-                    ));
+                    return Err(DelightQLError::from(Constraint::General {
+                        message: "a fact-function family carries only declared modes".to_string(),
+                    }));
                 };
                 callable_only |=
                     definition.entity_type() == EntityType::DqlDefaultFactFunctionExpression;

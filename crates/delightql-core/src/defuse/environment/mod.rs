@@ -21,10 +21,15 @@
 
 pub(crate) mod lookup;
 pub(crate) mod reach;
+pub(crate) mod scoped;
+
+pub(in crate::defuse) use scoped::ChoeSpending;
+pub(crate) use scoped::{ScopedCfe, ScopedEffectArms, ScopedHo, ScopedSlotWorld};
 
 pub(crate) use lookup::RelationAnswer;
 pub(crate) use reach::DeclarationReach;
 
+use crate::diagnostic::{Cfe, DelightQLError, Ho, Resolution};
 use std::collections::HashMap;
 
 use crate::error::Result;
@@ -56,11 +61,66 @@ impl LocalCte {
     }
 }
 
+/// THE IDENTITY OF ONE LEXICAL QUERY FRAME — the block of query-local
+/// claims one authored query owns. Minted only when a name fact enters a
+/// world, so a frame nothing pushed cannot be named, and the number a live
+/// stack happens to have reached is not a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueryFrameId(u64);
+
+impl QueryFrameId {
+    /// The counter is PROCESS-WIDE, so no two worlds ever mint the same
+    /// frame: a site that reached a world it was not minted in names a
+    /// frame that world provably does not hold, rather than one that
+    /// happens to carry the same ordinal. A frame identity never reaches
+    /// emitted output, so sharing the counter costs no determinism there.
+    fn mint() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        QueryFrameId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// WHERE A QUERY-LOCAL DEFINITION WAS DECLARED: the lexical frame holding
+/// its claim, and the horizon that claim's position minted.
+///
+/// The pair is stamped by the REGISTRATION that put the definition in the
+/// world, and it is PRIVATE TO THIS MODULE. Nothing outside constructs one,
+/// receives one, or holds one: a site travels only inside the selected
+/// definition it belongs to, so there is no safe signature through which a
+/// caller could pair one definition's declaration with another's body, and
+/// no count of the frames a caller happens to have open can stand in for
+/// the frame a declaration is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LexicalSite {
+    frame: QueryFrameId,
+    horizon: crate::pipeline::asts::core::LexicalHorizon,
+}
+
+/// One authored query's claims, under the identity the world minted for
+/// them.
+#[derive(Debug, Clone)]
+struct QueryFrame {
+    id: QueryFrameId,
+    names: crate::pipeline::asts::core::QueryLocalNames,
+    /// THE RELATION BINDINGS this frame's block declared, kept unresolved.
+    /// A body made of many statements resolves them afresh in each — the
+    /// world they read changes as the plan creates relations — so they stay
+    /// with the frame that declared them rather than travelling on a walk.
+    /// Empty for a frame whose one query resolved its own bindings.
+    bindings: Vec<crate::pipeline::ast_unresolved::CteBinding>,
+}
+
 /// The manifestation returned by the one query-local selection operation.
 pub(crate) enum QueryLocalSelection {
     Relation(LocalCte),
-    Value(crate::pipeline::asts::core::CfeDefinition),
-    HigherOrder(crate::pipeline::asts::core::HoDefinition),
+    Value(ScopedCfe),
+    HigherOrder(ScopedHo),
+    /// An effect-marked CTE label: every same-label arm the block declared,
+    /// under the site that declared them.
+    EffectRelation(ScopedEffectArms),
+    /// The query's own effect-mirror CHOE, selected as the same carrier a
+    /// pure one is: one law for both manifestations of a scoped definition.
+    EffectHigherOrder(ScopedHo),
 }
 
 pub(crate) enum QueryLocalRegistration {
@@ -74,6 +134,12 @@ pub(crate) enum QueryLocalRegistration {
     },
     Value(crate::pipeline::asts::core::CfeDefinition),
     HigherOrder(crate::pipeline::asts::core::HoDefinition),
+    /// One effect-marked CTE arm. The label denotes the corresponding union
+    /// of every arm declared under it, so arms accumulate in authored order.
+    EffectRelation {
+        name: delightql_types::SqlIdentifier,
+        arm: crate::pipeline::ast_unresolved::CteBinding,
+    },
 }
 
 /// The bindings ONE lexical frame owns. Private storage shared by both
@@ -91,16 +157,22 @@ struct Locals {
     /// hold them: a body addresses its formals through this, and a nested
     /// call inherits from it.
     carriers: crate::defuse::carriers::CarrierRecord,
-    cfes: HashMap<delightql_types::SqlIdentifier, Vec<crate::pipeline::asts::core::CfeDefinition>>,
+    cfes: HashMap<delightql_types::SqlIdentifier, Vec<ScopedCfe>>,
     /// The query-scoped higher-order definitions — the CHOEs — by bare
     /// subject, pure and effect mirror alike.
-    hos: HashMap<delightql_types::SqlIdentifier, crate::pipeline::asts::core::HoDefinition>,
-    /// Nested unresolved queries' common name facts, outermost first.
-    query_names: Vec<crate::pipeline::asts::core::QueryLocalNames>,
-    /// A query-scoped body currently resolving at its authored declaration
-    /// horizon. CTE/CFE bodies push here; CHOE bodies carry the same fact in
-    /// their owned body scope.
-    horizons: Vec<ActiveHorizon>,
+    hos: HashMap<delightql_types::SqlIdentifier, ScopedHo>,
+    /// The effect-marked CTE labels, each holding every arm declared under
+    /// it in authored order, stamped with the site that declared them.
+    effect_ctes: HashMap<delightql_types::SqlIdentifier, ScopedEffectArms>,
+    /// Nested unresolved queries' common name facts, outermost first, each
+    /// under the identity minted when it entered.
+    query_names: Vec<QueryFrame>,
+    /// THE OPEN DECLARATIONS, outermost first. Every query-scoped body
+    /// resolving at its authored declaration site stands here — a CTE
+    /// binding, a CFE body, a CHOE body alike — so the INNERMOST of them
+    /// governs visibility, whichever kind it is. Two stacks could not say
+    /// which of a CTE horizon and a CHOE body was entered last.
+    declarations: Vec<ActiveDeclaration>,
     aliases: HashMap<delightql_types::SqlIdentifier, delightql_types::SqlIdentifier>,
     /// Relations earlier statements of the same plan created. Their heading
     /// is lexical knowledge, but the relation is a physical DML target
@@ -134,21 +206,27 @@ struct Frame {
 struct BodyScope {
     ctes: HashMap<delightql_types::SqlIdentifier, LocalCte>,
     synthetic_ctes: HashMap<delightql_types::SqlIdentifier, LocalCte>,
-    cfes: HashMap<delightql_types::SqlIdentifier, Vec<crate::pipeline::asts::core::CfeDefinition>>,
-    hos: HashMap<delightql_types::SqlIdentifier, crate::pipeline::asts::core::HoDefinition>,
+    cfes: HashMap<delightql_types::SqlIdentifier, Vec<ScopedCfe>>,
+    hos: HashMap<delightql_types::SqlIdentifier, ScopedHo>,
+    effect_ctes: HashMap<delightql_types::SqlIdentifier, ScopedEffectArms>,
     carriers: crate::defuse::carriers::CarrierRecord,
     aliases: HashMap<delightql_types::SqlIdentifier, delightql_types::SqlIdentifier>,
-    /// Number of query-name facts already open when this body was entered.
-    /// The immediately preceding fact owns this body's authored horizon;
-    /// facts pushed later belong to nested queries and carry their own law.
-    query_depth: usize,
-    horizon: crate::pipeline::asts::core::LexicalHorizon,
 }
 
+/// ONE OPEN QUERY-SCOPED BODY, standing at the site its declaration was
+/// stamped with — a CTE binding, a CFE body, a pure CHOE body, an effect
+/// CHOE body. There is no second state: every body opening, on every road,
+/// names the declaration it reads from.
 #[derive(Debug)]
-struct ActiveHorizon {
-    query_index: usize,
-    horizon: crate::pipeline::asts::core::LexicalHorizon,
+struct ActiveDeclaration {
+    site: LexicalSite,
+    /// HOW MANY QUERY FRAMES STOOD WHEN THIS BODY OPENED. Everything below
+    /// that mark was already standing — it is the CALLER'S text, whatever
+    /// its depth — and everything at or above it this body pushed itself.
+    /// The distinction cannot be read off a frame index alone: a body that
+    /// opens on the world its demand stands in (an effect CHOE does) has
+    /// the demand site's own frames sitting above its declaration's.
+    opened_over: usize,
 }
 
 impl Locals {
@@ -162,11 +240,12 @@ impl Locals {
             carriers: self.carriers.clone(),
             cfes: self.cfes.clone(),
             hos: self.hos.clone(),
+            effect_ctes: self.effect_ctes.clone(),
             query_names: self.query_names.clone(),
-            horizons: self
-                .horizons
+            declarations: self
+                .declarations
                 .iter()
-                .map(ActiveHorizon::closed_copy)
+                .map(ActiveDeclaration::closed_copy)
                 .collect(),
             aliases: self.aliases.clone(),
             materialized: self.materialized.clone(),
@@ -190,33 +269,58 @@ impl Locals {
             .find_map(|frame| frame.scope.as_mut())
     }
 
-    /// The horizon governing one particular query-name fact. A horizon is
-    /// inseparable from the fact whose construction minted it: nested query
-    /// facts remain governed by their own declarations, and facts outside an
-    /// opened body are not visible through that body.
+    /// WHERE THE GOVERNING DECLARATION STANDS: the position, in this
+    /// world's frame stack, of the frame the innermost open query-scoped
+    /// body was DECLARED in.
+    ///
+    /// `Ok(None)` means no body is open and the whole stack is in view.
+    /// A site whose frame has left the stack is not a visibility answer of
+    /// any kind — it is a broken pairing, and it refuses rather than
+    /// silently hiding or revealing names.
+    fn governing(
+        &self,
+    ) -> Result<Option<(usize, crate::pipeline::asts::core::LexicalHorizon, usize)>> {
+        let (site, opened_over) = match self.declarations.last() {
+            None => return Ok(None),
+            Some(declaration) => (declaration.site, declaration.opened_over),
+        };
+        let at = self
+            .query_names
+            .iter()
+            .position(|frame| frame.id == site.frame)
+            .ok_or_else(|| {
+                crate::diagnostic::Internal::invariant(
+                    "defuse::environment",
+                    "an open query-scoped body names a lexical frame this world does not hold",
+                )
+            })?;
+        Ok(Some((at, site.horizon, opened_over)))
+    }
+
+    /// The horizon governing one frame of this world's stack.
+    ///
+    /// ONE RULE for every query-scoped body, whatever declared it: the
+    /// frame the open declaration stands in is admitted up to that
+    /// declaration's horizon, every frame nested INSIDE it is admitted
+    /// whole, and a frame the declaration itself is nested in is another
+    /// query's text. Which frame that is comes from the declaration's own
+    /// stamped site — never from how many frames happen to be open.
     fn horizon_for(
         &self,
         query_index: usize,
-    ) -> Option<crate::pipeline::asts::core::LexicalHorizon> {
-        if let Some(active) = self.horizons.last() {
-            return match query_index.cmp(&active.query_index) {
-                std::cmp::Ordering::Less => None,
-                std::cmp::Ordering::Equal => Some(active.horizon),
-                std::cmp::Ordering::Greater => {
-                    Some(crate::pipeline::asts::core::LexicalHorizon::all())
-                }
-            };
-        }
-        if let Some(scope) = self.body_scope() {
-            return if query_index >= scope.query_depth {
-                Some(crate::pipeline::asts::core::LexicalHorizon::all())
-            } else if query_index.checked_add(1) == Some(scope.query_depth) {
-                Some(scope.horizon)
-            } else {
-                None
-            };
-        }
-        Some(crate::pipeline::asts::core::LexicalHorizon::all())
+    ) -> Result<Option<crate::pipeline::asts::core::LexicalHorizon>> {
+        let Some((at, horizon, opened_over)) = self.governing()? else {
+            return Ok(Some(crate::pipeline::asts::core::LexicalHorizon::all()));
+        };
+        Ok(if query_index == at {
+            Some(horizon)
+        } else if query_index >= opened_over {
+            // Pushed by this body's own resolution — its own nested text.
+            Some(crate::pipeline::asts::core::LexicalHorizon::all())
+        } else {
+            // Standing before this body opened: another query's text.
+            None
+        })
     }
 
     /// The instantiation frames a formal lookup walks, innermost first,
@@ -254,19 +358,18 @@ impl BodyScope {
             synthetic_ctes: self.synthetic_ctes.clone(),
             cfes: self.cfes.clone(),
             hos: self.hos.clone(),
+            effect_ctes: self.effect_ctes.clone(),
             carriers: self.carriers.clone(),
             aliases: self.aliases.clone(),
-            query_depth: self.query_depth,
-            horizon: self.horizon,
         }
     }
 }
 
-impl ActiveHorizon {
+impl ActiveDeclaration {
     fn closed_copy(&self) -> Self {
-        ActiveHorizon {
-            query_index: self.query_index,
-            horizon: self.horizon,
+        ActiveDeclaration {
+            site: self.site,
+            opened_over: self.opened_over,
         }
     }
 }
@@ -373,17 +476,15 @@ impl FormalInventory {
         if declared == supplied {
             return Ok(());
         }
-        Err(crate::error::DelightQLError::validation_error_categorized(
-            "cfe/arity",
-            format!(
+        Err(DelightQLError::from(Cfe::Arity {
+            message: format!(
                 "the definition declares {declared} {} parameter{}; {supplied} actual{} \
                  supplied",
                 role.spelled(),
                 if declared == 1 { "" } else { "s" },
                 if supplied == 1 { " was" } else { "s were" },
             ),
-            "supply one actual per declared parameter",
-        ))
+        }))
     }
 
     /// Bind ordered VALUE actuals to the declared parameters of one role,
@@ -428,11 +529,9 @@ impl FormalInventory {
             .iter()
             .find(|(declared, id)| declared == name && id.role == FormalRole::Rule)
         else {
-            return Err(crate::error::DelightQLError::validation_error_categorized(
-                "resolution/ho/rule-formal",
-                format!("'{name}' is not a declared rule-valued parameter"),
-                "closed residual binding",
-            ));
+            return Err(DelightQLError::from(Ho::RuleFormal {
+                message: format!("'{name}' is not a declared rule-valued parameter"),
+            }));
         };
         self.rules.insert(id.clone(), value);
         Ok(())
@@ -450,15 +549,13 @@ impl FormalInventory {
             .iter()
             .find(|(declared, id)| declared == name && id.role != FormalRole::Callable)
         else {
-            return Err(crate::error::DelightQLError::validation_error_categorized(
-                "cfe/formals/undeclared",
-                format!(
+            return Err(DelightQLError::from(Cfe::FormalsUndeclared {
+                message: format!(
                     "'{}' is not a declared parameter of this definition — a \
                      binding must name a declared formal",
                     name
                 ),
-                "formal inventory",
-            ));
+            }));
         };
         let id = id.clone();
         self.values.insert(id, value);
@@ -691,6 +788,11 @@ impl DeclarationEnvironment {
     pub(crate) fn namespace(&self) -> &str {
         &self.namespace
     }
+
+    /// The reach the declaration's names are selected under.
+    pub(in crate::defuse) fn reach(&self) -> &DeclarationReach {
+        &self.reach
+    }
 }
 
 /// The enclosing row a context-aware body (`..`) declared it reads. The
@@ -822,7 +924,11 @@ impl Environment {
     }
 
     pub(crate) fn push_query_names(&mut self, names: crate::pipeline::asts::core::QueryLocalNames) {
-        self.locals_mut().query_names.push(names);
+        self.locals_mut().query_names.push(QueryFrame {
+            id: QueryFrameId::mint(),
+            names,
+            bindings: Vec::new(),
+        });
     }
 
     pub(crate) fn pop_query_names(&mut self) {
@@ -832,34 +938,140 @@ impl Environment {
             .expect("a query resolution pops the name fact it pushed");
     }
 
-    pub(crate) fn push_horizon(&mut self, horizon: crate::pipeline::asts::core::LexicalHorizon) {
-        let query_index = self
-            .locals()
+    /// A CTE BINDING'S BODY OPENS. The binding is resolved by the very act
+    /// that pushed its query's name fact, so the innermost frame IS the
+    /// frame this binding was declared in — the site is minted from the
+    /// declaration, not recovered from a depth.
+    pub(crate) fn push_binding_declaration(
+        &mut self,
+        horizon: crate::pipeline::asts::core::LexicalHorizon,
+    ) {
+        let locals = self.locals_mut();
+        let frame = locals
             .query_names
-            .len()
-            .checked_sub(1)
-            .expect("a query-scoped horizon requires its query name fact");
-        self.locals_mut().horizons.push(ActiveHorizon {
-            query_index,
-            horizon,
+            .last()
+            .expect("a query-scoped binding requires its query name fact")
+            .id;
+        let opened_over = locals.query_names.len();
+        locals.declarations.push(ActiveDeclaration {
+            site: LexicalSite { frame, horizon },
+            opened_over,
         });
     }
 
-    pub(crate) fn pop_horizon(&mut self) {
-        self.locals_mut()
-            .horizons
-            .pop()
-            .expect("a query-scoped body pops the horizon it pushed");
+    /// A QUERY-SCOPED VALUE DEFINITION'S BODY OPENS AT ITS OWN DECLARATION
+    /// SITE — the site its registration stamped, read from the carrier the
+    /// selection produced. The site is not an argument, so no caller can
+    /// open one definition's body at another's lexical position.
+    pub(in crate::defuse::environment) fn push_scoped_declaration(
+        &mut self,
+        definition: &ScopedCfe,
+    ) {
+        let locals = self.locals_mut();
+        let opened_over = locals.query_names.len();
+        locals.declarations.push(ActiveDeclaration {
+            site: definition.site(),
+            opened_over,
+        });
     }
 
-    /// ONE QUERY-LOCAL SELECTION. Wrong kind and not-yet-visible are closed
+    /// The pop of whichever declaration road opened one: the CTE-binding
+    /// road's [`Self::push_binding_declaration`] outside this module, the
+    /// scoped-definition authority's own openings inside it.
+    pub(crate) fn pop_declaration(&mut self) {
+        self.locals_mut()
+            .declarations
+            .pop()
+            .expect("a query-scoped body pops the declaration it pushed");
+    }
+
+    /// ONE STATEMENT, RESTATED under the block standing here: its own body
+    /// beneath that block's relation bindings. A statement that arrived with
+    /// bindings of its own is not one of these — the door refuses to pair a
+    /// caller-supplied block with this world's declarations.
+    pub(in crate::defuse) fn restate_with_standing_bindings(
+        &self,
+        query: crate::pipeline::ast_unresolved::Query,
+    ) -> Result<crate::pipeline::ast_unresolved::Query> {
+        if !query.locals.is_empty() {
+            return Err(crate::diagnostic::Internal::invariant(
+                "defuse::environment",
+                "a statement of a standing block carries no block of its own",
+            ));
+        }
+        Ok(crate::pipeline::ast_unresolved::Query::binding(
+            crate::pipeline::asts::core::QueryLocals::bindings_only(self.standing_bindings()?),
+            query.body,
+        ))
+    }
+
+    /// THE RELATION BINDINGS IN LEXICAL REACH of the body standing here.
+    ///
+    /// DERIVED FROM THE FRAMES, never rebuilt by a walk: every frame the
+    /// open declaration admits contributes the bindings that declaration's
+    /// horizon lets it see, outermost first — the order a nearer binding
+    /// needs to read a farther one — and a spelling a nearer frame declares
+    /// takes the outer one's place entirely, claim and binding together,
+    /// because selection stops at the nearer claim. A claimless
+    /// compiler-built binding belongs to its own frame alone.
+    ///
+    /// They are cloned per statement because each statement resolves them
+    /// against the world as that statement finds it: the plan creates
+    /// relations between statements, and a binding reads what exists when
+    /// it runs. What never moves is which names are in reach.
+    pub(in crate::defuse) fn standing_bindings(
+        &self,
+    ) -> Result<Vec<crate::pipeline::ast_unresolved::CteBinding>> {
+        use crate::pipeline::asts::core::queries::QueryLocalJudgment;
+        use crate::pipeline::asts::core::QueryLocalDemand;
+        let locals = self.locals();
+        let mut nearer: std::collections::HashSet<&delightql_types::SqlIdentifier> =
+            std::collections::HashSet::new();
+        let mut reachable = Vec::new();
+        for (index, frame) in locals.query_names.iter().enumerate() {
+            let Some(horizon) = locals.horizon_for(index)? else {
+                continue;
+            };
+            reachable.push((index, frame, horizon));
+        }
+        // Innermost first for the shadowing decision, then restored to
+        // outermost-first for resolution order.
+        let mut kept: Vec<Vec<crate::pipeline::ast_unresolved::CteBinding>> =
+            vec![Vec::new(); reachable.len()];
+        for (slot, (_, frame, horizon)) in reachable.iter().enumerate().rev() {
+            let mut declared_here = Vec::new();
+            for binding in &frame.bindings {
+                match binding.subject().authored_name() {
+                    None => kept[slot].push(binding.clone()),
+                    Some(name) => {
+                        if nearer.contains(name) {
+                            continue;
+                        }
+                        if matches!(
+                            frame
+                                .names
+                                .judge(name, *horizon, QueryLocalDemand::Relation),
+                            QueryLocalJudgment::Lawful(_)
+                        ) {
+                            declared_here.push(name);
+                            kept[slot].push(binding.clone());
+                        }
+                    }
+                }
+            }
+            nearer.extend(declared_here);
+        }
+        Ok(kept.into_iter().flatten().collect())
+    }
+
+    /// ONE QUERY-LOCAL SELECTION. Wrong kind and not-yet-visible are closed    /// ONE QUERY-LOCAL SELECTION. Wrong kind and not-yet-visible are closed
     /// refusals; `Ok(None)` alone proves local absence and licenses an outer
     /// lookup road.
     pub(crate) fn select_query_local(
         &self,
         name: &delightql_types::SqlIdentifier,
         demand: crate::pipeline::asts::core::QueryLocalDemand,
-        horizon: Option<crate::pipeline::asts::core::LexicalHorizon>,
+        scoped: Option<&ScopedSlotWorld>,
     ) -> Result<Option<QueryLocalSelection>> {
         use crate::pipeline::asts::core::QueryLocalKind;
         let locals = self.locals();
@@ -875,16 +1087,38 @@ impl Environment {
                 return Ok(Some(QueryLocalSelection::Relation(cte.clone())));
             }
         }
+        // A SEALED SLOT supplies the site its own body stands at; every
+        // other position reads the site the innermost open declaration
+        // stamped. Both answer the same question of the same frame, so
+        // neither road decides visibility by counting frames.
+        let supplied = match scoped.map(ScopedSlotWorld::site) {
+            Some(site) => Some((
+                locals
+                    .query_names
+                    .iter()
+                    .position(|frame| frame.id == site.frame)
+                    .ok_or_else(|| {
+                        crate::diagnostic::Internal::invariant(
+                            "defuse::environment",
+                            "a sealed slot names a lexical frame this world does not hold",
+                        )
+                    })?,
+                site.horizon,
+            )),
+            None => None,
+        };
         let mut selected_kind = None;
-        for (query_index, names) in locals.query_names.iter().enumerate().rev() {
-            let scoped_horizon = if let Some(horizon) = horizon {
-                if query_index + 1 == locals.query_names.len() {
-                    Some(horizon)
-                } else {
-                    None
-                }
-            } else {
-                locals.horizon_for(query_index)
+        for (query_index, frame) in locals.query_names.iter().enumerate().rev() {
+            let names = &frame.names;
+            let scoped_horizon = match supplied {
+                Some((at, horizon)) => match query_index.cmp(&at) {
+                    std::cmp::Ordering::Less => None,
+                    std::cmp::Ordering::Equal => Some(horizon),
+                    std::cmp::Ordering::Greater => {
+                        Some(crate::pipeline::asts::core::LexicalHorizon::all())
+                    }
+                },
+                None => locals.horizon_for(query_index)?,
             };
             let Some(scoped_horizon) = scoped_horizon else {
                 continue;
@@ -916,7 +1150,7 @@ impl Environment {
                             definitions
                                 .iter()
                                 .rev()
-                                .find(|definition| selected_horizon.contains(definition.horizon()))
+                                .find(|scoped| selected_horizon.contains(scoped.declared_horizon()))
                         })
                         .cloned()
                         .map(QueryLocalSelection::Value),
@@ -926,18 +1160,32 @@ impl Environment {
                         .or_else(|| locals.hos.get(name))
                         .cloned()
                         .map(QueryLocalSelection::HigherOrder),
-                    QueryLocalKind::EffectRelation | QueryLocalKind::EffectHigherOrder => None,
+                    // THE EFFECT MANIFESTATIONS ANSWER HERE TOO. One
+                    // selection authority for every query-local kind: the
+                    // effect walk has no parallel block to search, so an
+                    // effect body reads its declarations exactly as a pure
+                    // one does.
+                    QueryLocalKind::EffectRelation => locals
+                        .body_scope()
+                        .and_then(|scope| scope.effect_ctes.get(name))
+                        .or_else(|| locals.effect_ctes.get(name))
+                        .cloned()
+                        .map(QueryLocalSelection::EffectRelation),
+                    QueryLocalKind::EffectHigherOrder => locals
+                        .body_scope()
+                        .and_then(|scope| scope.hos.get(name))
+                        .or_else(|| locals.hos.get(name))
+                        .cloned()
+                        .map(QueryLocalSelection::EffectHigherOrder),
                 };
                 selected.map(Some).ok_or_else(|| {
-                    crate::error::DelightQLError::validation_error_categorized(
-                        crate::uri_registry::subcat::RESOLUTION_CALLABLE_UNKNOWN,
-                        format!(
+                    DelightQLError::from(Resolution::CallableUnknown {
+    message: format!(
                             "query-local name '{name}' is visible here, but its {} is not available while resolving {}",
                             kind.description(),
                             demand.description()
                         ),
-                        "a visible query-local binding never falls through to an outer definition",
-                    )
+})
                 })
             }
         }
@@ -989,6 +1237,21 @@ impl Environment {
     /// never reads these stores without first consuming the common name fact.
     pub(crate) fn register_query_local(&mut self, registration: QueryLocalRegistration) {
         let locals = self.locals_mut();
+        // A DEFINITION whose body is resolved later — a value or a
+        // higher-order one — is registered inside the query whose name fact
+        // holds its claim: `resolve_query_with` pushes the fact and then
+        // registers the manifestations it spent. The innermost frame is
+        // therefore that definition's declaring frame BY CONSTRUCTION, and
+        // it is stamped now so no later act has to work it out. A relation
+        // binding needs none: its body is resolved where it is written, and
+        // a compiler-built one carries no authored claim at all.
+        let declaring_frame = || {
+            locals
+                .query_names
+                .last()
+                .expect("a query-local definition stands inside its query's name fact")
+                .id
+        };
         match registration {
             QueryLocalRegistration::Relation { name, relation } => {
                 match locals.body_scope_mut() {
@@ -1006,16 +1269,48 @@ impl Environment {
                         .insert(name, LocalCte::Ordinary(relation)),
                 };
             }
+            // THE DECLARATION SITE IS STAMPED HERE, by the act that puts
+            // the definition in the world: the frame is the one whose name
+            // fact holds this definition's claim, and the horizon is the
+            // one that claim's position minted. Nothing else pairs them.
             QueryLocalRegistration::Value(cfe) => {
+                let site = LexicalSite {
+                    frame: declaring_frame(),
+                    horizon: cfe.horizon(),
+                };
+                let name = cfe.name.clone();
+                let scoped = ScopedCfe::stamped(cfe, site);
                 match locals.body_scope_mut() {
-                    Some(scope) => scope.cfes.entry(cfe.name.clone()).or_default().push(cfe),
-                    None => locals.cfes.entry(cfe.name.clone()).or_default().push(cfe),
+                    Some(scope) => scope.cfes.entry(name).or_default().push(scoped),
+                    None => locals.cfes.entry(name).or_default().push(scoped),
                 };
             }
-            QueryLocalRegistration::HigherOrder(ho) => {
+            // The label's arms accumulate in authored order under the site
+            // that declared them: the label denotes their corresponding
+            // union, so a later arm joins the earlier ones rather than
+            // replacing them.
+            QueryLocalRegistration::EffectRelation { name, arm } => {
+                let site = LexicalSite {
+                    frame: declaring_frame(),
+                    horizon: crate::pipeline::asts::core::LexicalHorizon::all(),
+                };
                 match locals.body_scope_mut() {
-                    Some(scope) => scope.hos.insert(ho.name().clone(), ho),
-                    None => locals.hos.insert(ho.name().clone(), ho),
+                    Some(scope) => scope.effect_ctes.entry(name),
+                    None => locals.effect_ctes.entry(name),
+                }
+                .or_insert_with(|| ScopedEffectArms::stamped(site))
+                .admit(arm);
+            }
+            QueryLocalRegistration::HigherOrder(ho) => {
+                let site = LexicalSite {
+                    frame: declaring_frame(),
+                    horizon: *ho.horizon(),
+                };
+                let name = ho.name().clone();
+                let scoped = ScopedHo::stamped(ho, site);
+                match locals.body_scope_mut() {
+                    Some(scope) => scope.hos.insert(name, scoped),
+                    None => locals.hos.insert(name, scoped),
                 };
             }
         }
@@ -1076,27 +1371,28 @@ impl Environment {
     /// frame for exactly the lease's extent. The body's own registrations
     /// land in the frame and leave with it; the world beneath answers only
     /// what the horizon admits.
-    pub(in crate::defuse) fn opened_body(
+    /// The definition arrives WHOLE, so the site the body opens at is the
+    /// site its own registration stamped: there is no signature here that
+    /// takes a body beside a lexical position chosen for it.
+    pub(in crate::defuse::environment) fn opened_body(
         &mut self,
         formals: FormalBindings,
         carriers: &crate::defuse::carriers::CarrierRecord,
-        horizon: crate::pipeline::asts::core::LexicalHorizon,
+        definition: &ScopedHo,
     ) -> Instantiated<'_> {
-        let query_depth = self.locals().query_names.len();
-        self.push_frame(Self::body_frame(
-            formals,
-            carriers,
-            query_depth,
-            horizon,
-        ));
+        let locals = self.locals_mut();
+        let opened_over = locals.query_names.len();
+        locals.declarations.push(ActiveDeclaration {
+            site: definition.declaration_site(),
+            opened_over,
+        });
+        self.push_frame(Self::body_frame(formals, carriers));
         Instantiated { world: self }
     }
 
     fn body_frame(
         formals: FormalBindings,
         carriers: &crate::defuse::carriers::CarrierRecord,
-        query_depth: usize,
-        horizon: crate::pipeline::asts::core::LexicalHorizon,
     ) -> Frame {
         Frame {
             formals,
@@ -1105,10 +1401,9 @@ impl Environment {
                 synthetic_ctes: HashMap::new(),
                 cfes: HashMap::new(),
                 hos: HashMap::new(),
+                effect_ctes: HashMap::new(),
                 carriers: carriers.formals_only(),
                 aliases: HashMap::new(),
-                query_depth,
-                horizon,
             }),
         }
     }
@@ -1117,11 +1412,18 @@ impl Environment {
         self.locals_mut().instantiations.push(frame);
     }
 
+    /// A frame leaves, and — when it was a body's — the declaration it
+    /// opened leaves with it. The two are pushed and popped by the same
+    /// acts, so neither can outlive the other.
     fn pop_frame(&mut self) {
-        self.locals_mut()
+        let frame = self
+            .locals_mut()
             .instantiations
             .pop()
             .expect("an instantiation lease pops the frame it pushed");
+        if frame.scope.is_some() {
+            self.pop_declaration();
+        }
     }
 
     /// The caller-resolved VALUE a formal name spends in this world: the
@@ -1272,27 +1574,129 @@ impl Drop for Instantiated<'_> {
     }
 }
 
+/// ONE DECLARATION STANDING over a world held behind a `RefCell`. Pushed at
+/// construction and popped on drop, each under a borrow lasting only that
+/// long, so the walk it governs may borrow the world in between.
+///
+/// Constructed only by the scoped-definition authority, from a site it holds
+/// — never from a site a caller supplies.
+pub(in crate::defuse::environment) struct DeclaredArms<'w> {
+    world: &'w std::cell::RefCell<Environment>,
+}
+
+impl<'w> DeclaredArms<'w> {
+    pub(in crate::defuse::environment) fn open(
+        world: &'w std::cell::RefCell<Environment>,
+        site: LexicalSite,
+    ) -> Self {
+        let mut open = world.borrow_mut();
+        let locals = open.locals_mut();
+        let opened_over = locals.query_names.len();
+        locals
+            .declarations
+            .push(ActiveDeclaration { site, opened_over });
+        drop(open);
+        DeclaredArms { world }
+    }
+}
+
+impl Drop for DeclaredArms<'_> {
+    fn drop(&mut self) {
+        self.world.borrow_mut().pop_declaration();
+    }
+}
+
+/// ONE AUTHORED QUERY-LOCAL BLOCK, DECLARED on a world held behind a
+/// `RefCell` for the extent of the body it governs.
+///
+/// An effect body is one block and many statements. Its claims and its
+/// definitions are declared HERE, once, so every statement — and every
+/// directive demand between statements — reads the same declaration set;
+/// nothing re-derives it and no walk carries a copy of it. What each
+/// statement still carries is its relation bindings, which resolve afresh
+/// as the plan's world changes.
+pub(in crate::defuse::environment) struct DeclaredBlock<'w> {
+    world: &'w std::cell::RefCell<Environment>,
+}
+
+impl<'w> DeclaredBlock<'w> {
+    pub(in crate::defuse::environment) fn open(
+        world: &'w std::cell::RefCell<Environment>,
+        locals: crate::pipeline::asts::core::QueryLocals<crate::pipeline::asts::core::Unresolved>,
+    ) -> Self {
+        let (names, cfes, hos, ctes) = locals.spend();
+        let mut open = world.borrow_mut();
+        open.push_query_names(names);
+        open.locals_mut()
+            .query_names
+            .last_mut()
+            .expect("the frame just pushed")
+            .bindings = ctes
+            .iter()
+            .filter(|cte| !cte.subject().declares_effect())
+            .cloned()
+            .collect();
+        for cfe in cfes {
+            open.register_query_local(QueryLocalRegistration::Value(cfe));
+        }
+        for ho in hos {
+            open.register_query_local(QueryLocalRegistration::HigherOrder(ho));
+        }
+        for cte in ctes {
+            // Only the effect-marked bindings are manifestations of this
+            // block: a pure binding resolves in each statement that reads
+            // it, because the world it reads is the plan's, not the text's.
+            if cte.subject().declares_effect() {
+                if let Some(name) = cte.subject().authored_name().cloned() {
+                    open.register_query_local(QueryLocalRegistration::EffectRelation {
+                        name,
+                        arm: cte,
+                    });
+                }
+            }
+        }
+        drop(open);
+        DeclaredBlock { world }
+    }
+}
+
+impl Drop for DeclaredBlock<'_> {
+    fn drop(&mut self) {
+        self.world.borrow_mut().pop_query_names();
+    }
+}
+
 /// The same lease over a world held behind a `RefCell` (an effect plan's
 /// world): the frame is pushed at construction and popped on drop, each
 /// under a borrow that lasts only for the push or the pop, so the plan's
 /// own statement resolutions may borrow the world in between.
-pub(in crate::defuse) struct SharedInstantiated<'w> {
+pub(in crate::defuse::environment) struct SharedInstantiated<'w> {
     world: &'w std::cell::RefCell<Environment>,
 }
 
 impl<'w> SharedInstantiated<'w> {
-    pub(in crate::defuse) fn body(
+    /// AN EFFECT CHOE'S BODY OPENS AT ITS OWN DECLARATION SITE — the site
+    /// its registration stamped, read from the carrier the selection
+    /// produced, exactly as a pure CHOE's body opens. The effect road holds
+    /// no separate visibility rule: what this body may see is what the
+    /// declaration standing here admits.
+    pub(in crate::defuse::environment) fn opened_body(
         world: &'w std::cell::RefCell<Environment>,
         formals: FormalBindings,
-        horizon: crate::pipeline::asts::core::LexicalHorizon,
+        definition: &ScopedHo,
     ) -> Self {
-        let query_depth = world.borrow().locals().query_names.len();
-        world.borrow_mut().push_frame(Environment::body_frame(
+        let mut open = world.borrow_mut();
+        let locals = open.locals_mut();
+        let opened_over = locals.query_names.len();
+        locals.declarations.push(ActiveDeclaration {
+            site: definition.declaration_site(),
+            opened_over,
+        });
+        open.push_frame(Environment::body_frame(
             formals,
             &crate::defuse::carriers::CarrierRecord::default(),
-            query_depth,
-            horizon,
         ));
+        drop(open);
         SharedInstantiated { world }
     }
 }
@@ -1329,28 +1733,136 @@ mod query_local_selection_tests {
         block.admit_cfe(cfe(&name)).expect("earlier CFE");
         block.admit_cfe(cfe(&name)).expect("later CFE");
         let locals = block.seal().expect("the block seals");
-        let earlier = locals.cfes()[0].horizon();
-        let later = locals.cfes()[1].horizon();
+        let earlier_horizon = locals.cfes()[0].horizon();
+        let later_horizon = locals.cfes()[1].horizon();
         let mut environment = Environment::Use(UseEnvironment::detached());
         environment.push_query_names(locals.names().clone());
-        for definition in locals.cfes() {
-            environment.register_query_local(QueryLocalRegistration::Value(definition.clone()));
-        }
 
-        let selected_at = |horizon| match environment
+        let selected = |environment: &Environment| match environment
             .select_query_local(
                 &name,
                 crate::pipeline::asts::core::QueryLocalDemand::Value,
-                Some(horizon),
+                None,
             )
             .expect("selection")
             .expect("visible CFE")
         {
-            QueryLocalSelection::Value(definition) => definition.horizon(),
+            QueryLocalSelection::Value(scoped) => scoped,
             _ => unreachable!("value demand returns a value"),
         };
-        assert_eq!(selected_at(earlier), earlier);
-        assert_eq!(selected_at(later), later);
+
+        // The earlier definition's carrier, taken from THIS world — the
+        // only place one can come from, since a site is not a value.
+        environment.register_query_local(QueryLocalRegistration::Value(locals.cfes()[0].clone()));
+        let earlier = selected(&environment);
+        assert_eq!(earlier.declared_horizon(), earlier_horizon);
+
+        // With both registered and no declaration open, the whole block is
+        // in view and the LATEST claim of the spelling answers.
+        environment.register_query_local(QueryLocalRegistration::Value(locals.cfes()[1].clone()));
+        assert_eq!(selected(&environment).declared_horizon(), later_horizon);
+
+        // Standing in the EARLIER definition's own body, the later
+        // declaration is not yet visible.
+        environment.push_scoped_declaration(&earlier);
+        assert_eq!(selected(&environment).declared_horizon(), earlier_horizon);
+        environment.pop_declaration();
+        assert_eq!(selected(&environment).declared_horizon(), later_horizon);
+    }
+
+    /// LEXICAL REACH IS THE DECLARATION'S FRAME, NOT A DEPTH.
+    ///
+    /// A definition declared in the outermost frame stays visible however
+    /// many frames stand between it and the body being resolved — which is
+    /// what a stack-length convention cannot express, because the number it
+    /// reads grows with the caller's nesting rather than with the
+    /// declaration's position.
+    #[test]
+    fn a_declaration_reaches_its_body_at_any_nesting() {
+        let name = delightql_types::SqlIdentifier::new("f");
+        let mut block = crate::pipeline::asts::core::QueryLocalBlock::default();
+        block.admit_cfe(cfe(&name)).expect("the only CFE");
+        let locals = block.seal().expect("the block seals");
+        let mut environment = Environment::Use(UseEnvironment::detached());
+        environment.push_query_names(locals.names().clone());
+        environment.register_query_local(QueryLocalRegistration::Value(locals.cfes()[0].clone()));
+
+        let selected = match environment
+            .select_query_local(
+                &name,
+                crate::pipeline::asts::core::QueryLocalDemand::Value,
+                None,
+            )
+            .expect("selection")
+            .expect("visible CFE")
+        {
+            QueryLocalSelection::Value(scoped) => scoped,
+            _ => unreachable!("value demand returns a value"),
+        };
+
+        // Nine intervening query frames — every one of them a body opened
+        // between the declaration and this resolution.
+        for _ in 0..9 {
+            environment.push_query_names(crate::pipeline::asts::core::QueryLocalNames::default());
+        }
+        environment.push_scoped_declaration(&selected);
+        assert!(
+            environment
+                .select_query_local(
+                    &name,
+                    crate::pipeline::asts::core::QueryLocalDemand::Value,
+                    None,
+                )
+                .expect("selection")
+                .is_some(),
+            "the declaration's own frame is still in view at any nesting"
+        );
+    }
+
+    /// A SITE WHOSE FRAME THIS WORLD DOES NOT HOLD IS NOT AN ANSWER.
+    ///
+    /// The pairing is broken, and a broken pairing refuses rather than
+    /// silently hiding or revealing names — the enumeration that decides
+    /// visibility has to be able to point at the frame it enumerated.
+    #[test]
+    fn a_site_whose_frame_left_the_world_refuses() {
+        let name = delightql_types::SqlIdentifier::new("f");
+        let mut block = crate::pipeline::asts::core::QueryLocalBlock::default();
+        block.admit_cfe(cfe(&name)).expect("the only CFE");
+        let locals = block.seal().expect("the block seals");
+        let mut environment = Environment::Use(UseEnvironment::detached());
+        environment.push_query_names(locals.names().clone());
+        environment.register_query_local(QueryLocalRegistration::Value(locals.cfes()[0].clone()));
+        let selected = match environment
+            .select_query_local(
+                &name,
+                crate::pipeline::asts::core::QueryLocalDemand::Value,
+                None,
+            )
+            .expect("selection")
+            .expect("visible CFE")
+        {
+            QueryLocalSelection::Value(scoped) => scoped,
+            _ => unreachable!("value demand returns a value"),
+        };
+
+        // The frame the carrier names leaves; the world pushes another
+        // holding the very same claims. Frame identities are minted per
+        // push and never reused, so the replacement is a DIFFERENT frame
+        // however identical its contents.
+        environment.pop_query_names();
+        environment.push_query_names(locals.names().clone());
+        environment.push_scoped_declaration(&selected);
+        assert!(
+            environment
+                .select_query_local(
+                    &name,
+                    crate::pipeline::asts::core::QueryLocalDemand::Value,
+                    None,
+                )
+                .is_err(),
+            "a declaration naming a frame this world does not hold refuses"
+        );
     }
 }
 

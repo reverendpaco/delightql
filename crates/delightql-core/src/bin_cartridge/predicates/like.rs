@@ -21,6 +21,7 @@
 use crate::bin_cartridge::{
     BinEntity, EntitySignature, GeneratorContext, OutputSchema, Parameter, SqlGeneratable,
 };
+use crate::diagnostic::{DelightQLError, Semantic};
 use crate::enums::EntityType;
 use crate::error::Result;
 
@@ -78,10 +79,9 @@ impl SqlGeneratable for LikePredicate {
         negated: bool,
     ) -> Result<String> {
         if args.len() != 2 {
-            return Err(crate::error::DelightQLError::validation_error(
-                &format!("like expects 2 arguments, got {}", args.len()),
-                "LikePredicate::generate_sql",
-            ));
+            return Err(DelightQLError::from(Semantic::Arity {
+                message: format!("like expects 2 arguments, got {}", args.len()),
+            }));
         }
 
         // Use the render function provided by the generator.

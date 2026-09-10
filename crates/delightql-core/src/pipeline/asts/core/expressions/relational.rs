@@ -47,6 +47,8 @@ pub enum InnerRelationPattern<P: Phase = Unresolved> {
     CorrelatedScalarJoin {
         identifier: QualifiedName,
         correlation_filters: Vec<TruthExpression<P>>,
+        /// The positions the enclosing join computes for this boundary.
+        deferred: Vec<DeferredItem<P>>,
         subquery: Box<Chain<P>>,
     },
 
@@ -58,11 +60,80 @@ pub enum InnerRelationPattern<P: Phase = Unresolved> {
         identifier: QualifiedName,
         correlation_filters: Vec<TruthExpression<P>>,
         aggregations: Vec<DomainExpression<P>>,
+        /// The positions the enclosing join computes for this boundary.
+        deferred: Vec<DeferredItem<P>>,
         subquery: Box<Chain<P>>,
     },
 }
 
+/// ONE POSITION THE ENCLOSING JOIN COMPUTES for a derived table: a
+/// publication inside the interior whose value reads the row the interior
+/// is correlated to. The interior carries the position toward its boundary
+/// unread; the join that brings the boundary in evaluates the value over
+/// its own operands — the enclosing row, and the interior occurrences the
+/// value reads, which the boundary keeps readable beside its heading.
+/// Taken off the interior's publication by classification, as the hoisted
+/// conditions are; the publication keeps the position, and emits nothing
+/// for it.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("deferred_item")]
+pub struct DeferredItem<P: Phase> {
+    /// The position as the interior's publication minted it.
+    port: crate::relation::PortId,
+    /// The value the join computes.
+    value: DomainExpression<P>,
+}
+
+impl<P: Phase<Output = crate::relation::PortId>> DeferredItem<P> {
+    /// THE ONE MINT: from a publication item WHOLE — the value the item
+    /// states and the port the authority wrote for that very position —
+    /// where the record says the publication stated the position as
+    /// evaluated at the boundary. No road takes a port beside a value.
+    pub fn of(item: &super::super::OneOut<P>, registry: &crate::names::Registry) -> Option<Self> {
+        let port = *item.output();
+        crate::relation::deferred_by_publication(registry, port).then(|| DeferredItem {
+            port,
+            value: item.expr.clone(),
+        })
+    }
+}
+
+impl<P: Phase> DeferredItem<P> {
+    /// CROSS A PHASE, OR A SAME-PHASE REWRITE: the value is re-spelled
+    /// through the walk's leaf hook and the position it stands at is kept
+    /// — a consuming act, so the pair is never open.
+    pub fn crossing<Q: Phase>(
+        self,
+        value: impl FnOnce(DomainExpression<P>) -> crate::error::Result<DomainExpression<Q>>,
+    ) -> crate::error::Result<DeferredItem<Q>> {
+        Ok(DeferredItem {
+            port: self.port,
+            value: value(self.value)?,
+        })
+    }
+
+    /// The interior position the join computes.
+    pub fn port(&self) -> crate::relation::PortId {
+        self.port
+    }
+
+    /// SPEND the item at the join: the value it computes there.
+    pub fn into_value(self) -> DomainExpression<P> {
+        self.value
+    }
+}
+
 impl<P: Phase> InnerRelationPattern<P> {
+    /// The chain this pattern is a derived table of.
+    pub fn subquery(&self) -> &Chain<P> {
+        match self {
+            InnerRelationPattern::Indeterminate { subquery, .. }
+            | InnerRelationPattern::UncorrelatedDerivedTable { subquery, .. }
+            | InnerRelationPattern::CorrelatedScalarJoin { subquery, .. }
+            | InnerRelationPattern::CorrelatedGroupJoin { subquery, .. } => subquery,
+        }
+    }
+
     /// REBUILD THE CHAIN THIS PATTERN IS A DERIVED TABLE OF.
     ///
     /// Every classification wraps exactly one, so a walk that rebuilds the
@@ -94,24 +165,38 @@ impl<P: Phase> InnerRelationPattern<P> {
             InnerRelationPattern::CorrelatedScalarJoin {
                 identifier,
                 correlation_filters,
+                deferred,
                 subquery,
             } => InnerRelationPattern::CorrelatedScalarJoin {
                 identifier,
                 correlation_filters,
+                deferred,
                 subquery: Box::new(nested(*subquery)?),
             },
             InnerRelationPattern::CorrelatedGroupJoin {
                 identifier,
                 correlation_filters,
                 aggregations,
+                deferred,
                 subquery,
             } => InnerRelationPattern::CorrelatedGroupJoin {
                 identifier,
                 correlation_filters,
                 aggregations,
+                deferred,
                 subquery: Box::new(nested(*subquery)?),
             },
         })
+    }
+
+    /// The positions the enclosing join computes for this derived table.
+    pub fn deferred(&self) -> &[DeferredItem<P>] {
+        match self {
+            InnerRelationPattern::Indeterminate { .. }
+            | InnerRelationPattern::UncorrelatedDerivedTable { .. } => &[],
+            InnerRelationPattern::CorrelatedScalarJoin { deferred, .. }
+            | InnerRelationPattern::CorrelatedGroupJoin { deferred, .. } => deferred,
+        }
     }
 }
 
@@ -278,6 +363,92 @@ mod mention_tests {
             Some("v".to_string())
         );
         assert!(GroundMention::Scratch { row: scratch() }.alias().is_none());
+    }
+}
+
+/// AN INTERIOR REALIZED: the classification the pattern takes, and how the
+/// body it now holds relates to the body the interior stood over.
+///
+/// The one value a walk's realization hook answers with, and the chain
+/// carrier JUDGES it before building the head: a realization that keeps its
+/// body must hold the body the head actually stood over, and one that
+/// replaces it must hold a [`crate::relation::Replacement`] the authority
+/// judged FOR that body — the operand it names is compared against the body
+/// in hand, and the chain it holds against the body the pattern holds. So a
+/// realization of some other interior, a body nobody judged, and a pattern
+/// shaped around a chain other than the replacement's are each refused
+/// where the head is built. Private fields; the two constructors are the
+/// only assemblies.
+pub struct Realized<P: Phase> {
+    pattern: InnerRelationPattern<P>,
+    body: RealizedBody,
+}
+
+enum RealizedBody {
+    /// The interior keeps the body it stood over.
+    Kept,
+    /// The body is replaced by a rebuild the authority judged: `of` is the
+    /// operand the replacement names, `now` the relation it publishes.
+    Replaced {
+        of: crate::relation::SemanticRelation,
+        now: crate::relation::SemanticRelation,
+    },
+}
+
+impl<P: Phase> Realized<P> {
+    /// A classification over the body the interior stood over. The carrier
+    /// checks that the body IS that one.
+    pub fn kept(pattern: InnerRelationPattern<P>) -> Self {
+        Realized {
+            pattern,
+            body: RealizedBody::Kept,
+        }
+    }
+
+    /// A classification over a REPLACED body: the replacement's own chain
+    /// is what `shape` is handed and what the pattern holds, and the
+    /// operand the replacement names is what the carrier judges against.
+    pub fn replaced(
+        replacement: crate::relation::Replacement<P>,
+        shape: impl FnOnce(Box<Chain<P>>) -> InnerRelationPattern<P>,
+    ) -> Self
+    where
+        P: Phase<Scope = crate::relation::SemanticRelation>,
+    {
+        let of = replacement.of();
+        let now = replacement.published();
+        Realized {
+            pattern: shape(Box::new(replacement.into_chain())),
+            body: RealizedBody::Replaced { of, now },
+        }
+    }
+
+    /// JUDGE the realization against the body the head stood over, and open
+    /// it. The chain carrier's road.
+    pub(super) fn judged(
+        self,
+        stood_over: Option<crate::relation::SemanticRelation>,
+    ) -> crate::error::Result<InnerRelationPattern<P>> {
+        let holds = P::into_scope(self.pattern.subquery().published());
+        let lawful = match self.body {
+            RealizedBody::Kept => holds == stood_over,
+            RealizedBody::Replaced { of, now } => stood_over == Some(of) && holds == Some(now),
+        };
+        if !lawful {
+            return Err(crate::diagnostic::Internal::invariant(
+                "chain",
+                "an interior was realized over a body other than the one it stood over: a \
+                 realization keeps its body, or replaces it with a rebuild the authority \
+                 judged for that body",
+            ));
+        }
+        Ok(self.pattern)
+    }
+
+    /// Open the realization without the carrier's judgment: the
+    /// phase-crossing road, where the head crosses by its own crossing.
+    pub(crate) fn into_pattern(self) -> InnerRelationPattern<P> {
+        self.pattern
     }
 }
 

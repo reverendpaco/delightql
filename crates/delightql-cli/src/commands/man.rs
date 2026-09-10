@@ -30,7 +30,7 @@ struct Page {
 }
 
 fn load_pages() -> Result<Vec<Page>> {
-    let mut handle = crate::connection::open_handle()?;
+    let mut handle = crate::connection::open_handle(crate::connection::SessionProfile::client())?;
     let pages = {
         let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
         // The embedded image is bound as "man" by open_handle and mounted

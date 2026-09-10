@@ -104,6 +104,7 @@
 (identifier) @variable
 (namespace (identifier) @namespace)
 (callee (predicate_identifier name: (identifier) @function))
+(citation name: (identifier) @function)
 
 ; A definition's SUBJECT. The subject stands ON the form — never buried in a
 ; heading — so ONE pattern through the `rule_form` supertype reaches every

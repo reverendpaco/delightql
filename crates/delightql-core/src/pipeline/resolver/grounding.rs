@@ -2,18 +2,8 @@
 // Copyright 2026 Daniel Eklund
 //! Grounding support: function inlining and view expansion
 //!
-//! When a query uses the grounding operator (^), consulted definitions from
-//! grounded namespaces are applied at the unresolved AST level before normal
-//! resolution proceeds.
-//!
-//! **Function inlining**: `double:(x) :- x * 2` in namespace `lib::math` causes
-//! `data::test^lib::math.users(*) |> (first_name, double:(balance) as doubled)` to become
-//! `... |> (first_name, (balance * 2) as doubled)` before resolution.
-//!
-//! **View expansion**: `high_balance(*) :- users(*), balance > 1000` causes
-//! `data::test^lib::views.high_balance(*)` to expand into the view body with
-//! unqualified table references patched to use the data namespace.
 
+use crate::diagnostic::{Constraint, Internal, Parse, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_unresolved;
 use crate::pipeline::asts::core::Unresolved;
@@ -46,9 +36,11 @@ pub(crate) fn build_case_body_from_clauses(
 
         // A CLAUSE'S BODY IS WHAT IT COMPUTES.
         let body = clause.as_scalar_body().ok_or_else(|| {
-            DelightQLError::parse_error(format!(
-                "Expected scalar body for multi-clause function '{name}', got relational"
-            ))
+            DelightQLError::from(Constraint::General {
+                message: format!(
+                    "Expected scalar body for multi-clause function '{name}', got relational"
+                ),
+            })
         })?;
 
         let guard = params.iter().find_map(|p| match p {
@@ -84,7 +76,8 @@ pub(super) fn judge_window_row(
         return Ok(());
     };
     if supplied < min as usize || supplied > max as usize {
-        return Err(DelightQLError::parse_error(format!(
+        return Err(DelightQLError::from(Parse::Function {
+    message: format!(
             "the window function '{callee_name}' takes {} argument{}; the invocation hands it {supplied}",
             if min == max {
                 min.to_string()
@@ -92,7 +85,8 @@ pub(super) fn judge_window_row(
                 format!("{min} to {max}")
             },
             if max == 1 { "" } else { "s" },
-        )));
+        ),
+}));
     }
     Ok(())
 }
@@ -134,12 +128,12 @@ pub(crate) fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec
     for pos in 0..max_params {
         let mut has_glob = false;
         let mut has_argumentative = false;
-        let mut arg_columns: Option<Vec<String>> = None;
+        let mut arg_columns: Option<Vec<delightql_types::SqlIdentifier>> = None;
         let mut has_scalar = false;
         let mut has_ground_scalar = false;
         let mut rule_signatures = Vec::new();
         let mut ground_values: Vec<(usize, String)> = Vec::new();
-        let mut column_name: Option<String> = None;
+        let mut column_name: Option<delightql_types::SqlIdentifier> = None;
 
         for (clause_ordinal, head) in heads.iter().enumerate() {
             if let Some(param) = head.get(pos) {
@@ -149,9 +143,9 @@ pub(crate) fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec
                         cols: HeadItems::Glob,
                     } => {
                         has_glob = true;
-                        // Glob contributes canonical name (table parameter name, e.g., "T")
+                        // Glob contributes the declared name (table parameter name, e.g., "T")
                         if column_name.is_none() {
-                            column_name = Some(name.to_string());
+                            column_name = Some(name.clone());
                         }
                     }
                     HoParam::Relation {
@@ -160,24 +154,35 @@ pub(crate) fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec
                     } => {
                         has_argumentative = true;
                         if arg_columns.is_none() {
-                            arg_columns = Some(cols.iter().map(|c| c.supply.spelling()).collect());
+                            arg_columns = Some(
+                                cols.iter()
+                                    .map(|c| match &c.supply {
+                                        crate::pipeline::asts::core::definitions::Supply::Ref(
+                                            name,
+                                        ) => name.clone(),
+                                        other => {
+                                            delightql_types::SqlIdentifier::new(other.spelling())
+                                        }
+                                    })
+                                    .collect(),
+                            );
                         }
-                        // Argumentative contributes canonical name (table parameter name)
+                        // Argumentative contributes the declared name (table parameter name)
                         if column_name.is_none() {
-                            column_name = Some(name.to_string());
+                            column_name = Some(name.clone());
                         }
                     }
                     HoParam::Scalar { name, .. } => {
                         has_scalar = true;
-                        // Free variable — contributes canonical name
+                        // Free variable — contributes the declared name
                         if column_name.is_none() {
-                            column_name = Some(name.to_string());
+                            column_name = Some(name.clone());
                         }
                     }
                     HoParam::Rule { name, signature } => {
                         rule_signatures.push(signature);
                         if column_name.is_none() {
-                            column_name = Some(name.to_string());
+                            column_name = Some(name.clone());
                         }
                     }
                     HoParam::Ground { text, .. } => {
@@ -227,56 +232,23 @@ pub(crate) fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec
 }
 pub(crate) use crate::pipeline::query_features::HoParamBindings;
 
-fn bind_proffer_scope(
-    bindings: &mut HoParamBindings,
-    param_name: &str,
-    identities: &crate::relation::Planning,
-) -> crate::error::Result<()> {
-    let scope = identities.authority().reserve_proffer();
-    bindings
-        .table_scope_params
-        .insert(param_name.to_string(), scope);
-    Ok(())
-}
-
-/// Create structural proffer bindings for an HO view's parameters.
-///
-/// Used at consult time to parse the view body with placeholder values,
-/// enabling early validation of syntax and structure without real call-site args.
+/// CONSULT-TIME PLACEHOLDER BINDINGS for a parameterized definition parsed
+/// before any call supplies actuals: every relation formal and scalar
+/// formal reads a proffer the carrier authority minted, and a ground
+/// position reads its constant. Analysis only.
 pub(crate) fn create_proffer_bindings(
     head: &crate::pipeline::asts::ddl::Head,
     identities: &crate::relation::Planning,
 ) -> crate::error::Result<HoParamBindings> {
-    let mut bindings = HoParamBindings::default();
+    let mut bindings = HoParamBindings {
+        formals: crate::defuse::carriers::RelationFormals::proffered(head, identities)?,
+        ..HoParamBindings::default()
+    };
     for param in head.ho_params.as_deref().unwrap_or_default() {
         match param {
-            HoParam::Relation {
-                name,
-                cols: HeadItems::Glob,
-            } => {
-                bind_proffer_scope(&mut bindings, name.as_str(), identities)?;
-            }
-            HoParam::Relation {
-                name,
-                cols: HeadItems::Listed(items),
-            } => {
-                let columns: Vec<String> = items.iter().map(|i| i.supply.spelling()).collect();
-                let null_row: Vec<crate::pipeline::asts::core::LiteralValue> = columns
-                    .iter()
-                    .map(|_| crate::pipeline::asts::core::LiteralValue::Null)
-                    .collect();
-                match lift_scalars_to_anonymous_table(&columns, &[null_row]) {
-                    Ok(anon) => {
-                        bindings.table_expr_params.insert(name.to_string(), anon);
-                    }
-                    Err(_) => {
-                        bind_proffer_scope(&mut bindings, name.as_str(), identities)?;
-                    }
-                }
-            }
+            HoParam::Relation { .. } => {}
             HoParam::Scalar { name, .. } => {
                 bindings.scalar_formals.insert(name.to_string());
-                bind_proffer_scope(&mut bindings, name.as_str(), identities)?;
             }
             HoParam::Rule { .. } => {
                 // A rule formal is answered only by a closed residual value
@@ -366,11 +338,13 @@ pub(crate) fn lift_scalars_to_anonymous_table(
     rows: &[Vec<crate::pipeline::asts::core::LiteralValue>],
 ) -> Result<ast_unresolved::Chain> {
     if let Some(row) = rows.iter().find(|row| row.len() != column_names.len()) {
-        return Err(DelightQLError::parse_error(format!(
-            "a lifted row carries {} value(s); the heading names {}",
-            row.len(),
-            column_names.len()
-        )));
+        return Err(DelightQLError::from(Semantic::Arity {
+            message: format!(
+                "a lifted row carries {} value(s); the heading names {}",
+                row.len(),
+                column_names.len()
+            ),
+        }));
     }
     let column_headers = Some(
         column_names
@@ -392,7 +366,10 @@ pub(crate) fn lift_scalars_to_anonymous_table(
         .collect::<Vec<_>>();
     let table = crate::pipeline::asts::core::AnonTable::from_values(column_headers, rows)
         .ok_or_else(|| {
-            DelightQLError::parse_error("a lifted table has a nonempty heading and body")
+            Internal::invariant(
+                "resolver::grounding",
+                "a lifted table has a nonempty heading and body",
+            )
         })?;
     Ok(ast_unresolved::Chain::authored(
         ast_unresolved::GroundForm::Literal(crate::pipeline::asts::core::AnonRelation::plain(

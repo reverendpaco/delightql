@@ -163,7 +163,7 @@ pub(super) enum FixedShape<'a> {
 pub(super) fn law_of<'a>(form: &'a RelForm<'a>) -> InterfaceLaw<'a> {
     match form {
         RelForm::Source(_) => InterfaceLaw::New,
-        RelForm::Anonymous(spec) => match spec.shape {
+        RelForm::Anonymous(spec) => match spec.shape() {
             AnonymousShape::Tabular | AnonymousShape::ArgumentRow => InterfaceLaw::New,
         },
         RelForm::Opaque => InterfaceLaw::Opaque,

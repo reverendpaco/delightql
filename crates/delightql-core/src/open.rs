@@ -12,9 +12,9 @@ use delightql_protocol::{
     Session, VersionResult,
 };
 
-use crate::api::{self, ColumnInfo, ConnectionFactory, FetchResult, QueryResult};
+use crate::api::{self, ApiError, ColumnInfo, ConnectionFactory, FetchResult, QueryResult};
 use crate::relay::RelayParty;
-use crate::system::DelightQLSystem;
+use crate::system::{DelightQLSystem, ReadySystem};
 
 // Type alias for the backend session type (erased handler)
 type BackendSession = Session<DirectTransport<Box<dyn Handler + Send>>>;
@@ -25,7 +25,7 @@ type RelaySession<'a> =
 
 /// Concrete handle implementation. Not visible outside this crate.
 pub(crate) struct DqlHandleImpl {
-    system: Box<DelightQLSystem>,
+    system: Box<ReadySystem>,
     /// Creates new handlers wrapping the SAME user connection.
     /// After mount! does ATTACH, all handlers see the attached databases.
     handler_factory: Box<dyn Fn() -> Box<dyn Handler + Send> + Send + Sync>,
@@ -43,7 +43,7 @@ pub(crate) struct DqlSessionImpl<'a> {
 }
 
 impl<'a> api::DqlSession for DqlSessionImpl<'a> {
-    fn query(&mut self, text: &str) -> Result<QueryResult, String> {
+    fn query(&mut self, text: &str) -> Result<QueryResult, ApiError> {
         let resp = self
             .session
             .query(text.as_bytes().to_vec())
@@ -62,19 +62,7 @@ impl<'a> api::DqlSession for DqlSessionImpl<'a> {
                     .collect();
                 Ok(QueryResult { handle, columns })
             }
-            QueryResponse::Error {
-                kind,
-                identity,
-                message,
-            } => {
-                let id = String::from_utf8_lossy(&identity);
-                let msg = String::from_utf8_lossy(&message);
-                if identity.is_empty() {
-                    Err(format!("{:?}: {}", kind, msg))
-                } else {
-                    Err(format!("[{}] {:?}: {}", id, kind, msg))
-                }
-            }
+            QueryResponse::Error(error) => Err(ApiError::received(&error)),
         }
     }
 
@@ -82,7 +70,7 @@ impl<'a> api::DqlSession for DqlSessionImpl<'a> {
         &mut self,
         handle: &delightql_protocol::QueryHandle,
         count: u64,
-    ) -> Result<FetchResult, String> {
+    ) -> Result<FetchResult, ApiError> {
         let agreed = self
             .session
             .agreed_orientation(Orientation::Rows)
@@ -101,23 +89,11 @@ impl<'a> api::DqlSession for DqlSessionImpl<'a> {
                 rows: vec![],
                 finished: true,
             }),
-            FetchResponse::Error {
-                kind,
-                identity,
-                message,
-            } => {
-                let id = String::from_utf8_lossy(&identity);
-                let msg = String::from_utf8_lossy(&message);
-                if identity.is_empty() {
-                    Err(format!("{:?}: {}", kind, msg))
-                } else {
-                    Err(format!("[{}] {:?}: {}", id, kind, msg))
-                }
-            }
+            FetchResponse::Error(error) => Err(ApiError::received(&error)),
         }
     }
 
-    fn close(&mut self, handle: delightql_protocol::QueryHandle) -> Result<(), String> {
+    fn close(&mut self, handle: delightql_protocol::QueryHandle) -> Result<(), ApiError> {
         self.session.close(handle).map_err(|e| e.message)?;
         Ok(())
     }
@@ -138,11 +114,8 @@ fn make_backend_session(backend: Box<dyn Handler + Send>) -> Result<BackendSessi
         .map_err(|e| format!("Backend version handshake failed: {}", e.message))?
     {
         VersionResult::Accepted(s) => Ok(s),
-        VersionResult::Rejected { kind, message } => Err(format!(
-            "Backend rejected ({:?}): {}",
-            kind,
-            String::from_utf8_lossy(&message)
-        )),
+        // The peer's statement, presented as received — identity kept.
+        VersionResult::Rejected(error) => Err(ApiError::received(&error).to_string()),
     }
 }
 
@@ -188,11 +161,7 @@ impl api::DqlHandle for DqlHandleImpl {
             .map_err(|e| format!("Relay version handshake failed: {}", e.message))?
         {
             VersionResult::Accepted(session) => Ok(Box::new(DqlSessionImpl { session })),
-            VersionResult::Rejected { kind, message } => Err(format!(
-                "Relay version rejected ({:?}): {}",
-                kind,
-                String::from_utf8_lossy(&message)
-            )),
+            VersionResult::Rejected(error) => Err(ApiError::received(&error).to_string()),
         }
     }
 
@@ -248,12 +217,13 @@ impl api::DqlHandle for DqlHandleImpl {
 
     fn recover_session(&mut self) -> Result<api::SessionRecovery, String> {
         // The one reset authority: retries pending compensation first and
-        // clears the quarantine latch only after every rebuild step succeeds
+        // clears the quarantine latch only after the fresh world is installed
         // — the same road the protocol Reset control takes.
         self.system.reinit_bootstrap().map_err(|e| e.to_string())?;
         Ok(api::SessionRecovery {
-            rebuilt: "the session catalog: bootstrap metadata, system namespaces, \
-                      seed programs, and the health latch (cleared)"
+            rebuilt: "the session catalog: a fresh instance of the pristine world \
+                      (bootstrap metadata, system namespaces, seed facts), and \
+                      the health latch (cleared)"
                 .to_string(),
             lost: "session-local state: mounts, consulted definitions, enlisted \
                    namespaces, temporary objects, and the session's \
@@ -267,12 +237,6 @@ impl api::DqlHandle for DqlHandleImpl {
 }
 
 impl DqlHandleImpl {
-    /// Get mutable access to the underlying system (crate-internal only).
-    #[allow(dead_code)]
-    pub(crate) fn system_mut(&mut self) -> &mut DelightQLSystem {
-        &mut self.system
-    }
-
     /// Get shared access to the underlying system (crate-internal only).
     pub(crate) fn system(&self) -> &DelightQLSystem {
         &self.system
@@ -285,10 +249,11 @@ impl DqlHandleImpl {
 ///
 /// Flow:
 /// 1. `factory.create(":memory:")` → initial connection + handler
-/// 2. Create bootstrap (:memory: SQLite, independent of user DB)
-/// 3. Register bootstrap (id=1) and user (id=2) connections
-/// 4. Create empty "main" namespace — no user introspection
-/// 5. The CLI sends `mount!("path", "main")` as its first query to populate "main"
+/// 2. Construct the pristine world (:memory: SQLite, independent of the
+///    user DB): bootstrap (id=1) and user (id=2) connection rows, builtins,
+///    overlays, seeds; freeze its image; instantiate it as the session
+/// 3. The "main" namespace is empty — no user introspection
+/// 4. The CLI sends `mount!("path", "main")` as its first query to populate "main"
 ///
 /// `mount_factory` is the types-level factory used by `mount!`/`import!`
 /// when the path is a URI scheme (`delightql-siso://`, etc.). Embeddings that can
@@ -302,29 +267,17 @@ pub fn open(
         .create(":memory:")
         .map_err(|e| format!("Failed to create initial connection: {}", e))?;
 
-    let mut system =
-        DelightQLSystem::new(created.connection, created.introspector, &created.db_type)
-            .map_err(|e| format!("{}", e))?;
+    // On native, `ReadySystem::new` constructs, finalizes (stdlib
+    // overlays, seed programs), freezes and instantiates the pristine
+    // world: the handle receives the one reset-capable type, which cannot
+    // exist without the image every reset installs. On wasm the name is
+    // the wasm system itself, which has no bootstrap catalog and no reset
+    // (`reinit_bootstrap` refuses there); it is not given a pretend image.
+    let mut system = ReadySystem::new(created.connection, created.introspector, &created.db_type)
+        .map_err(|e| format!("{}", e))?;
     if let Some(mf) = mount_factory {
         system.set_connection_factory(mf);
     }
-
-    // Run embedded seed programs for their effects (e.g. seed/docs.dql
-    // self-documents the sys:: tables via doc!). Idempotent — safe on every
-    // startup. The system is fully built here, so there is no init reentrancy.
-    //
-    // wasm gate (load-bearing): the
-    // wasm `DelightQLSystem` is the rusqlite-free minimal struct with NO
-    // bootstrap catalog (see wasm_system.rs — `run_seed_programs` isn't even
-    // defined there, and `reinit_bootstrap` returns "not supported"). Seeds'
-    // doc! writes into the bootstrap sys:: tables, which do not exist on
-    // wasm, so there is nothing for a seed to write to. open() and
-    // reinit_bootstrap therefore AGREE on wasm (neither runs seeds); the
-    // asymmetry only exists on native, where both run them. Running seeds on
-    // wasm would require porting the whole bootstrap catalog, not dropping
-    // this gate.
-    #[cfg(not(target_arch = "wasm32"))]
-    system.run_seed_programs().map_err(|e| format!("{}", e))?;
 
     Ok(Box::new(DqlHandleImpl {
         system: Box::new(system),

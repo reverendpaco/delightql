@@ -6,10 +6,9 @@
 // This is for transpilation TARGETS, not runtime infrastructure.
 
 use super::introspect::introspect_sqlite_database;
-use delightql_types::introspect::{
-    DatabaseIntrospector, DiscoveredEntity, DiscoveredRelation,
-};
-use delightql_types::{DelightQLError, Result};
+use delightql_types::diagnostic::Runtime;
+use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity, DiscoveredRelation};
+use delightql_types::Result;
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
@@ -34,7 +33,7 @@ impl SqliteIntrospector {
 impl DatabaseIntrospector for SqliteIntrospector {
     fn introspect_entities(&self) -> Result<Vec<DiscoveredEntity>> {
         let conn = self.connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire lock on SQLite connection",
                 format!("Connection was poisoned: {}", e),
             )
@@ -42,17 +41,13 @@ impl DatabaseIntrospector for SqliteIntrospector {
 
         // Call the local introspect_sqlite_database() function
         // Schema is None because we're introspecting the main user database
-        introspect_sqlite_database(&*conn, None).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to introspect SQLite database: {}", e),
-                e.to_string(),
-            )
-        })
+        introspect_sqlite_database(&*conn, None)
+            .map_err(|e| super::engine_error("Failed to introspect SQLite database", e))
     }
 
     fn introspect_entities_in_schema(&self, schema: &str) -> Result<Vec<DiscoveredEntity>> {
         let conn = self.connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire lock on SQLite connection",
                 format!("Connection was poisoned: {}", e),
             )
@@ -60,9 +55,9 @@ impl DatabaseIntrospector for SqliteIntrospector {
 
         // Call the local introspect_sqlite_database() function with schema parameter
         introspect_sqlite_database(&*conn, Some(schema)).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to introspect SQLite schema '{}': {}", schema, e),
-                e.to_string(),
+            super::engine_error(
+                &format!("Failed to introspect SQLite schema '{}'", schema),
+                e,
             )
         })
     }
@@ -73,7 +68,7 @@ impl DatabaseIntrospector for SqliteIntrospector {
         relation_name: &str,
     ) -> Result<Option<DiscoveredRelation>> {
         let conn = self.connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire lock on SQLite connection",
                 format!("Connection was poisoned: {}", e),
             )
@@ -88,12 +83,9 @@ impl DatabaseIntrospector for SqliteIntrospector {
         let columns =
             super::introspect::introspect_table_columns(&conn, introspection_schema, relation_name)
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!(
-                            "Failed to introspect SQLite relation '{}': {}",
-                            relation_name, e
-                        ),
-                        e.to_string(),
+                    super::engine_error(
+                        &format!("Failed to introspect SQLite relation '{}'", relation_name),
+                        e,
                     )
                 })?;
         if columns.is_empty() {

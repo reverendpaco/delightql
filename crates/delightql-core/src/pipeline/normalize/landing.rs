@@ -26,6 +26,7 @@
 //! the same nested application, so nothing downstream branches on how the
 //! call arrived.
 
+use crate::diagnostic::{Ho, Landing};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::{
     transform_standard_application, walk_transform_domain, AstTransform,
@@ -86,14 +87,12 @@ pub(crate) fn land_relation(
 /// identity is one for every position that can hold a landing — a pure
 /// invocation and a directive break the same rule.
 pub(crate) fn two_landings(count: usize) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "resolution/ho/pipe_landing",
-        format!(
+    DelightQLError::from(Ho::PipeLanding {
+        message: format!(
             "one pipe, one landing — this call writes {count} placeholders; \
              exactly one @ names the parameter that receives the pipe"
         ),
-        "exactly one explicit @",
-    )
+    })
 }
 
 /// Whether this node is the hole a landing spends.
@@ -206,38 +205,32 @@ pub(crate) fn spend_in_application(
 /// a glyph that names nothing, so the refusal teaches the spelling that
 /// does name it.
 pub(crate) fn the_slot_is_one(written: &str, slots: usize) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "landing/two_holes",
-        format!(
+    DelightQLError::from(Landing::TwoHoles {
+        message: format!(
             "'{written}' writes '@' {slots} times and one value flows in: the bare hole \
              lands once, so the second one has no reading"
         ),
-        "name the value and use the name as often as you like — ':(|x| …)'",
-    )
+    })
 }
 
 /// A binder names the flow; `@` names it too. One form spells it once.
 pub(crate) fn binder_beside_a_hole(written: &str, binder: &str) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "landing/binder_and_hole",
-        format!(
+    DelightQLError::from(Landing::BinderAndHole {
+        message: format!(
             "'{written}' binds the flowing value to '{binder}' and also writes '@' for it: \
              the binder IS the flow, so '@' inside it names nothing"
         ),
-        format!("write '{binder}' where the value belongs"),
-    )
+    })
 }
 
 /// A binder that stands nowhere receives nothing.
 pub(crate) fn binder_receives_nothing(written: &str, binder: &str) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "landing/discarded",
-        format!(
+    DelightQLError::from(Landing::Discarded {
+        message: format!(
             "'{written}' binds the flowing value to '{binder}' and never uses it, so the \
              value would be discarded"
         ),
-        format!("use '{binder}' where the value belongs, or write the constant directly"),
-    )
+    })
 }
 
 /// THE BINDER, SPENT. Every reference addressing the binder's name becomes
@@ -294,12 +287,10 @@ pub(crate) fn bind_the_binder(
 
 /// A form with no argument row wrote no hole, so nothing receives the value.
 pub(crate) fn nothing_receives_it(written: &str) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "landing/discarded",
-        format!(
+    DelightQLError::from(Landing::Discarded {
+        message: format!(
             "'{written}' takes the piped value and has nowhere to put it, so the value \
              would be discarded"
         ),
-        "write the constant directly, or write '@' where the value belongs",
-    )
+    })
 }

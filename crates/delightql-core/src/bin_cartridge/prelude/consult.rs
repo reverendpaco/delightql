@@ -16,6 +16,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::{Consult, Directive, DirectiveBinding, Internal, Runtime};
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::*;
@@ -28,19 +29,17 @@ pub(crate) fn resolve_ns_prefix(name: &str, consulting_ns: &str) -> Result<Strin
     if name.starts_with(".::") {
         let suffix = &name[3..];
         if suffix.is_empty() {
-            return Err(DelightQLError::database_error(
-                ".:: prefix requires a name after it",
-                "Empty relative namespace",
-            ));
+            return Err(DelightQLError::from(DirectiveBinding::Value {
+                message: ".:: prefix requires a name after it".to_string(),
+            }));
         }
         Ok(format!("{}::{}", consulting_ns, suffix))
     } else if name.starts_with("::") {
         let suffix = &name[2..];
         if suffix.is_empty() {
-            return Err(DelightQLError::database_error(
-                ":: prefix requires a name after it",
-                "Empty absolute namespace",
-            ));
+            return Err(DelightQLError::from(DirectiveBinding::Value {
+                message: ":: prefix requires a name after it".to_string(),
+            }));
         }
         Ok(suffix.to_string())
     } else {
@@ -165,13 +164,12 @@ impl EffectExecutable for ConsultPredicate {
     ) -> Result<EntityResult> {
         // Validate argument count
         if arguments.len() != 2 {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(DirectiveBinding::Arity {
+                message: format!(
                     "consult!() expects 2 arguments (file_path, namespace), got {}",
                     arguments.len()
                 ),
-                "Invalid argument count",
-            ));
+            }));
         }
 
         // Extract file_path from first argument
@@ -181,10 +179,9 @@ impl EffectExecutable for ConsultPredicate {
         let namespace = extract_string_literal(&arguments[1], "namespace")?;
 
         if namespace.is_empty() {
-            return Err(DelightQLError::database_error(
-                "consult!() namespace cannot be empty",
-                "Empty namespace name",
-            ));
+            return Err(DelightQLError::from(DirectiveBinding::Value {
+                message: "consult!() namespace cannot be empty".to_string(),
+            }));
         }
 
         let _count = execute_consult(system, &file_path, &namespace, None)?;
@@ -228,18 +225,18 @@ pub(crate) fn execute_liminal_via_entity(
         .bin_registry()
         .lookup_entity(&format!("{name}!"))
         .ok_or_else(|| {
-            DelightQLError::database_error(
+            Internal::invariant(
+                "bin_cartridge::prelude::consult",
                 format!(
                     "liminal directive '{name}!' has a descriptor but no registered \
                      entity — a registration accident, not a policy"
                 ),
-                "Unregistered directive",
             )
         })?;
     let executable = entity.as_effect_executable().ok_or_else(|| {
-        DelightQLError::database_error(
+        Internal::invariant(
+            "bin_cartridge::prelude::consult",
             format!("liminal directive '{name}!' is not executable"),
-            "Not executable",
         )
     })?;
     // The liminal ledger records this statement separately
@@ -257,16 +254,14 @@ pub(crate) fn execute_liminal_via_entity(
 fn bind_liminal_args(name: &str, args: &[String], consulting_ns: &str) -> Result<Vec<String>> {
     use crate::pipeline::asts::effects::{descriptor, DirectiveParamKind};
     let desc = descriptor(name).ok_or_else(|| {
-        DelightQLError::database_error(
-            format!("no descriptor for liminal directive '{name}!'"),
-            "Unknown directive",
-        )
+        DelightQLError::from(Directive::Unknown {
+            message: format!("no descriptor for liminal directive '{name}!'"),
+        })
     })?;
     let required = desc.params.iter().filter(|p| !p.optional).count();
     if args.len() < required || args.len() > desc.params.len() {
-        return Err(DelightQLError::validation_error_categorized(
-            "directive/binding/arity",
-            format!(
+        return Err(DelightQLError::from(DirectiveBinding::Arity {
+            message: format!(
                 "{name}! expects {} argument(s) ({}), got {}",
                 if required == desc.params.len() {
                     required.to_string()
@@ -280,8 +275,7 @@ fn bind_liminal_args(name: &str, args: &[String], consulting_ns: &str) -> Result
                     .join(", "),
                 args.len()
             ),
-            "directive arity",
-        ));
+        }));
     }
     let mut bound: Vec<String> = Vec::with_capacity(args.len());
     for (param, arg) in desc.params.iter().zip(args) {
@@ -471,13 +465,12 @@ pub(crate) fn execute_liminal_forms(
                 }
                 "consult" => {
                     if directive.args.len() != 2 {
-                        return Err(DelightQLError::database_error(
-                            format!(
+                        return Err(DelightQLError::from(DirectiveBinding::Arity {
+                            message: format!(
                                 "consult!() in DDL expects 2 arguments, got {}",
                                 directive.args.len()
                             ),
-                            "Invalid directive",
-                        ));
+                        }));
                     }
                     let resolved_ns = resolve_ns_prefix(&directive.args[1], namespace)?;
                     if mode == LiminalDirectiveMode::Replay
@@ -490,10 +483,10 @@ pub(crate) fn execute_liminal_forms(
                 }
                 "expose" => {
                     if directive.args.is_empty() {
-                        return Err(DelightQLError::database_error(
-                            "expose!() requires at least one namespace argument",
-                            "Invalid directive",
-                        ));
+                        return Err(DelightQLError::from(DirectiveBinding::Arity {
+                            message: "expose!() requires at least one namespace argument"
+                                .to_string(),
+                        }));
                     }
                     // An exposure selects its child NOW, as the child stands
                     // after the directives before it (a nested consult! has
@@ -505,13 +498,12 @@ pub(crate) fn execute_liminal_forms(
                 }
                 "doc" => {
                     if directive.args.len() != 2 {
-                        return Err(DelightQLError::database_error(
-                            format!(
+                        return Err(DelightQLError::from(DirectiveBinding::Arity {
+                            message: format!(
                             "doc!() in a liminal space expects 2 arguments (target, doc), got {}",
                             directive.args.len()
                         ),
-                            "Invalid directive",
-                        ));
+                        }));
                     }
                     prepared.doc(directive.args[0].clone(), directive.args[1].clone());
                 }
@@ -582,15 +574,13 @@ fn prove_goal(
     // from a relational goal; this is the second fence, on what the goal
     // COMPILED to, so no future lowering can make a witness mutate.
     if compiled.kind != crate::pipeline::compiled_query::SqlKind::Query {
-        return Err(DelightQLError::validation_error_categorized(
-            crate::uri_registry::subcat::CONSULT_WITNESS_READ_ONLY,
-            format!(
+        return Err(DelightQLError::from(Consult::WitnessReadOnly {
+            message: format!(
                 "the consulted goal '?- {canonical}' compiled to a statement that writes: \
                  a consultation may READ user data only, through a top-level goal that \
                  proves and records a YES/NO witness"
             ),
-            "a consulted witness may not write",
-        ));
+        }));
     }
 
     // The goal executes on the connection resolution routed it to, exactly
@@ -600,7 +590,7 @@ fn prove_goal(
         None => std::sync::Arc::clone(&system.connection),
     };
     let conn = connection.lock().map_err(|e| {
-        DelightQLError::connection_poison_error(
+        Runtime::poisoned(
             "Failed to acquire the connection lock for a consulted goal",
             format!("Connection was poisoned: {e}"),
         )
@@ -620,10 +610,10 @@ fn prove_goal(
 /// liminal space's only stopper is abort, and a goal whose verdict is
 /// unknown is not a NO.
 fn witness_failed(spelling: &str, cause: impl std::fmt::Display) -> DelightQLError {
-    DelightQLError::database_error(
-        format!("the consulted goal '?- {spelling}' could not be proved: {cause}"),
-        "witness failure",
-    )
+    DelightQLError::from(Runtime::General {
+        message: format!("the consulted goal '?- {spelling}' could not be proved: {cause}"),
+        details: "witness failure".to_string(),
+    })
 }
 
 /// Execute a consult operation: read file, process embedded directives,
@@ -651,16 +641,14 @@ pub(crate) fn execute_consult(
     // silent merge, and never an append: no later source joins an existing
     // consulted namespace.
     if system.namespace_exists(namespace)? {
-        return Err(DelightQLError::validation_error_categorized(
-            "directive/consult/exists",
-            format!(
+        return Err(DelightQLError::from(Directive::ConsultExists {
+            message: format!(
                 "consult! creates namespace '{namespace}' from one source, and it \
                  already exists. Reload the same source with reconsult!(\"{namespace}\") \
                  or remove it first with unconsult!(\"{namespace}\") — one consulted \
                  source owns one namespace, and a second consult is never a merge"
             ),
-            "consult lifecycle",
-        ));
+        }));
     }
 
     // Resolve relative path against session CWD (for test isolation).
@@ -670,10 +658,9 @@ pub(crate) fn execute_consult(
 
     // Read the file
     let source = std::fs::read_to_string(file_path).map_err(|e| {
-        DelightQLError::database_error(
-            format!("consult!() failed to read file '{}': {}", file_path, e),
-            "File read error",
-        )
+        DelightQLError::from(Runtime::Io {
+            message: format!("consult!() failed to read file '{}': {}", file_path, e),
+        })
     })?;
 
     // ONE PARSE PER CONSULTED SUBMISSION. Parse errors get the consult!()
@@ -729,14 +716,15 @@ fn consult_body(
             None => namespace.to_string(),
         };
         crate::pipeline::inline_ddl::register_inline_ddl_block(&block.body, &child_ns, system)
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!(
+            .map_err(|e| match e {
+                DelightQLError::Semantic(_) => e,
+                e => DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Inline DDL block failed in consult of '{}': {}",
                         file_path, e
                     ),
-                    "inline DDL error",
-                )
+                    details: "inline DDL".to_string(),
+                }),
             })?;
     }
 
@@ -752,41 +740,32 @@ fn consult_body(
     Ok(definitions_loaded)
 }
 
-/// Wrap a parse failure from a consulted file in the consult!() context
-/// (a `database_error`, so its class is `error://runtime` like every other
-/// consult refusal), while letting categorized validation errors — the
-/// effect-algebra refusals such as liminal eligibility and R-rule badges —
-/// pass through UNWRAPPED, keeping their badges legible. Used by both
-/// the extraction parse (complete-form segmentation) and the
+/// Wrap a GENERIC parse failure from a consulted file in the consult!()
+/// context (a `database_error`, so its class is `error://runtime` like every
+/// other consult refusal), while letting every refusal that carries an
+/// identity of its own — a semantic refusal such as the effect-algebra's
+/// liminal eligibility and R-rule badges, or a parse TEACHING such as the
+/// no-precedence refusal — pass through UNWRAPPED, keeping its badge legible.
+/// Used by both the extraction parse (complete-form segmentation) and the
 /// cleaned-source parse so the two stages fail identically.
 fn wrap_consult_parse_error(e: DelightQLError, file_path: &str) -> DelightQLError {
-    if matches!(
-        e,
-        DelightQLError::ValidationError {
-            subcategory: Some(_),
-            ..
+    match e {
+        // A semantic refusal keeps its identity: the effect-algebra teachings
+        // such as liminal eligibility and R-rule badges are what the load
+        // publishes.
+        DelightQLError::Semantic(_) => e,
+        // A TEACHING KEEPS ITS IDENTITY, wherever in the file the author made
+        // the mistake it names: re-wrapping it would bury the identity the
+        // teaching exists to publish. Only the generic refusal — the text
+        // failed to parse, and nothing more is known — is a consult failure
+        // and is wrapped as one.
+        DelightQLError::Parse(ref parse) if !parse.is_generic() => e,
+        e => Runtime::General {
+            message: format!("consult!() failed to parse '{}': {}", file_path, e),
+            details: "Parse error".to_string(),
         }
-    ) {
-        return e;
+        .into(),
     }
-    // A TEACHING ABOUT THE DEFINITION'S OWN SHAPE keeps its badge: re-wrapping
-    // it would bury the identity the teaching exists to publish. Every other
-    // parse failure of a consulted file is a consult failure and is wrapped as
-    // one — including a teaching about an expression inside it, which says
-    // nothing about the file being a definition file.
-    if let DelightQLError::ParseError {
-        subcategory: Some(badge),
-        ..
-    } = &e
-    {
-        if crate::uri_registry::subcat::PARSE_DEFINITION_SHAPED.contains(badge) {
-            return e;
-        }
-    }
-    DelightQLError::database_error(
-        format!("consult!() failed to parse '{}': {}", file_path, e),
-        "Parse error",
-    )
 }
 
 /// A recognized liminal statement. The typed shape lives with the effect
@@ -934,10 +913,11 @@ impl Consulted {
     /// is typed definition content normalized with its enclosing submission.
     pub(crate) fn read_without_directives(source: &str, context: &str) -> Result<Consulted> {
         let consulted = Consulted::read(source).map_err(|e| match e {
-            DelightQLError::ParseError { .. } => DelightQLError::database_error(
-                format!("{context}: failed to parse DDL: {e}"),
-                "Parse error",
-            ),
+            DelightQLError::Parse(_) => Runtime::General {
+                message: format!("{context}: failed to parse DDL: {e}"),
+                details: "Parse error".to_string(),
+            }
+            .into(),
             other => other,
         })?;
         let mut names: Vec<String> = consulted
@@ -949,13 +929,13 @@ impl Consulted {
         names.extend(consulted.witnesses().map(|w| format!("?- {}", w.canonical)));
         if !names.is_empty() {
             let names = names.join(", ");
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!(
                     "embedded liminal statements ({names}) are not supported in {context} — \
                      only consult!()/reconsult!() files execute them today"
                 ),
-                "Unsupported directive",
-            ));
+                details: "Unsupported directive".to_string(),
+            }));
         }
         Ok(consulted)
     }
@@ -965,14 +945,12 @@ impl Consulted {
 /// one, so a body the canonicalizer cannot render has no ledger identity —
 /// keeping the raw bytes would be a second spelling authority.
 fn unspellable_goal(authored: &str, detail: String) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        crate::uri_registry::subcat::CONSULT_GOAL_UNSPELLABLE,
-        format!(
+    DelightQLError::from(Consult::GoalUnspellable {
+        message: format!(
             "the consulted goal '?- {authored}' has no canonical spelling, so the load's \
              ledger cannot name it: {detail}"
         ),
-        "a consulted goal is named by its canonical spelling",
-    )
+    })
 }
 
 /// WHAT A LIMINAL FORM MAY DECLARE.
@@ -992,15 +970,13 @@ fn admit_liminal_declarations(goal: &crate::pipeline::normalize::Goal) -> Result
     use crate::pipeline::normalize::GoalCategory;
 
     let refuse = |what: &str, teaching: &str| {
-        Err(DelightQLError::validation_error_categorized(
-            crate::uri_registry::subcat::CONSULT_LIMINAL_DECLARATION,
-            format!(
+        Err(DelightQLError::from(Consult::LiminalDeclaration {
+            message: format!(
                 "the liminal statement '?- {}' declares {what}, and a load has no road to \
                  spend it: {teaching}",
                 goal.spelling
             ),
-            "a liminal declaration with no evaluator",
-        ))
+        }))
     };
 
     if goal.declared.expected_error.is_some() {
@@ -1043,13 +1019,8 @@ fn liminal_directive(query: &Query) -> Result<EmbeddedDirective> {
     use crate::pipeline::asts::core::expressions::access::Access;
     use crate::pipeline::asts::core::{GroundForm, Relation, SealedCall};
 
-    let not_eligible = |detail: String| {
-        DelightQLError::validation_error_categorized(
-            crate::pipeline::asts::effects::LIMINAL_NOT_ELIGIBLE_BADGE,
-            detail,
-            "not liminal-eligible",
-        )
-    };
+    let not_eligible =
+        |detail: String| DelightQLError::from(Directive::LiminalNotEligible { message: detail });
 
     if !query.is_bare() {
         return Err(not_eligible(
@@ -1173,10 +1144,9 @@ pub(super) fn extract_string_literal(expr: &DomainExpression, arg_name: &str) ->
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
             Ok(s.clone())
         }
-        _ => Err(DelightQLError::database_error(
-            format!("consult!() {} must be a string literal", arg_name),
-            "Invalid argument type",
-        )),
+        _ => Err(DelightQLError::from(DirectiveBinding::Value {
+            message: format!("consult!() {} must be a string literal", arg_name),
+        })),
     }
 }
 
@@ -1235,9 +1205,9 @@ mod liminal_abort_tests {
         }
     }
 
-    fn fresh_system() -> crate::system::DelightQLSystem {
+    fn fresh_system() -> crate::system::ReadySystem {
         let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        crate::system::DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+        crate::system::ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh in-memory system should build")
     }
 
@@ -1341,9 +1311,9 @@ mod name_collision_tests {
         }
     }
 
-    fn fresh_system() -> crate::system::DelightQLSystem {
+    fn fresh_system() -> crate::system::ReadySystem {
         let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        crate::system::DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+        crate::system::ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh in-memory system should build")
     }
 
@@ -1629,9 +1599,9 @@ mod liminal_ledger_tests {
         }
     }
 
-    fn fresh_system() -> crate::system::DelightQLSystem {
+    fn fresh_system() -> crate::system::ReadySystem {
         let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        crate::system::DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+        crate::system::ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh in-memory system should build")
     }
 
@@ -2008,6 +1978,40 @@ mod liminal_ledger_tests {
             system.liminal_receipt_row_count(),
             before,
             "the aborted load left no ledger rows"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wrapper_tests {
+    use super::wrap_consult_parse_error;
+    use crate::diagnostic::{DelightQLError, Parse};
+
+    /// A TEACHING KEEPS ITS IDENTITY through the consult wrapper: the
+    /// no-precedence refusal inside a consulted body is still `parse/pony`.
+    #[test]
+    fn a_teaching_keeps_its_identity_through_a_consulted_file() {
+        let pony = DelightQLError::from(Parse::Pony {
+            message: "mixed connectives".to_string(),
+        });
+        let kept = wrap_consult_parse_error(pony, "ddl/predicates.dql");
+        assert_eq!(kept.id().hierarchy(), "parse/pony");
+    }
+
+    /// The generic refusal says only that the text failed to parse, so it is
+    /// the consult failure it always was.
+    #[test]
+    fn a_generic_failure_is_a_consult_failure() {
+        let generic = DelightQLError::from(Parse::Ddl {
+            message: "Syntax error".to_string(),
+        });
+        let wrapped = wrap_consult_parse_error(generic, "ddl/predicates.dql");
+        assert!(matches!(wrapped, DelightQLError::Runtime(_)), "{wrapped:?}");
+        assert!(
+            wrapped
+                .to_string()
+                .contains("consult!() failed to parse 'ddl/predicates.dql'"),
+            "{wrapped}"
         );
     }
 }

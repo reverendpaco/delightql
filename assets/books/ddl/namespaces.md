@@ -279,7 +279,7 @@ young_users(*) :- users(*), age < 30
 
 For a permanent binding, use `ground!()`:
 ```delightql
-ground!(data::production, lib::analytics, "lib::analytics_prod")
+ground!("data::production", "lib::analytics", "lib::analytics_prod")
 ```
 
 All three arguments are required. The first two are namespace paths; the

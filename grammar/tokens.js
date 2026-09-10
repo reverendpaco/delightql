@@ -35,8 +35,14 @@ module.exports = {
   of_keyword: $ => 'of',
   // Two spellings each; the CST keeps the authored bytes and normalization
   // drops the distinction.
-  asc_keyword: $ => choice('asc', 'ascending'),
-  desc_keyword: $ => choice('desc', 'descending'),
+  // NOT keywords: a direction stands only after a complete expression inside
+  // `#( … )`, where no name can stand, so it is lexed contextually there
+  // and the same spelling is an ordinary identifier everywhere else. As a
+  // keyword, `asc`/`ascending` share the alias keyword's prefix `as`, and
+  // admitting them as identifiers made the generator drop the argument-list
+  // reading of `f(q.a, q.b)(*)`.
+  asc_keyword: $ => token(prec(1, /asc(ending)?/)),
+  desc_keyword: $ => token(prec(1, /desc(ending)?/)),
 
   // ---- pipes ---------------------------------------------------------------
   pipe_operator: $ => '|>',

@@ -76,7 +76,7 @@ same_schema(T(*), V(*))(*) :-
   together(~> count:() as a),
     first_md(~> count:() as b),
     second_md(~> count:() as c)
-      |> ( (a == b) and (b == c) as pass)
+      |> ( (a = b) and (b = c) as pass)
 ```
 
 **Sigma predicates:**

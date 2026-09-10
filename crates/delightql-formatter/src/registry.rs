@@ -84,7 +84,7 @@ pub const VERBATIM: &[Kind] = &[
     Kind::KeyedBinding, Kind::KeyedMetadata, Kind::KeyedValue, Kind::Lambda, Kind::LambdaBinder,
     Kind::Landing, Kind::LeadingOuterGrelex, Kind::LiftSigil,
     Kind::LowerOrderEffrelex, Kind::MarkedTarget, Kind::MatchArm,
-    Kind::Membership, Kind::Meta, Kind::MetaSigil,
+    Kind::Membership, Kind::Meta, Kind::MetaSigil, Kind::MixedConnectiveRun,
     Kind::MetadataBinding, Kind::MetadataGroup, Kind::MetadataSigil,
     Kind::MinusContinuation, Kind::MinusSigil, Kind::MutationMarker,
     Kind::MutationSource, Kind::NameTemplatePlaceholder,

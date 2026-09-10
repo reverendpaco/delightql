@@ -194,7 +194,7 @@ fn worker_loop(
 ) {
     // The session's backend is created by the mount! below (if any); the
     // handle itself comes straight from the factories, no pre-opened manager.
-    let mut handle = match crate::connection::open_handle() {
+    let mut handle = match crate::connection::open_handle(crate::connection::SessionProfile::Server) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("worker-{}: failed to init system: {}", worker_id, e);

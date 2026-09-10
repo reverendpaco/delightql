@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delightql_types::db_traits::{DatabaseConnection, DbValue};
-use delightql_types::error::{DelightQLError, Result};
+use delightql_types::error::Result;
 
 use crate::coprocess::SharedCoprocess;
 
@@ -39,12 +39,10 @@ impl PipeConnection {
 
 impl DatabaseConnection for PipeConnection {
     fn execute(&self, sql: &str, _params: &[DbValue]) -> Result<usize> {
-        let (_columns, rows) = self.shared.execute_query_raw(sql).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Pipe execution failed: {}", e),
-                e.to_string(),
-            )
-        })?;
+        let (_columns, rows) = self
+            .shared
+            .execute_query_raw(sql)
+            .map_err(|e| crate::error::diagnostic("Pipe execution failed", e))?;
         Ok(rows.len())
     }
 
@@ -53,12 +51,10 @@ impl DatabaseConnection for PipeConnection {
     }
 
     fn query_row_values(&self, sql: &str, _params: &[DbValue]) -> Result<Option<Vec<DbValue>>> {
-        let (_columns, mut rows) = self.shared.execute_query_raw(sql).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Pipe query failed: {}", e),
-                e.to_string(),
-            )
-        })?;
+        let (_columns, mut rows) = self
+            .shared
+            .execute_query_raw(sql)
+            .map_err(|e| crate::error::diagnostic("Pipe query failed", e))?;
 
         if rows.is_empty() {
             return Ok(None);
@@ -78,12 +74,10 @@ impl DatabaseConnection for PipeConnection {
         sql: &str,
         _params: &[DbValue],
     ) -> Result<(Vec<String>, Vec<Vec<DbValue>>)> {
-        let (cols, rows) = self.shared.execute_query_raw(sql).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Pipe query failed: {}", e),
-                e.to_string(),
-            )
-        })?;
+        let (cols, rows) = self
+            .shared
+            .execute_query_raw(sql)
+            .map_err(|e| crate::error::diagnostic("Pipe query failed", e))?;
         let typed_rows = rows
             .into_iter()
             .map(|row| row.into_iter().map(|v| self.field(v)).collect())

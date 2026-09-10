@@ -57,17 +57,23 @@
 //! carrier. A compiler-owned row travels as the product of the act that
 //! bound or allocated it, never as an identity a caller copied.
 
+mod anonymous;
 mod join;
 mod lookup;
 mod pattern;
 mod standing;
 
+pub(crate) use anonymous::{BornPosition, JudgedBirth};
 pub(in crate::pipeline::resolver) use join::shared_using_names;
 pub(crate) use pattern::StrictPhaseConverter;
-pub(crate) use standing::{
-    AnonRouting, PatternOperand, PatternOwner, ResolvedQuery, ResolvedRelation,
-};
+/// An UNFINISHED read: the pattern applied, its constraints not yet spent.
+/// Only the join position needs one, and only the relation authority mints
+/// one — the pair is what keeps a member's read from being assembled from
+/// a name and a relation chosen apart.
+pub(in crate::pipeline::resolver) use standing::PatternRead;
+pub(crate) use standing::{PatternOperand, PatternOwner, ResolvedQuery, ResolvedRelation};
 
+use crate::diagnostic::{Constraint, Resolution, ResolutionSetop};
 use crate::error::Result;
 use crate::names::Sym;
 use crate::pipeline::asts::core::ColumnOccurrence;
@@ -103,6 +109,14 @@ pub(crate) struct Terminal(());
 
 impl Terminal {
     fn judged() -> Self {
+        Terminal(())
+    }
+
+    /// A proof for a test of the relation authority, which cannot open a
+    /// lexical position of its own. Test-only: production mints the proof
+    /// only where a lookup was made.
+    #[cfg(test)]
+    pub(crate) fn judged_for_test() -> Self {
         Terminal(())
     }
 }
@@ -346,12 +360,189 @@ impl Frontier {
 /// it does not — the same act, judged by its company. No single reference
 /// knows which it is, so the fact is accumulated over the whole condition
 /// and read once at the end.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Witness {
-    /// A name bound inside the interior relation.
-    pub anchored: bool,
-    /// A name found nothing there and was answered by the enclosing row.
-    pub escaped: bool,
+///
+/// A VERDICT, not a record: it says whether the condition correlates, and
+/// nothing about which occurrences it read. What a hoisted correlation owes
+/// is derived by the relation authority's own act from the condition and
+/// the relation it stands on; a list carried from here would be a second
+/// authority for the same fact, and a list is something a caller can pair
+/// with the wrong condition.
+#[derive(Clone, Copy, Debug)]
+struct Witness {
+    /// Some reference landed on the relation under the reader's finger.
+    anchored: bool,
+    /// Some reference — at this position or nested inside it, spelled by
+    /// name or by position — was answered past the relation under the
+    /// reader's finger: by an earlier frame here or by an enclosing row.
+    escaped: bool,
+    /// HOW MANY INTERIOR BOUNDARIES THE ENCLOSING JOIN EVALUATES lie
+    /// between this position and the farthest answer: none, and every
+    /// answer stands in the statement this position's level emits; one,
+    /// and an answer stands in the row the join evaluating this interior
+    /// reads; two or more, and an answer stands in a row no such join can
+    /// read.
+    crossings: u8,
+    /// HOW MANY POSITIONS OUT the farthest answer stands: none, and every
+    /// answer is a frame of this position — the statement its level emits
+    /// or a member standing beside it; one or more, and an answer stands in
+    /// a row enclosing this position, readable in place where no hoisted
+    /// boundary lies between.
+    positions_out: u8,
+}
+
+impl Witness {
+    /// Whether some name was bound inside the interior relation.
+    fn is_anchored(&self) -> bool {
+        self.anchored
+    }
+
+    /// Whether some name reached out to the enclosing row.
+    fn has_escaped(&self) -> bool {
+        self.escaped
+    }
+
+    /// Whether the condition is a CORRELATION: it reads the enclosing row
+    /// and the interior relation both.
+    fn correlates(&self) -> bool {
+        self.anchored && self.escaped
+    }
+
+    /// Whether some answer stands in a row enclosing this position.
+    fn reaches_enclosing(&self) -> bool {
+        self.positions_out >= 1
+    }
+
+    /// Whether some answer stands past an interior boundary the enclosing
+    /// join evaluates — outside the statement this position's level emits.
+    fn reaches_past_interior(&self) -> bool {
+        self.crossings >= 1
+    }
+
+    /// Whether some answer stands past the join that evaluates the
+    /// interior this position is in — a row no join can read.
+    fn reaches_beyond_join(&self) -> bool {
+        self.crossings >= 2
+    }
+
+    fn none() -> Self {
+        Witness {
+            anchored: false,
+            escaped: false,
+            crossings: 0,
+            positions_out: 0,
+        }
+    }
+}
+
+/// RUN ONE LEXICAL EXTENT: the marks are cleared before the operation and
+/// read after it — a nested position's lookups mark this one as they reach
+/// past it — and what the operation resolved comes out OWNED BESIDE what
+/// its lookups reached, as one [`Judged`]. Begin and end are private to
+/// this module, `Witness` has no public mint and leaves this module only
+/// inside a `Judged`, and the extent is opened only under a [`Role`] — a
+/// token only the fold's own module can make — so the product reaches
+/// exactly the fold's operation-owned acts, and the only roads out of it
+/// are the consuming judgments below.
+pub(in crate::pipeline::resolver) fn extent<'reg, 'db, T>(
+    fold: &mut super::resolver_fold::ResolverFold<'reg, 'db>,
+    op: impl FnOnce(&mut super::resolver_fold::ResolverFold<'reg, 'db>) -> Result<T>,
+    _role: super::resolver_fold::Role,
+) -> Result<Judged<T>> {
+    let prior = fold.lexical.marks.replace(Witness::none());
+    let out = op(fold);
+    let witness = fold.lexical.marks.replace(prior);
+    Ok(Judged {
+        value: out?,
+        witness,
+        correlations: fold.correlations,
+    })
+}
+
+/// THE PRODUCT OF ONE LEXICAL EXTENT: what the operation resolved, owned
+/// beside EVERY fact its lexical evaluation judgment is derived from — the
+/// witness of what its lookups reached, and the evaluation point of the
+/// fold that ran the extent — one thing from the moment the extent
+/// closes. Born only in [`extent`]; its fields are private; it is neither
+/// `Clone` nor `Copy`; no accessor answers any part alone, and no consumer
+/// supplies or substitutes a part later. The value leaves only through a
+/// consuming judgment that spends the witness and the evaluation point on
+/// that very value in the same act: the here-only judgment, the
+/// restriction verdict, and the relation authority's stating of a
+/// position. There is no road by which a witness earned by one extent, or
+/// the mode of one fold, meets a value resolved by another.
+pub(crate) struct Judged<T> {
+    value: T,
+    witness: Witness,
+    /// The evaluation point of the fold that ran the extent, read when the
+    /// extent closed: in place, or hoisted to the enclosing join.
+    correlations: super::Correlations,
+}
+
+impl<T> Judged<T> {
+    /// THE HERE-ONLY JUDGMENT: answer the value only after a read past the
+    /// interior boundary the enclosing join evaluates has been refused —
+    /// the level that consumes it is emitted inside that boundary, where
+    /// the enclosing row is not readable. The value that comes out has
+    /// been judged to read nothing an evaluation would have to record.
+    pub(crate) fn here(self, what: &str) -> Result<T> {
+        if self.witness.reaches_past_interior() {
+            return Err(crate::relation::enclosing_position_refusal(what));
+        }
+        Ok(self.value)
+    }
+
+    /// THE STATING SPLIT, for the relation authority alone: the value and
+    /// the evaluation its extent earned under the evaluation point of the
+    /// fold that ran it — here when nothing enclosing was reached;
+    /// enclosing otherwise, past the join when two hoisted boundaries were
+    /// crossed. The halves come apart only under a
+    /// [`Stating`](crate::relation::pending::Stating) license, which only
+    /// `relation::pending` mints and spends inside the acts that write
+    /// them into one position in the same breath.
+    pub(crate) fn into_stated(
+        self,
+        _stating: crate::relation::pending::Stating,
+    ) -> (T, crate::relation::pending::Evaluation) {
+        use crate::relation::pending::{EnclosingReach, Evaluation};
+        let evaluation = if !self.witness.reaches_enclosing() {
+            Evaluation::Here
+        } else {
+            Evaluation::Enclosing {
+                correlations: self.correlations,
+                reach: if self.witness.reaches_beyond_join() {
+                    EnclosingReach::PastTheJoin
+                } else {
+                    EnclosingReach::TheJoin
+                },
+            }
+        };
+        (self.value, evaluation)
+    }
+}
+
+impl Judged<crate::pipeline::asts::core::TruthExpression<crate::pipeline::asts::core::Resolved>> {
+    /// THE RESTRICTION VERDICT: the condition answered inside the verdict
+    /// its lookups earned under the evaluation point of the fold that ran
+    /// the extent. The refusing verdicts carry no condition; the using
+    /// verdicts carry it.
+    pub(in crate::pipeline::resolver) fn restriction(self) -> super::resolver_fold::Restriction {
+        use super::resolver_fold::Restriction;
+        let Judged {
+            value,
+            witness,
+            correlations,
+        } = self;
+        if witness.has_escaped() && !witness.is_anchored() {
+            return Restriction::ConstrainsNothing;
+        }
+        if correlations == super::Correlations::Hoisted && witness.correlates() {
+            if witness.reaches_beyond_join() {
+                return Restriction::BeyondReach;
+            }
+            return Restriction::Correlated(value);
+        }
+        Restriction::Plain(value)
+    }
 }
 
 /// HOW FAR A BARE NAME REACHES from the frame it is written over.
@@ -416,6 +607,13 @@ impl Frame {
     }
 }
 
+/// Where, among one position's own frames, an answered port stands.
+enum Holding {
+    Innermost,
+    Earlier,
+    Nowhere,
+}
+
 /// THE FOLD'S LEXICAL POSITION: the relations under the reader's finger,
 /// innermost last, and the enclosing fold's position behind them.
 ///
@@ -430,6 +628,25 @@ pub(crate) struct Position<'e> {
     /// its own: an anonymous literal's headers and cells, and a call's
     /// authored arguments, are decided over everything in view at once.
     flat: bool,
+    /// WHAT THE LOOKUPS MADE HERE, OR NESTED HERE, REACHED. Written by the
+    /// one address judgment for every spelling, from the frame the answer
+    /// stood in: a nested position marks every position it escapes
+    /// through, so an interior learns that something inside it — a
+    /// witness's body, a scalar subquery — read the row enclosing it. A
+    /// cell, because a nested position holds this one by shared borrow.
+    /// The operation judging one construct resets it before and reads it
+    /// after; nothing else reads it.
+    marks: std::cell::Cell<Witness>,
+    /// WHERE THIS POSITION IS EVALUATED relative to the one enclosing it:
+    /// in place, as the target's own subquery, or at the enclosing join,
+    /// which is what makes leaving this position a crossing the judgment
+    /// counts.
+    mode: super::Correlations,
+    /// THE LOOKUP RESTATES: the reference being answered is a publication
+    /// item that carries its position rather than a value that reads it,
+    /// so a position the enclosing join computes may answer — it continues,
+    /// unread. Set for exactly one lookup by the publication that makes it.
+    carrying: std::cell::Cell<bool>,
 }
 
 impl<'e> Position<'e> {
@@ -440,17 +657,137 @@ impl<'e> Position<'e> {
             frames: Vec::new(),
             enclosing: None,
             flat: false,
+            marks: std::cell::Cell::new(Witness::none()),
+            mode: super::Correlations::InPlace,
+            carrying: std::cell::Cell::new(false),
         }
     }
 
     /// A position INSIDE another: an interior expression sees the row it
-    /// is correlated to through this borrow and through nothing else.
-    pub(crate) fn enclosed_by(outer: &'e Position<'e>) -> Self {
+    /// is correlated to through this borrow and through nothing else, and
+    /// states where it is evaluated relative to that row.
+    pub(crate) fn enclosed_by(outer: &'e Position<'e>, mode: super::Correlations) -> Self {
         Position {
             frames: Vec::new(),
             enclosing: Some(outer),
             flat: false,
+            marks: std::cell::Cell::new(Witness::none()),
+            mode,
+            carrying: std::cell::Cell::new(false),
         }
+    }
+
+    /// STATE THAT THE NEXT LOOKUPS RESTATE a position rather than read it —
+    /// a publication item that is a bare reference — answering the prior
+    /// setting so the publication can put it back.
+    pub(crate) fn set_carrying(&self, carrying: bool) -> bool {
+        self.carrying.replace(carrying)
+    }
+
+    /// THE ONE JUDGMENT AFTER SELECTION, for every spelling and every
+    /// selection road: which frame the answer stood in decides what the
+    /// reference reached. Landing on the relation under the reader's finger
+    /// anchors this position; landing anywhere behind it — an earlier frame
+    /// here, or an enclosing row — is an escape, and a position the answer
+    /// lies entirely outside of is escaped THROUGH, so the enclosing
+    /// positions are judged in turn until one holds the answer. A
+    /// publication that selects an ordinal's occurrence by its own
+    /// enumeration ([`Position::in_order`]) records the judgment here too.
+    pub(crate) fn judged(
+        &self,
+        occurrence: &ColumnOccurrence,
+        registry: &crate::relation::Planning,
+    ) -> Result<()> {
+        self.mark(occurrence.column, registry)
+    }
+
+    fn mark(&self, port: PortId, registry: &crate::relation::Planning) -> Result<()> {
+        // The positions the answer lies outside of, innermost first, and
+        // the one holding it.
+        let mut passed: Vec<&Position<'_>> = Vec::new();
+        let mut position: Option<&Position<'_>> = Some(self);
+        let mut holder: Option<(&Position<'_>, Holding)> = None;
+        while let Some(here) = position {
+            match here.holding(port, registry)? {
+                Holding::Nowhere => {
+                    passed.push(here);
+                    position = here.enclosing;
+                }
+                held => {
+                    holder = Some((here, held));
+                    break;
+                }
+            }
+        }
+        if let Some((here, held)) = holder {
+            let mut marks = here.marks.get();
+            match held {
+                Holding::Innermost => marks.anchored = true,
+                Holding::Earlier | Holding::Nowhere => marks.escaped = true,
+            }
+            here.marks.set(marks);
+        }
+        // EACH POSITION PASSED COUNTS THE HOISTED BOUNDARIES between itself
+        // and the answer: its own, if the enclosing join evaluates it, and
+        // every one it is nested in up to the holder.
+        let mut crossings: u8 = 0;
+        let mut positions_out: u8 = 0;
+        for here in passed.iter().rev() {
+            if here.mode == super::Correlations::Hoisted {
+                crossings = crossings.saturating_add(1);
+            }
+            positions_out = positions_out.saturating_add(1);
+            let mut marks = here.marks.get();
+            marks.escaped = true;
+            marks.crossings = marks.crossings.max(crossings);
+            marks.positions_out = marks.positions_out.max(positions_out);
+            here.marks.set(marks);
+        }
+        Ok(())
+    }
+
+    /// Which of this position's own frames reaches a port: the innermost
+    /// (every frame, when the row is read flat), an earlier one, or none.
+    fn holding(&self, port: PortId, registry: &crate::relation::Planning) -> Result<Holding> {
+        let count = self.frames.len();
+        for (index, frame) in self.frames.iter().enumerate().rev() {
+            if Self::frame_reaches(frame, port, registry)? {
+                return Ok(if self.flat || index + 1 == count {
+                    Holding::Innermost
+                } else {
+                    Holding::Earlier
+                });
+            }
+        }
+        Ok(Holding::Nowhere)
+    }
+
+    /// Whether a frame reaches a port: the positions its carriers publish,
+    /// their witness ports, and every position of a relation the frame's
+    /// routes name — a join member's own arm, which a qualified reference
+    /// reaches beneath the join's republication of it, and the operands a
+    /// correlation attached to the carrier may name.
+    fn frame_reaches(
+        frame: &Frame,
+        port: PortId,
+        registry: &crate::relation::Planning,
+    ) -> Result<bool> {
+        if Self::ports_of(frame, registry)?.contains(&port) {
+            return Ok(true);
+        }
+        for binding in frame.bindings(frame.reach, registry) {
+            let reached = match &binding.ports {
+                Some(ports) => ports.contains(&port),
+                None => registry
+                    .authority()
+                    .interface(&binding.relation)
+                    .is_ok_and(|interface| interface.ports().contains(&port)),
+            };
+            if reached {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Enter a frame: the operation about to resolve stands over this
@@ -596,14 +933,44 @@ impl<'e> Position<'e> {
     }
 
     /// EVERY POSITION IN VIEW — the frames standing here and everything
-    /// enclosing them — for the USING correlation that pairs an interior's
-    /// columns with the row it looks left into by name. Publication, not
-    /// permission: these are the positions the relations publish to anyone.
+    /// enclosing them, sibling truth witnesses included — for the row a
+    /// binder may reuse. Publication, not permission: these are the
+    /// positions the relations publish to anyone.
     pub(crate) fn ports_in_view(
         &self,
         registry: &crate::relation::Planning,
     ) -> Result<Vec<PortId>> {
         self.all_ports(registry)
+    }
+
+    /// THE ROW IN VIEW — every position the relations standing here and
+    /// enclosing them PUBLISH — for the dequalifying correlation that pairs
+    /// a read's columns with the row it looks left into by name. A sibling
+    /// truth witness (`+orders(...)` beside the read) is addressable by
+    /// name but is not a row: a `.(id)` pairs with the row's `id`, never
+    /// with a witness's.
+    pub(crate) fn row_in_view(&self, registry: &crate::relation::Planning) -> Result<Vec<PortId>> {
+        let mut ports = Vec::new();
+        let mut positions: Vec<&Position<'_>> = vec![self];
+        let mut outer = self.enclosing;
+        while let Some(position) = outer {
+            positions.push(position);
+            outer = position.enclosing;
+        }
+        for position in positions {
+            for frame in position.frames.iter().rev() {
+                for carrier in frame.standing.carriers() {
+                    for port in
+                        crate::relation::published_ports(registry, &carrier.semantic_relation())?
+                    {
+                        if !ports.contains(&port) {
+                            ports.push(port);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(ports)
     }
 
     /// The innermost frame and the reach it is read with, unless the row is
@@ -713,12 +1080,43 @@ impl<'e> Position<'e> {
     /// THE ONE ADDRESS JUDGMENT. A written reference — bare, qualified, or
     /// ordinal — is decided over the frames standing here and answers with
     /// a port, an exhaustive ambiguity, an absence, or a refusal. The set
-    /// it is decided over is assembled here and reaches no caller.
+    /// it is decided over is assembled here and reaches no caller. What
+    /// the answer reached is judged once, after selection, the same way
+    /// for every spelling, and recorded on this position and on every
+    /// position the answer lies outside of.
     pub(crate) fn address(
         &self,
         reference: ColumnReference,
         in_correlation: bool,
-        witness: &mut Witness,
+        registry: &crate::relation::Planning,
+    ) -> Result<UnificationResult> {
+        let result = self.select(reference, in_correlation, registry)?;
+        if let UnificationResult::Resolved(occurrence) = &result {
+            // A POSITION THE ENCLOSING JOIN COMPUTES is published by the
+            // interior and readable only past its boundary; a reference
+            // answered by that very position stands inside the interior.
+            if !self.carrying.get()
+                && crate::relation::evaluated_at_boundary(registry, occurrence.column)
+            {
+                return Ok(UnificationResult::Refused(
+                    crate::relation::enclosing_position_refusal("a reference inside the interior"),
+                ));
+            }
+            self.mark(occurrence.column, registry)?;
+        }
+        Ok(result)
+    }
+
+    /// THE SELECTION: which occurrence a spelling names, over the frames
+    /// standing here. A name and an ordinal select differently — one by
+    /// publication, one by position within the scope its qualifier chooses
+    /// — and take the same tiers: the reach of the frame under the reader's
+    /// finger, and under row reach the interior relation first, the whole
+    /// view only where the interior proves the spelling absent.
+    fn select(
+        &self,
+        reference: ColumnReference,
+        in_correlation: bool,
         registry: &crate::relation::Planning,
     ) -> Result<UnificationResult> {
         let Some((local, reach)) = self.local() else {
@@ -732,9 +1130,9 @@ impl<'e> Position<'e> {
             ));
         };
         let local_ports = Self::ports_of(local, registry)?;
-        let (qualifier, is_named) = match &reference {
-            ColumnReference::Named { qualifier, .. } => (qualifier.as_deref(), true),
-            ColumnReference::Ordinal { qualifier, .. } => (qualifier.as_deref(), false),
+        let qualifier = match &reference {
+            ColumnReference::Named { qualifier, .. }
+            | ColumnReference::Ordinal { qualifier, .. } => qualifier.as_deref(),
         };
         match reach {
             // A PIPE FORM selects over its own input: a bare name reaches
@@ -753,22 +1151,14 @@ impl<'e> Position<'e> {
                 registry,
             )),
             Reach::Row => {
-                if !is_named {
-                    // An ordinal counts positions within the scope its
-                    // qualifier chooses, over everything in view.
-                    return Ok(lookup::unify_single_column(
-                        reference,
-                        &self.all_ports(registry)?,
-                        &self.all_visible(registry),
-                        registry,
-                    ));
-                }
                 // An interior relation is the lexical scope under the
                 // reader's finger. Search it before the enclosing context,
                 // including for a qualified reference: a second `addresses`
                 // interior shadows an earlier sibling named `addresses`. A
                 // different qualifier widens only after the local heading
-                // proves it absent.
+                // proves it absent. An ordinal counts positions within the
+                // scope its qualifier chooses, and counts the interior's
+                // first: a position past its width is absent from it.
                 //
                 // `_` is exempt. Narrowing is LEXICAL SHADOWING — an inner
                 // relation named `addresses` hides an outer one — and
@@ -779,51 +1169,36 @@ impl<'e> Position<'e> {
                 let has_enclosing = !self.enclosing_ports(registry)?.is_empty();
                 let narrowed =
                     !points_at_a_pipe && (has_enclosing || (in_correlation && qualifier.is_none()));
-                let result = if narrowed {
-                    match lookup::unify_single_column(
-                        reference.clone(),
-                        &local_ports,
-                        &self.local_visible(registry),
-                        registry,
-                    ) {
-                        // ABSENT from the inner relation is not a miss. A
-                        // correlated subquery stands inside a statement, and
-                        // a name the subquery's own source does not publish
-                        // is what the enclosing row is there to answer.
-                        // Widen only on absence: a name the inner relation
-                        // claims ambiguously is still the inner relation's.
-                        UnificationResult::Unresolved(_) | UnificationResult::Refused(_) => {
-                            if in_correlation {
-                                witness.escaped = true;
-                            }
-                            lookup::unify_single_column(
-                                reference,
-                                &self.all_ports(registry)?,
-                                &self.all_visible(registry),
-                                registry,
-                            )
-                        }
-                        settled => settled,
-                    }
-                } else {
-                    lookup::unify_single_column(
+                if !narrowed {
+                    return Ok(lookup::unify_single_column(
                         reference,
                         &self.all_ports(registry)?,
                         &self.all_visible(registry),
                         registry,
-                    )
-                };
-                // Anchoring is decided by which relation the reference
-                // LANDED on, not by how it was spelled. Escaping is not its
-                // complement: only the widening above is an escape.
-                if in_correlation {
-                    if let UnificationResult::Resolved(occurrence) = &result {
-                        if local_ports.contains(&occurrence.column) {
-                            witness.anchored = true;
-                        }
-                    }
+                    ));
                 }
-                Ok(result)
+                match lookup::unify_single_column(
+                    reference.clone(),
+                    &local_ports,
+                    &self.local_visible(registry),
+                    registry,
+                ) {
+                    // ABSENT from the inner relation is not a miss. A
+                    // correlated subquery stands inside a statement, and
+                    // a name the subquery's own source does not publish
+                    // is what the enclosing row is there to answer.
+                    // Widen only on absence: a name the inner relation
+                    // claims ambiguously is still the inner relation's.
+                    UnificationResult::Unresolved(_) | UnificationResult::Refused(_) => {
+                        Ok(lookup::unify_single_column(
+                            reference,
+                            &self.all_ports(registry)?,
+                            &self.all_visible(registry),
+                            registry,
+                        ))
+                    }
+                    settled => Ok(settled),
+                }
             }
         }
     }
@@ -856,23 +1231,24 @@ impl<'e> Position<'e> {
                             crate::pipeline::resolver::resolving::domain_expressions::simple::opaque_heading_refusal(),
                         );
                     }
-                    return Err(DelightQLError::column_not_found_error(name, error_context));
+                    return Err(DelightQLError::from(Resolution::Column {
+                        column: name.to_string(),
+                        context: error_context.to_string(),
+                    }));
                 }
                 UnificationResult::Opaque => {
                     return Err(crate::pipeline::resolver::opaque_reference_refusal());
                 }
-                UnificationResult::Refused(refusal) => return Err(refusal.into_error()),
+                UnificationResult::Refused(refusal) => return Err(refusal),
                 UnificationResult::Ambiguous { column, tables } => {
-                    return Err(DelightQLError::ValidationError {
+                    return Err(DelightQLError::from(Constraint::General {
                         message: format!(
                             "Column '{}' {} is ambiguous. Could refer to: {}",
                             column,
                             error_context,
                             tables.join(", ")
                         ),
-                        context: error_context.to_string(),
-                        subcategory: None,
-                    });
+                    }));
                 }
             }
         }
@@ -894,7 +1270,7 @@ impl<'e> Position<'e> {
         // the position the glob means is the one standing here. The carry
         // record says which; nothing is paired by name or order.
         let standing = self.all_ports(registry)?;
-        Ok(reached
+        let reached: Vec<PortId> = reached
             .into_iter()
             .filter_map(|port| {
                 if standing.contains(&port) {
@@ -905,6 +1281,14 @@ impl<'e> Position<'e> {
                     .copied()
                     .find(|here| crate::relation::stands_where(registry, *here, port))
             })
+            .collect();
+        // THE JUDGMENT IS THE SAME FOR EVERY SPELLING: a glob over the
+        // enclosing row reaches it exactly as each name would.
+        for port in &reached {
+            self.mark(*port, registry)?;
+        }
+        Ok(reached
+            .into_iter()
             .map(|port| ColumnOccurrence::addressed(port, true, Terminal::judged()))
             .collect())
     }
@@ -988,22 +1372,18 @@ impl<'e> Position<'e> {
             .collect();
         match named.as_slice() {
             [relation] => Ok(*relation),
-            [] => Err(DelightQLError::validation_error_categorized(
-                "resolution/setop/correlation_owner",
-                format!(
+            [] => Err(DelightQLError::from(ResolutionSetop::CorrelationOwner {
+                message: format!(
                     "set-operation correlation qualifier '{}' does not name a visible operand",
                     qualifier
                 ),
-                "qualify each whole-heading reference by an operand name or alias",
-            )),
-            _ => Err(DelightQLError::validation_error_categorized(
-                "resolution/setop/correlation_owner",
-                format!(
+            })),
+            _ => Err(DelightQLError::from(ResolutionSetop::CorrelationOwner {
+                message: format!(
                     "set-operation correlation qualifier '{}' names more than one visible operand",
                     qualifier
                 ),
-                "use distinct operand aliases",
-            )),
+            })),
         }
     }
 }
@@ -1037,4 +1417,93 @@ fn read_of(
     Ok(ResolvedRelation::answering_for_itself(
         row.read(RowRead(()), identities)?,
     ))
+}
+
+#[cfg(test)]
+mod judged_tests {
+    //! The consuming judgments of a judged product read the witness THAT
+    //! product owns and nothing else. Witnesses are built here, in the one
+    //! module that can, because no road outside `extent` mints one; the
+    //! stating split is not exercised here because its license is minted
+    //! only by `relation::pending` — the lateral-addressing corpus pins it
+    //! end to end.
+    use super::*;
+    use crate::pipeline::asts::core::{Resolved, TruthExpression};
+    use crate::pipeline::resolver::resolver_fold::Restriction;
+    use crate::pipeline::resolver::Correlations;
+
+    fn judged<T>(value: T, witness: Witness, correlations: Correlations) -> Judged<T> {
+        Judged {
+            value,
+            witness,
+            correlations,
+        }
+    }
+
+    fn witness(anchored: bool, escaped: bool, crossings: u8, positions_out: u8) -> Witness {
+        Witness {
+            anchored,
+            escaped,
+            crossings,
+            positions_out,
+        }
+    }
+
+    fn truth() -> TruthExpression<Resolved> {
+        use crate::pipeline::asts::core::{
+            Comparison, DomainExpression, FunctionApplication, LiteralValue,
+        };
+        let one = || {
+            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Boolean(true)))
+        };
+        TruthExpression::Comparison(Comparison {
+            operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+            left: Box::new(one()),
+            right: Box::new(one()),
+        })
+    }
+
+    /// HERE-ONLY: a value whose lookups stayed inside the statement its
+    /// level emits is answered; one that reached past the interior
+    /// boundary the enclosing join evaluates is refused, and the value
+    /// never comes out.
+    #[test]
+    fn the_here_only_judgment_reads_the_products_own_witness() {
+        let hoisted = Correlations::Hoisted;
+        assert_eq!(
+            judged(7, witness(true, false, 0, 0), hoisted)
+                .here("probe")
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            judged(7, witness(false, true, 0, 1), hoisted)
+                .here("probe")
+                .unwrap(),
+            7
+        );
+        let refused = judged(7, witness(false, true, 1, 1), hoisted)
+            .here("probe")
+            .unwrap_err();
+        assert!(refused.to_string().contains("probe"), "{refused}");
+    }
+
+    /// RESTRICTION: the verdict is decided by the witness the condition
+    /// earned and the evaluation point the product carries from the fold
+    /// that ran it — and the refusing verdicts carry no condition out.
+    #[test]
+    fn the_restriction_verdict_reads_the_products_own_witness_and_mode() {
+        let hoisted = Correlations::Hoisted;
+        let plain = judged(truth(), witness(true, false, 0, 0), hoisted).restriction();
+        assert!(matches!(plain, Restriction::Plain(_)));
+        let nothing = judged(truth(), witness(false, true, 0, 1), hoisted).restriction();
+        assert!(matches!(nothing, Restriction::ConstrainsNothing));
+        let correlated = judged(truth(), witness(true, true, 1, 1), hoisted).restriction();
+        assert!(matches!(correlated, Restriction::Correlated(_)));
+        let beyond = judged(truth(), witness(true, true, 2, 2), hoisted).restriction();
+        assert!(matches!(beyond, Restriction::BeyondReach));
+        let in_place =
+            judged(truth(), witness(true, true, 1, 1), Correlations::InPlace).restriction();
+        assert!(matches!(in_place, Restriction::Plain(_)));
+    }
 }

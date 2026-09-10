@@ -10,6 +10,7 @@
 //! It is asked of the registry HERE, exactly once, and the answer is the
 //! occurrence the value publishes.
 
+use crate::diagnostic::Compression;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
@@ -40,7 +41,10 @@ pub(in crate::pipeline::resolver) fn resolve_scalar_relation_via_fold(
         },
     };
     let resolved = fold
-        .resolve_interior(relation.body().clone().attached())?
+        .resolve_interior(
+            relation.body().clone().attached(),
+            crate::pipeline::resolver::Correlations::InPlace,
+        )?
         .into_body();
 
     let sole = sole_column(&resolved, &fold.core.identities, &identifier)?;
@@ -86,26 +90,21 @@ fn published_relation(expr: &ast_resolved::Chain) -> &crate::relation::SemanticR
 }
 
 fn wider_heading(identifier: &ast_unresolved::QualifiedName, width: usize) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "compression/degree",
-        format!(
+    DelightQLError::from(Compression::Degree {
+        message: format!(
             "'{}' stands where ONE value stands and publishes {width} columns; the \
              compression guarantees one row, not one column",
             identifier.name.as_str()
         ),
-        "project the column the value is — `…:( |> (the_column), #<1)` — or reduce to it",
-    )
+    })
 }
 
 fn opaque_heading(identifier: &ast_unresolved::QualifiedName) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "compression/degree",
-        format!(
+    DelightQLError::from(Compression::Degree {
+        message: format!(
             "'{}' stands where ONE value stands and its heading is not published by the \
              target, so its width is unknown; unknown never means one",
             identifier.name.as_str()
         ),
-        "project the column the value is — `…:( |> (the_column), #<1)` — or declare the \
-         relation's dimensions at its mention",
-    )
+    })
 }

@@ -2,7 +2,7 @@
 -- Executed at the END of sync_bin_cartridges_to_bootstrap — per-functor
 -- rules reference entity rows by id, and entity ids are session-local
 -- insertion order, so the seed resolves them by (name, type) subselect.
--- Idempotent via NOT EXISTS (sync runs on init AND reinit).
+-- Idempotent via NOT EXISTS; sync runs once, at canonical construction.
 --
 -- +like → ILIKE on postgres/duckdb: a FIDELITY rule, not a spelling
 -- preference. Canonical (SQLite) LIKE is case-insensitive for ASCII;

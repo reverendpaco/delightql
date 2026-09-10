@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 delightql-protocol = { path = "../delightql-protocol" }
 delightql-types = { path = "../delightql-types" }
+delightql-backends = { path = "../delightql-backends", default-features = false, features = ["sqlite"] }
 rusqlite.workspace = true
 
 [dev-dependencies]

@@ -45,7 +45,7 @@ The F-PIPE sigil `/->`{.delightql .sigil} composes functions left to right:
 
 ```delightql
 employee(*), length:(LastName) > 5
-  |> +( LastName /-> upper:() |-> trim:() as CapitalizedLastName)
+  |> +( LastName /-> upper:() /-> trim:() as CapitalizedLastName)
 ```
 
 
@@ -65,24 +65,17 @@ The LAMBDA sigil `:( )`{.delightql .sigil} creates an inline function. The `@` m
 
 ```delightql
 employee(*), length:(LastName) > 5
-    |> +(  BirthDate /-> strftime:("%Y",@) |-> :( @ + 2) as BirthYearPlusTwo,
-           BirthDate /-> strftime:("%Y",@) |-> sqrt:() as SqrtOfBirthYear)
+    |> +(  BirthDate /-> strftime:("%Y",@) /-> :( @ + 2) as BirthYearPlusTwo,
+           BirthDate /-> strftime:("%Y",@) /-> sqrt:() as SqrtOfBirthYear)
 ```
 
-Use the F-PIPE-END `/->>`{.delightql .sigil}   if you want the implicit parameter to be piped to the *last* argument.
-
-```delightql
-employee(*), length:(LastName) > 5
-    |> +(  BirthDate /->> strftime:("%Y") |-> :( @ + 2) as BirthYearPlusTwo,
-           BirthDate /->> strftime:("%Y") |-> sqrt:() as SqrtOfBirthYear)
-```
 
 A lambda has an alternate spelling where a programmer may name the parameter coming in:
 
 ```delightql
 employee(*), length:(LastName) > 5
-    |> +(  BirthDate /->> strftime:("%Y") |-> :(|bday| bday + 2) as BirthYearPlusTwo,
-           BirthDate /->> strftime:("%Y") |-> sqrt:() as SqrtOfBirthYear)
+    |> +(  BirthDate /-> strftime:("%Y") /-> :(|bday| bday + 2) as BirthYearPlusTwo,
+           BirthDate /-> strftime:("%Y") /-> sqrt:() as SqrtOfBirthYear)
 ```
 
 Use the **LAMBDA-PARAM** `|  |` to capture and name the input variable as the named parameter.

@@ -12,12 +12,12 @@ use std::sync::Arc;
 use delightql_cli::exec_ng::run_dql_query;
 use delightql_cli::client::context::Mode;
 use delightql_cli::client::database::{ClientDatabase, InputKind, InputOutcome, WriteOutcome};
-use delightql_cli::client::mount::{install_repl_namespace, open_client_handle};
+use delightql_cli::client::mount::install_repl_namespace;
+use delightql_cli::connection::{open_handle, SessionProfile};
 
 fn live() -> (Arc<ClientDatabase>, Box<dyn delightql_core::api::DqlHandle>) {
     let db = Arc::new(ClientDatabase::open_on(Mode::Other).expect("open the live database"));
-    let mut handle = open_client_handle(&db).expect("open the repl handle");
-    install_repl_namespace(&mut *handle).expect("install repl::*");
+    let handle = open_handle(SessionProfile::Client(Some(db.clone()))).expect("open the repl handle");
     (db, handle)
 }
 
@@ -309,8 +309,7 @@ fn the_bug_tarball_carries_the_session_files_and_the_client_database() {
     std::fs::write(user_db.path(), b"").unwrap();
 
     let db = Arc::new(ClientDatabase::open_on(Mode::Other).unwrap());
-    let mut handle = open_client_handle(&db).expect("handle");
-    install_repl_namespace(&mut *handle).expect("install repl::*");
+    let mut handle = open_handle(SessionProfile::Client(Some(db.clone()))).expect("handle");
     let (id, _) = db.record_input(InputKind::Dql, "users(*)");
     db.close_input(id, InputOutcome::Succeeded, None, Some("SELECT 1".into()), Some(1.0));
 

@@ -30,6 +30,15 @@ pub struct Statement {
     pub headings: Vec<Vec<ColId>>,
     /// Every column this statement references.
     pub refs: Vec<ColId>,
+    /// THE SCOPES THIS STATEMENT BINDS AT STATEMENT LEVEL — its `WITH`
+    /// names. Unlike a FROM-item alias, which reaches only its own item,
+    /// one of these stands over every relation name the statement writes.
+    pub bindings: Vec<ScopeId>,
+    /// EVERY CATALOG RELATION THIS STATEMENT READS. Their spellings are
+    /// the catalog's and cannot be arbitrated, so they hold their
+    /// characters against the bindings above: a binding that took one
+    /// would capture the read.
+    pub entities: Vec<EntityId>,
 }
 
 /// The open/reserved naming states a bundle passes through. Uninhabited:
@@ -303,6 +312,28 @@ pub(super) fn baptise_with_policy<'r>(
         .chain(authored_reserved.iter().cloned())
         .collect();
 
+    // THE CATALOG SPELLINGS THIS BUNDLE ACTUALLY WRITES. They are the
+    // characters an engine resolves a bare relation name to, and nothing
+    // here can change them, so a statement-level binding must not take
+    // one: `WITH emp AS (…)` standing over a read of the table `emp`
+    // captures that read, and a body that selected the table by identity
+    // would be answered by the caller's binding instead.
+    //
+    // A FROM-item alias is not in this space — it reaches only its own
+    // item — which is why an authored occurrence of the catalog object
+    // itself keeps its spelling.
+    let spelled_entities: HashSet<Vec<u8>> = bundle
+        .statements
+        .iter()
+        .flat_map(|statement| statement.entities.iter())
+        .filter_map(|entity| reg.entity_binding_key(*entity))
+        .collect();
+    let bindings: HashSet<ScopeId> = bundle
+        .statements
+        .iter()
+        .flat_map(|statement| statement.bindings.iter().copied())
+        .collect();
+
     let mut scopes: HashMap<ScopeId, String> = HashMap::new();
     let mut cols: HashMap<ColId, (String, bool)> = HashMap::new();
     let mut reports: HashMap<ScopeId, String> = HashMap::new();
@@ -409,7 +440,6 @@ pub(super) fn baptise_with_policy<'r>(
                     },
                     ScopeKind::SetArm { .. } => "arm",
                     ScopeKind::Resolution { .. } => "r",
-                    ScopeKind::ErHop { .. } => "hop",
                     ScopeKind::HoCarrier { .. } => "ho",
                     ScopeKind::Scratch { .. } => "scratch",
                     ScopeKind::Interior => "int",
@@ -433,9 +463,16 @@ pub(super) fn baptise_with_policy<'r>(
         } else if authored.is_some() {
             // Catalog reservation means "do not invent this spelling", not
             // "rename an authored occurrence of the catalog object itself".
-            // Authored scopes arbitrate only with other authored scopes, then
-            // reserve their chosen spelling against every later invention.
-            let name = uniquify(&mut authored_used, base);
+            // Authored scopes arbitrate only with other authored scopes —
+            // and, when the scope is a statement-level binding, with the
+            // catalog spellings this bundle writes, which cannot move.
+            // Then they reserve their chosen spelling against every later
+            // invention.
+            let name = if bindings.contains(&scope) {
+                uniquify_against(&mut authored_used, &spelled_entities, base)
+            } else {
+                uniquify(&mut authored_used, base)
+            };
             used.insert(canonical_key(&name));
             name
         } else {
@@ -563,13 +600,23 @@ pub(super) fn baptise_with_policy<'r>(
 }
 
 fn uniquify(used: &mut HashSet<Vec<u8>>, base: String) -> String {
-    if used.insert(canonical_key(&base)) {
+    uniquify_against(used, &HashSet::new(), base)
+}
+
+/// The same arbitration, against one more set of names that cannot move —
+/// the catalog spellings the bundle writes. They are never inserted into
+/// `used`: they are not this pass's to allocate, and an entity is free to
+/// appear as many times as the statement reads it.
+fn uniquify_against(used: &mut HashSet<Vec<u8>>, fixed: &HashSet<Vec<u8>>, base: String) -> String {
+    let key = canonical_key(&base);
+    if !fixed.contains(&key) && used.insert(key) {
         return base;
     }
     let mut i = 2u32;
     loop {
         let candidate = format!("{}_{}", base, i);
-        if used.insert(canonical_key(&candidate)) {
+        let key = canonical_key(&candidate);
+        if !fixed.contains(&key) && used.insert(key) {
             return candidate;
         }
         i += 1;

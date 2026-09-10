@@ -457,13 +457,23 @@ fn get_history_path() -> Option<PathBuf> {
 
         // Try to create config directory if it doesn't exist
         if let Err(e) = fs::create_dir_all(config_dir) {
-            crate::client::incident::warning("config", crate::client::incident::hierarchy::CONFIG, format!("failed to create the config directory: {e}"));
+            crate::client::incident::warning(
+                "config",
+                delightql_types::diagnostic::Client::Config {
+                    message: format!("failed to create the config directory: {e}"),
+                },
+            );
             return None;
         }
 
         Some(config_dir.join("history"))
     } else {
-        crate::client::incident::warning("config", crate::client::incident::hierarchy::CONFIG, "could not determine the config directory for history".to_string());
+        crate::client::incident::warning(
+            "config",
+            delightql_types::diagnostic::Client::Config {
+                message: "could not determine the config directory for history".to_string(),
+            },
+        );
         None
     }
 }
@@ -493,7 +503,14 @@ pub fn run_interactive_with_connection(
     ctrlc::set_handler(|| {
         QUERY_INTERRUPTED.store(true, Ordering::Relaxed);
     })
-    .unwrap_or_else(|e| crate::client::incident::warning("terminal", crate::client::incident::hierarchy::TERMINAL, format!("could not set the Ctrl-C handler: {e}")));
+    .unwrap_or_else(|e| {
+        crate::client::incident::warning(
+            "terminal",
+            delightql_types::diagnostic::Client::Terminal {
+                message: format!("could not set the Ctrl-C handler: {e}"),
+            },
+        )
+    });
 
     // Initialize syntax highlighter with config (if prettify feature enabled)
     #[cfg(feature = "prettify")]
@@ -669,7 +686,12 @@ pub fn run_interactive_with_connection(
     if let Some(history_path) = get_history_path() {
         if history_path.exists() {
             if let Err(e) = rl.load_history(&history_path) {
-                crate::client::incident::warning("config", crate::client::incident::hierarchy::CONFIG, format!("failed to load history: {e}"));
+                crate::client::incident::warning(
+                    "config",
+                    delightql_types::diagnostic::Client::Config {
+                        message: format!("failed to load history: {e}"),
+                    },
+                );
             }
         }
     }
@@ -872,7 +894,12 @@ pub fn run_interactive_with_connection(
                 break;
             }
             Err(err) => {
-                crate::client::incident::error("terminal", crate::client::incident::hierarchy::TERMINAL, format!("error reading line: {err}"));
+                crate::client::incident::error(
+                    "terminal",
+                    delightql_types::diagnostic::Client::Terminal {
+                        message: format!("error reading line: {err}"),
+                    },
+                );
                 break;
             }
         }
@@ -881,7 +908,12 @@ pub fn run_interactive_with_connection(
     // Save history
     if let Some(history_path) = get_history_path() {
         if let Err(e) = rl.save_history(&history_path) {
-            crate::client::incident::warning("config", crate::client::incident::hierarchy::CONFIG, format!("failed to save history: {e}"));
+            crate::client::incident::warning(
+                "config",
+                delightql_types::diagnostic::Client::Config {
+                    message: format!("failed to save history: {e}"),
+                },
+            );
         }
     }
 
@@ -912,4 +944,3 @@ fn process_input(
         Ok(CommandResult::Continue)
     }
 }
-

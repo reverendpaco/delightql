@@ -204,16 +204,16 @@ mod lifecycle {
         let relation = registry
             .authority()
             .derive(crate::relation::RelForm::Anonymous(
-                crate::relation::form::AnonymousSpec {
-                    shape: crate::relation::form::AnonymousShape::Tabular,
-                    slots: &[crate::relation::form::AnonymousSlot::Binder {
+                crate::relation::form::AnonymousSpec::plain(
+                    crate::relation::form::AnonymousShape::Tabular,
+                    &[crate::relation::form::AnonymousSlot::Binder {
                         position: 0,
                         named,
                         declared_type: None,
                         shape: crate::names::ValueShape::Unknown,
                     }],
-                    answers_to: None,
-                },
+                    None,
+                ),
             ))
             .unwrap();
         let port = crate::relation::published_ports(&registry, &relation).unwrap()[0];

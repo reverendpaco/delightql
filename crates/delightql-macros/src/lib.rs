@@ -4,8 +4,22 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Lit};
 
+mod taxon;
+
+/// Derive the diagnostic-hierarchy machinery for one nested enum of the
+/// error taxonomy. See `taxon.rs` for the attribute grammar. The generated
+/// code names `crate::taxon::…`, so the deriving crate exposes that module.
+#[proc_macro_derive(Taxon, attributes(taxon, family, leaf, external, carrier))]
+pub fn derive_taxon(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match taxon::derive(input) {
+        Ok(tokens) => TokenStream::from(tokens),
+        Err(error) => TokenStream::from(error.to_compile_error()),
+    }
+}
+
 /// Derive macro for the ToLispy trait
-/// 
+///
 /// # Basic usage:
 /// ```
 /// #[derive(ToLispy)]
@@ -13,7 +27,7 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, Lit};
 ///     Relational(RelationalExpression),
 /// }
 /// ```
-/// 
+///
 /// # With custom names:
 /// ```
 /// #[derive(ToLispy)]
@@ -29,10 +43,10 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, Lit};
 pub fn derive_to_lispy(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
-    
+
     // Extract generics to support types like RelationalExpression<Phase>
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    
+
     let implementation = match &input.data {
         Data::Enum(data_enum) => {
             // Generate match arms for each variant
@@ -107,7 +121,7 @@ pub fn derive_to_lispy(input: TokenStream) -> TokenStream {
                     }
                 }
             });
-            
+
             quote! {
                 impl #impl_generics ToLispy for #name #ty_generics #where_clause {
                     fn to_lispy(&self) -> String {
@@ -120,16 +134,14 @@ pub fn derive_to_lispy(input: TokenStream) -> TokenStream {
         }
         Data::Struct(data_struct) => {
             // Get struct's lispy name
-            let lispy_name = get_lispy_name(&input.attrs)
-                .unwrap_or_else(|| camel_to_snake(&name.to_string()));
-            
+            let lispy_name =
+                get_lispy_name(&input.attrs).unwrap_or_else(|| camel_to_snake(&name.to_string()));
+
             match &data_struct.fields {
                 Fields::Named(fields) => {
                     // Regular struct with named fields
-                    let field_names: Vec<_> = fields.named.iter()
-                        .map(|f| &f.ident)
-                        .collect();
-                    
+                    let field_names: Vec<_> = fields.named.iter().map(|f| &f.ident).collect();
+
                     if field_names.is_empty() {
                         quote! {
                             impl #impl_generics ToLispy for #name #ty_generics #where_clause {
@@ -181,13 +193,14 @@ pub fn derive_to_lispy(input: TokenStream) -> TokenStream {
             panic!("ToLispy does not support unions")
         }
     };
-    
+
     TokenStream::from(implementation)
 }
 
 /// Extract the lispy name from #[lispy("name")] attribute
 fn get_lispy_name(attrs: &[syn::Attribute]) -> Option<String> {
-    attrs.iter()
+    attrs
+        .iter()
         .find(|attr| attr.path().is_ident("lispy"))
         .and_then(|attr| {
             attr.parse_args::<Lit>().ok().and_then(|lit| {
@@ -204,7 +217,7 @@ fn get_lispy_name(attrs: &[syn::Attribute]) -> Option<String> {
 fn camel_to_snake(s: &str) -> String {
     let mut result = String::new();
     let mut prev_upper = false;
-    
+
     for (i, ch) in s.chars().enumerate() {
         if ch.is_uppercase() && i > 0 && !prev_upper {
             result.push('_');
@@ -212,6 +225,6 @@ fn camel_to_snake(s: &str) -> String {
         result.push(ch.to_lowercase().next().unwrap());
         prev_upper = ch.is_uppercase();
     }
-    
+
     result
 }

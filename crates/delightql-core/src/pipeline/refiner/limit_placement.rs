@@ -18,6 +18,7 @@
 //
 // Set-op + limit handling lives in the set-op branch pass, not here.
 
+use crate::diagnostic::{DelightQLError, Interior};
 use crate::error::Result;
 use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern as CoreInnerRelationPattern;
 use crate::pipeline::asts::resolved::{
@@ -119,6 +120,11 @@ fn classify(step: Step) -> std::result::Result<ChainStep, Step> {
         Continuation::Access { .. } => Ok(ChainStep::Access(step)),
         Continuation::Pipe { .. } => Ok(ChainStep::Pipe(step)),
         Continuation::Restrict { .. } => Ok(ChainStep::Filter(step)),
+        // The restriction the enclosing join evaluates observes the rows a
+        // bound before it chose exactly as any restriction does, so it seals
+        // that bound; and it lands back where it was minted, because a
+        // sealing wrap republishes the relation it wrapped.
+        Continuation::Correlated(_) => Ok(ChainStep::Filter(step)),
         Continuation::Bound { bound } => {
             let bound = bound.clone();
             Ok(ChainStep::Bound(bound))
@@ -161,6 +167,7 @@ fn linearizes(form: &Continuation) -> bool {
         Continuation::Access { .. }
             | Continuation::Pipe { .. }
             | Continuation::Restrict { .. }
+            | Continuation::Correlated(_)
             | Continuation::Bound { .. }
             | Continuation::Destructure { .. }
             | Continuation::Structural(_)
@@ -423,6 +430,27 @@ fn offset_value(step: &ChainStep) -> Option<i64> {
     }
 }
 
+/// Whether a correlated restriction stands in this chain's own run or in a
+/// member's right arm — the steps the interior's classification would take
+/// out. A bag arm cannot carry one (the set refused at construction) and a
+/// nested interior's head owns its own, so neither is entered.
+#[stacksafe::stacksafe]
+fn carries_correlation(expr: &Chain) -> bool {
+    expr.continuations().iter().any(|step| match step.form() {
+        Continuation::Correlated(_) => true,
+        Continuation::Member { rhs, .. } => carries_correlation(rhs),
+        Continuation::Access { .. }
+        | Continuation::Restrict { .. }
+        | Continuation::Bound { .. }
+        | Continuation::Correlate { .. }
+        | Continuation::Destructure { .. }
+        | Continuation::BagOp { .. }
+        | Continuation::Pipe { .. }
+        | Continuation::ErJoin(_)
+        | Continuation::Structural(_) => false,
+    })
+}
+
 /// True if `expr` carries a row bound — arbitrary or ordered — anywhere
 /// along its top-level pipe/filter chain (without descending into joins,
 /// set-ops, or inner-relation subqueries — those are sealed contexts).
@@ -441,6 +469,26 @@ fn branch_has_top_level_limit(expr: &Chain) -> bool {
 /// then asked the interior top-N road to prove a partition over correlations
 /// that were never the wrap's.
 fn wrap_as_indeterminate(inner: Chain, identities: &Planning) -> Result<Chain> {
+    // A CORRELATION CANNOT BE SEALED. The wrap is a boundary of its own —
+    // an uncorrelated derived table the pattern classifier does not open —
+    // so a correlated restriction standing inside it would never be taken
+    // out and hoisted to the join that evaluates it, and the per-outer-row
+    // ranking the bound needs would have to be restaged inside the seal.
+    // That realization is not available here; the interior refuses,
+    // naming the operation, rather than ranking the wrong population or
+    // failing further in.
+    if carries_correlation(&inner) {
+        return Err(DelightQLError::from(Interior::CorrelationSupport {
+            message: "a correlated interior cannot carry its correlation through a bound that a \
+                      later step observes: the rows the bound chooses are ranked per outer row \
+                      at the enclosing join, and a step written after the bound that drops, \
+                      reorders or collapses those rows would need that ranking sealed inside a \
+                      nested derived table the join cannot see into — write the step before \
+                      the bound, keep every step after the bound row-preserving, or state the \
+                      correlation outside the interior"
+                .to_string(),
+        }));
+    }
     let identifier = QualifiedName {
         namespace_path: NamespacePath::empty(),
         name: SqlIdentifier::from("__dql_limit_wrap"),

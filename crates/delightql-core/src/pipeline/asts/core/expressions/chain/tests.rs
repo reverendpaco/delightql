@@ -159,7 +159,7 @@ fn source_spine_stops_at_a_bag_operation_and_at_an_edge() {
     let over_edge = restrict(sentinel("a").then(Step::authored(Continuation::ErJoin(
         ErJoinStep {
             transitive: false,
-            context: Some("ctx".to_string()),
+            context: "ctx".to_string(),
             left_spelling: "a".to_string(),
             right_spelling: "b".to_string(),
             rhs: Chain::read(

@@ -125,6 +125,9 @@ pub struct SourceSlot {
     /// The catalog's type spelling. SQL type syntax, not an identifier, so
     /// it travels as value data and is never interned as a name.
     pub declared_type: Option<String>,
+    /// The catalog recorded this dimension as an interior relation: the
+    /// value is a nested payload and embeds as one.
+    pub interior: bool,
 }
 
 #[derive(Debug)]
@@ -154,7 +157,11 @@ pub enum AnonymousShape {
 /// hygienic; no caller can combine those dispositions with another origin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnonymousSlot {
-    /// A header lvar introduces a named position.
+    /// A header lvar introduces a named position. Whether the spelling
+    /// REUSES a live position of the row the relation is composed with is
+    /// not the slot's to say: that edge is judged by the lexical authority
+    /// and rides only inside a [`JudgedHeading`], beside the slot it was
+    /// judged for.
     Binder {
         position: u32,
         named: Spelling,
@@ -188,11 +195,75 @@ pub enum AnonymousSlot {
     },
 }
 
+/// The anonymous form. Private fields: a spec that carries reuse edges
+/// exists only inside [`AnonymousSpec::born_judged`], for the one derivation
+/// the authored-header birth performs, and every other road builds a plain
+/// one that reuses nothing.
 #[derive(Debug)]
 pub struct AnonymousSpec<'a> {
-    pub shape: AnonymousShape,
-    pub slots: &'a [AnonymousSlot],
-    pub answers_to: Option<Spelling>,
+    shape: AnonymousShape,
+    slots: &'a [AnonymousSlot],
+    answers_to: Option<Spelling>,
+    /// One entry per slot where a heading was judged; empty otherwise.
+    reuses: &'a [Option<PortId>],
+}
+
+impl<'a> AnonymousSpec<'a> {
+    /// A heading no lexical judgment made: it reuses nothing.
+    pub fn plain(
+        shape: AnonymousShape,
+        slots: &'a [AnonymousSlot],
+        answers_to: Option<Spelling>,
+    ) -> Self {
+        AnonymousSpec {
+            shape,
+            slots,
+            answers_to,
+            reuses: &[],
+        }
+    }
+
+    /// THE ONE BIRTH OF AN AUTHORED HEADER ROW. The slots and the reuse
+    /// edges beside them are the pairs one lexical judgment made, and this
+    /// derives them ONCE, on the authority that judged them: the spec is
+    /// built here, spent in the same expression, and never handed out. The
+    /// proof is minted only by the authored-header birth, so no other road
+    /// can bring judged ingredients here.
+    pub(crate) fn born_judged(
+        planning: &super::Planning,
+        positions: Vec<(AnonymousSlot, Option<PortId>)>,
+        answers_to: Option<Spelling>,
+        _proof: crate::pipeline::resolver::JudgedBirth,
+    ) -> crate::error::Result<SemanticRelation> {
+        let (slots, reuses): (Vec<AnonymousSlot>, Vec<Option<PortId>>) =
+            positions.into_iter().unzip();
+        planning
+            .authority()
+            .derive(super::RelForm::Anonymous(AnonymousSpec {
+                shape: AnonymousShape::Tabular,
+                slots: &slots,
+                answers_to,
+                reuses: &reuses,
+            }))
+    }
+
+    pub fn shape(&self) -> AnonymousShape {
+        self.shape
+    }
+
+    pub fn slots(&self) -> &'a [AnonymousSlot] {
+        self.slots
+    }
+
+    pub fn answers_to(&self) -> Option<Spelling> {
+        self.answers_to
+    }
+
+    /// The live port the slot at `position` reuses, as judged — read by the
+    /// mint act alone.
+    pub(super) fn reuse_at(&self, position: usize) -> Option<PortId> {
+        self.reuses.get(position).copied().flatten()
+    }
 }
 
 // ----------------------------------------------------- transparent/export
@@ -218,8 +289,6 @@ pub enum ExportWhy {
     Stage,
     /// A `WITH` binding.
     Cte { role: CteWhy, label: CteLabelWhy },
-    /// One hop of an entity-relationship chain.
-    ErHop { hop: u16 },
     /// The SQL-hygiene re-alias of a join operand. An alias by ownership,
     /// answering to nothing.
     EmissionAlias,
@@ -308,11 +377,6 @@ pub struct ProjectSpec<'a> {
     pub input: SemanticRelation,
     pub why: ProjectWhy,
     pub slots: &'a [ProjectSlot],
-    /// Input positions the result does NOT publish and a later operation
-    /// still reads — a hoisted correlation's carrier. Lowering emits them
-    /// as physical support beside the published list; nothing addresses
-    /// them by name.
-    pub dependencies: &'a [PortId],
 }
 
 /// One endpoint position an ER edge boundary exports.
@@ -690,9 +754,11 @@ pub struct NarrowSpec<'a> {
 #[derive(Debug)]
 pub struct InteriorSpec {
     /// The column that owns this interior. Atomic with the back-link: a
-    /// column owns exactly one interior.
-    pub owner: PortId,
-    pub body: SemanticRelation,
+    /// column owns exactly one interior. Constructed only inside the
+    /// relation authority: the act that mints an owner is the act that
+    /// states its child.
+    pub(in crate::relation) owner: PortId,
+    pub(in crate::relation) body: SemanticRelation,
 }
 
 #[derive(Debug)]

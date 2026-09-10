@@ -162,15 +162,9 @@ fn measure() -> Measurement {
 /// fails here rather than being absorbed into a percentage.
 const REFUSED_BY_LAW: &[(&str, usize)] = &[
     // Exact `_` is reserved deixis: never an authored name, bare or
-    // stropped. The two cells are the pinned refusal witnesses.
-    ("delightql-error://semantic/identifier/deixis", 2),
-    // A reserved word is an identifier only when stropped; the inventory is
-    // the declared union in `names::identifier`. The two cells are the
-    // pinned refusal witnesses; every other corpus source spells its
-    // reserved names stropped.
-    // The third is the anon-header witness; the fourth is the dedicated
-    // relation-position witness, now refused at this boundary before lookup.
-    ("delightql-error://semantic/identifier/keyword", 4),
+    // stropped. Two alias cells pin the refusal, and the keyword ball's
+    // control pins that the keyword repeal did not release it.
+    ("delightql-error://semantic/identifier/deixis", 3),
     // THE SET IS CLOSED: `(~~emit …~~)` is reserved room.
     ("delightql-error://semantic/annotation/reserved", 4),
     // `equals` is assertion SYNTAX: binary, and only inside an assertion.
@@ -232,8 +226,12 @@ const REFUSED_BY_LAW: &[(&str, usize)] = &[
     ("delightql-error://parse/danger/unknown", 5),
     ("delightql-error://parse/config/unknown", 5),
     // NO PRECEDENCE: an infix composition standing as a function pipe's
-    // source has two readings and the language picks neither.
-    ("delightql-error://parse/pony", 4),
+    // source has two readings and the language picks neither (two cells), and
+    // a run mixing `and` with `or` is recognized only as the grammar's
+    // refusal witness and refused here (the two query cells and the one
+    // consulted body of blind_composition_20260909). Mixed operators never
+    // parse, so those files are outside the admitted set counted here.
+    ("delightql-error://parse/pony", 5),
     // THE RETIRED GLYPHS: `==` and `!==` are not tokens; the two cells are
     // the pinned refusal witnesses, each teaching `=`/`!=` beside the
     // explicit `+sql_eq`/`+sql_ne` prelude predicate.
@@ -308,6 +306,11 @@ const REFUSED_BY_LAW: &[(&str, usize)] = &[
         "delightql-error://semantic/resolution/choe/head_agreement",
         3,
     ),
+    // An edge body outside the simple shape refuses at declaration. The
+    // witnesses: er_composition's nineteen refusal cells, grounding's seven,
+    // the query-local-binding cell in cte_heads, and the bare-declaration
+    // control in er_default_context.
+    ("delightql-error://semantic/grounding/er/body_shape", 27),
 ];
 
 /// The DEFERRALS: lawful forms the surviving AST has no carrier for. The

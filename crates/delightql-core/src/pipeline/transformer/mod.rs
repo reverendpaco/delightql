@@ -17,6 +17,7 @@
 
 mod anchors;
 pub mod builder;
+mod collected_windows;
 mod descend;
 mod dml;
 mod plan;
@@ -27,6 +28,7 @@ mod tree_group;
 
 pub use plan::Mutation;
 
+use crate::diagnostic::{DelightQLError, Dml};
 use crate::error::Result;
 use crate::pipeline::asts::refined as ast_refined;
 use crate::pipeline::sql_ast::{QueryExpression, SqlStatement};
@@ -73,13 +75,18 @@ pub(crate) struct TransformCtx {
 impl TransformCtx {
     /// Create a child context for a correlated subquery.
     ///
-    /// The outer scope's columns are captured so that `s_lower_lvar` can
-    /// resolve correlated references without a caller-side passthrough.
+    /// The enclosing level's exact sites are captured so that a correlated
+    /// reference is answered by the site that emits its occurrence. EVERY
+    /// ENCLOSING LEVEL STAYS VISIBLE: a subquery inside a subquery may name
+    /// the outermost row, so the sites this level reaches stand ahead of
+    /// the ones already visible around it rather than replacing them.
     pub(super) fn with_outer_scope(&self, qualify: &dyn builder::Qualify) -> TransformCtx {
+        let mut outer_sites = qualify.sql_sites();
+        outer_sites.extend(self.outer_sites.iter().copied());
         TransformCtx {
             relations: self.relations.clone(),
             identities: std::rc::Rc::clone(&self.identities),
-            outer_sites: qualify.sql_sites(),
+            outer_sites,
             names: self.names.fork(),
             danger_gates: self.danger_gates.clone(),
         }
@@ -155,12 +162,11 @@ impl Lowered {
         if self.obligations.is_empty() && self.prepare.is_empty() {
             return Ok(self.statement);
         }
-        Err(crate::error::DelightQLError::validation_error_categorized(
-            "dml/plan/unrunnable_obligation",
-            "this statement may not run without a check that only the effect \
-             plan can perform, and this road executes statements alone",
-            "run the mutation as a query rather than compiling it to SQL",
-        ))
+        Err(DelightQLError::from(Dml::PlanUnrunnableObligation {
+            message: "this statement may not run without a check that only the effect \
+             plan can perform, and this road executes statements alone"
+                .to_string(),
+        }))
     }
 }
 

@@ -21,9 +21,7 @@
 
 mod analyzer;
 mod bag;
-pub(crate) mod carry;
 mod cdt_wj_rewriter;
-pub(crate) mod correlation_analyzer;
 mod flattener;
 mod laws;
 mod limit_placement;
@@ -34,6 +32,7 @@ mod rebuilder;
 mod settled;
 mod types;
 
+use crate::diagnostic::{Internal, ResolutionSetop, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::{walk_transform_relation, AstTransform, FoldAction};
 use crate::pipeline::asts::refined::Refined;
@@ -48,6 +47,29 @@ struct RefinerFold<'a> {
     is_top_level: bool,
     danger_gates: crate::pipeline::danger_gates::DangerGateMap,
     identities: &'a crate::relation::Planning,
+}
+
+impl<'a> RefinerFold<'a> {
+    /// The fold for a subtree the rebuilder crosses in an INNER context —
+    /// a predicate leaf, a call argument, a derived table's hoisted
+    /// condition — where it holds no fold of its own.
+    ///
+    /// THIS IS THE ONLY ROAD INTO THE REFINED PHASE. The walk carries a
+    /// chainless subtree mechanically and routes every chain inside it
+    /// through the hub, so a relation cannot cross the edge with its
+    /// segment unjudged: a separate carrying fold would answer for a
+    /// chain by copying it, and a member's condition copied across stays a
+    /// filter over the join it should correlate.
+    pub(super) fn inner(
+        danger_gates: crate::pipeline::danger_gates::DangerGateMap,
+        identities: &'a crate::relation::Planning,
+    ) -> Self {
+        RefinerFold {
+            is_top_level: false,
+            danger_gates,
+            identities,
+        }
+    }
 }
 
 impl RefinerFold<'_> {
@@ -87,96 +109,96 @@ impl RefinerFold<'_> {
     fn refine_bag_chain(&mut self, expr: resolved::Chain) -> Result<refined::Chain> {
         let expr = self.claim_bag_correlations(expr)?;
         let peeled = expr.peel().map_err(|_| {
-            crate::error::DelightQLError::transformation_error(
-                "a chain standing on a bag step ends in a step or a predicate",
+            Internal::invariant(
                 "refiner",
+                "a chain standing on a bag step ends in a step or a predicate",
             )
         })?;
         match peeled.last().form() {
-            resolved::Continuation::Restrict { .. } => {
-                peeled.crossing(self, |walk, prefix, form, _| {
+            resolved::Continuation::Restrict { .. } => peeled.crossing(
+                self,
+                |walk, prefix| Ok(walk.transform_relational_action(prefix)?.into_inner()),
+                |walk, form, _| {
                     let resolved::Continuation::Restrict { condition, origin } = form else {
                         unreachable!("the step was just matched as a restriction")
                     };
-                    let source = walk.transform_relational_action(prefix)?.into_inner();
                     let condition =
                         rebuilder::refine_predicate_boolean(condition, &walk.identities)?;
-                    Ok((
-                        source,
-                        refined::Continuation::Restrict { condition, origin },
-                    ))
-                })
-            }
+                    Ok(refined::Continuation::Restrict { condition, origin })
+                },
+            ),
             resolved::Continuation::BagOp { .. } => {
-                peeled.crossing(self, |walk, prefix, form, carrier| {
-                    let resolved::Continuation::BagOp {
-                        operator,
-                        arm,
-                        correlation,
-                    } = form
-                    else {
-                        unreachable!("the step was just matched as a bag operation")
-                    };
-                    // Minus is minus: the left rows with no corresponding row in
-                    // the arm, duplicates preserved and nulls matching nulls.
-                    // That is the whole-tuple anti-semijoin, so a BARE minus is
-                    // a correlated minus whose predicate is filled in here —
-                    // bare and correlated never become two roads, and there is
-                    // no `EXCEPT` for the multiset law to be lost in.
-                    let correlation = match (correlation, operator) {
-                        (None, resolved::SetOperator::MinusCorresponding) => {
-                            Some(resolved::BagCorrelation {
-                                with_arm: crate::pipeline::asts::vocabulary::ArmIx::from_raw(0),
-                                predicate: resolved::CorrPred::Expression(
-                                    bag::whole_tuple_correlation(*carrier, &walk.identities)?,
-                                ),
-                                min_multiplicity: false,
-                            })
-                        }
-                        (correlation, _) => correlation,
-                    };
-                    // ONE CALL PER OPERAND, through the authority.
-                    let left = walk.refine_operand(prefix)?;
-                    let arm = walk.refine_operand(arm)?;
-                    let correlation = match correlation {
-                        Some(correlation) => Some(refined::BagCorrelation {
-                            with_arm: correlation.with_arm,
-                            // The whole-heading form travels WHOLE. It is not
-                            // expanded here and it is not a predicate to refine:
-                            // the mode it aligns by is what the lowering reads.
-                            predicate: match correlation.predicate {
-                                resolved::CorrPred::Expression(predicate) => {
-                                    refined::CorrPred::Expression(
-                                        rebuilder::refine_predicate_boolean(
-                                            predicate,
-                                            &walk.identities,
-                                        )?,
-                                    )
-                                }
-                                resolved::CorrPred::Whole(whole) => {
-                                    refined::CorrPred::Whole(match whole {
-                                        resolved::WholeHeading::ByName { left, right } => {
-                                            refined::WholeHeading::ByName { left, right }
-                                        }
-                                        resolved::WholeHeading::ByPosition { left, right } => {
-                                            refined::WholeHeading::ByPosition { left, right }
-                                        }
-                                    })
-                                }
-                            },
-                            min_multiplicity: correlation.min_multiplicity,
-                        }),
-                        None => None,
-                    };
-                    Ok((
-                        left,
-                        refined::Continuation::BagOp {
+                // ONE CALL PER OPERAND, through the authority: the left
+                // operand crosses first, as the prefix; the arm crosses
+                // inside the step's own form.
+                peeled.crossing(
+                    self,
+                    |walk, prefix| walk.refine_operand(prefix),
+                    |walk, form, carrier| {
+                        let resolved::Continuation::BagOp {
                             operator,
                             arm,
                             correlation,
-                        },
-                    ))
-                })
+                        } = form
+                        else {
+                            unreachable!("the step was just matched as a bag operation")
+                        };
+                        // Minus is minus: the left rows with no corresponding row in
+                        // the arm, duplicates preserved and nulls matching nulls.
+                        // That is the whole-tuple anti-semijoin, so a BARE minus is
+                        // a correlated minus whose predicate is filled in here —
+                        // bare and correlated never become two roads, and there is
+                        // no `EXCEPT` for the multiset law to be lost in.
+                        let correlation = match (correlation, operator) {
+                            (None, resolved::SetOperator::MinusCorresponding) => {
+                                Some(resolved::BagCorrelation {
+                                    with_arm: crate::pipeline::asts::vocabulary::ArmIx::from_raw(0),
+                                    predicate: resolved::CorrPred::Expression(
+                                        bag::whole_tuple_correlation(*carrier, &walk.identities)?,
+                                    ),
+                                    min_multiplicity: false,
+                                })
+                            }
+                            (correlation, _) => correlation,
+                        };
+                        let arm = walk.refine_operand(arm)?;
+                        let correlation = match correlation {
+                            Some(correlation) => Some(refined::BagCorrelation {
+                                with_arm: correlation.with_arm,
+                                // The whole-heading form travels WHOLE. It is not
+                                // expanded here and it is not a predicate to refine:
+                                // the mode it aligns by is what the lowering reads.
+                                predicate: match correlation.predicate {
+                                    resolved::CorrPred::Expression(predicate) => {
+                                        refined::CorrPred::Expression(
+                                            rebuilder::refine_predicate_boolean(
+                                                predicate,
+                                                &walk.identities,
+                                            )?,
+                                        )
+                                    }
+                                    resolved::CorrPred::Whole(whole) => {
+                                        refined::CorrPred::Whole(match whole {
+                                            resolved::WholeHeading::ByName { left, right } => {
+                                                refined::WholeHeading::ByName { left, right }
+                                            }
+                                            resolved::WholeHeading::ByPosition { left, right } => {
+                                                refined::WholeHeading::ByPosition { left, right }
+                                            }
+                                        })
+                                    }
+                                },
+                                min_multiplicity: correlation.min_multiplicity,
+                            }),
+                            None => None,
+                        };
+                        Ok(refined::Continuation::BagOp {
+                            operator,
+                            arm,
+                            correlation,
+                        })
+                    },
+                )
             }
             _ => unreachable!("a chain standing on a bag step ends in a step or a predicate"),
         }
@@ -342,13 +364,11 @@ impl RefinerFold<'_> {
             unreachable!("the run's steps are bag steps")
         };
         if correlation.is_some() {
-            return Err(DelightQLError::validation_error_categorized(
-                "resolution/setop/correlation_owner",
-                "two set-operation correlations land on the same operand, so \
-                     which one that operand is filtered by is unstated",
-                "correlate each operand with one earlier operand: \
-                     `x(*) as a ; y(*) as b ; z(*) as c, a.k = b.k, b.k = c.k`",
-            ));
+            return Err(DelightQLError::from(ResolutionSetop::CorrelationOwner {
+                message: "two set-operation correlations land on the same operand, so \
+                     which one that operand is filtered by is unstated"
+                    .to_string(),
+            }));
         }
         let operator = expr.bag_operator_at(owner).expect("the step is a bag step");
         *expr
@@ -365,13 +385,6 @@ impl RefinerFold<'_> {
 }
 
 impl AstTransform<Resolved, Refined> for RefinerFold<'_> {
-    fn fold_correlation_arm(
-        &mut self,
-        arm: crate::relation::SemanticRelation,
-    ) -> Result<crate::relation::SemanticRelation> {
-        Ok(arm)
-    }
-
     crate::pipeline::ast_transform::uninhabited_payload_folds!(
         fold_column_ordinal,
         fold_column_range,
@@ -382,11 +395,9 @@ impl AstTransform<Resolved, Refined> for RefinerFold<'_> {
         &mut self,
         _: crate::pipeline::asts::core::FormalHole,
     ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-        Err(crate::error::DelightQLError::validation_error_categorized(
-            "value/open/unapplied",
-            "a composition input stands outside any callable applying it",
-            "the position that applies an open body spends its slot",
-        ))
+        Err(DelightQLError::from(Semantic::ValueOpenUnapplied {
+            message: "a composition input stands outside any callable applying it".to_string(),
+        }))
     }
 
     fn fold_cover_callable(&mut self, callable: ()) -> crate::error::Result<()> {
@@ -400,7 +411,6 @@ impl AstTransform<Resolved, Refined> for RefinerFold<'_> {
         Ok(target)
     }
     crate::pipeline::ast_transform::decided_payload_travels_forward!(
-        fold_scope(crate::relation::SemanticRelation),
         fold_output(crate::relation::PortId),
         fold_scalar_output(crate::relation::PortId),
         fold_destructure(Vec<crate::pipeline::asts::core::DestructureMapping>),
@@ -482,15 +492,19 @@ impl RefinerFold<'_> {
                     ) || (matches!(rel, resolved::Relation::FunctorCall { call: _, .. })
                         && self.is_dml_call(rel));
                 if handled_whole {
-                    // The HEAD travels whole: its payload is refined and what
-                    // it publishes rides through the same scope fold every
-                    // phase-selected payload uses.
+                    // The HEAD travels whole: its payload is refined inside
+                    // the node, and what it publishes crosses unchanged —
+                    // a crossing is not the place a head acquires a
+                    // different relation.
                     let head = expr.head().clone();
-                    let resolved::GroundForm::Reference(rel) = head.form().clone() else {
-                        unreachable!("just matched a reference head")
-                    };
-                    let form = refined::GroundForm::Reference(self.transform_relation(rel)?);
-                    let refined_head = head.folded(self, form)?;
+                    let refined_head = head.crossing(|form| {
+                        let resolved::GroundForm::Reference(rel) = form else {
+                            unreachable!("just matched a reference head")
+                        };
+                        Ok(refined::GroundForm::Reference(
+                            self.refine_relation_head(rel)?,
+                        ))
+                    })?;
                     return Ok(FoldAction::Replaced(refined::Chain::ground(refined_head)));
                 }
             }
@@ -510,8 +524,9 @@ impl RefinerFold<'_> {
             let peeled = expr.peel().expect("just matched a trailing step");
             return Ok(FoldAction::Replaced(peeled.crossing(
                 self,
-                |walk, prefix, form, _| {
-                    let form = match form {
+                |walk, prefix| Ok(walk.transform_relational_action(prefix)?.into_inner()),
+                |walk, form, _| {
+                    Ok(match form {
                         resolved::Continuation::Bound { bound } => {
                             refined::Continuation::Bound { bound }
                         }
@@ -521,15 +536,15 @@ impl RefinerFold<'_> {
                             mode,
                             schema,
                         } => refined::Continuation::Destructure {
-                            source: Box::new(carry::domain(*source)?),
-                            pattern: carry::tree_pattern(pattern)?,
+                            source: Box::new(walk.transform_domain(*source)?),
+                            pattern: crate::pipeline::ast_transform::walk_transform_tree_pattern(
+                                walk, pattern,
+                            )?,
                             mode,
                             schema,
                         },
                         _ => unreachable!("just matched a bound or a destructure"),
-                    };
-                    let refined_source = walk.transform_relational_action(prefix)?.into_inner();
-                    Ok((refined_source, form))
+                    })
                 },
             )?));
         }
@@ -561,12 +576,16 @@ impl RefinerFold<'_> {
                                 operator,
                                 named: (),
                             } => refined::Continuation::Pipe {
-                                operator: walk.transform_operator(operator)?,
+                                operator: crate::pipeline::ast_transform::walk_transform_operator(
+                                    walk, operator,
+                                )?,
                                 named: (),
                             },
                             resolved::Continuation::Access { access, named: () } => {
                                 refined::Continuation::Access {
-                                    access: carry::access(access)?,
+                                    access: crate::pipeline::ast_transform::walk_transform_access(
+                                        walk, access,
+                                    )?,
                                     named: (),
                                 }
                             }
@@ -621,56 +640,63 @@ impl RefinerFold<'_> {
     }
 
     // -------------------------------------------------------------------------
-    // transform_relation — inline classification of InnerRelation patterns
+    // refine_relation_head — inline classification of InnerRelation patterns
     // -------------------------------------------------------------------------
     //
-    // This replaces the classify_patterns pre-pass. When encountering an
-    // Indeterminate InnerRelation, we classify it on the resolved subquery
-    // then convert to refined phase mechanically. The FAR cycle (via the
-    // rebuilder) handles real subquery refinement later.
-    //
-    // For already-classified patterns, walk_transform_inner_relation handles
-    // recursion into subqueries and correlation filters.
-    fn transform_relation(&mut self, rel: resolved::Relation) -> Result<refined::Relation> {
+    // THE REFINER'S OWN ROAD for a head that crosses whole, reached from the
+    // head's crossing and from nowhere a walk dispatches: the walk has no
+    // hook that answers with a head's structure, so this is not one. An
+    // indeterminate interior is classified here, over its descended body;
+    // then the interior's subquery is refined through THIS fold, so it
+    // reaches the routing hub like every other chain.
+    fn refine_relation_head(&mut self, rel: resolved::Relation) -> Result<refined::Relation> {
         match rel {
             resolved::Relation::InnerRelation {
                 pattern,
                 alias,
                 outer,
             } => {
-                let refined_pattern = match pattern {
+                let classified = match pattern {
                     resolved::InnerRelationPattern::Indeterminate {
                         identifier,
                         subquery,
                     } => {
-                        // Recursively classify nested InnerRelation patterns
-                        // in the subquery. This uses the fold's walk to descend
-                        // into operators and ConsultedView bodies — fixing the
-                        // classify_operator() no-op bug by construction.
-                        let classified_subquery = pattern_classifier::classify_patterns_via_fold(
+                        // THE REALIZATION IS THE CLASSIFICATION, over the
+                        // descended body: every interior nested in the
+                        // subquery is realized first, and the pattern is
+                        // classified over that body. The head crosses by
+                        // its own crossing below, so the realization is
+                        // opened here rather than judged by the carrier;
+                        // the body replacement it may hold was judged by
+                        // the authority all the same.
+                        let subquery = pattern_classifier::classify_patterns_via_fold(
                             *subquery,
                             &self.identities,
                         )?;
-
-                        // Classify the outer pattern on the classified subquery.
-                        let classified = pattern_classifier::classify_inner_relation_pattern(
+                        pattern_classifier::classify_inner_relation_pattern(
                             identifier,
-                            classified_subquery,
+                            subquery,
                             &self.identities,
-                        )?;
-
-                        // The subquery is refined later by the rebuilder
-                        // (FAR cycle), when this InnerRelation is reached in
-                        // a segment; nothing is decided about it here.
-                        carry::inner_relation(classified)?
+                        )?
+                        .into_pattern()
                     }
-                    already_classified => {
-                        // The subquery inside was classified by the pre-pass
-                        // or by an earlier fold invocation, so this one has
-                        // nothing left to decide.
-                        carry::inner_relation(already_classified)?
-                    }
+                    already_classified => already_classified,
                 };
+
+                // THE INTERIOR IS REFINED BEFORE THE HEAD CROSSES. Its
+                // subquery travels through this fold's hub, so the segment
+                // it holds is flattened, analyzed and rebuilt — a member's
+                // stated condition becomes that pair's correlation, and an
+                // interior nested in it is classified at its own crossing.
+                // A head standing alone reaches no enclosing segment
+                // afterwards, so nothing else would open this body: carried
+                // across unrefined, its member conditions stay filters over
+                // the finished join, and an optional member's condition in
+                // WHERE discards the rows the join padded.
+                let refined_pattern =
+                    crate::pipeline::ast_transform::walk_transform_inner_relation(
+                        self, classified,
+                    )?;
 
                 Ok(refined::Relation::InnerRelation {
                     pattern: refined_pattern,

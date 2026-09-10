@@ -122,7 +122,6 @@ impl ScratchRow {
     pub fn relation(&self) -> SemanticRelation {
         self.relation
     }
-
 }
 
 impl std::fmt::Debug for ScratchRow {
@@ -155,7 +154,7 @@ impl NamedScratch {
     pub fn under(
         row: ScratchRow,
         name: delightql_types::SqlIdentifier,
-        _witness: crate::pipeline::effect_transformer::ReceiptNaming,
+        _witness: crate::defuse::effect_body::ReceiptNaming,
     ) -> NamedScratch {
         NamedScratch { row, name }
     }
@@ -283,11 +282,11 @@ mod tests {
         let second = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         let theirs = first
             .authority()
-            .derive(RelForm::Anonymous(AnonymousSpec {
-                shape: AnonymousShape::Tabular,
-                slots: &[],
-                answers_to: None,
-            }))
+            .derive(RelForm::Anonymous(AnonymousSpec::plain(
+                AnonymousShape::Tabular,
+                &[],
+                None,
+            )))
             .expect("an anonymous relation is built");
 
         let ours = second.authority();
@@ -317,11 +316,11 @@ mod tests {
         let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         let built = registry
             .authority()
-            .derive(RelForm::Anonymous(AnonymousSpec {
-                shape: AnonymousShape::Tabular,
-                slots: &[],
-                answers_to: None,
-            }))
+            .derive(RelForm::Anonymous(AnonymousSpec::plain(
+                AnonymousShape::Tabular,
+                &[],
+                None,
+            )))
             .expect("an anonymous relation is built");
         let elsewhere = registry.authority();
         assert!(elsewhere.interface(&built).is_ok());
@@ -337,11 +336,11 @@ mod tests {
         let second = crate::relation::Planning::open(crate::names::Registry::new(&[]));
         let theirs = first
             .authority()
-            .derive(RelForm::Anonymous(AnonymousSpec {
-                shape: AnonymousShape::Tabular,
-                slots: &[],
-                answers_to: None,
-            }))
+            .derive(RelForm::Anonymous(AnonymousSpec::plain(
+                AnonymousShape::Tabular,
+                &[],
+                None,
+            )))
             .expect("an anonymous relation is built");
         let sealed = second.seal();
         assert!(sealed.interface(&theirs).is_err());

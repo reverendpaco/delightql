@@ -17,6 +17,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::DirectiveBinding;
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::*;
@@ -75,13 +76,12 @@ impl EffectExecutable for GroundPredicate {
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
         if arguments.len() != 3 {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(DirectiveBinding::Arity {
+                message: format!(
                     "ground!() expects 3 arguments (data_ns, lib_ns, new_ns_name), got {}",
                     arguments.len()
                 ),
-                "Invalid argument count",
-            ));
+            }));
         }
 
         let data_ns = extract_string_literal(&arguments[0], "data_ns")?;
@@ -89,10 +89,9 @@ impl EffectExecutable for GroundPredicate {
         let new_ns_name = extract_string_literal(&arguments[2], "new_ns_name")?;
 
         if data_ns.is_empty() || lib_ns.is_empty() || new_ns_name.is_empty() {
-            return Err(DelightQLError::database_error(
-                "ground!() arguments cannot be empty",
-                "Empty argument",
-            ));
+            return Err(DelightQLError::from(DirectiveBinding::Value {
+                message: "ground!() arguments cannot be empty".to_string(),
+            }));
         }
 
         let _count = system.ground_namespace(&data_ns, &lib_ns, &new_ns_name)?;
@@ -115,9 +114,8 @@ fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<Str
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
             Ok(s.clone())
         }
-        _ => Err(DelightQLError::database_error(
-            format!("ground!() {} must be a string literal", arg_name),
-            "Invalid argument type",
-        )),
+        _ => Err(DelightQLError::from(DirectiveBinding::Value {
+            message: format!("ground!() {} must be a string literal", arg_name),
+        })),
     }
 }

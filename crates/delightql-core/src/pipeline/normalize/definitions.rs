@@ -13,6 +13,7 @@
 //! category is read off the production rather than off the body.
 
 use super::Normalizer;
+use crate::diagnostic::{DdlHead, FactFunction, Internal, Parse, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::definitions::{
     name_conflict, Fixpoint, HeadItem, HeadItems, HoParam, Offered, ResidualMode, ResidualSignature,
@@ -135,12 +136,14 @@ impl<'t> Normalizer<'t> {
                                 // would silently overwrite the first, so it
                                 // refuses instead of last-wins.
                                 if context != ContextMode::None {
-                                    return Err(DelightQLError::validation_error_categorized(
-                                        "ddl/head/duplicate_context_marker",
-                                        "a signature declares its capture once — a second \
+                                    return Err(DelightQLError::from(
+                                        DdlHead::DuplicateContextMarker {
+                                            message:
+                                                "a signature declares its capture once — a second \
                                          context marker has nothing to add and would silently \
-                                         replace the first. Keep one marker",
-                                        "one context capture per signature",
+                                         replace the first. Keep one marker"
+                                                    .to_string(),
+                                        },
                                     ));
                                 }
                                 // THE MARKER LEADS. A context call supplies
@@ -294,7 +297,8 @@ impl<'t> Normalizer<'t> {
                 return Ok(format!("{}!", self.identifier(name).as_str()));
             }
         }
-        Err(DelightQLError::parse_error(
+        Err(Internal::invariant(
+            "normalize::definitions",
             "an effect identifier has a predicate identifier",
         ))
     }
@@ -432,20 +436,19 @@ impl<'t> Normalizer<'t> {
     /// positional call binds the captures first — so a marker declared after
     /// a parameter would silently reorder every call.
     pub(crate) fn context_marker_position_refusal() -> DelightQLError {
-        DelightQLError::validation_error_categorized(
-            "ddl/head/context_position",
-            "the context capture leads the signature — a `..` declared after a \
-             parameter would silently reorder every call",
-            "declare the capture first: `f:(..{cols}, rest…)`",
-        )
+        DelightQLError::from(DdlHead::ContextPosition {
+            message: "the context capture leads the signature — a `..` declared after a \
+             parameter would silently reorder every call"
+                .to_string(),
+        })
     }
 
     fn function_param(&mut self, node: cst::FunctionParam<'t>) -> Result<HoParam> {
         match node {
             // Handled by the head: a capture is not a parameter.
-            cst::FunctionParam::ContextMarker(_) => Err(DelightQLError::parse_error(
-                "a context marker declares a capture, not a parameter",
-            )),
+            cst::FunctionParam::ContextMarker(_) => Err(DelightQLError::from(Parse::General {
+                message: "a context marker declares a capture, not a parameter".to_string(),
+            })),
             cst::FunctionParam::CallableParam(param) => {
                 let name = self.require(param.name(), "a callable parameter has a name")?;
                 Ok(HoParam::Scalar {
@@ -533,15 +536,13 @@ impl<'t> Normalizer<'t> {
                 // elaborate to, so it refuses toward the header spelling
                 // rather than silently disappearing.
                 if row_offers.iter().flatten().any(Option::is_some) {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "ddl/head/parameterized_fact_offer",
-                        format!(
+                    return Err(DelightQLError::from(DdlHead::ParameterizedFactOffer {
+                        message: format!(
                             "'{subject}': a parameterized fact names its output positions \
                              in its header, not on its data — write \
                              `{subject}(…)(name, … ---- rows)`"
                         ),
-                        "a parameterized fact's heading is its header",
-                    ));
+                    }));
                 }
                 Ok(self.clause(
                     DefKind::HoView,
@@ -581,12 +582,11 @@ impl<'t> Normalizer<'t> {
                 // silently dropped from the declared head while the table
                 // keeps its width — so it refuses instead.
                 let cst::Slot::NamedReference(reference) = slot else {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "ddl/head/fact_header",
-                        "a parameterized fact's header names its output positions — \
-                         every header item is a column name",
-                        "a fact header item is a column name",
-                    ));
+                    return Err(DelightQLError::from(DdlHead::FactHeader {
+                        message: "a parameterized fact's header names its output positions — \
+                         every header item is a column name"
+                            .to_string(),
+                    }));
                 };
                 let column = self.authored_column(reference)?;
                 items.push(HeadItem::plumb(column.name));
@@ -803,15 +803,12 @@ impl<'t> Normalizer<'t> {
                 .map(SqlIdentifier::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(DelightQLError::validation_error_categorized(
-                "fact_function/output_reads_no_input",
-                format!(
+            return Err(DelightQLError::from(FactFunction::OutputReadsNoInput {
+                message: format!(
                     "a fact function output cell reads '{column}', which is not one of its \
                      declared inputs — those are {declared}"
                 ),
-                "an output is determined by the declared inputs: read one of them, or write \
-                 an expression over constants",
-            ));
+            }));
         }
         Ok(value)
     }
@@ -828,24 +825,35 @@ impl<'t> Normalizer<'t> {
         let left = self.require(node.left(), "an edge declares a left term")?;
         let right = self.require(node.right(), "an edge declares a right term")?;
         let body = self.require(node.body(), "an edge declaration has a body")?;
+        // OMISSION DENOTES ::normal: a bare declaration and an explicitly
+        // normal one are the same subject, so the default is written into
+        // the stored identity here rather than read back at use.
         let context = match node.context() {
             Some(context) => {
                 let symbol = self.require(context.child(), "an edge context is a symbol")?;
                 self.text(symbol).trim_start_matches("::").to_string()
             }
-            None => {
-                return Err(DelightQLError::validation_error_categorized(
-                    "grounding/er/context_required",
-                    "an edge declaration names its context",
-                    "write the context as a symbol: `a(*) &(::normal) b(*) :- …`",
-                ))
-            }
+            None => crate::defuse::er::DEFAULT_CONTEXT.to_string(),
         };
         // IDENTITY IS THE CANONICAL SPELLING: the stored keys are the
         // canonical bytes, never the authored ones.
         let left_spelling = crate::term_spec::canonicalize_term(self.text(left))?;
         let right_spelling = crate::term_spec::canonicalize_term(self.text(right))?;
+        let reads = crate::term_spec::body_reads(self.tree, body);
         let query = self.relex_query(body)?;
+        // THE SHAPE IS JUDGED AT DECLARATION: a body outside the simple
+        // shape refuses here, naming the offending part, before anything
+        // is stored; its reads are held to the terms by canonical
+        // spelling, from the body's own bytes. Stored source is re-judged
+        // the same way at use, as the invariant of what declaration
+        // admitted.
+        crate::defuse::er::judge_declared_body(
+            &query,
+            &reads,
+            &left_spelling,
+            &right_spelling,
+            &context,
+        )?;
         let doc = self.doc_slot(node.children().filter_map(edge_doc))?;
         Ok(self.clause(
             DefKind::Edge,
@@ -972,13 +980,7 @@ pub(crate) fn offers_agree_with_header(
 /// Whether a refusal says "not yet", rather than "never". Only the
 /// substituted-term identity does: everything else is a rule the body broke.
 pub(crate) fn awaits_substitution(error: &DelightQLError) -> bool {
-    matches!(
-        error,
-        DelightQLError::ValidationError {
-            subcategory: Some(subcategory),
-            ..
-        } if *subcategory == crate::uri_registry::subcat::LIMIT_VALUE
-    )
+    matches!(error, DelightQLError::Semantic(Semantic::LimitValue { .. }))
 }
 
 fn doc_slot_of(child: cst::FoRuleChild<'_>) -> Option<cst::DocSlot<'_>> {
@@ -1037,12 +1039,11 @@ fn width(subject: &str, position: &str, declared: usize, written: usize) -> Resu
     if declared == written {
         return Ok(());
     }
-    Err(DelightQLError::validation_error_categorized(
-        "fact_function/width",
-        format!("'{subject}' declares {declared} for its {position}, and one row writes {written}"),
-        "every arm's match row is as wide as the declared inputs, and every output row \
-         as wide as the declared outputs",
-    ))
+    Err(DelightQLError::from(FactFunction::Width {
+        message: format!(
+            "'{subject}' declares {declared} for its {position}, and one row writes {written}"
+        ),
+    }))
 }
 
 /// A DECLARED NAME IS DECLARED ONCE, over the whole declared heading.
@@ -1071,12 +1072,9 @@ fn unique_heading(
         } else {
             format!("once as an {earlier} and once as an {role}")
         };
-        return Err(DelightQLError::validation_error_categorized(
-            "fact_function/duplicate_name",
-            format!("'{subject}' declares '{name}' {collision}"),
-            "the inputs and the outputs are ONE heading: each position holds its own name, \
-             and a repeated one leaves a reader with two answers",
-        ));
+        return Err(DelightQLError::from(FactFunction::DuplicateName {
+            message: format!("'{subject}' declares '{name}' {collision}"),
+        }));
     }
     Ok(())
 }

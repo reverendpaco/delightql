@@ -15,7 +15,7 @@
 
 use crate::pipeline::asts::resolved as ast_resolved;
 use crate::pipeline::Pipeline;
-use crate::system::DelightQLSystem;
+use crate::system::ReadySystem;
 use delightql_types::introspect::{DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 use delightql_types::DatabaseIntrospector;
@@ -53,8 +53,8 @@ impl DatabaseIntrospector for Users {
     }
 }
 
-fn world() -> DelightQLSystem {
-    let mut system = DelightQLSystem::new(
+fn world() -> ReadySystem {
+    let mut system = ReadySystem::new(
         Arc::new(Mutex::new(MockDatabaseConnection::new())),
         Box::new(Users),
         "sqlite",
@@ -204,8 +204,11 @@ fn ordinary_and_induced_empty_record_expansions_agree() {
         induced_sql.contains("CASE WHEN 1 THEN JSON_OBJECT() END"),
         "the induced level must aggregate empty objects: {induced_sql}",
     );
+    // The induced level embeds through the one inner-level reading: parsed
+    // back so it nests, and an inner level that collected nothing reads as
+    // the empty collection.
     assert!(
-        induced_sql.contains("JSON_OBJECT('nested', json("),
+        induced_sql.contains("JSON_OBJECT('nested', COALESCE(json("),
         "the outer record must retain the induced level: {induced_sql}",
     );
 }

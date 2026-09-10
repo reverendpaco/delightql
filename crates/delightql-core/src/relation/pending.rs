@@ -22,6 +22,7 @@
 //! same resolved vocabulary the nodes carry.
 
 use crate::pipeline::asts::core::{DomainExpression, Resolved};
+use crate::pipeline::resolver::Judged;
 
 /// ONE POSITION A PUBLICATION STATES.
 ///
@@ -33,44 +34,194 @@ use crate::pipeline::asts::core::{DomainExpression, Resolved};
 /// expression's shape would make a carried reference the author wrote
 /// indistinguishable from one the engine wrote for it.
 pub(crate) enum Position {
-    /// A position the author wrote: the value it publishes and the name it
-    /// asks to answer to.
-    Authored {
-        expr: DomainExpression<Resolved>,
-        naming: Option<delightql_types::SqlIdentifier>,
-    },
+    /// A position the author wrote: the value it publishes, the name it
+    /// asks to answer to, and where its value is evaluated.
+    Authored(Stated),
     /// A position the ENGINE wrote, expanding a glob the author wrote.
-    Expanded {
-        expr: DomainExpression<Resolved>,
-        naming: Option<delightql_types::SqlIdentifier>,
-    },
+    Expanded(Stated),
     /// A glob standing for a whole operand it does not expand. It publishes
     /// nothing of its own: what it stands for is published by the positions
     /// beside it.
     Whole,
 }
 
+/// ONE STATED POSITION: its value, the name it asks for, and where the
+/// value is evaluated. The fields are private: a position is born only
+/// inside the fold's publication act — from the [`Judged`] product of the
+/// one lexical extent that resolved its value, taken whole — or as the
+/// restatement of a port the compiler already holds, whose value reads
+/// nothing.
+pub(crate) struct Stated {
+    expr: DomainExpression<Resolved>,
+    naming: Option<delightql_types::SqlIdentifier>,
+    evaluation: Evaluation,
+}
+
+/// THE STATING LICENSE: the one field is private, so only this module
+/// mints it, and it is minted only inside `Position::authored` and
+/// `Position::expanded`, which spend it to take a [`Judged`] apart and
+/// write its value and its evaluation into one position in the same act.
+/// The halves of a judged product exist as separate values nowhere else.
+pub(crate) struct Stating(());
+
 impl Position {
+    /// A POSITION THE AUTHOR WROTE, as the fold's publication act states
+    /// it: the judged product of the one extent that resolved the value —
+    /// value, witness and the evaluation point of the fold that ran it,
+    /// owned together — taken whole.
+    pub(crate) fn authored(
+        judged: Judged<DomainExpression<Resolved>>,
+        naming: Option<delightql_types::SqlIdentifier>,
+    ) -> Self {
+        let (expr, evaluation) = judged.into_stated(Stating(()));
+        Position::Authored(Stated {
+            expr,
+            naming,
+            evaluation,
+        })
+    }
+
+    /// THE POSITIONS AN ENGINE EXPANSION WROTE, as one extent under one
+    /// judgment: the whole expansion and its witness cross as one judged
+    /// product, and every expanded position is evaluated where the
+    /// expansion's lookups reached.
+    pub(crate) fn expanded(judged: Judged<Vec<DomainExpression<Resolved>>>) -> Vec<Self> {
+        let (exprs, evaluation) = judged.into_stated(Stating(()));
+        exprs
+            .into_iter()
+            .map(|expr| {
+                Position::Expanded(Stated {
+                    expr,
+                    naming: None,
+                    evaluation: evaluation.again(),
+                })
+            })
+            .collect()
+    }
+
+    /// A COMPILER RESTATEMENT OF A PORT IT HOLDS — a narrowing to the
+    /// binders, a receipt's positions. The value is the port itself and
+    /// reads nothing, so it is evaluated where the port stands; whether the
+    /// operand carries the port is the authority's judgment at the carry.
+    pub(crate) fn restating(
+        port: super::PortId,
+        naming: Option<delightql_types::SqlIdentifier>,
+    ) -> Self {
+        Position::Authored(Stated {
+            expr: engine_reference(port),
+            naming,
+            evaluation: Evaluation::Here,
+        })
+    }
+
+    /// The same restatement, as an engine expansion of the operand's heading.
+    pub(crate) fn restating_expanded(port: super::PortId) -> Self {
+        Position::Expanded(Stated {
+            expr: engine_reference(port),
+            naming: None,
+            evaluation: Evaluation::Here,
+        })
+    }
+
     /// The value standing at this position, where one stands there.
     pub(crate) fn value(&self) -> Option<&DomainExpression<Resolved>> {
         match self {
-            Self::Authored { expr, .. } | Self::Expanded { expr, .. } => Some(expr),
+            Self::Authored(stated) | Self::Expanded(stated) => Some(&stated.expr),
             Self::Whole => None,
         }
     }
 
     /// The name this position asks its output to answer to.
-    pub(super) fn naming(&self) -> Option<&delightql_types::SqlIdentifier> {
+    pub(crate) fn naming(&self) -> Option<&delightql_types::SqlIdentifier> {
         match self {
-            Self::Authored { naming, .. } | Self::Expanded { naming, .. } => naming.as_ref(),
+            Self::Authored(stated) | Self::Expanded(stated) => stated.naming.as_ref(),
             Self::Whole => None,
         }
     }
 
     /// Whether the engine wrote this position expanding a glob.
     pub(crate) fn is_engine_expansion(&self) -> bool {
-        matches!(self, Self::Expanded { .. })
+        matches!(self, Self::Expanded(_))
     }
+
+    /// Where this position's value is evaluated. A whole publishes nothing
+    /// and evaluates here.
+    pub(super) fn evaluation(&self) -> &Evaluation {
+        match self {
+            Self::Authored(stated) | Self::Expanded(stated) => &stated.evaluation,
+            Self::Whole => &Evaluation::Here,
+        }
+    }
+
+    /// The stated value and name, for the authority that writes the item
+    /// over the port it minted.
+    pub(super) fn into_stated(
+        self,
+    ) -> Option<(
+        DomainExpression<Resolved>,
+        Option<delightql_types::SqlIdentifier>,
+    )> {
+        match self {
+            Self::Authored(stated) | Self::Expanded(stated) => Some((stated.expr, stated.naming)),
+            Self::Whole => None,
+        }
+    }
+}
+
+fn engine_reference(port: super::PortId) -> DomainExpression<Resolved> {
+    use crate::pipeline::asts::core::{ColumnOccurrence, NamedReference, Reference};
+    DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence::engine(
+        port,
+    ))))
+}
+
+/// WHERE A STATED POSITION'S VALUE IS EVALUATED, as the lexical authority
+/// judged the reads the value makes. Born only where a [`Judged`] product
+/// is taken apart under a [`Stating`] license, and written only into a
+/// [`Stated`] position in that same act; read by the relation authority
+/// through [`Position::evaluation`] and by nothing else. Neither `Clone`
+/// nor `Copy`: a finished position's evaluation cannot be copied off
+/// beside another value.
+pub(crate) enum Evaluation {
+    /// Every reference the value makes stands in the statement the
+    /// operand's level emits, or the value makes none.
+    Here,
+    /// Some reference reached past the interior boundary the enclosing
+    /// join evaluates, under the evaluation mode of the interior the
+    /// publication stands in: in an interior evaluated in place the value
+    /// is the target's own correlated expression; in one the enclosing
+    /// join evaluates, the value is computed at that join — where the row
+    /// is readable only if it is that join's own.
+    Enclosing {
+        correlations: crate::pipeline::resolver::Correlations,
+        reach: EnclosingReach,
+    },
+}
+
+impl Evaluation {
+    /// The same evaluation again, for the several positions one expansion
+    /// writes under one judgment. Private: only the expansion's own act
+    /// repeats an evaluation, and only across the positions it writes.
+    fn again(&self) -> Self {
+        match self {
+            Evaluation::Here => Evaluation::Here,
+            Evaluation::Enclosing {
+                correlations,
+                reach,
+            } => Evaluation::Enclosing {
+                correlations: *correlations,
+                reach: *reach,
+            },
+        }
+    }
+}
+
+/// HOW FAR A READ PAST THE INTERIOR REACHES: the row the join evaluating
+/// the interior reads, or one beyond that join.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnclosingReach {
+    TheJoin,
+    PastTheJoin,
 }
 
 /// WHAT A PUBLICATION DOES TO THE HEADING STANDING TO ITS LEFT.
@@ -285,22 +436,6 @@ pub(crate) enum Pending {
         input: super::SemanticRelation,
         access: crate::pipeline::asts::resolved::Access,
     },
-    /// A projection REBUILT to carry correlation columns a hoisted
-    /// predicate still reads. The rebuild publishes the projection it
-    /// replaces, whole, with the carriers as dependencies; the stored
-    /// items are the projection's own, relanded through the carry edges
-    /// this act writes, and the replacement is recorded in the same act.
-    CarrierInjection {
-        /// The projection this rebuild replaces — its operand and its
-        /// obligation at once.
-        replaces: super::SemanticRelation,
-        carriers: Vec<super::PortId>,
-        items: Vec<crate::pipeline::asts::resolved::OutItem>,
-        /// Which operator the tree stored for the original: an embed keeps
-        /// the operand whole and a projection states a heading, and the
-        /// rebuild stores the one that was there.
-        stored: Publishes,
-    },
     /// A hygienic support position that crosses as part of a closed value.
     /// Unlike a predicate dependency, a later join must be able to spend
     /// this position, so it belongs to the semantic interface until the
@@ -308,6 +443,20 @@ pub(crate) enum Pending {
     CrossingCarrierInjection {
         replaces: super::SemanticRelation,
         carriers: Vec<super::PortId>,
+        items: Vec<crate::pipeline::asts::resolved::OutItem>,
+        stored: Publishes,
+    },
+    /// A parameterized fixpoint's support published beside one clause's
+    /// projection: the sealed support names, per pair, the position of the
+    /// projection operand that carries the caller's actual and the exact
+    /// caller-resolved actual port it stands for. Only the definition-use
+    /// authority, resolving a clause under its own frontier, can construct
+    /// that value; the hidden position is marked with its actual as it is
+    /// minted, so every later read and carry of the fixpoint keeps it as
+    /// the frontier's own.
+    FrontierActualInjection {
+        replaces: super::SemanticRelation,
+        support: crate::defuse::carriers::FrontierSupport,
         items: Vec<crate::pipeline::asts::resolved::OutItem>,
         stored: Publishes,
     },
@@ -335,9 +484,10 @@ pub(crate) struct SlotRow {
     answers_to: Option<crate::names::Spelling>,
     positions: Vec<PatternPosition>,
     /// Hygienic support positions of the operand the read carries beside
-    /// the pattern — correlation carriers, injected discriminators. Not
-    /// part of the declared heading the pattern addresses; they ride as
-    /// dependencies of the read.
+    /// the pattern — a higher-order expansion's injected discriminators.
+    /// Not part of the declared heading the pattern addresses; they ride
+    /// as dependencies of the read. A correlation's support is not among
+    /// them: the authority carries that by its own law.
     carriers: Vec<super::PortId>,
 }
 

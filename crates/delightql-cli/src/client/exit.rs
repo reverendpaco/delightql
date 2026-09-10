@@ -86,7 +86,10 @@ pub fn finish(handle: Option<&mut dyn DqlHandle>, exit_code: i32) -> Option<Sess
     let handle: &mut dyn DqlHandle = match handle {
         Some(h) => h,
         None => {
-            fresh = crate::connection::open_handle_over(Some(db.clone())).ok()?.0;
+            fresh = crate::connection::SessionProfile::Client(Some(db.clone()))
+                .open()
+                .ok()?
+                .0;
             &mut *fresh
         }
     };

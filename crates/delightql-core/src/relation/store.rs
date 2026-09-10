@@ -18,8 +18,9 @@
 //! it: two authorities over one registry must agree on both, and a seal
 //! that only closed one builder would close nothing.
 
+use crate::diagnostic::Internal;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::carrier::{BuilderMark, SemanticRelation};
@@ -110,6 +111,15 @@ struct Inner {
     /// The exact configured-value port each carried support position
     /// realizes. Equal values captured by different closures stay distinct.
     residual_capture_values: HashMap<PortId, PortId>,
+    /// THE CALLER'S ACTUAL A FIXPOINT CARRIES: the exact caller-resolved
+    /// actual port a hygienic support position of a parameterized fixpoint
+    /// stands for. The anchor admits the caller row once; every frontier
+    /// row descends from one anchor row and carries that row's actual here,
+    /// so a recursive clause reads the caller through its frontier and never
+    /// joins the caller relation a second time. Ordinary carry acts
+    /// propagate it, so the position survives the fixpoint's export, its
+    /// reads, and the projections between them.
+    frontier_actuals: HashMap<PortId, PortId>,
     /// The scalar value class carried by each semantic position.  This map
     /// is intentionally one-way: no value-to-port index exists.
     values: HashMap<PortId, ValueId>,
@@ -121,6 +131,24 @@ struct Inner {
     /// a walk and never revised: a value class shared by republications
     /// cannot choose a position, and this edge never chooses among two.
     continues: HashMap<PortId, PortId>,
+    /// Positions a READ of a definition minted. A read is where a row
+    /// occurrence begins: two reads of one definition share what they read
+    /// and nothing else, so a source walk that reaches a stated source only
+    /// by stepping behind one of these positions has reached the
+    /// definition, not an occurrence the two relations stand over. Written
+    /// once, at the port's birth, by the one act that instantiates.
+    read_boundaries: HashSet<PortId>,
+    /// Relations a ROW-PRESERVING, single-operand derivation produced — a
+    /// projection, export, access, rename, ordering, witness or ER boundary
+    /// over one input. Such a relation republishes its operand's rows under
+    /// its own positions; a set, join, group, read or destructure does not,
+    /// and no reader may treat one as its operand standing again.
+    /// Written once, by the deriving act.
+    republications: HashSet<RelationId>,
+    /// Relations a JOIN derived. A join stands over exactly its two operands;
+    /// a rebuild reproduces joins and republications and nothing else, so the
+    /// operation tree it judges an operand by may contain only these.
+    joins: HashSet<RelationId>,
     next_value: u32,
     /// The exact semantic occurrence that first published each port.
     port_relations: HashMap<PortId, RelationId>,
@@ -128,6 +156,34 @@ struct Inner {
     inputs: HashMap<RelationId, Vec<SemanticRelation>>,
     /// Exact non-output ports an operation must still read while lowering.
     dependencies: HashMap<RelationId, Vec<PortId>>,
+    /// CORRELATION SUPPORT, per relation: the law its derivation stated,
+    /// the interior occurrences correlated restrictions marked on it
+    /// directly, the positions its consumers must keep readable, and the
+    /// positions its own level emits beside its heading — the owed ones it
+    /// does not publish. Written by the one correlation act and by every
+    /// derivation's own judgment; read by lowering and by the classifier
+    /// that asks which table a hoisted condition's reference belongs to.
+    support_laws: HashMap<RelationId, super::support::SupportLaw>,
+    support_marks: HashMap<RelationId, Vec<PortId>>,
+    support_owes: HashMap<RelationId, Vec<PortId>>,
+    support_emits: HashMap<RelationId, Vec<PortId>>,
+    /// THE RUN A LEVEL EMITS AFTER ITS HEADING, in emission order — its
+    /// constraint dependencies and then its correlation support, or, for a
+    /// join, its operands' runs left then right.
+    support_runs: HashMap<RelationId, Vec<PortId>>,
+    /// POSITIONS EVALUATED AT THE INTERIOR BOUNDARY, per relation: a
+    /// publication from the enclosing row inside an interior the enclosing
+    /// join evaluates is computed at that join, so every level from the
+    /// publication to the boundary carries the position unread, and the
+    /// boundary hands it to the join. `deferred_marks` is what a
+    /// publication stated directly; `deferred` is each level's judgment;
+    /// `deferred_ports` is every position so carried, for a read to refuse
+    /// against; `realized_ports` is what a boundary spent outward — the
+    /// positions the enclosing join computes for it.
+    deferred_marks: HashMap<RelationId, Vec<PortId>>,
+    deferred: HashMap<RelationId, Vec<PortId>>,
+    deferred_ports: std::collections::HashSet<PortId>,
+    realized_ports: std::collections::HashSet<PortId>,
     /// Physical storage read by a semantic occurrence, when it has one.
     storages: HashMap<RelationId, StorageId>,
     definitions: HashMap<RelationId, DefinitionId>,
@@ -187,12 +243,25 @@ impl RelationStore {
                 reuses: Vec::new(),
                 residual_row_tokens: HashMap::new(),
                 residual_capture_values: HashMap::new(),
+                frontier_actuals: HashMap::new(),
                 values: HashMap::new(),
                 continues: HashMap::new(),
+                read_boundaries: HashSet::new(),
+                republications: HashSet::new(),
+                joins: HashSet::new(),
                 next_value: 0,
                 port_relations: HashMap::new(),
                 inputs: HashMap::new(),
                 dependencies: HashMap::new(),
+                support_laws: HashMap::new(),
+                support_marks: HashMap::new(),
+                support_owes: HashMap::new(),
+                support_emits: HashMap::new(),
+                support_runs: HashMap::new(),
+                deferred_marks: HashMap::new(),
+                deferred: HashMap::new(),
+                deferred_ports: std::collections::HashSet::new(),
+                realized_ports: std::collections::HashSet::new(),
                 storages: HashMap::new(),
                 definitions: HashMap::new(),
                 instances: HashMap::new(),
@@ -453,6 +522,38 @@ impl RelationStore {
             .copied()
     }
 
+    /// MARK A SUPPORT POSITION AS CARRYING ONE CALLER ACTUAL through a
+    /// parameterized fixpoint. Re-marking with the same actual is the
+    /// carry's own propagation meeting the explicit mark; a different actual
+    /// is a construction error.
+    pub(super) fn mark_frontier_actual(&self, port: PortId, actual: PortId) {
+        let prior = self
+            .inner
+            .borrow_mut()
+            .frontier_actuals
+            .insert(port, actual);
+        assert!(
+            prior.is_none() || prior == Some(actual),
+            "a frontier support position carries exactly one caller actual"
+        );
+    }
+
+    pub(super) fn carry_frontier_actual(&self, output: PortId, source: PortId) {
+        let actual = self.inner.borrow().frontier_actuals.get(&source).copied();
+        if let Some(actual) = actual {
+            let prior = self
+                .inner
+                .borrow_mut()
+                .frontier_actuals
+                .insert(output, actual);
+            assert!(prior.is_none() || prior == Some(actual));
+        }
+    }
+
+    pub(super) fn frontier_actual(&self, port: PortId) -> Option<PortId> {
+        self.inner.borrow().frontier_actuals.get(&port).copied()
+    }
+
     pub(super) fn record_lineage(&self, output: PortId, source: PortId) {
         self.inner
             .borrow_mut()
@@ -489,6 +590,41 @@ impl RelationStore {
             inner.continues.insert(output, origin).is_none(),
             "an occurrence effect is assigned once, at the port's birth"
         );
+    }
+
+    /// MARK A POSITION AS MINTED BY A READ OF A DEFINITION — once, at its
+    /// birth, by the instantiating act.
+    pub(super) fn record_read_boundary(&self, port: PortId) {
+        assert!(
+            self.inner.borrow_mut().read_boundaries.insert(port),
+            "a read boundary is recorded once, at the port's birth"
+        );
+    }
+
+    /// Whether a read of a definition minted this position.
+    pub(super) fn is_read_boundary(&self, port: PortId) -> bool {
+        self.inner.borrow().read_boundaries.contains(&port)
+    }
+
+    /// MARK A RELATION AS A ROW-PRESERVING REPUBLICATION of its one operand.
+    pub(super) fn record_republication(&self, relation: RelationId) {
+        self.inner.borrow_mut().republications.insert(relation);
+    }
+
+    /// Whether a row-preserving single-operand derivation produced this
+    /// relation.
+    pub(super) fn is_republication(&self, relation: RelationId) -> bool {
+        self.inner.borrow().republications.contains(&relation)
+    }
+
+    /// MARK A RELATION AS A JOIN of its two recorded operands.
+    pub(super) fn record_join(&self, relation: RelationId) {
+        self.inner.borrow_mut().joins.insert(relation);
+    }
+
+    /// Whether a join derived this relation.
+    pub(super) fn is_join(&self, relation: RelationId) -> bool {
+        self.inner.borrow().joins.contains(&relation)
     }
 
     /// The exact origin a position continues — itself, when no act
@@ -559,6 +695,155 @@ impl RelationStore {
             .get(&relation)
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub(super) fn record_support_law(&self, relation: RelationId, law: super::support::SupportLaw) {
+        self.inner.borrow_mut().support_laws.insert(relation, law);
+    }
+
+    pub(super) fn support_law(&self, relation: RelationId) -> Option<super::support::SupportLaw> {
+        self.inner.borrow().support_laws.get(&relation).copied()
+    }
+
+    /// A correlated restriction stood on this relation and read these of
+    /// its interior occurrences. Appended, never replaced: two restrictions
+    /// on one relation owe the union.
+    pub(super) fn mark_correlation(&self, relation: RelationId, inner: &[PortId]) {
+        let mut store = self.inner.borrow_mut();
+        let marks = store.support_marks.entry(relation).or_default();
+        for port in inner {
+            if !marks.contains(port) {
+                marks.push(*port);
+            }
+        }
+    }
+
+    pub(super) fn support_marks(&self, relation: RelationId) -> Vec<PortId> {
+        self.inner
+            .borrow()
+            .support_marks
+            .get(&relation)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The judged support of one relation, replacing whatever an earlier
+    /// judgment recorded: a step landed back on a changed operand is
+    /// re-judged whole.
+    pub(super) fn record_support(
+        &self,
+        relation: RelationId,
+        owes: Vec<PortId>,
+        emits: Vec<PortId>,
+        run: Vec<PortId>,
+    ) {
+        let mut store = self.inner.borrow_mut();
+        store.support_owes.insert(relation, owes);
+        store.support_emits.insert(relation, emits);
+        store.support_runs.insert(relation, run);
+    }
+
+    pub(super) fn support_run(&self, relation: RelationId) -> Vec<PortId> {
+        self.inner
+            .borrow()
+            .support_runs
+            .get(&relation)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn support_owed(&self, relation: RelationId) -> Vec<PortId> {
+        self.inner
+            .borrow()
+            .support_owes
+            .get(&relation)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn support_emitted(&self, relation: RelationId) -> Vec<PortId> {
+        self.inner
+            .borrow()
+            .support_emits
+            .get(&relation)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// A publication stated that this position of the relation is
+    /// evaluated at the interior boundary.
+    pub(super) fn mark_deferred(&self, relation: RelationId, port: PortId) {
+        let mut store = self.inner.borrow_mut();
+        let marks = store.deferred_marks.entry(relation).or_default();
+        if !marks.contains(&port) {
+            marks.push(port);
+        }
+    }
+
+    pub(super) fn deferred_marks(&self, relation: RelationId) -> Vec<PortId> {
+        self.inner
+            .borrow()
+            .deferred_marks
+            .get(&relation)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The judged deferral of one relation, replacing an earlier judgment:
+    /// the positions it carries toward the boundary unread.
+    pub(super) fn record_deferral(&self, relation: RelationId, defers: Vec<PortId>) {
+        let mut store = self.inner.borrow_mut();
+        for port in &defers {
+            store.deferred_ports.insert(*port);
+        }
+        store.deferred.insert(relation, defers);
+    }
+
+    pub(super) fn deferred(&self, relation: RelationId) -> Vec<PortId> {
+        self.inner
+            .borrow()
+            .deferred
+            .get(&relation)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn is_deferred_port(&self, port: PortId) -> bool {
+        self.inner.borrow().deferred_ports.contains(&port)
+    }
+
+    pub(super) fn is_realized_port(&self, port: PortId) -> bool {
+        self.inner.borrow().realized_ports.contains(&port)
+    }
+
+    /// THE BOUNDARY SPENDS ITS DEFERRALS OUTWARD: the positions it carried
+    /// toward itself are the enclosing join's to compute, so nothing over
+    /// the boundary defers them and a reference past it reads them.
+    pub(super) fn spend_deferral_outward(&self, relation: RelationId) {
+        let mut store = self.inner.borrow_mut();
+        for port in store.deferred.remove(&relation).unwrap_or_default() {
+            store.deferred_ports.remove(&port);
+            store.realized_ports.insert(port);
+        }
+    }
+
+    /// Whether this position is emitted by no level of its own: carried
+    /// toward a boundary unread, or the boundary's position the enclosing
+    /// join computes.
+    pub(super) fn unemitted_here(&self, port: PortId) -> bool {
+        let store = self.inner.borrow();
+        store.deferred_ports.contains(&port) || store.realized_ports.contains(&port)
+    }
+
+    /// THE BOUNDARY SPENDS OUTWARD: its level still emits what the body
+    /// owed, so the enclosing join can read it, and nothing standing over
+    /// the boundary owes it any further — the join is where the correlation
+    /// is evaluated.
+    pub(super) fn spend_support_outward(&self, relation: RelationId) {
+        self.inner
+            .borrow_mut()
+            .support_owes
+            .insert(relation, Vec::new());
     }
 
     pub(super) fn storage_for_entity(
@@ -774,11 +1059,11 @@ impl RelationStore {
 }
 
 fn sealed_error() -> DelightQLError {
-    DelightQLError::transformation_error(
+    Internal::invariant(
+        "semantic relation",
         "the semantic epoch is sealed: relations are constructed through \
          refinement and bound to physical slots after it, and nothing past \
          the seal mints either half of one",
-        "semantic relation",
     )
 }
 
@@ -807,11 +1092,11 @@ mod tests {
         ];
         registry
             .authority()
-            .derive(RelForm::Anonymous(AnonymousSpec {
-                shape: AnonymousShape::Tabular,
-                slots: &slots,
-                answers_to: None,
-            }))
+            .derive(RelForm::Anonymous(AnonymousSpec::plain(
+                AnonymousShape::Tabular,
+                &slots,
+                None,
+            )))
             .expect("an anonymous relation is built")
     }
 
@@ -828,11 +1113,11 @@ mod tests {
     fn anonymous(registry: &Planning) -> crate::relation::SemanticRelation {
         registry
             .authority()
-            .derive(RelForm::Anonymous(AnonymousSpec {
-                shape: AnonymousShape::Tabular,
-                slots: &[],
-                answers_to: None,
-            }))
+            .derive(RelForm::Anonymous(AnonymousSpec::plain(
+                AnonymousShape::Tabular,
+                &[],
+                None,
+            )))
             .expect("an anonymous relation is built")
     }
 
@@ -869,7 +1154,6 @@ mod tests {
                 input: source,
                 why: ProjectWhy::Stage,
                 slots: &slots,
-                dependencies: &[],
             }))
             .expect("the projection is built");
         let ports = registry
@@ -1243,11 +1527,7 @@ mod tests {
         names.relations().seal();
         let before = names.scopes_minted();
         let refused = super::super::builder::SemanticBuilder::new(&names).derive(
-            RelForm::Anonymous(AnonymousSpec {
-                shape: AnonymousShape::Tabular,
-                slots: &[],
-                answers_to: None,
-            }),
+            RelForm::Anonymous(AnonymousSpec::plain(AnonymousShape::Tabular, &[], None)),
         );
         assert!(refused.is_err(), "a sealed store constructs nothing");
         assert_eq!(

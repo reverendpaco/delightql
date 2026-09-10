@@ -16,7 +16,6 @@ use super::functions::PureCall;
 use super::helpers::QualifiedName;
 use crate::pipeline::asts::vocabulary::{Vec1, Vec2};
 use crate::{lispy::ToLispy, ToLispy};
-use delightql_types::SqlIdentifier;
 
 /// `+` and `\+` — the mark that says which way a named proof is read.
 ///
@@ -230,19 +229,18 @@ pub enum MembershipSource {
 }
 
 /// What an authored truth PROBE said about the relation it probes: how the
-/// author addressed it, and the dequalifying access that IS its correlation.
+/// author addressed it. A dequalifying access inside the probe is the
+/// mention's own and stays on it; the read performs that correlation where
+/// it resolves.
 ///
 /// Spent at resolution — the probe's relation is resolved and the
-/// correlation synthesized — so a resolved tree holds none of it. That is
+/// addressing has nothing left to say — so a resolved tree holds none of it. That is
 /// what lets ONE existence carrier serve both phases instead of an
 /// authored/resolved variant pair repeating every other field.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("probe_addressing")]
 pub struct ProbeAddressing {
     pub identifier: QualifiedName,
-    /// `+orders(*.(status))` — the dequalifying access inside the probe IS
-    /// the correlation. Empty when explicit conditions are written instead.
-    pub using_columns: Vec<SqlIdentifier>,
 }
 
 /// `probe in rel( … )` — membership in what a relation publishes.

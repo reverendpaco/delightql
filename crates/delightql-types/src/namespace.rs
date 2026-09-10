@@ -4,7 +4,6 @@
 ///
 /// This is a simplified version without dependencies on core's lispy traits.
 /// The full version with ToLispy support lives in delightql-core.
-
 use crate::identifier::SqlIdentifier;
 use serde::{Deserialize, Serialize};
 
@@ -32,14 +31,21 @@ impl NamespacePath {
     /// Single-level path
     pub fn single(name: impl Into<String>) -> Self {
         NamespacePath {
-            items: vec![NamespaceItem { name: SqlIdentifier::new(name) }],
+            items: vec![NamespaceItem {
+                name: SqlIdentifier::new(name),
+            }],
         }
     }
 
     /// Multi-level path from parts (innermost → outermost)
     pub fn from_parts(parts: Vec<String>) -> Self {
         NamespacePath {
-            items: parts.into_iter().map(|name| NamespaceItem { name: SqlIdentifier::new(name) }).collect(),
+            items: parts
+                .into_iter()
+                .map(|name| NamespaceItem {
+                    name: SqlIdentifier::new(name),
+                })
+                .collect(),
         }
     }
 

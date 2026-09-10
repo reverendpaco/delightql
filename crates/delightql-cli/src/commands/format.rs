@@ -77,7 +77,8 @@ pub fn handle_format_subcommand(command: &Command, _base_args: &CliArgs) -> Resu
 /// catalog, so no user database is needed.
 #[cfg(feature = "formatter")]
 fn apply_style_bundle(config: &mut delightql_formatter::FormatConfig, style: &str) -> Result<()> {
-    let mut handle = crate::connection::open_handle().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let mut handle = crate::connection::open_handle(crate::connection::SessionProfile::client())
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
     let query = format!("sys::format.bundle(*), bundle = \"{}\"", style);
     let qr = session
@@ -143,7 +144,12 @@ fn format_with_library(
         apply_style_bundle(&mut config, style_name)?;
     }
     for warning in delightql_formatter::apply_config_file(&mut config, None) {
-        crate::client::incident::warning("format", crate::client::incident::hierarchy::FORMAT, warning.to_string());
+        crate::client::incident::warning(
+            "format",
+            delightql_types::diagnostic::Client::Format {
+                message: warning.to_string(),
+            },
+        );
     }
     let outcome = delightql_formatter::format_outcome(&input, &config)?;
 
@@ -157,20 +163,21 @@ fn format_with_library(
             PassReason::DefinitionFile => {
                 crate::client::incident::warning(
                     "format",
-                    crate::client::incident::hierarchy::FORMAT,
-                    "this is a definition library — `dql format` speaks the \
+                    delightql_types::diagnostic::Client::Format {
+                        message: "this is a definition library — `dql format` speaks the \
                      query grammar only and cannot format rule definitions \
                      yet; returned unchanged"
-                        .to_string(),
+                            .to_string(),
+                    },
                 );
                 if !fail_if_not_formatted {
                     print!("{}", outcome.text());
                 }
                 {
-                crate::client::exit::finish(None, 2);
-                crate::client::exit::announce();
-                std::process::exit(2);
-            }
+                    crate::client::exit::finish(None, 2);
+                    crate::client::exit::announce();
+                    std::process::exit(2);
+                }
             }
             PassReason::ParseError => {
                 // THE TOOL'S ACCOMMODATION, not a second semantics. `dql
@@ -185,14 +192,20 @@ fn format_with_library(
                 if is_definition_file {
                     crate::client::incident::warning(
                         "format",
-                        crate::client::incident::hierarchy::FORMAT,
-                        "this is a definition library — `dql format` speaks the \
+                        delightql_types::diagnostic::Client::Format {
+                            message: "this is a definition library — `dql format` speaks the \
                          query grammar only and cannot format rule definitions \
                          yet; returned unchanged"
-                            .to_string(),
+                                .to_string(),
+                        },
                     );
                 } else {
-                    crate::client::incident::warning("format", crate::client::incident::hierarchy::FORMAT, "input does not parse; returned unchanged".to_string());
+                    crate::client::incident::warning(
+                        "format",
+                        delightql_types::diagnostic::Client::Format {
+                            message: "input does not parse; returned unchanged".to_string(),
+                        },
+                    );
                 }
                 // A parse error is "cannot determine" in BOTH modes —
                 // there is no formatted form of unparseable input.
@@ -200,23 +213,27 @@ fn format_with_library(
                     print!("{}", outcome.text());
                 }
                 {
-                crate::client::exit::finish(None, 2);
-                crate::client::exit::announce();
-                std::process::exit(2);
-            }
+                    crate::client::exit::finish(None, 2);
+                    crate::client::exit::announce();
+                    std::process::exit(2);
+                }
             }
             PassReason::UnhandledNode(kind) => crate::client::incident::warning(
                 "format",
-                crate::client::incident::hierarchy::FORMAT,
-                format!("formatter does not yet handle node '{kind}'; input returned unchanged"),
+                delightql_types::diagnostic::Client::Format {
+                    message: format!(
+                        "formatter does not yet handle node '{kind}'; input returned unchanged"
+                    ),
+                },
             ),
             PassReason::TokenStreamChanged(detail) => crate::client::incident::warning(
                 "format",
-                crate::client::incident::hierarchy::FORMAT,
-                format!(
-                    "formatting would have changed the token stream ({detail}); \
+                delightql_types::diagnostic::Client::Format {
+                    message: format!(
+                        "formatting would have changed the token stream ({detail}); \
                      input returned unchanged"
-                ),
+                    ),
+                },
             ),
         }
         if fail_if_not_formatted {

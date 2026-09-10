@@ -51,6 +51,7 @@ pub(crate) mod wasm_system;
 pub(crate) use wasm_system as system;
 
 // Re-export error types from delightql-types (needed at crate root for macros/ergonomics)
+pub use delightql_types::diagnostic;
 pub use delightql_types::error;
 pub use delightql_types::{DelightQLError, Result};
 

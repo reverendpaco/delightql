@@ -27,7 +27,7 @@ Given this example definition in assertion mode:
 ```{.delightql .am}
 summarize(T(*))(*) :-
   T(*)
-    ~> ( count:(%LastName)  as distinct_last_name_count,
+    %( ~>  count:(%LastName)  as distinct_last_name_count,
          count:(%Department) as distinct_department_count,
          count:(*)           as total_count,
          avg:(Salary)        as average_salary )
@@ -37,7 +37,7 @@ the expression `employee(*) |> summarize(*)`{.delightql} expands to:
 
 ```delightql
 employee(*)
-  ~> ( count:(%LastName)  as distinct_last_name_count,
+    %( ~>  count:(%LastName)  as distinct_last_name_count,
        count:(%Department) as distinct_department_count,
        count:(*)           as total_count,
        avg:(Salary)        as average_salary )

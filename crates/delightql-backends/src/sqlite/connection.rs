@@ -4,19 +4,15 @@
 ///
 /// Provides thread-safe connection management for SQLite databases,
 /// supporting both in-memory and file-based databases.
+use delightql_types::diagnostic::Runtime;
 use delightql_types::{DelightQLError, Result};
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// Helper to convert rusqlite errors to DelightQL errors
+/// The engine's refusal under the operation that met it.
 fn rusqlite_to_dql_error(e: rusqlite::Error, operation: &str) -> DelightQLError {
-    DelightQLError::DatabaseOperationError {
-        message: format!("{} failed", operation),
-        details: format!("SQLite error: {}", e),
-        source: Some(Box::new(e)),
-        subcategory: None,
-    }
+    super::engine_error(&format!("{operation} failed"), e)
 }
 
 /// Connection information structure for SQLite databases
@@ -38,16 +34,15 @@ pub struct SqliteConnectionManager {
 impl SqliteConnectionManager {
     /// Create a new connection to an in-memory SQLite database
     pub fn new_memory() -> Result<Self> {
-        let connection = Connection::open_in_memory().map_err(|e| rusqlite_to_dql_error(e, "Open in-memory database"))?;
+        let connection = Connection::open_in_memory()
+            .map_err(|e| rusqlite_to_dql_error(e, "Open in-memory database"))?;
 
         // Attach system schemas (SQLite-specific operation)
         // These are session-specific temporary schemas for the user database
         // NOTE: _bootstrap is NO LONGER attached here - it's a separate internal
         // SQLite connection managed by delightql-core as an engine implementation detail
         connection
-            .execute_batch(
-                "ATTACH DATABASE ':memory:' AS 'sys';",
-            )
+            .execute_batch("ATTACH DATABASE ':memory:' AS 'sys';")
             .map_err(|e| rusqlite_to_dql_error(e, "Attach system schemas"))?;
 
         let connection = Arc::new(Mutex::new(connection));
@@ -67,17 +62,16 @@ impl SqliteConnectionManager {
         // Ensure the parent directory exists if creating a new database
         if let Some(parent) = Path::new(path).parent() {
             if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(DelightQLError::IoError)?;
+                std::fs::create_dir_all(parent).map_err(DelightQLError::from)?;
             }
         }
 
-        let connection = Connection::open(path).map_err(|e| rusqlite_to_dql_error(e, "Open database file"))?;
+        let connection =
+            Connection::open(path).map_err(|e| rusqlite_to_dql_error(e, "Open database file"))?;
 
         // Attach system schemas (SQLite-specific operation)
         connection
-            .execute_batch(
-                "ATTACH DATABASE ':memory:' AS 'sys';",
-            )
+            .execute_batch("ATTACH DATABASE ':memory:' AS 'sys';")
             .map_err(|e| rusqlite_to_dql_error(e, "Attach system schemas"))?;
 
         let connection = Arc::new(Mutex::new(connection));
@@ -97,23 +91,21 @@ impl SqliteConnectionManager {
     pub fn new_file_existing(path: &str) -> Result<Self> {
         // Check if database file exists
         if !Path::new(path).exists() {
-            return Err(DelightQLError::ParseError {
+            return Err(Runtime::Io {
                 message: format!(
                     "Database file '{}' does not exist. Use --make-new-db-if-missing to create it.",
                     path
                 ),
-                source: None,
-                subcategory: None,
-            });
+            }
+            .into());
         }
 
-        let connection = Connection::open(path).map_err(|e| rusqlite_to_dql_error(e, "Open database file"))?;
+        let connection =
+            Connection::open(path).map_err(|e| rusqlite_to_dql_error(e, "Open database file"))?;
 
         // Attach system schemas (SQLite-specific operation)
         connection
-            .execute_batch(
-                "ATTACH DATABASE ':memory:' AS 'sys';",
-            )
+            .execute_batch("ATTACH DATABASE ':memory:' AS 'sys';")
             .map_err(|e| rusqlite_to_dql_error(e, "Attach system schemas"))?;
 
         let connection = Arc::new(Mutex::new(connection));
@@ -164,7 +156,7 @@ impl SqliteConnectionManager {
     /// Test if the connection is working
     pub fn test_connection(&self) -> Result<()> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!("Previous operation panicked. Error: {}", poison_err),
             )
@@ -184,7 +176,7 @@ impl SqliteConnectionManager {
     /// Attach another SQLite database file with a schema name
     pub fn attach_database_file(&self, db_path: &str, schema_name: &str) -> Result<()> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!("Previous operation panicked. Error: {}", poison_err),
             )

@@ -47,6 +47,7 @@ rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rmp-serde.workspace = true
 insta = "1.0"
 similar = "2.4.0"
 colored = "2.0"

@@ -14,17 +14,37 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod admitted;
+mod application;
 pub(crate) mod bound_use;
-pub(crate) mod carriers;
-pub(crate) use bound_use::ClosedRelationActual;
 pub(crate) mod callable;
+pub(crate) mod carriers;
 pub(crate) mod environment;
+/// THE EFFECT-BODY AUTHORITY, reached by the planner under this name: the
+/// entrances that compile a program or a demanded rule, and the selection
+/// of a consulted rule. The module lives beneath the scoped-definition
+/// authority because that is where a scoped body is readable.
+pub(crate) use environment::scoped::effect as effect_body;
 pub(crate) mod er;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod grounded_world;
 pub(crate) mod ho;
 pub(crate) mod instance;
 pub(crate) mod select;
+
+/// HOW ONE CLAUSE OF A PARAMETERIZED FIXPOINT REACHES ITS CALLER.
+///
+/// A parameter monomorphizes into the anchor: a base clause ADMITS the
+/// caller row (the carrier is joined into it once) and publishes the
+/// caller's actuals beside its heading as hidden support; a recursive
+/// clause reads the caller THROUGH THE FRONTIER it carries — its formals
+/// land on that support — and never joins the caller relation again, which
+/// is what keeps one caller's work out of another's progression. Decided
+/// where the clause is shaped, verified where its self-reference binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClauseCaller {
+    Admitted,
+    Carried,
+}
 
 /// One unresolved recursive-frontier binding, minted only while the
 /// definition-use authority owns the opened clause and its exact frontier.
@@ -35,6 +55,7 @@ pub(crate) struct FrontierCte {
     body: crate::pipeline::ast_unresolved::Chain,
     frontier: instance::DefinitionFrontier,
     authority: crate::pipeline::asts::core::CteAuthority,
+    caller: ClauseCaller,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -63,16 +84,22 @@ impl FrontierCte {
         body: crate::pipeline::ast_unresolved::Chain,
         frontier: instance::DefinitionFrontier,
         authority: crate::pipeline::asts::core::CteAuthority,
+        caller: ClauseCaller,
     ) -> Self {
         FrontierCte {
             body,
             frontier,
             authority,
+            caller,
         }
     }
 
     pub(crate) fn body(&self) -> &crate::pipeline::ast_unresolved::Chain {
         &self.body
+    }
+
+    pub(crate) fn caller(&self) -> ClauseCaller {
+        self.caller
     }
 
     pub(crate) fn authority(&self) -> &crate::pipeline::asts::core::CteAuthority {
@@ -98,6 +125,7 @@ impl FrontierCte {
             body: map(self.body)?,
             frontier: self.frontier,
             authority: self.authority,
+            caller: self.caller,
         })
     }
 
@@ -117,16 +145,34 @@ impl FrontierCte {
             body,
             frontier: self.frontier,
             authority,
+            caller: self.caller,
         }
     }
 
-    pub(crate) fn into_resolution(
+    /// RESOLVE THIS CLAUSE AND CARRY ITS FRONTIER'S SUPPORT, as one act:
+    /// the body resolves through the capability the fixpoint authority
+    /// hands in, the crossing carriers republish, and every caller actual
+    /// the frontier carries is published beside the clause's last
+    /// projection. The frontier never leaves this value, so the support
+    /// relationship is minted only for a clause of the group it belongs to.
+    pub(crate) fn resolve(
         self,
-    ) -> (
-        crate::pipeline::ast_unresolved::Chain,
-        crate::pipeline::asts::core::CteAuthority,
-    ) {
-        (self.body, self.authority)
+        resolver: &mut dyn crate::pipeline::resolver::CteResolver,
+    ) -> crate::error::Result<crate::pipeline::bindings::ResolvedClauseBody> {
+        let FrontierCte {
+            body,
+            frontier,
+            authority,
+            caller: _,
+        } = self;
+        let origin = authority.origin;
+        let expression = resolver.resolve_cte_expression(body, authority.horizon)?;
+        let crossing = resolver.crossing_carriers().to_vec();
+        let expression =
+            carriers::inject_crossing_carriers(expression, &crossing, resolver.identities())?;
+        let expression =
+            carriers::carry_frontier_actuals(expression, &frontier, resolver.identities())?;
+        Ok(crate::pipeline::bindings::ResolvedClauseBody { expression, origin })
     }
 
     pub(crate) fn folded<Q, F>(self, walk: &mut F) -> crate::error::Result<FrontierCrossing<Q>>
@@ -139,6 +185,7 @@ impl FrontierCte {
             body: walk.transform_relational_action(self.body)?.into_inner(),
             frontier: self.frontier,
             authority: self.authority,
+            caller: self.caller,
         })
     }
 }
@@ -149,6 +196,7 @@ pub struct FrontierCrossing<P: crate::pipeline::asts::core::Phase> {
     body: crate::pipeline::asts::core::Chain<P>,
     frontier: instance::DefinitionFrontier,
     authority: crate::pipeline::asts::core::CteAuthority,
+    caller: ClauseCaller,
 }
 
 impl FrontierCrossing<crate::pipeline::asts::core::Unresolved> {
@@ -157,6 +205,7 @@ impl FrontierCrossing<crate::pipeline::asts::core::Unresolved> {
             body: self.body,
             frontier: self.frontier,
             authority: self.authority,
+            caller: self.caller,
         }
     }
 }

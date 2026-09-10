@@ -5,6 +5,7 @@
 //! This module handles the resolution of base relations and relational calls.
 //! and pattern application for positional patterns.
 use super::ResolvedRelation;
+use crate::diagnostic::{Constraint, Internal, Narrowing, Resolution, Runtime, Semantic};
 use crate::pipeline::asts::core::{AuthoredColumn, ColumnOccurrence, GroundForm};
 
 use super::tvf::get_tvf_schema;
@@ -25,7 +26,8 @@ pub(super) fn bind_physical_relation(
     identities: &crate::relation::Planning,
 ) -> Result<()> {
     let Some(entity) = identities.authority().entity(&relation)? else {
-        return Err(DelightQLError::parse_error(
+        return Err(Internal::invariant(
+            "resolver::relation_resolver",
             "A physical relation heading has no catalog entity identity",
         ));
     };
@@ -49,10 +51,9 @@ pub(super) fn resolve_schema_free_access(
             Ok(ast_resolved::Access::Dequalify(columns.clone()))
         }
         ast_unresolved::Access::DequalifyAll => Ok(ast_resolved::Access::DequalifyAll),
-        ast_unresolved::Access::Slots(_) => Err(DelightQLError::validation_error(
-            "A positional relation access requires a resolved heading",
-            "Positional pattern resolution",
-        )),
+        ast_unresolved::Access::Slots(_) => Err(DelightQLError::from(Resolution::Schema {
+            message: "A positional relation access requires a resolved heading".to_string(),
+        })),
     }
 }
 
@@ -167,9 +168,9 @@ pub(super) fn resolve_structural_scope(
         unreachable!("resolve_structural_scope called with a different relation")
     };
     let carrier = fold.env.structural(pending).ok_or_else(|| {
-        DelightQLError::validation_error(
+        Internal::invariant(
+            "resolver::relation_resolver",
             "A structural relation was read before its binding was resolved",
-            "structural relation",
         )
     })?;
     read_compiler_relation(carrier, authored_name, alias, access, outer, fold)
@@ -244,9 +245,9 @@ fn read_compiler_relation(
     let source_columns =
         crate::relation::published_ports(&fold.core.identities, &source.semantic_relation())?;
     if source_columns.is_empty() {
-        return Err(DelightQLError::validation_error(
+        return Err(Internal::invariant(
+            "resolver::relation_resolver",
             "A plan-scope relation was read before its heading was published",
-            "compiler relation identity",
         ));
     }
 
@@ -261,9 +262,9 @@ fn read_compiler_relation(
     };
     let Some(authored_name) = authored_name else {
         if !matches!(access, ast_unresolved::Access::All) || outer {
-            return Err(DelightQLError::validation_error(
+            return Err(Internal::invariant(
+                "resolver::relation_resolver",
                 "A direct plan-scope read cannot carry user access metadata",
-                "effect plan identity",
             ));
         }
         return Ok(source);
@@ -309,119 +310,14 @@ fn read_compiler_relation(
     .restricted_by_its_own_constraints(&fold.core.identities)
 }
 
-/// Resolve a Ground relation variant (named table, view, CTE, or consulted entity).
-///
-/// This handles passthrough tables, grounded entities, namespace-qualified tables,
-/// unqualified tables, CTEs, consulted views/facts, and unknown entities.
+/// Resolve a Ground relation variant (named table, view, CTE, or consulted
+/// entity) in HEAD position: select once, then open the answer whole.
 pub(super) fn resolve_ground(
     rel: ast_unresolved::Relation,
     access: ast_unresolved::Access,
     fold: &mut super::resolver_fold::ResolverFold<'_, '_>,
 ) -> Result<ResolvedRelation> {
-    use crate::defuse::environment::RelationAnswer;
-
-    let ast_unresolved::Relation::Ground {
-        mention:
-            ast_unresolved::GroundMention::Named {
-                identifier,
-                alias,
-                mutation_target,
-                passthrough,
-            },
-        outer,
-    } = rel
-    else {
-        unreachable!("resolve_ground called with non-Ground variant");
-    };
-
-    // `!!` is evidence about the relation this access reads, and it belongs
-    // to the occurrence the access publishes — recorded below, once the
-    // relation kind has been settled and before anything is built on it.
-    // Every relation built from that occurrence afterwards carries the
-    // evidence, so a name, an alias, a CTE binding or a join arm hands it on
-    // instead of leaving a later reader to walk the syntax back to a ground
-    // name it may no longer have.
-    let marked_relation = mutation_target.then(|| {
-        fold.core
-            .identities
-            .intern(identifier.name.as_str(), identifier.name.is_stropped())
-    });
-
-    // PASSTHROUGH: skip entity catalog, use schema introspector directly.
-    if passthrough {
-        let resolved = r_resolve_passthrough(identifier, access, alias, outer, fold)?;
-        resolved.noting_mutation_mark(marked_relation, &fold.core.identities)?;
-        return Ok(resolved);
-    }
-
-    // ONE LOOKUP AUTHORITY, both spellings: the environment owns the
-    // closed qualified decision (catalog provider, current definitions,
-    // closed miss) exactly as it owns the unqualified ladder.
-    let mut serve_bootstrap: Option<ServedBootstrapRead> = None;
-    let resolution = if !identifier.namespace_path.is_empty() {
-        let (answer, serve) = fold.env.relation_qualified(
-            fold.core,
-            &identifier.namespace_path,
-            &identifier.name,
-            fold.config.serve_bootstrap_reads,
-        )?;
-        if let Some(serve) = serve {
-            serve_bootstrap = Some(ServedBootstrapRead {
-                canonical: serve.canonical,
-                backend_schema: serve.backend_schema,
-                namespace_fq: serve.namespace_fq,
-            });
-        }
-        answer
-    } else {
-        let entity_name = identifier.name.clone();
-        fold.env.relation(fold.core, &entity_name, alias.as_ref())?
-    };
-
-    let resolved = match resolution {
-        RelationAnswer::CTE { entity, frontier } => {
-            r_resolve_cte(entity, frontier, identifier, access, alias, outer, fold)
-        }
-        RelationAnswer::MaterializedRelation(entity_info) => {
-            r_resolve_cte(entity_info, None, identifier, access, alias, outer, fold)
-        }
-        RelationAnswer::DatabaseEntity(entity_info) => {
-            r_resolve_database_entity(entity_info, access, alias, outer, fold)
-        }
-        RelationAnswer::ConsultedView(selected) => {
-            r_resolve_consulted_view(selected, access, alias, outer, fold)
-        }
-        RelationAnswer::DefinedNonRelation { name, entity_type } => {
-            Err(defined_non_relation_error(&name, entity_type))
-        }
-        // THE CATEGORY IS RIGHT AND THE ROAD IS MISSING. Reaching this arm
-        // means the executable boundary — which runs before resolution, over
-        // the submission's own chains — did not see this occurrence, so the
-        // rows were never produced. Refusing here is what keeps a known
-        // relation out of the generic-TVF fallback, where its namespace would
-        // be stripped and SQL generated against a table that does not exist.
-        RelationAnswer::RuntimeServedRelation { name, entity_type } => {
-            Err(runtime_served_unreached_error(&name, entity_type))
-        }
-        RelationAnswer::Ambiguous(message) => Err(DelightQLError::validation_error(
-            message,
-            "Ambiguous unqualified entity resolution",
-        )),
-        // A FREE DATA NAME OF A DECLARATION with no bound world: refuse
-        // with the grounding teaching — no caller, session, or backend
-        // relation answers it ambiently.
-        RelationAnswer::DataHole { name, world } => Err(
-            crate::defuse::environment::lookup::unbound_data_hole(&name, &world),
-        ),
-        RelationAnswer::BuiltInFunction => r_resolve_unknown(identifier),
-        _ => r_resolve_unknown(identifier),
-    }?;
-    resolved.noting_mutation_mark(marked_relation, &fold.core.identities)?;
-    let resolved = match serve_bootstrap {
-        Some(served) => serve_bootstrap_relation(resolved, served, fold)?,
-        None => resolved,
-    };
-    Ok(resolved)
+    select_ground(rel, fold)?.into_whole(access, fold)
 }
 
 /// A bootstrap read a materialization source resolves: served as rows.
@@ -497,7 +393,7 @@ fn serve_bootstrap_relation(
 
     let connection = system.bootstrap_connection();
     let guard = connection.lock().map_err(|e| {
-        DelightQLError::connection_poison_error(
+        Runtime::poisoned(
             "Failed to acquire bootstrap lock for a served materialization source",
             format!("Connection was poisoned: {}", e),
         )
@@ -600,7 +496,7 @@ fn serve_bootstrap_relation(
 }
 
 fn internal_serving_error(message: &str) -> DelightQLError {
-    DelightQLError::transformation_error(message, "bootstrap_serving")
+    Internal::invariant("bootstrap_serving", message)
 }
 
 /// One engine value as the literal it spells. The catalog's declared
@@ -619,10 +515,10 @@ fn served_literal(
         ValueRef::Real(value) => LiteralValue::Number(format!("{value:?}")),
         ValueRef::Text(bytes) => LiteralValue::String(String::from_utf8_lossy(bytes).into_owned()),
         ValueRef::Blob(_) => {
-            return Err(DelightQLError::validation_error_categorized(
-                "materialization/bootstrap_blob",
-                "a bootstrap BLOB column has no literal spelling to serve",
-                "project the column out of the materialization source",
+            return Err(DelightQLError::from(
+                Semantic::MaterializationBootstrapBlob {
+                    message: "a bootstrap BLOB column has no literal spelling to serve".to_string(),
+                },
             ))
         }
     })
@@ -658,15 +554,13 @@ fn defined_non_relation_error(
 ) -> DelightQLError {
     let message = match entity_type {
         BootstrapEntityType::DqlDefaultFactFunctionExpression => {
-            return DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::RESOLUTION_FACT_FUNCTION_RELATIONAL_FACE,
-                format!(
+            return DelightQLError::from(Resolution::FactFunctionRelationalFace {
+                message: format!(
                     "'{name}' is a default-bearing fact function and has no relational face — \
                      call it as `{name}:(inputs)`, or map that call over a separately supplied \
                      finite relation"
                 ),
-                "a `_ -> outputs` arm denotes an unbounded input complement",
-            );
+            });
         }
         BootstrapEntityType::DqlFunctionExpression
         | BootstrapEntityType::DqlHoFunctionExpression
@@ -675,10 +569,16 @@ fn defined_non_relation_error(
              `{name}:(args)`. (A case/scalar function has no relation face \
              `{name}(*)`.)"
         ),
-        BootstrapEntityType::DqlHoTemporaryViewExpression => format!(
-            "'{name}' is a higher-order view, not a relation — supply its \
-             relation argument, for example `{name}(source(*))(*)`"
-        ),
+        BootstrapEntityType::DqlHoTemporaryViewExpression => {
+            // A higher-order view invoked without its relation argument is
+            // an arity refusal, not an unresolved name.
+            return DelightQLError::from(crate::diagnostic::Semantic::Arity {
+                message: format!(
+                    "'{name}' is a higher-order view, not a relation — supply its \
+                     relation argument, for example `{name}(source(*))(*)`"
+                ),
+            });
+        }
         BootstrapEntityType::DqlTemporarySigmaRule | BootstrapEntityType::BinSigmaPredicate => {
             format!(
                 "'{name}' is a sigma predicate, not a relation — use it in a \
@@ -698,10 +598,9 @@ fn defined_non_relation_error(
             other.variant_name()
         ),
     };
-    DelightQLError::validation_error(
-        message,
-        format!("'{name}' resolved to {}", entity_type.variant_name()),
-    )
+    DelightQLError::from(Resolution::General {
+        message: message.to_string(),
+    })
 }
 
 /// A runtime-served relation that resolution reached before execution did.
@@ -715,15 +614,14 @@ fn runtime_served_unreached_error(
     name: &SqlIdentifier,
     entity_type: BootstrapEntityType,
 ) -> DelightQLError {
-    DelightQLError::validation_error(
-        format!(
-            "'{name}' is a bin relation served by the runtime, and this \
+    DelightQLError::from(Resolution::General {
+        message: format!(
+            "'{name}' ({entity_type:?}) is a bin relation served by the runtime, and this \
              occurrence escaped the executable boundary that produces its \
              rows — a compiler fence, not a semantic outcome; the direct, \
              bound and consulted spellings all execute"
         ),
-        format!("'{name}' resolved to {}", entity_type.variant_name()),
-    )
+    })
 }
 
 /// Handle PASSTHROUGH resolution: skip entity catalog, use schema introspector directly.
@@ -736,11 +634,11 @@ pub(super) fn r_resolve_passthrough(
     fold: &mut super::resolver_fold::ResolverFold<'_, '_>,
 ) -> Result<ResolvedRelation> {
     if identifier.namespace_path.is_empty() {
-        return Err(DelightQLError::validation_error(
-            "Passthrough table access requires a namespace path (e.g., main/table_name(*))"
-                .to_string(),
-            "passthrough_requires_namespace".to_string(),
-        ));
+        return Err(DelightQLError::from(Constraint::General {
+            message:
+                "Passthrough table access requires a namespace path (e.g., main/table_name(*))"
+                    .to_string(),
+        }));
     }
 
     // Prefer the mounted catalog, then ask the target introspector for a
@@ -794,13 +692,12 @@ pub(super) fn r_resolve_passthrough(
     // no dimensions can be answered without a heading, and which accesses
     // those are is the access type's own answer.
     if !access.is_whole() {
-        return Err(DelightQLError::validation_error(
-            format!(
+        return Err(DelightQLError::from(Resolution::Schema {
+    message: format!(
                 "Passthrough table '{}/{}' schema not available — only (*) is allowed, not positional binding",
                 identifier.namespace_path, identifier.name
             ),
-            "passthrough_opaque_glob_only".to_string(),
-        ));
+}));
     }
 
     // A passthrough reads a backend table the entity catalog does not
@@ -815,16 +712,21 @@ pub(super) fn r_resolve_passthrough(
 ///
 /// The head is where a ground relation lives; the continuations that may sit
 /// above it (a generated restriction) do not carry outerness.
-/// Handle CTE resolution result.
-pub(crate) fn r_resolve_cte(
+/// THE SCOPE A LEXICAL RELATION NAME READS: a query-local CTE or a
+/// plan-created relation, as the one access boundary publishes it.
+///
+/// Both positions that may read such a name — a chain head and a join
+/// member — derive it here and nowhere else. A read built from the
+/// binding's own body relation instead answers to whatever that body's
+/// source was bound to, so the member spelling would name the CTE's first
+/// table where the head spelling names the CTE.
+fn local_read_scope(
     entity_info: crate::resolution::EntityInfo,
     frontier: Option<crate::defuse::instance::DefinitionFrontier>,
-    identifier: ast_unresolved::QualifiedName,
-    access: ast_unresolved::Access,
-    alias: Option<SqlIdentifier>,
-    outer: bool,
+    identifier: &ast_unresolved::QualifiedName,
+    alias: Option<&SqlIdentifier>,
     fold: &mut super::resolver_fold::ResolverFold<'_, '_>,
-) -> Result<ResolvedRelation> {
+) -> Result<crate::relation::SemanticRelation> {
     use crate::resolution::EntityDefinition;
 
     if let Some(frontier) = &frontier {
@@ -833,7 +735,6 @@ pub(crate) fn r_resolve_cte(
 
     let canonical_name = entity_info.canonical_name.clone();
     let backend_schema = entity_info.backend_schema;
-    // Extract the CTE schema
     let EntityDefinition::RelationSchema(cte_schema) = entity_info.definition;
     if canonical_name.is_some() {
         bind_physical_relation(
@@ -849,9 +750,9 @@ pub(crate) fn r_resolve_cte(
         .authority()
         .is_plan_scratch(&cte_schema)?
     {
-        return Err(DelightQLError::validation_error(
+        return Err(Internal::invariant(
+            "resolver::relation_resolver",
             "Plan scratch must be referenced by scope identity",
-            "effect plan identity",
         ));
     }
     // The consult of a USER-DEFINED CTE is an access boundary,
@@ -868,25 +769,319 @@ pub(crate) fn r_resolve_cte(
     // rework, not by breaking it. Argumentative access still
     // declares its own bare lvars either way: the pattern
     // resolver re-declares on selection.
-    let source_scope = cte_schema;
-    // ONE INSTANCE of the binding: the access boundary is its own relation,
-    // and what crosses it, under what name, is the boundary's law.
-    let access_name: SqlIdentifier = alias.clone().unwrap_or_else(|| identifier.name.clone());
+    let access_name: SqlIdentifier = alias.cloned().unwrap_or_else(|| identifier.name.clone());
     let access_spelling = fold
         .core
         .identities
         .intern(access_name.as_str(), access_name.is_stropped());
-    let instance =
+    // ONE INSTANCE of the binding: the access boundary is its own relation,
+    // and what crosses it, under what name, is the boundary's law.
+    fold.core
+        .identities
+        .authority()
+        .derive(crate::relation::RelForm::Instantiate(
+            crate::relation::form::InstanceSpec {
+                kind: crate::relation::form::DefinitionKind::Cte,
+                template: cte_schema,
+                answers_to: Some(access_spelling),
+            },
+        ))
+}
+
+/// THE SCOPE A CATALOG RELATION NAME READS, with its physical identity
+/// bound and its alias export derived. Shared by the head and member
+/// positions for the same reason [`local_read_scope`] is.
+fn catalog_read_scope(
+    entity_info: crate::resolution::EntityInfo,
+    alias: &Option<SqlIdentifier>,
+    access: &ast_unresolved::Access,
+    fold: &mut super::resolver_fold::ResolverFold<'_, '_>,
+) -> Result<crate::relation::SemanticRelation> {
+    use crate::resolution::EntityDefinition;
+
+    let canonical_name = entity_info.canonical_name.clone();
+    let entity_backend_schema = entity_info.backend_schema;
+    let EntityDefinition::RelationSchema(table_schema) = entity_info.definition;
+    bind_physical_relation(
+        table_schema,
+        canonical_name.as_ref(),
+        entity_backend_schema.as_deref(),
+        &fold.core.identities,
+    )?;
+    // THE ALIAS REPUBLICATION IS THE WHOLE READ'S. A read that names no
+    // dimensions answers to its alias by republishing the base heading
+    // under it. A SLOT ROW publishes its own interface instead, owned by
+    // the same alias through the pattern owner — republishing underneath
+    // it re-roots the base ports, and a ground slot's restriction then
+    // names a port the emitted read no longer binds.
+    if matches!(access, ast_unresolved::Access::Slots(_)) {
+        return Ok(table_schema);
+    }
+    let (aliased, _base_cols) =
+        relabel_columns_with_alias(table_schema, alias, &fold.core.identities)?;
+    Ok(aliased)
+}
+
+/// WHAT A NAMED GROUND MENTION DENOTES — selected ONCE.
+///
+/// The lookup runs here and nowhere else. The answer then travels to
+/// whichever finish the position needs: a chain head takes the whole
+/// relation, a slotted join member takes an unfinished read where the
+/// answer is a readable scope. No outcome carries permission to look the
+/// spelling up again, so one use never selects twice and the two positions
+/// cannot disagree about what a name means.
+pub(super) struct GroundSelection<'db> {
+    identifier: ast_unresolved::QualifiedName,
+    alias: Option<SqlIdentifier>,
+    outer: bool,
+    /// `!!` is evidence about the relation this access reads, and it
+    /// belongs to the occurrence the access publishes.
+    marked_relation: Option<crate::names::Spelling>,
+    denotes: Denotation<'db>,
+}
+
+/// What the selection found. A passthrough carries no catalog answer: its
+/// own backend lookup needs the access, so the finish performs it — once.
+enum Denotation<'db> {
+    Passthrough,
+    Catalog {
+        answer: crate::defuse::environment::RelationAnswer<'db>,
+        serve: Option<ServedBootstrapRead>,
+    },
+}
+
+/// A JOIN MEMBER'S OUTCOME, from the one selection it spent.
+pub(super) enum MemberOutcome {
+    /// The slot row applied to the selected readable scope. The
+    /// constraints are still the join's to partition into its correlation
+    /// and the read's own restriction, which is the only thing the member
+    /// position decides.
+    Patterned(super::lexical::PatternRead),
+    /// The selection opened whole. Not a permission to select again — this
+    /// relation IS the answer this member's selection produced.
+    Whole(ResolvedRelation),
+}
+
+/// SELECT what a named ground mention denotes. One lookup, both spellings:
+/// the environment owns the closed qualified decision (catalog provider,
+/// current definitions, closed miss) exactly as it owns the unqualified
+/// ladder.
+pub(super) fn select_ground<'db>(
+    rel: ast_unresolved::Relation,
+    fold: &mut super::resolver_fold::ResolverFold<'_, 'db>,
+) -> Result<GroundSelection<'db>> {
+    let ast_unresolved::Relation::Ground {
+        mention:
+            ast_unresolved::GroundMention::Named {
+                identifier,
+                alias,
+                mutation_target,
+                passthrough,
+            },
+        outer,
+    } = rel
+    else {
+        unreachable!("select_ground called with a mention that is not a name");
+    };
+
+    // Recorded before anything is built on it, so every relation built from
+    // that occurrence afterwards carries the evidence — a name, an alias, a
+    // CTE binding or a join arm hands it on instead of leaving a later
+    // reader to walk the syntax back to a ground name it may no longer have.
+    let marked_relation = mutation_target.then(|| {
         fold.core
             .identities
-            .authority()
-            .derive(crate::relation::RelForm::Instantiate(
-                crate::relation::form::InstanceSpec {
-                    kind: crate::relation::form::DefinitionKind::Cte,
-                    template: source_scope,
-                    answers_to: Some(access_spelling),
-                },
-            ))?;
+            .intern(identifier.name.as_str(), identifier.name.is_stropped())
+    });
+
+    let denotes = if passthrough {
+        // PASSTHROUGH: skip the entity catalog; the schema introspector
+        // answers, and it answers with the access in hand.
+        Denotation::Passthrough
+    } else if identifier.namespace_path.is_empty() {
+        Denotation::Catalog {
+            answer: fold
+                .env
+                .relation(fold.core, &identifier.name, alias.as_ref())?,
+            serve: None,
+        }
+    } else {
+        let (answer, serve) = fold.env.relation_qualified(
+            fold.core,
+            &identifier.namespace_path,
+            &identifier.name,
+            fold.config.serve_bootstrap_reads,
+        )?;
+        Denotation::Catalog {
+            answer,
+            serve: serve.map(|serve| ServedBootstrapRead {
+                canonical: serve.canonical,
+                backend_schema: serve.backend_schema,
+                namespace_fq: serve.namespace_fq,
+            }),
+        }
+    };
+
+    Ok(GroundSelection {
+        identifier,
+        alias,
+        outer,
+        marked_relation,
+        denotes,
+    })
+}
+
+impl<'db> GroundSelection<'db> {
+    /// The WHOLE relation this selection denotes.
+    pub(super) fn into_whole(
+        self,
+        access: ast_unresolved::Access,
+        fold: &mut super::resolver_fold::ResolverFold<'_, 'db>,
+    ) -> Result<ResolvedRelation> {
+        use crate::defuse::environment::RelationAnswer;
+
+        let GroundSelection {
+            identifier,
+            alias,
+            outer,
+            marked_relation,
+            denotes,
+        } = self;
+
+        let (answer, serve) = match denotes {
+            Denotation::Passthrough => {
+                let resolved = r_resolve_passthrough(identifier, access, alias, outer, fold)?;
+                resolved.noting_mutation_mark(marked_relation, &fold.core.identities)?;
+                return Ok(resolved);
+            }
+            Denotation::Catalog { answer, serve } => (answer, serve),
+        };
+
+        let resolved = match answer {
+            RelationAnswer::CTE { entity, frontier } => {
+                r_resolve_cte(entity, frontier, identifier, access, alias, outer, fold)
+            }
+            RelationAnswer::MaterializedRelation(entity_info) => {
+                r_resolve_cte(entity_info, None, identifier, access, alias, outer, fold)
+            }
+            RelationAnswer::DatabaseEntity(entity_info) => {
+                r_resolve_database_entity(entity_info, access, alias, outer, fold)
+            }
+            RelationAnswer::ConsultedView(selected) => {
+                r_resolve_consulted_view(selected, access, alias, outer, fold)
+            }
+            RelationAnswer::DefinedNonRelation { name, entity_type } => {
+                Err(defined_non_relation_error(&name, entity_type))
+            }
+            // THE CATEGORY IS RIGHT AND THE ROAD IS MISSING. Reaching this
+            // arm means the executable boundary — which runs before
+            // resolution, over the submission's own chains — did not see
+            // this occurrence, so the rows were never produced. Refusing
+            // here is what keeps a known relation out of the generic-TVF
+            // fallback, where its namespace would be stripped and SQL
+            // generated against a table that does not exist.
+            RelationAnswer::RuntimeServedRelation { name, entity_type } => {
+                Err(runtime_served_unreached_error(&name, entity_type))
+            }
+            RelationAnswer::Ambiguous(message) => {
+                Err(DelightQLError::from(Resolution::Ambiguous {
+                    message: message.to_string(),
+                }))
+            }
+            // A FREE DATA NAME OF A DECLARATION with no bound world: refuse
+            // with the grounding teaching — no caller, session, or backend
+            // relation answers it ambiently.
+            RelationAnswer::DataHole { name, world } => Err(
+                crate::defuse::environment::lookup::unbound_data_hole(&name, &world),
+            ),
+            RelationAnswer::BuiltInFunction => r_resolve_unknown(identifier),
+            _ => r_resolve_unknown(identifier),
+        }?;
+        resolved.noting_mutation_mark(marked_relation, &fold.core.identities)?;
+        match serve {
+            Some(served) => serve_bootstrap_relation(resolved, served, fold),
+            None => Ok(resolved),
+        }
+    }
+
+    /// The SLOTTED MEMBER'S outcome. A readable scope keeps its read
+    /// unfinished for the join; every other answer this selection produced
+    /// opens whole, through the very same finish the head position uses.
+    pub(super) fn into_member(
+        self,
+        access: &ast_unresolved::Access,
+        fold: &mut super::resolver_fold::ResolverFold<'_, 'db>,
+    ) -> Result<MemberOutcome> {
+        use crate::defuse::environment::RelationAnswer;
+
+        // A mutation mark and a served bootstrap read are acts on a
+        // FINISHED relation — the mark rides the occurrence the access
+        // publishes, the serving replaces the read with its own literal
+        // scope — so this selection opens whole for them. Neither looks the
+        // name up again.
+        let readable = match &self.denotes {
+            Denotation::Passthrough => false,
+            Denotation::Catalog { serve, answer } => {
+                self.marked_relation.is_none()
+                    && serve.is_none()
+                    && matches!(
+                        answer,
+                        RelationAnswer::CTE { .. }
+                            | RelationAnswer::MaterializedRelation(_)
+                            | RelationAnswer::DatabaseEntity(_)
+                    )
+            }
+        };
+        if !readable {
+            return Ok(MemberOutcome::Whole(self.into_whole(access.clone(), fold)?));
+        }
+
+        let GroundSelection {
+            identifier,
+            alias,
+            outer,
+            denotes,
+            ..
+        } = self;
+        let Denotation::Catalog { answer, .. } = denotes else {
+            unreachable!("a readable member selection carries a catalog answer");
+        };
+        let scope = match answer {
+            RelationAnswer::CTE { entity, frontier } => {
+                local_read_scope(entity, frontier, &identifier, alias.as_ref(), fold)?
+            }
+            RelationAnswer::MaterializedRelation(entity) => {
+                local_read_scope(entity, None, &identifier, alias.as_ref(), fold)?
+            }
+            RelationAnswer::DatabaseEntity(entity) => {
+                catalog_read_scope(entity, &alias, access, fold)?
+            }
+            _ => unreachable!("the readable judgment admitted only these three answers"),
+        };
+
+        // THE ONE ARGUMENTATIVE OPERATION, over the relation the selection
+        // answered with: the slot row is judged and applied there, and the
+        // read comes back unfinished for the join that owns the left row.
+        Ok(MemberOutcome::Patterned(ResolvedRelation::patterned(
+            super::PatternOperand::Read { scope, outer },
+            access,
+            pattern_owner(&alias),
+            fold,
+        )?))
+    }
+}
+
+/// Handle CTE resolution result.
+pub(crate) fn r_resolve_cte(
+    entity_info: crate::resolution::EntityInfo,
+    frontier: Option<crate::defuse::instance::DefinitionFrontier>,
+    identifier: ast_unresolved::QualifiedName,
+    access: ast_unresolved::Access,
+    alias: Option<SqlIdentifier>,
+    outer: bool,
+    fold: &mut super::resolver_fold::ResolverFold<'_, '_>,
+) -> Result<ResolvedRelation> {
+    let instance = local_read_scope(entity_info, frontier, &identifier, alias.as_ref(), fold)?;
     let resolved = super::ResolvedRelation::patterned(
         super::PatternOperand::Read {
             scope: instance,
@@ -909,23 +1104,7 @@ pub(super) fn r_resolve_database_entity(
     outer: bool,
     fold: &mut super::resolver_fold::ResolverFold<'_, '_>,
 ) -> Result<ResolvedRelation> {
-    use crate::resolution::EntityDefinition;
-
-    // Extract fields before entity_info is consumed
-    let canonical_name = entity_info.canonical_name.clone();
-    let entity_backend_schema = entity_info.backend_schema;
-    // Extract the table schema
-    let EntityDefinition::RelationSchema(table_schema) = entity_info.definition;
-    bind_physical_relation(
-        table_schema,
-        canonical_name.as_ref(),
-        entity_backend_schema.as_deref(),
-        &fold.core.identities,
-    )?;
-    // Apply alias if present
-    let (aliased, _base_cols) =
-        relabel_columns_with_alias(table_schema, &alias, &fold.core.identities)?;
-
+    let aliased = catalog_read_scope(entity_info, &alias, &access, fold)?;
     let resolved = super::ResolvedRelation::patterned(
         super::PatternOperand::Read {
             scope: aliased,
@@ -1041,10 +1220,10 @@ pub(super) fn r_resolve_unknown(
         )
     };
 
-    Err(DelightQLError::TableNotFoundError {
-        table_name,
+    Err(DelightQLError::from(Resolution::Table {
+        table: table_name,
         context,
-    })
+    }))
 }
 
 /// Infer a `declared_type` for each anonymous-table column from its literal
@@ -1056,7 +1235,7 @@ pub(super) fn r_resolve_unknown(
 /// corresponding-union NULL pads, whose type comes from the Registry value
 /// facts. An untyped pad inside a subquery collapses to text at the pg
 /// subquery boundary before the union can resolve it against the typed branch.
-fn infer_anon_column_types(
+pub(in crate::pipeline::resolver) fn infer_anon_column_types(
     rows: &crate::pipeline::asts::vocabulary::Vec1<ast_resolved::TabularRow<ast_resolved::Datum>>,
 ) -> Vec<Option<String>> {
     let num_cols = rows.first().len();
@@ -1096,7 +1275,7 @@ fn infer_anon_column_types(
         .collect()
 }
 
-fn infer_anon_column_shapes(
+pub(in crate::pipeline::resolver) fn infer_anon_column_shapes(
     rows: &crate::pipeline::asts::vocabulary::Vec1<ast_resolved::TabularRow<ast_resolved::Datum>>,
 ) -> Vec<crate::names::ValueShape> {
     use crate::pipeline::asts::core::Enclyph;
@@ -1157,15 +1336,13 @@ pub(super) fn refuse_knowable_object_narrowing(
         .copied()
         .expect("the named position came from this exhaustive heading");
     if identities.facts(occurrence.column()).shape == crate::names::ValueShape::Record {
-        return Err(DelightQLError::validation_error_categorized(
-            "narrowing/object_literal",
-            format!(
+        return Err(DelightQLError::from(Narrowing::ObjectLiteral {
+            message: format!(
                 "narrowing iterates an array — every row of '{column}' is a single \
                  object. Path into the object instead: ({column}:{{.field}}), or \
                  spell the one-element sequence: [{{...}}]."
             ),
-            "brace narrowing",
-        ));
+        }));
     }
     Ok(())
 }
@@ -1205,22 +1382,6 @@ pub(super) fn resolve_anonymous(
         alias: relation_alias,
         outer,
     } = anon;
-    // `_` is the disregarded slot: no term of its own, no name, and the
-    // classification below reads that absence directly.
-    let column_headers = header
-        .as_ref()
-        .map(|row| {
-            row.iter()
-                .map(|item| match &item.slot {
-                    crate::pipeline::asts::core::Slot::Anon => Ok(None),
-                    _ => item.term().map(Some).ok_or_else(|| {
-                        DelightQLError::parse_error("a tabular header slot has a domain term")
-                    }),
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?;
-
     let scope_answer = relation_alias.as_ref().map(|alias| {
         fold.core
             .identities
@@ -1267,52 +1428,16 @@ pub(super) fn resolve_anonymous(
         )))
     })?;
 
-    // An lvar cannot appear both in a header and in the data rows of
-    // the same anonymous table: the header is the probe,
-    // a row lvar is a candidate — the same name in both makes the
-    // membership vacuously true, and in the relational forms it
-    // collides the declaration with the reference.
-    if let Some(headers) = &column_headers {
-        for header in headers {
-            let Some(ast_unresolved::DomainExpression::Reference(Reference::Named(
-                NamedReference(AuthoredColumn { name, .. }),
-            ))) = header
-            else {
-                continue;
-            };
-            let repeated = rows.iter().any(|row| {
-                row.iter().any(|datum| {
-                    let cell = datum.value();
-                    matches!(cell,
-                        ast_unresolved::DomainExpression::Reference(Reference::Named(NamedReference(AuthoredColumn { name: cell_name, .. })))
-                            if delightql_types::SqlIdentifier::str_eq(cell_name.as_str(), name))
-                })
-            });
-            if repeated {
-                return Err(crate::error::DelightQLError::validation_error_categorized(
-                    "resolution/anon/header_row_lvar",
-                    format!(
-                        "lvar '{}' appears both as a header and in the data rows of the same anonymous table",
-                        name
-                    ),
-                    "the header is the probe and a row lvar is a candidate — probing a column against itself is vacuously true; drop the self-candidate or rename the header",
-                ));
-            }
-        }
-    }
-
-    // Literal-grid type inference: the rows are the columns' declaration.
-    let inferred_types = infer_anon_column_types(&resolved_rows);
-    let inferred_shapes = infer_anon_column_shapes(&resolved_rows);
-
-    // Classify the complete heading before the relation exists. Each member
-    // chooses one closed anonymous-slot law; none chooses an owner,
-    // addressing disposition, or destination scope.
-    // THE HEADER READS BY THE SLOT VOCABULARY — bind, reuse, ground,
-    // disregard — the same row the caller pattern reads. Only binders
-    // publish: a repeated binder is the same variable twice (one published
-    // column and an equality between the positions), `_` disregards, and a
-    // ground or computed term constrains and publishes nothing.
+    // THE HEADER IS A SLOT ROW, judged by the lexical authority over the
+    // row this relation is composed with — bind, reuse, ground, disregard,
+    // the same vocabulary the caller pattern reads — and BORN by the same
+    // judgment: the carrier that judged it owns the alias, the planning
+    // authority, the grid's facts and every reuse edge, and its one
+    // consuming operation derives the relation. Only binders publish: a
+    // repeated binder is the same variable twice (one published column and
+    // an equality between the positions), `_` disregards, and a ground or
+    // computed term constrains and publishes nothing. This road supplies
+    // the birth one thing: how a computed header resolves over the row.
     enum HeaderRole {
         Binder,
         /// The same variable again: an equality with the position that
@@ -1325,121 +1450,72 @@ pub(super) fn resolve_anonymous(
         Constrains,
     }
     let mut roles: Vec<HeaderRole> = Vec::new();
-    let (header_values, slots) = if let Some(headers) = &column_headers {
-        let mut seen: Vec<(String, usize)> = Vec::new();
-        let mut values = Vec::with_capacity(headers.len());
-        let mut slots = Vec::with_capacity(headers.len());
-        for (idx, header) in headers.iter().enumerate() {
-            let declared_type = inferred_types.get(idx).cloned().flatten();
-            let shape = inferred_shapes.get(idx).copied().unwrap_or_default();
-            match header {
-                Some(ast_unresolved::DomainExpression::Reference(Reference::Named(
-                    NamedReference(AuthoredColumn { name, .. }),
-                ))) => {
-                    // A BINDER IS A VARIABLE, and only variables unify: a
-                    // stropped spelling is an authored NAME, so repeating
-                    // one is a name collision (minted apart), not a
-                    // self-unification.
-                    if let Some(&(_, first)) = (!name.is_stropped())
-                        .then(|| {
-                            seen.iter().find(|(spelt, _)| {
-                                delightql_types::SqlIdentifier::str_eq(spelt, name.as_str())
-                            })
-                        })
-                        .flatten()
-                    {
-                        roles.push(HeaderRole::Repeat { first });
-                        slots.push(crate::relation::form::AnonymousSlot::Constraint {
-                            position: idx as u32,
-                            declared_type,
-                            shape,
-                        });
-                        // The value is written after the derivation, when the
-                        // first binder's port exists.
-                        values.push(None);
-                        continue;
-                    }
-                    if !name.is_stropped() {
-                        seen.push((name.to_string(), idx));
-                    }
-                    let named = fold
-                        .core
-                        .identities
-                        .intern(name.as_str(), name.is_stropped());
+    let (header_values, resolved_schema) = if let Some(header) = &header {
+        let planning: &crate::relation::Planning = fold.core.identities;
+        let birth = fold.lexical.judge_anonymous_header(
+            header,
+            &rows,
+            &resolved_rows,
+            relation_alias.as_ref(),
+            planning,
+        )?;
+        // A computed header names a column of the ENCLOSING row —
+        // `_(upper:(description) @ …)` probes the outer relation's
+        // `description`. It resolves against the same context the data
+        // rows do, because it is a reference out of the same place; the
+        // birth asks for each such term in position order.
+        let born = birth.born(|term| resolve_against_outer_context(fold, term))?;
+        let mut values = Vec::with_capacity(born.positions.len());
+        for position in born.positions {
+            match position {
+                super::BornPosition::Binds => {
                     roles.push(HeaderRole::Binder);
-                    slots.push(crate::relation::form::AnonymousSlot::Binder {
-                        position: idx as u32,
-                        named,
-                        declared_type,
-                        shape,
-                    });
                     values.push(None);
                 }
-                None => {
-                    // `_` — the disregarded slot.
+                super::BornPosition::Repeats { first } => {
+                    roles.push(HeaderRole::Repeat { first });
+                    // The value is written below, from the first binder's
+                    // port.
+                    values.push(None);
+                }
+                super::BornPosition::Disregards => {
                     roles.push(HeaderRole::Disregard);
-                    slots.push(crate::relation::form::AnonymousSlot::Constraint {
-                        position: idx as u32,
-                        declared_type,
-                        shape,
-                    });
                     values.push(None);
                 }
-                Some(_) => {
-                    // A computed header names a column of the ENCLOSING row —
-                    // `_(upper:(description) @ …)` probes the outer relation's
-                    // `description`. It resolves against the same context the
-                    // data rows do, because it is a reference out of the same
-                    // place.
-                    let header = header.clone().expect("the Some arm holds a term");
+                super::BornPosition::Constrains(resolved) => {
                     roles.push(HeaderRole::Constrains);
-                    let resolved_expr = resolve_against_outer_context(fold, header.clone())?;
-                    let slot = match &resolved_expr {
-                        ast_resolved::DomainExpression::Application(
-                            ast_resolved::FunctionApplication::Ground(_),
-                        ) => crate::relation::form::AnonymousSlot::Literal {
-                            position: idx as u32,
-                            declared_type,
-                            shape,
-                        },
-                        ast_resolved::DomainExpression::Application(_) => {
-                            crate::relation::form::AnonymousSlot::Constraint {
-                                position: idx as u32,
-                                declared_type,
-                                shape,
-                            }
-                        }
-                        other => panic!("catch-all hit in relation_resolver.rs resolve_inline_relation (DomainExpression column name): {:?}", other),
-                    };
-                    slots.push(slot);
-                    values.push(Some(resolved_expr));
+                    values.push(Some(resolved));
                 }
             }
         }
-        (Some(values), slots)
+        (Some(values), born.relation)
     } else {
-        let num_cols = resolved_rows.first().len();
-        let slots = (0..num_cols)
-            .map(|idx| crate::relation::form::AnonymousSlot::Inferred {
-                position: idx as u32,
-                declared_type: inferred_types.get(idx).cloned().flatten(),
-                shape: inferred_shapes.get(idx).copied().unwrap_or_default(),
-            })
-            .collect();
-        (None, slots)
+        // A headerless grid: one inferred position per column, reusing
+        // nothing — the plain road.
+        let inferred_types = infer_anon_column_types(&resolved_rows);
+        let inferred_shapes = infer_anon_column_shapes(&resolved_rows);
+        let inferred_slots: Vec<crate::relation::form::AnonymousSlot> =
+            (0..resolved_rows.first().len())
+                .map(|idx| crate::relation::form::AnonymousSlot::Inferred {
+                    position: idx as u32,
+                    declared_type: inferred_types.get(idx).cloned().flatten(),
+                    shape: inferred_shapes.get(idx).copied().unwrap_or_default(),
+                })
+                .collect();
+        (
+            None,
+            fold.core
+                .identities
+                .authority()
+                .derive(crate::relation::RelForm::Anonymous(
+                    crate::relation::form::AnonymousSpec::plain(
+                        crate::relation::form::AnonymousShape::Tabular,
+                        &inferred_slots,
+                        scope_answer,
+                    ),
+                ))?,
+        )
     };
-
-    let resolved_schema =
-        fold.core
-            .identities
-            .authority()
-            .derive(crate::relation::RelForm::Anonymous(
-                crate::relation::form::AnonymousSpec {
-                    shape: crate::relation::form::AnonymousShape::Tabular,
-                    slots: &slots,
-                    answers_to: scope_answer,
-                },
-            ))?;
     let ports = crate::relation::published_ports(&fold.core.identities, &resolved_schema)?;
     let self_reference = |port: crate::relation::PortId| {
         ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
@@ -1532,12 +1608,7 @@ pub(super) fn resolve_anonymous(
             .iter()
             .zip(&published)
             .filter(|(_, publishes)| **publishes)
-            .map(|(port, _)| crate::relation::pending::Position::Authored {
-                expr: ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                    ColumnOccurrence::engine(*port),
-                ))),
-                naming: None,
-            })
+            .map(|(port, _)| crate::relation::pending::Position::restating(*port, None))
             .collect();
         let (narrowed, _) = fold.core.identities.authority().bind(
             crate::relation::pending::Pending::Publication {
@@ -1608,13 +1679,9 @@ fn resolve_functor_call_inner(
     // Nothing is taken apart and nothing is rebuilt: the row that reaches
     // the higher-order road is the row the build made, landed member and
     // all, so there is no filtered copy to keep in step with an index and
-    // no index for a copy to disagree with. What that road owes is the
-    // SHAPE the landing needs — a relation formal, and a complete left
-    // prefix beside it.
-    let piped = arguments
-        .judged()?
-        .landed()
-        .map(|landed| landed.relation.clone());
+    // no index for a copy to disagree with, and no second copy of the
+    // flowing relation beside the row. That road admits the row against
+    // the declaration it selects.
 
     // Higher-order view invocation: the ONE definition-use entrance for
     // parameterized definitions. Naming is judged here (an authored
@@ -1635,7 +1702,6 @@ fn resolve_functor_call_inner(
             function_stropped,
             &access,
             &arguments,
-            piped,
             caller_row,
             fold,
             alias.clone(),
@@ -1663,10 +1729,9 @@ fn resolve_functor_call_inner(
                 namespace.unwrap_or_default(),
             )
             .map_err(|error| {
-                DelightQLError::parse_error(format!(
-                    "invalid namespace on relation '{}': {:?}",
-                    function, error
-                ))
+                DelightQLError::from(Resolution::General {
+                    message: format!("invalid namespace on relation '{}': {:?}", function, error),
+                })
             })?,
             name: function.clone().into(),
         };
@@ -1724,32 +1789,29 @@ fn resolve_functor_call_inner(
                     reverse: ordinal.reverse,
                     qualifier: ordinal.qualifier.clone(),
                 };
-                let mut witness = super::Witness::default();
-                let resolved = fold.lexical.flatly(|position| {
-                    position.address(reference, false, &mut witness, &fold.core.identities)
-                })?;
+                let resolved = fold
+                    .lexical
+                    .flatly(|position| position.address(reference, false, &fold.core.identities))?;
                 let occurrence = match resolved {
                     UnificationResult::Resolved(occurrence) => occurrence,
                     UnificationResult::Unresolved(column) => {
-                        return Err(DelightQLError::column_not_found_error(
-                            column,
-                            "in TVF argument",
-                        ))
+                        return Err(DelightQLError::from(Resolution::Column {
+    column: column.to_string(),
+    context: "in TVF argument".to_string(),
+}))
                     }
                     UnificationResult::Ambiguous { column, tables } => {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "resolution/ambiguous",
-                            format!(
+                        return Err(DelightQLError::from(Resolution::Ambiguous {
+    message: format!(
                                 "Column '{column}' in TVF argument is ambiguous. Could refer to: {}",
                                 tables.join(", ")
                             ),
-                            "TVF argument",
-                        ))
+}))
                     }
                     UnificationResult::Opaque => {
                         return Err(crate::pipeline::resolver::opaque_reference_refusal())
                     }
-                    UnificationResult::Refused(refusal) => return Err(refusal.into_error()),
+                    UnificationResult::Refused(refusal) => return Err(refusal),
                 };
                 bound_arguments[index] = Some(ast_resolved::DomainExpression::Reference(
                     Reference::Named(NamedReference(occurrence)),
@@ -1769,10 +1831,9 @@ fn resolve_functor_call_inner(
                     name: name.clone(),
                     qualifier: qualifier.clone(),
                 };
-                let mut witness = super::Witness::default();
-                let resolved = fold.lexical.flatly(|position| {
-                    position.address(reference, false, &mut witness, &fold.core.identities)
-                })?;
+                let resolved = fold
+                    .lexical
+                    .flatly(|position| position.address(reference, false, &fold.core.identities))?;
                 match resolved {
                     UnificationResult::Resolved(occurrence) => {
                         bound_arguments[index] = Some(ast_resolved::DomainExpression::Reference(
@@ -1783,22 +1844,20 @@ fn resolve_functor_call_inner(
                         return Err(crate::pipeline::resolver::opaque_reference_refusal())
                     }
                     UnificationResult::Unresolved(column) => {
-                        return Err(DelightQLError::column_not_found_error(
-                            column,
-                            "in TVF argument",
-                        ))
+                        return Err(DelightQLError::from(Resolution::Column {
+                            column: column.to_string(),
+                            context: "in TVF argument".to_string(),
+                        }))
                     }
-                    UnificationResult::Refused(refusal) => return Err(refusal.into_error()),
+                    UnificationResult::Refused(refusal) => return Err(refusal),
                     UnificationResult::Ambiguous { column, tables } => {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "resolution/ambiguous",
-                            format!(
+                        return Err(DelightQLError::from(Resolution::Ambiguous {
+                            message: format!(
                                 "Ambiguous column '{}' exists in scopes: {}",
                                 column,
                                 tables.join(", ")
                             ),
-                            "in TVF argument",
-                        ))
+                        }))
                     }
                 }
             }
@@ -1822,6 +1881,21 @@ fn resolve_functor_call_inner(
         )?;
     }
 
+    // A DIRECTIVE NEVER REACHES THE TARGET-FUNCTION ROAD. Every `!`-named
+    // callee is the routing authority's: a built-in is realized by its
+    // descriptor and a user directive by its definition, and either standing
+    // here means classification let an effect through as a pure call. Only
+    // a genuinely unknown, non-directive name keeps the open fallback.
+    if function.ends_with('!') {
+        return Err(Internal::invariant(
+            "resolver::relation_resolver",
+            format!(
+                "directive '{function}' reached target-function resolution; the routing \
+                 authority owns every directive callee"
+            ),
+        ));
+    }
+
     // A TVF the catalog describes publishes a known heading; one it does
     // not is the default-transpilation case, and its heading is the
     // target's until a caller pattern declares one.
@@ -1835,11 +1909,9 @@ fn resolve_functor_call_inner(
             );
             // Keep Unknown schema
         } else {
-            return Err(DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::RESOLUTION_CALLABLE_UNKNOWN,
-                format!("Unknown TVF: {function}"),
-                "unknown table-valued callable",
-            ));
+            return Err(DelightQLError::from(Resolution::CallableUnknown {
+                message: format!("Unknown TVF: {function}"),
+            }));
         }
     }
 
@@ -1865,15 +1937,14 @@ fn resolve_functor_call_inner(
                     ..
                 }) = slot
                 else {
-                    return Err(DelightQLError::validation_error(
-                        format!(
+                    return Err(DelightQLError::from(Constraint::General {
+                        message: format!(
                             "the heading of TVF '{}' is an ordered projection of \
                              the function's columns — each slot must be a bare \
                              column name",
                             table_name
                         ),
-                        "in TVF heading",
-                    ));
+                    }));
                 };
                 let sym = fold
                     .core
@@ -1884,15 +1955,13 @@ fn resolve_functor_call_inner(
                 // is published as `name_2` and then READ as though the
                 // function offered a column by that name.
                 if bound.contains(&sym) {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "constraint",
-                        format!(
+                    return Err(DelightQLError::from(Constraint::General {
+                        message: format!(
                             "Duplicate column '{name}' in the heading of TVF \
                              '{table_name}': programmer-authored names must be \
                              unique. Rename one with 'as' to disambiguate"
                         ),
-                        "in TVF heading",
-                    ));
+                    }));
                 }
                 bound.push(sym);
                 // Every carrier is enumerated, never the first: the hard-coded
@@ -1905,21 +1974,19 @@ fn resolve_functor_call_inner(
                 let source = match (carriers.next(), carriers.next()) {
                     (Some(source), None) => source,
                     (None, _) => {
-                        return Err(DelightQLError::column_not_found_error(
-                            name.to_string(),
-                            format!("in the heading of TVF '{}'", table_name),
-                        ))
+                        return Err(DelightQLError::from(Resolution::Column {
+                            column: name.to_string(),
+                            context: format!("in the heading of TVF '{}'", table_name),
+                        }))
                     }
                     (Some(_), Some(_)) => {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "resolution/ambiguous",
-                            format!(
+                        return Err(DelightQLError::from(Resolution::Ambiguous {
+                            message: format!(
                                 "TVF '{table_name}' publishes '{name}' more than \
                                  once, so a heading slot naming it reaches no \
                                  single column"
                             ),
-                            "in TVF heading",
-                        ))
+                        }))
                     }
                 };
                 selected.push(crate::relation::form::ProjectSlot::Carried {
@@ -1990,16 +2057,14 @@ fn resolve_functor_call_inner(
                     if let Some((name, spelling)) = declared {
                         let sym = fold.core.identities.canonical(spelling);
                         if bound.contains(&sym) {
-                            return Err(DelightQLError::validation_error_categorized(
-                                "constraint",
-                                format!(
+                            return Err(DelightQLError::from(Constraint::General {
+                                message: format!(
                                     "Duplicate column '{}' in the declared heading of \
                                  '{table_name}': programmer-authored names must be \
                                  unique. Rename one with 'as' to disambiguate",
                                     name
                                 ),
-                                "in TVF heading",
-                            ));
+                            }));
                         }
                         bound.push(sym);
                     }
@@ -2014,11 +2079,11 @@ fn resolve_functor_call_inner(
                     .identities
                     .authority()
                     .derive(crate::relation::RelForm::Anonymous(
-                        crate::relation::form::AnonymousSpec {
-                            shape: crate::relation::form::AnonymousShape::Tabular,
-                            slots: &declared_slots,
-                            answers_to: Some(hint),
-                        },
+                        crate::relation::form::AnonymousSpec::plain(
+                            crate::relation::form::AnonymousShape::Tabular,
+                            &declared_slots,
+                            Some(hint),
+                        ),
                     ))?;
             let ports = crate::relation::published_ports(&fold.core.identities, &declared_scope)?;
             let mut occurrences = Vec::with_capacity(ports.len());
@@ -2081,17 +2146,15 @@ fn resolve_functor_call_inner(
             (Some(value), _) => value,
             (None, Some(domain)) => convert_domain_expression(domain, &fold.core.identities)?,
             (None, None) => {
-                return Err(DelightQLError::validation_error_categorized(
-                    crate::uri_registry::subcat::RESOLUTION_CALLABLE_UNKNOWN,
-                    format!(
+                return Err(DelightQLError::from(Resolution::CallableUnknown {
+                    message: format!(
                         "no DQL callable '{function}' exists, and the default target \
                          transpilation cannot carry its relation or callable \
                          argument — a target function row holds values only. \
                          Every authored argument must survive the fallback, so the \
                          call refuses instead of dropping one."
                     ),
-                    "unknown callable with a relation argument",
-                ));
+                }));
             }
         };
         resolved_ho_arguments.push(crate::pipeline::asts::core::operators::HoArgument::Value(
@@ -2171,11 +2234,10 @@ pub(super) fn resolve_inner_relation(
             ..
         } => (identifier, subquery),
         _ => {
-            return Err(crate::error::DelightQLError::ParseError {
-                message: "Expected Indeterminate pattern from builder".to_string(),
-                source: None,
-                subcategory: None,
-            });
+            return Err(Internal::invariant(
+                "resolver::relation_resolver",
+                "Expected Indeterminate pattern from builder".to_string(),
+            ));
         }
     };
 
@@ -2191,30 +2253,26 @@ pub(super) fn resolve_inner_relation(
         };
         fold.core.identities.intern(text, stropped)
     };
-    let resolved_subquery = fold.resolve_interior((*subquery).clone())?;
-
-    // A CORRELATED INNER RELATION PUBLISHES WHAT ITS CORRELATION READS.
-    // Refinement hoists the correlation onto the enclosing join, and the
-    // column it names has to survive a projection that did not mention it.
-    // The carrier is injected HERE, under the boundary, because the boundary
-    // derived below is what the outside addresses: injecting after it would
-    // add a position the boundary stands over and cannot answer for.
-    let correlation_filters = resolved_subquery.correlation_filters(&fold.core.identities)?;
+    // THE INTERIOR IS EVALUATED AT THE ENCLOSING JOIN. Its correlations are
+    // hoisted there, so every restriction inside that reads the enclosing
+    // row is the correlation act: the relation it stands on owes the
+    // interior occurrences it reads, and each operation up to the boundary
+    // keeps them readable or refuses. Nothing is injected afterwards and
+    // nothing later rediscovers what was owed.
+    let resolved_subquery = fold.resolve_interior(
+        (*subquery).clone(),
+        crate::pipeline::resolver::Correlations::Hoisted,
+    )?;
     // THE INTERIOR IS SPENT HERE: its lexical extent ends at the boundary
     // below, which is what the outside addresses. The body travels; the
     // scope it answered under does not cross with it.
     let resolved_subquery = resolved_subquery.into_body();
-    let resolved_subquery =
-        crate::pipeline::refiner::pattern_classifier::inject_hygienic_columns_if_needed(
-            resolved_subquery,
-            &correlation_filters,
-            &fold.core.identities,
-        )?;
 
     // Create resolved InnerRelation with Indeterminate pattern; the refiner
     // classifies it later. The head's boundary — the effective name qualified
     // globs like `users.*` or `u.*` match through — is derived FROM the
-    // subquery standing inside it, in the same act.
+    // subquery standing inside it, in the same act, and it is where the
+    // body's correlation support is spent outward.
     let resolved = ast_resolved::Relation::InnerRelation {
         pattern: ast_resolved::InnerRelationPattern::Indeterminate {
             identifier: convert_qualified_name(identifier),
@@ -2225,7 +2283,7 @@ pub(super) fn resolve_inner_relation(
     };
     let head = fold.core.identities.authority().boundary_head(
         GroundForm::Reference(resolved),
-        crate::relation::builder::Boundary::Alias {
+        crate::relation::builder::Boundary::Interior {
             answer: interior_self,
         },
     )?;

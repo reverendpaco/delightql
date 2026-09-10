@@ -21,6 +21,9 @@ path = "src/bin/dql_fatboy_postgres.rs"
 [dependencies]
 delightql-buildinfo = { path = "../delightql-buildinfo" }
 delightql-protocol = { path = "../delightql-protocol" }
+# The typed diagnostic hierarchy: the adapter constructs its own leaves and
+# the provider-owned SQLSTATE terminal; still no compiler.
+delightql-types = { path = "../delightql-types" }
 postgres = "0.19"
 clap.workspace = true
 libc = "0.2"

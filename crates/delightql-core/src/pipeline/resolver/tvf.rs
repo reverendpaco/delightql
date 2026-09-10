@@ -51,6 +51,7 @@ pub(super) fn get_tvf_schema(
                 position: position as u32,
                 named: Some(identities.intern(name, false)),
                 declared_type: Some((*data_type).to_string()),
+                interior: false,
             },
         )
         .collect();

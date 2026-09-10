@@ -127,6 +127,7 @@ fn a_scratch_table_gets_one_name_across_a_bundle() {
         scopes: vec![scratch],
         headings: vec![vec![col]],
         refs,
+        ..Default::default()
     };
     let bundle = Bundle::gather(vec![stmt(vec![]), stmt(vec![col]), stmt(vec![col])]);
 
@@ -149,6 +150,7 @@ fn a_reference_to_an_unnamed_scope_refuses() {
         scopes: vec![],
         headings: vec![],
         refs: vec![col],
+        ..Default::default()
     }]);
     // Matched rather than compared: `Baptised` deliberately has no `Debug`,
     // because a value that can print the name table is a road to characters.
@@ -204,6 +206,7 @@ fn emitted_names_do_not_depend_on_registry_age() {
             scopes: vec![stage1],
             headings: vec![carried1.to_vec()],
             refs: carried1.to_vec(),
+            ..Default::default()
         }])
         .reserve_authored(&fresh),
     )
@@ -224,6 +227,7 @@ fn emitted_names_do_not_depend_on_registry_age() {
             scopes: vec![stage2],
             headings: vec![carried2.to_vec()],
             refs: carried2.to_vec(),
+            ..Default::default()
         }])
         .reserve_authored(&aged),
     )
@@ -254,6 +258,7 @@ fn a_minted_name_cannot_collide_with_a_catalog_table() {
             scopes: vec![stage],
             headings: vec![carried.to_vec()],
             refs: carried.to_vec(),
+            ..Default::default()
         }])
         .reserve_authored(&reg),
     )
@@ -281,11 +286,13 @@ fn authored_bundle_scope_reserves_its_name_before_scratch_is_named() {
                 scopes: vec![scratch],
                 headings: Vec::new(),
                 refs: Vec::new(),
+                ..Default::default()
             },
             Statement {
                 scopes: vec![authored],
                 headings: Vec::new(),
                 refs: Vec::new(),
+                ..Default::default()
             },
         ])
         .reserve_authored(&reg),
@@ -311,6 +318,7 @@ fn one_heading_carrying_a_name_twice_poisons_both_occurrences() {
         scopes: vec![scope],
         headings: vec![vec![a, b_col]],
         refs: vec![],
+        ..Default::default()
     }]);
     let bap = baptise(&reg, &bundle.clone().reserve_authored(&reg)).unwrap();
     let first = spell_col(&bap, a);
@@ -326,6 +334,7 @@ fn one_heading_carrying_a_name_twice_poisons_both_occurrences() {
         scopes: vec![scope],
         headings: vec![vec![a], vec![b_col]],
         refs: vec![],
+        ..Default::default()
     }]);
     let bap2 = baptise(&reg, &bundle2.clone().reserve_authored(&reg)).unwrap();
     assert_eq!(spell_col(&bap2, a), "name");
@@ -350,6 +359,7 @@ fn an_uncontested_authored_name_is_never_minted_over() {
         scopes: vec![scope],
         headings: vec![cols.clone()],
         refs: vec![],
+        ..Default::default()
     }]);
     for _ in 0..2 {
         let bap = baptise(&reg, &bundle.clone().reserve_authored(&reg)).unwrap();
@@ -366,6 +376,7 @@ fn a_column_nobody_named_is_minted_fresh_every_compilation() {
         scopes: vec![scope],
         headings: vec![cols.clone()],
         refs: vec![],
+        ..Default::default()
     }]);
     let first = baptise(&reg, &bundle.clone().reserve_authored(&reg)).unwrap();
     let second = baptise(&reg, &bundle.clone().reserve_authored(&reg)).unwrap();
@@ -387,6 +398,7 @@ fn a_qualified_reference_is_derived_not_carried() {
             scopes: vec![base, stage],
             headings: vec![carried.to_vec()],
             refs: carried.to_vec(),
+            ..Default::default()
         }])
         .reserve_authored(&reg),
     )
@@ -613,6 +625,7 @@ fn two_unnamed_relations_report_two_different_names() {
             scopes: vec![first, second],
             headings: vec![first_cols.clone(), second_cols.clone()],
             refs: vec![],
+            ..Default::default()
         }])
         .reserve_authored(&reg),
     )
@@ -639,6 +652,7 @@ fn one_unnamed_relation_reports_one_name_however_often_it_is_asked() {
             scopes: vec![scope],
             headings: vec![cols],
             refs: vec![],
+            ..Default::default()
         }])
         .reserve_authored(&reg),
     )
@@ -657,6 +671,7 @@ fn a_drawn_report_does_not_survive_the_bundle_that_drew_it() {
         scopes: vec![scope],
         headings: vec![cols],
         refs: vec![],
+        ..Default::default()
     }]);
     let first = baptise(&reg, &bundle.clone().reserve_authored(&reg)).expect("listed");
     let second = baptise(&reg, &bundle.clone().reserve_authored(&reg)).expect("listed");
@@ -680,6 +695,7 @@ fn a_reported_scope_keeps_the_authored_spelling_baptism_had_to_disambiguate() {
         scopes: vec![first, second],
         headings: vec![first_cols.clone(), second_cols.clone()],
         refs: vec![first_cols[0], second_cols[0]],
+        ..Default::default()
     }]);
     let baptised =
         baptise(&reg, &bundle.clone().reserve_authored(&reg)).expect("both scopes are listed");
@@ -755,6 +771,7 @@ fn an_authored_column_reports_the_name_its_author_wrote() {
             scopes: vec![scope],
             headings: vec![cols.clone()],
             refs: vec![],
+            ..Default::default()
         }])
         .reserve_authored(&reg),
     )
@@ -777,6 +794,7 @@ fn a_poisoned_column_reports_its_position_not_the_drawn_characters() {
             scopes: vec![scope],
             headings: vec![cols.clone()],
             refs: vec![],
+            ..Default::default()
         }])
         .reserve_authored(&reg),
     )
@@ -813,10 +831,71 @@ fn a_fixed_relation_keeps_its_name_and_the_rival_moves() {
         scopes: vec![source, target],
         headings: vec![vec![source_id], vec![id]],
         refs: vec![source_id, id],
+        ..Default::default()
     }]);
     let b = baptise(&reg, &bundle.clone().reserve_authored(&reg)).expect("bundle names cleanly");
     assert_eq!(spell_scope(&b, target), "users");
     assert_ne!(spell_scope(&b, source), "users");
+}
+
+/// A STATEMENT-LEVEL BINDING CANNOT TAKE A CATALOG SPELLING the same
+/// bundle writes.
+///
+/// `WITH users AS (…)` stands over every relation name the statement
+/// spells, so a body that selected the table `users` by identity would be
+/// answered by the binding instead. The catalog characters cannot move —
+/// they are what the engine resolves — so the binding does.
+#[test]
+fn a_statement_binding_does_not_take_a_catalog_spelling_the_bundle_writes() {
+    let reg = Registry::new(&[]);
+    let (entity, table, id, _) = users(&reg);
+    // A binding the author spelled exactly like the table the statement reads.
+    let authored = reg.intern("users", false);
+    let binding = reg.mint_scope(
+        ScopeKind::Cte {
+            role: CteRole::Materialize,
+        },
+        Hint::User(authored),
+        None,
+    );
+    let bound_id = reg.rebind_sql_column(id, binding, reg.published(id));
+
+    let bundle = Bundle::gather(vec![Statement {
+        scopes: vec![binding, table],
+        headings: vec![vec![bound_id], vec![id]],
+        refs: vec![bound_id, id],
+        bindings: vec![binding],
+        entities: vec![entity],
+    }]);
+    let b = baptise(&reg, &bundle.clone().reserve_authored(&reg)).expect("bundle names cleanly");
+    assert_ne!(
+        spell_scope(&b, binding),
+        "users",
+        "the binding must not capture the catalog read"
+    );
+}
+
+/// THE SAME SPELLING, NOT A BINDING: an authored occurrence of the catalog
+/// object itself reaches only its own FROM entry, so it captures nothing
+/// and keeps its characters. The judgment is what the scope IS, not which
+/// characters it wanted.
+#[test]
+fn an_authored_alias_of_the_table_itself_keeps_its_spelling() {
+    let reg = Registry::new(&[]);
+    let (entity, table, id, _) = users(&reg);
+    let authored = reg.intern("users", false);
+    let alias = reg.mint_scope(ScopeKind::UserAlias, Hint::User(authored), None);
+    let aliased_id = reg.rebind_sql_column(id, alias, reg.published(id));
+
+    let bundle = Bundle::gather(vec![Statement {
+        scopes: vec![alias, table],
+        headings: vec![vec![aliased_id], vec![id]],
+        refs: vec![aliased_id, id],
+        bindings: Vec::new(),
+        entities: vec![entity],
+    }]);
+    let b = baptise(&reg, &bundle.clone().reserve_authored(&reg)).expect("bundle names cleanly");
+    assert_eq!(spell_scope(&b, alias), "users");
 }
 
 #[test]
@@ -834,6 +913,7 @@ fn an_authored_mint_spelling_preempts_the_canonical_draw() {
         scopes: vec![scope],
         headings: vec![vec![named, anonymous]],
         refs: vec![],
+        ..Default::default()
     }])
     .reserve_authored(&reg);
     let baptised = crate::names::baptism::baptise_with_policy(

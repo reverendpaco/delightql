@@ -16,6 +16,7 @@
 //! spelling the export answers to and the port each binder publishes.
 
 use super::{PatternOwner, Position, Terminal};
+use crate::diagnostic::{Constraint, Internal, Limitation, Resolution, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::names::Registry;
 use crate::pipeline::ast_transform::{walk_transform_boolean, walk_transform_domain, AstTransform};
@@ -182,6 +183,7 @@ pub(super) fn resolve(
         if crate::relation::is_higher_order_support(registry, port) {
             if registry.authority().residual_row_token(port).is_some()
                 || registry.authority().residual_capture_value(port).is_some()
+                || registry.authority().frontier_actual(port).is_some()
             {
                 crossing.push(port);
             } else {
@@ -196,15 +198,14 @@ pub(super) fn resolve(
     // heading: one slot per visible position, whatever the relation.
     if let ast_unresolved::Access::Slots(slots) = access {
         if slots.len() != visible.len() {
-            return Err(DelightQLError::validation_error(
-                format!(
+            return Err(DelightQLError::from(Semantic::Arity {
+    message: format!(
                     "Positional pattern incomplete - table '{}' has {} columns but pattern specifies {} elements",
                     spelled,
                     visible.len(),
                     slots.len()
                 ),
-                "Positional pattern validation".to_string(),
-            ));
+}));
         }
     }
     match normalize_pattern(access, &visible, &spelled, registry)? {
@@ -266,10 +267,10 @@ fn normalize_pattern(
                     .iter()
                     .any(|port| registry.published_sym(port.column()) == Some(name));
                 if !exists {
-                    return Err(DelightQLError::column_not_found_error(
-                        column.clone(),
-                        format!("USING column '{column}' not found in table '{spelled}'"),
-                    ));
+                    return Err(DelightQLError::from(Resolution::Column {
+                        column: column.clone().to_string(),
+                        context: format!("USING column '{column}' not found in table '{spelled}'"),
+                    }));
                 }
             }
             Ok(NormalizedColumnSpec::AllWithUsing(columns.clone()))
@@ -347,20 +348,17 @@ fn addressed_reuse(
         name: authored.name.clone(),
         qualifier: authored.qualifier.clone(),
     };
-    let mut witness = super::Witness::default();
-    match position.address(reference, false, &mut witness, registry)? {
+    match position.address(reference, false, registry)? {
         UnificationResult::Resolved(occurrence) => Ok(occurrence),
-        UnificationResult::Unresolved(_) => Err(DelightQLError::column_not_found_error(
-            spelled,
-            "in positional join pattern",
-        )),
-        UnificationResult::Ambiguous { .. } => Err(DelightQLError::validation_error_categorized(
-            "resolution/ambiguous",
-            "Positional join reference matches more than one left-hand column",
-            "qualify the reference with one visible relation",
-        )),
+        UnificationResult::Unresolved(_) => Err(DelightQLError::from(Resolution::Column {
+            column: spelled.to_string(),
+            context: "in positional join pattern".to_string(),
+        })),
+        UnificationResult::Ambiguous { .. } => Err(DelightQLError::from(Resolution::Ambiguous {
+            message: "Positional join reference matches more than one left-hand column".to_string(),
+        })),
         UnificationResult::Opaque => Err(crate::pipeline::resolver::opaque_reference_refusal()),
-        UnificationResult::Refused(refusal) => Err(refusal.into_error()),
+        UnificationResult::Refused(refusal) => Err(refusal),
     }
 }
 
@@ -577,9 +575,9 @@ fn whole_heading_step(
         }
         ast_unresolved::Access::DequalifyAll => ast_resolved::Access::DequalifyAll,
         ast_unresolved::Access::Slots(_) => {
-            return Err(DelightQLError::validation_error(
+            return Err(Internal::invariant(
+                "resolver::lexical::pattern",
                 "A positional pattern reached resolution without bound occurrences",
-                "Positional pattern resolution",
             ))
         }
     };
@@ -725,7 +723,6 @@ impl AstTransform<Unresolved, Resolved> for StrictPhaseConverter<'_, '_> {
     crate::pipeline::ast_transform::binder_is_bound_where_the_pattern_is_resolved!();
     crate::pipeline::ast_transform::a_landing_is_consumed_where_the_pipe_is_applied!();
     crate::pipeline::ast_transform::a_context_marker_is_consumed_where_the_call_instantiates!();
-    crate::pipeline::ast_transform::scope_is_minted_where_it_is_resolved!();
     crate::pipeline::ast_transform::minted_where_it_is_decided!(
         fold_output -> crate::relation::PortId: "an expression's output port",
         fold_scalar_output -> crate::relation::PortId: "a scalarized relation's column",
@@ -735,39 +732,31 @@ impl AstTransform<Unresolved, Resolved> for StrictPhaseConverter<'_, '_> {
         &mut self,
         _: crate::pipeline::asts::core::DomainHole,
     ) -> crate::error::Result<crate::pipeline::asts::core::FormalHole> {
-        Err(crate::error::DelightQLError::validation_error_categorized(
-            "value/open/unapplied",
-            "a composition input stands outside any callable applying it",
-            "the position that applies an open body spends its slot",
-        ))
+        Err(DelightQLError::from(Semantic::ValueOpenUnapplied {
+            message: "a composition input stands outside any callable applying it".to_string(),
+        }))
     }
 
     fn fold_cover_callable(
         &mut self,
         _: crate::pipeline::asts::core::Callable<crate::pipeline::asts::core::Unresolved>,
     ) -> crate::error::Result<()> {
-        Err(crate::error::DelightQLError::transformation_error(
-            "a cover's callable is applied where its operator resolves, and this fold is not that place",
-            "phase_payload",
-        ))
+        Err(Internal::invariant("phase_payload", "a cover's callable is applied where its operator resolves, and this fold is not that place"))
     }
 
     fn fold_rename_target(
         &mut self,
         _: crate::pipeline::asts::core::NameTarget,
     ) -> crate::error::Result<crate::names::Spelling> {
-        Err(crate::error::DelightQLError::transformation_error(
-            "a rename target is expanded where the rename resolves, and this fold is not that place",
-            "phase_payload",
-        ))
+        Err(Internal::invariant("phase_payload", "a rename target is expanded where the rename resolves, and this fold is not that place"))
     }
     fn fold_drill(
         &mut self,
         _: crate::pipeline::asts::core::operators::AuthoredDrill,
     ) -> crate::error::Result<crate::pipeline::asts::core::operators::BoundDrill> {
-        Err(crate::error::DelightQLError::transformation_error(
-            "an interior drill binds where its operator resolves, and this fold is not that place",
+        Err(Internal::invariant(
             "phase_payload",
+            "an interior drill binds where its operator resolves, and this fold is not that place",
         ))
     }
 
@@ -788,9 +777,11 @@ impl AstTransform<Unresolved, Resolved> for StrictPhaseConverter<'_, '_> {
             }
         }
         match expression {
-            DomainExpression::Reference(AstReference::Ordinal(_)) => Err(
-                DelightQLError::parse_error("Column ordinals not supported in pattern constraints"),
-            ),
+            DomainExpression::Reference(AstReference::Ordinal(_)) => {
+                Err(DelightQLError::from(Constraint::Unsupported {
+                    message: "Column ordinals not supported in pattern constraints".to_string(),
+                }))
+            }
             // A computed slot's interior sees exactly its own relation's
             // heading: the constraint compares this relation's column to an
             // expression over this relation's row. A bare name binds there;
@@ -808,8 +799,8 @@ impl AstTransform<Unresolved, Resolved> for StrictPhaseConverter<'_, '_> {
                 if namespace_path.is_empty() {
                     if let Some(resolved) = self
                         .instantiation
-                        .formals
-                        .and_then(|formals| formals.value(&name))
+                        .scoped
+                        .and_then(|scoped| scoped.formals().value(&name))
                         .cloned()
                         .or_else(|| self.instantiation.env.formal_value(&name))
                     {
@@ -829,26 +820,26 @@ impl AstTransform<Unresolved, Resolved> for StrictPhaseConverter<'_, '_> {
                     [column] => Ok(DomainExpression::Reference(AstReference::Named(
                         NamedReference(ColumnOccurrence::engine(*column)),
                     ))),
-                    [] => Err(DelightQLError::column_not_found_error(
-                        name.to_string(),
-                        "in a computed pattern slot",
-                    )),
-                    _ => Err(DelightQLError::validation_error(
-                        format!(
+                    [] => Err(DelightQLError::from(Resolution::Column {
+                        column: name.to_string(),
+                        context: "in a computed pattern slot".to_string(),
+                    })),
+                    _ => Err(DelightQLError::from(Resolution::Ambiguous {
+                        message: format!(
                             "column '{}' is published more than once in this \
                              relation's heading",
                             name
                         ),
-                        "in a computed pattern slot",
-                    )),
+                    })),
                 }
             }
             DomainExpression::Reference(AstReference::Named(NamedReference(AuthoredColumn {
                 ..
-            }))) => Err(DelightQLError::parse_error(
-                "a qualified reference inside a computed pattern slot cannot bind — \
-                 the slot sees only its own relation's heading",
-            )),
+            }))) => Err(DelightQLError::from(Constraint::General {
+                message: "a qualified reference inside a computed pattern slot cannot bind — \
+                 the slot sees only its own relation's heading"
+                    .to_string(),
+            })),
             other => walk_transform_domain(self, other),
         }
     }
@@ -858,18 +849,22 @@ impl AstTransform<Unresolved, Resolved> for StrictPhaseConverter<'_, '_> {
         expression: TruthExpression<Unresolved>,
     ) -> Result<TruthExpression<Resolved>> {
         match expression {
-            TruthExpression::Existence(Existence { .. }) => Err(DelightQLError::parse_error(
-                "EXISTS expressions not supported in pattern constraints",
-            )),
+            TruthExpression::Existence(Existence { .. }) => {
+                Err(DelightQLError::from(Constraint::Unsupported {
+                    message: "EXISTS expressions not supported in pattern constraints".to_string(),
+                }))
+            }
             TruthExpression::RelationalMembership(RelationalMembership { .. }) => {
-                Err(DelightQLError::parse_error(
-                    "IN subquery expressions not supported in pattern constraints",
-                ))
+                Err(DelightQLError::from(Constraint::Unsupported {
+                    message: "IN subquery expressions not supported in pattern constraints"
+                        .to_string(),
+                }))
             }
             TruthExpression::Sigma(SigmaApplication { .. }) => {
-                Err(DelightQLError::not_implemented(
-                    "Sigma predicates in pattern destructuring not yet supported",
-                ))
+                Err(DelightQLError::from(Limitation::NotImplemented {
+                    message: "Sigma predicates in pattern destructuring not yet supported"
+                        .to_string(),
+                }))
             }
             other => walk_transform_boolean(self, other),
         }

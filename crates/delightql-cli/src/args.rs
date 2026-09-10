@@ -466,7 +466,12 @@ impl DebugOptions {
                 "+features" => opts.features = true,
                 "+timing" => opts.timing = true,
                 _ if part.starts_with('+') => {
-                    crate::client::incident::warning("argument", crate::client::incident::hierarchy::ARGUMENT, format!("unknown debug option: {part}"));
+                    crate::client::incident::warning(
+                        "argument",
+                        delightql_types::diagnostic::Client::Argument {
+                            message: format!("unknown debug option: {part}"),
+                        },
+                    );
                 }
                 _ => {}
             }

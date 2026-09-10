@@ -12,6 +12,7 @@
 //! handles and copied facts; not one of them returns characters. Characters
 //! leave only through [`IdentSink`](super::sink::IdentSink).
 
+use crate::diagnostic::Internal;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -626,6 +627,16 @@ impl Registry {
         self.sql_column(at, None, Addressing::Hygienic)
     }
 
+    /// The column carries a nested relation payload with no static
+    /// interior heading to record — a metadata group's data-keyed record,
+    /// a tuple's positional rows. The physical fact alone: an embedding
+    /// nests it instead of quoting it.
+    pub(crate) fn mark_nested_payload(&self, of: ColId) {
+        self.inner.borrow_mut().cols[of.0 as usize]
+            .facts
+            .tree_valued = true;
+    }
+
     /// Mint the lexical scope used to emit an interior relation.
     /// Semantic ownership is recorded by the relation authority, not as a
     /// copied scope identity in a value-facts sidecar.
@@ -693,9 +704,9 @@ impl Registry {
             let mut inner = self.inner.borrow_mut();
             let record = &mut inner.scopes[scope.0 as usize];
             if record.answers_to.is_some() {
-                return Err(crate::error::DelightQLError::transformation_error(
-                    "a stage that already answers to a name cannot be named again",
+                return Err(Internal::invariant(
                     "stage owner",
+                    "a stage that already answers to a name cannot be named again",
                 ));
             }
             record.answers_to = Some(answer);
@@ -824,6 +835,24 @@ impl Registry {
     /// The canonical identities of every admitted authored name.
     pub(super) fn authored_reserved(&self) -> Vec<Sym> {
         self.inner.borrow().authored_reserved.clone()
+    }
+
+    /// THE COLLISION KEY of a catalog entity's emission, when a
+    /// statement-level binding could take it.
+    ///
+    /// An entity written with its backend schema is reached by a two-part
+    /// name, which no `WITH` name can capture, so it has no key here. One
+    /// written bare is reached by exactly the characters a binding would
+    /// take.
+    pub(super) fn entity_binding_key(&self, entity: EntityId) -> Option<Vec<u8>> {
+        let inner = self.inner.borrow();
+        let record = &inner.entities[entity.0 as usize];
+        if record.backend_schema.is_some() {
+            return None;
+        }
+        let canonical = record.canonical;
+        let sym = inner.spellings[canonical.0 as usize].canon;
+        Some(inner.canon_text[sym.0 as usize].clone())
     }
 
     pub(super) fn canon_bytes(&self, s: Sym) -> Vec<u8> {
@@ -1051,7 +1080,6 @@ impl Registry {
                     ScopeKind::Cte { .. } => "a with-binding",
                     ScopeKind::SetArm { .. } => "a set-operation arm",
                     ScopeKind::Resolution { .. } => "a resolution scope",
-                    ScopeKind::ErHop { .. } => "a relationship hop",
                     ScopeKind::HoCarrier { .. } => "a higher-order carrier",
                     ScopeKind::Scratch { .. } => "a scratch table",
                     ScopeKind::Interior => "an interior relation",

@@ -20,7 +20,7 @@ pub fn handle_book(
     export_images: Option<&std::path::Path>,
     db: Option<&std::path::Path>,
 ) -> Result<()> {
-    let mut handle = crate::connection::open_handle()?;
+    let mut handle = crate::connection::open_handle(crate::connection::SessionProfile::client())?;
 
     {
         let mut session = handle.session().map_err(|e| anyhow::anyhow!(e))?;

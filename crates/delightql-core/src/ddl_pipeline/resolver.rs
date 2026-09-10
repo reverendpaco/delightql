@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::diagnostic::{Constraint, DelightQLError, Manifest, Resolution};
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
 
 use crate::pipeline::ast_resolved;
@@ -72,6 +73,7 @@ fn build_available(
             position: position as u32,
             named: Some(identities.intern(column.name.as_str(), false)),
             declared_type: Some(column.col_type.clone()),
+            interior: false,
         })
         .collect::<Vec<_>>();
     let relation = identities
@@ -135,13 +137,9 @@ fn resolve_constraints(
             }
             DdlConstraint::ForeignKey { table, columns } => {
                 if table_level {
-                    return Err(crate::DelightQLError::validation_error_categorized(
-                        "imprint/manifest/table_foreign_key",
-                        "A table-level foreign key cannot distinguish its local columns from its referenced columns",
-                        "attach a one-column foreign key to its local schema column, for example \
-                         (\"local_column\", \"+parent(remote_column)\", \"fk_name\"); \
-                         composite foreign keys require a dedicated syntax",
-                    ));
+                    return Err(DelightQLError::from(Manifest::TableForeignKey {
+    message: "A table-level foreign key cannot distinguish its local columns from its referenced columns".to_string(),
+}));
                 }
                 let table_spelling = identities.intern(&table, false);
                 let entity = identities.mint_entity(table_spelling);
@@ -194,14 +192,13 @@ fn resolve_local_columns(
                 .collect();
             match matches.as_slice() {
                 [column] => Ok(*column),
-                [] => Err(crate::DelightQLError::validation_error(
-                    format!("Constraint references unknown column '{name}'"),
-                    "ddl_pipeline::resolver",
-                )),
-                _ => Err(crate::DelightQLError::validation_error(
-                    format!("Constraint references ambiguous column '{name}'"),
-                    "ddl_pipeline::resolver",
-                )),
+                [] => Err(DelightQLError::from(Resolution::Column {
+                    column: name.to_string(),
+                    context: "DDL constraint".to_string(),
+                })),
+                _ => Err(DelightQLError::from(Resolution::Ambiguous {
+                    message: format!("Constraint references ambiguous column '{name}'"),
+                })),
             }
         })
         .collect()
@@ -283,10 +280,10 @@ impl crate::pipeline::ast_transform::AstTransform<Unresolved, Unresolved> for Na
                 ),
             ) => {
                 let Some(subject) = self.subject else {
-                    return Err(crate::DelightQLError::transpilation_error(
-                        "A table-level DDL expression cannot use the value placeholder",
-                        "ddl_pipeline::resolver",
-                    ));
+                    return Err(DelightQLError::from(Constraint::General {
+                        message: "A table-level DDL expression cannot use the value placeholder"
+                            .to_string(),
+                    }));
                 };
                 Ok(DomainExpression::Reference(Reference::Named(
                     NamedReference(crate::pipeline::asts::core::AuthoredColumn {

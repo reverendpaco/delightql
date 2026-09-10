@@ -32,6 +32,7 @@
 //! [`PipeForm::ALL`], so the covering receipt cannot miss it) AND
 //! [`crossing`] says how its output crosses.
 
+use crate::diagnostic::Internal;
 use crate::error::Result;
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
@@ -449,24 +450,21 @@ fn drilled_interior(
         ..
     }) = step.form()
     else {
-        return Err(crate::error::DelightQLError::transformation_error(
-            "a narrowing access crossed without the drill it resolved",
+        return Err(Internal::invariant(
             "pipe crossing",
+            "a narrowing access crossed without the drill it resolved",
         ));
     };
     let nest = identities
         .published_sym(drill.column.column())
         .ok_or_else(|| {
-            crate::error::DelightQLError::transformation_error(
-                "a drilled column publishes no name to open its interior under",
+            Internal::invariant(
                 "pipe crossing",
+                "a drilled column publishes no name to open its interior under",
             )
         })?;
     let interior = crate::relation::interior(identities, drill.column)?.ok_or_else(|| {
-        crate::error::DelightQLError::transformation_error(
-            "a drilled column has no recorded interior",
-            "pipe crossing",
-        )
+        Internal::invariant("pipe crossing", "a drilled column has no recorded interior")
     })?;
     Ok((nest, interior))
 }
@@ -500,7 +498,6 @@ fn stage_export(
                     input: result,
                     why: crate::relation::form::ProjectWhy::Stage,
                     slots: &slots,
-                    dependencies: &[],
                 },
             ),
             sources,

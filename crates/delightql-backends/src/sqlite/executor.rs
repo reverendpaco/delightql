@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 use crate::sqlite::connection::SqliteConnectionManager;
+use delightql_types::diagnostic::{Resolution, Runtime};
 /// SQLite SQL Execution Interface
 ///
 /// Provides SQL execution capabilities for SQLite databases with support for
@@ -9,14 +10,9 @@ use delightql_types::{DelightQLError, Result};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
-/// Helper to convert rusqlite errors to DelightQL errors
+/// The engine's refusal under the operation that met it.
 fn rusqlite_to_dql_error(e: rusqlite::Error, operation: &str) -> DelightQLError {
-    DelightQLError::DatabaseOperationError {
-        message: format!("{} failed", operation),
-        details: format!("SQLite error: {}", e),
-        source: Some(Box::new(e)),
-        subcategory: None,
-    }
+    super::engine_error(&format!("{operation} failed"), e)
 }
 
 /// Query result structure that the SQLite executor provides
@@ -94,7 +90,7 @@ impl SqlitePreparedStatement {
 impl PreparedStatement for SqlitePreparedStatement {
     fn execute(&mut self, params: &[&dyn std::fmt::Display]) -> Result<QueryResult> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -147,7 +143,7 @@ impl PreparedStatement for SqlitePreparedStatement {
 
     fn execute_statement(&mut self, params: &[&dyn std::fmt::Display]) -> Result<usize> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -212,7 +208,7 @@ impl SqliteExecutorImpl {
 impl SqliteExecutor for SqliteExecutorImpl {
     fn execute_query(&mut self, sql: &str) -> Result<QueryResult> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -223,12 +219,7 @@ impl SqliteExecutor for SqliteExecutorImpl {
 
         let mut stmt = conn
             .prepare(sql)
-            .map_err(|e| DelightQLError::DatabaseOperationError {
-                message: "Failed to prepare SQL statement".to_string(),
-                details: format!("SQLite error: {}", e),
-                source: Some(Box::new(e)),
-                subcategory: None,
-            })?;
+            .map_err(|e| rusqlite_to_dql_error(e, "Failed to prepare SQL statement"))?;
 
         // Get column names
         let columns: Vec<String> = stmt
@@ -251,21 +242,11 @@ impl SqliteExecutor for SqliteExecutorImpl {
                 }
                 Ok(values)
             })
-            .map_err(|e| DelightQLError::DatabaseOperationError {
-                message: "Failed to execute query".to_string(),
-                details: format!("SQLite error: {}", e),
-                source: Some(Box::new(e)),
-                subcategory: None,
-            })?;
+            .map_err(|e| rusqlite_to_dql_error(e, "Failed to execute query"))?;
 
         let mut result_rows = Vec::new();
         for row in rows {
-            result_rows.push(row.map_err(|e| DelightQLError::DatabaseOperationError {
-                message: "Failed to fetch row".to_string(),
-                details: format!("SQLite error: {}", e),
-                source: Some(Box::new(e)),
-                subcategory: None,
-            })?);
+            result_rows.push(row.map_err(|e| rusqlite_to_dql_error(e, "Failed to fetch row"))?);
         }
 
         Ok(QueryResult::new(columns, result_rows))
@@ -273,7 +254,7 @@ impl SqliteExecutor for SqliteExecutorImpl {
 
     fn execute_statement(&mut self, sql: &str) -> Result<usize> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -291,7 +272,7 @@ impl SqliteExecutor for SqliteExecutorImpl {
 
     fn execute_transaction(&mut self, statements: &[&str]) -> Result<Vec<usize>> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -334,7 +315,7 @@ impl SqliteExecutor for SqliteExecutorImpl {
 
     fn table_exists(&self, table_name: &str) -> Result<bool> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -353,7 +334,7 @@ impl SqliteExecutor for SqliteExecutorImpl {
 
     fn get_table_schema(&self, table_name: &str) -> Result<TableSchema> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -369,15 +350,18 @@ impl SqliteExecutor for SqliteExecutorImpl {
             .map_err(|e| rusqlite_to_dql_error(e, "Check table exists"))?;
 
         if count == 0 {
-            return Err(DelightQLError::validation_error(
-                format!("Table '{}' does not exist", table_name),
-                "Schema introspection",
-            ));
+            return Err(Resolution::Table {
+                table: table_name.to_string(),
+                context: "Schema introspection".to_string(),
+            }
+            .into());
         }
 
         // Get column information using PRAGMA table_info
         let sql = format!("PRAGMA table_info({})", table_name);
-        let mut stmt = conn.prepare(&sql).map_err(|e| rusqlite_to_dql_error(e, "Get table schema"))?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| rusqlite_to_dql_error(e, "Get table schema"))?;
 
         let column_rows = stmt
             .query_map([], |row| {

@@ -3,27 +3,18 @@
 // The builder's collection context: HO parameter bindings threaded through
 // normalization, and the annotation sidecars a form declares.
 
-use crate::pipeline::asts::core::AuthoredColumn;
-use crate::pipeline::asts::core::{NamedReference, Reference};
 use std::collections::HashMap;
 
-/// HO parameter bindings threaded through the builder for AST-level substitution.
-///
-/// When a view body is parsed with HO bindings active, the builder substitutes
-/// param names at construction time instead of using text-level regex replacement.
+/// THE BINDINGS ONE PARAMETERIZED USE SUPPLIES to the body's normalizer:
+/// the relation formals, bound by the carrier authority with their
+/// receiving interface already applied, and the scalar formals the body's
+/// frame answers.
 #[derive(Debug, Clone, Default)]
 pub struct HoParamBindings {
-    /// Glob: param_name → compiler-owned carrier occurrence.
-    ///
-    /// This binding has no character spelling. The builder places the scope
-    /// directly in the unresolved relation and the resolver connects it to
-    /// the matching CTE binding.
-    pub table_scope_params: HashMap<String, crate::relation::StructuralRelation>,
-    /// The one table parameter receiving a piped source, when present.
-    /// The formal spelling is diagnostic; the scope is the binding.
-    pub pipe_carrier: Option<(String, crate::relation::StructuralRelation)>,
-    /// Argumentative: param_name → anonymous table Chain
-    pub table_expr_params: HashMap<String, crate::pipeline::asts::unresolved::Chain>,
+    /// The relation formals, each bound to the relation it reads AND the
+    /// interface it reads it under, as one value the carrier authority
+    /// minted. The normalizer reads them; nothing here writes one.
+    pub formals: crate::defuse::carriers::RelationFormals,
     /// THE SCALAR FORMALS. A bare name in this set is a PARAMETER of the
     /// definition: the normalizer leaves it standing as a reference (a slot
     /// written with it CONSTRAINS the position rather than binding a fresh
@@ -34,73 +25,21 @@ pub struct HoParamBindings {
     /// position that needs a value before resolution — a row bound
     /// (`#< n`) — reads it here, because a literal's encoding is its value.
     pub scalar_literals: HashMap<String, crate::pipeline::asts::core::LiteralValue>,
-    /// Pending arity checks for argumentative params that received table references.
-    /// (param_name, table_name, expected_column_count, column_names)
-    pub argumentative_table_refs: Vec<(String, delightql_types::SqlIdentifier, usize, Vec<String>)>,
-    /// Argumentative carrier params: param_name → the declared positional
-    /// column names. A glob access of the formal substitutes these as its
-    /// caller pattern, so the body sees the supplied table's columns under
-    /// the names the DECLARATION gives them — argumentative binding is
-    /// positional, and the supplied table's own spellings never reach the
-    /// body. A by-name binding needs no map: the body writes the
-    /// caller pattern itself, and that pattern IS the binding.
-    pub argumentative_patterns: HashMap<String, Vec<String>>,
-    /// The relation actuals, each ADMITTED as a closed relation value, to be
-    /// bound as carriers before the view body is expanded, with the part of
-    /// the call each is bound as. The landing a formal is addressed by is
-    /// written into `table_scope_params` by the bind, never ahead of it.
-    pub interior_ctes: Vec<(
-        String,
-        crate::relation::form::HoPart,
-        crate::defuse::ClosedRelationActual,
-    )>,
 }
 
 impl HoParamBindings {
-    /// Build a reference to a compiler-owned table carrier without first
-    /// converting its identity into a query-local name.
-    pub fn table_scope_relation(
+    /// THE BODY'S READ OF A RELATION FORMAL, under the access the body
+    /// wrote. `None` when the name is not a relation formal of this use.
+    pub fn formal_read(
         &self,
-        formal: &str,
+        formal: &delightql_types::SqlIdentifier,
         access: crate::pipeline::asts::unresolved::Access,
         alias: Option<delightql_types::SqlIdentifier>,
         outer: bool,
     ) -> Option<crate::pipeline::asts::unresolved::Chain> {
-        self.table_scope_params.get(formal).map(|scope| {
-            let access = match (&access, self.argumentative_patterns.get(formal)) {
-                (
-                    crate::pipeline::asts::unresolved::Access::All
-                    | crate::pipeline::asts::unresolved::Access::Unasked,
-                    Some(columns),
-                ) if !columns.is_empty() => crate::pipeline::asts::unresolved::Access::from_terms(
-                    columns
-                        .iter()
-                        .map(|name| {
-                            crate::pipeline::asts::unresolved::DomainExpression::Reference(
-                                Reference::Named(NamedReference(AuthoredColumn {
-                                    name: name.as_str().into(),
-                                    qualifier: None,
-                                    namespace_path:
-                                        crate::pipeline::asts::unresolved::NamespacePath::empty(),
-                                })),
-                            )
-                        })
-                        .collect(),
-                ),
-                _ => access,
-            };
-            crate::pipeline::asts::unresolved::Chain::read(
-                crate::pipeline::asts::unresolved::Relation::Ground {
-                    mention: crate::pipeline::asts::unresolved::GroundMention::Structural {
-                        pending: *scope,
-                        authored_name: Some(formal.into()),
-                        alias,
-                    },
-                    outer,
-                },
-                access,
-            )
-        })
+        self.formals
+            .get(formal)
+            .map(|bound| bound.read(access, alias, outer))
     }
 }
 

@@ -17,9 +17,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use delightql_protocol::{
-    ByteSeq, Cell, ClientTerm, Dimension, ErrorKind, Handle, Handler, MetaItem, Orientation,
-    Projection, ServerTerm, resolve_projection,
+    resolve_projection, ByteSeq, Cell, ClientTerm, Dimension, Handle, Handler, MetaItem,
+    Orientation, Projection, ServerTerm, WireError,
 };
+use delightql_types::diagnostic::{DelightQLError, Sqlite, SqliteNative};
 
 pub mod siso;
 
@@ -42,7 +43,7 @@ const DESCRIPTOR_PEEK_ROWS: usize = 64;
 enum StreamBatch {
     Rows(Vec<Vec<Cell>>),
     Done,
-    Error(String),
+    Error(DelightQLError),
 }
 
 // --- CursorState ---
@@ -60,6 +61,35 @@ pub struct SqlParty {
     connection: Arc<Mutex<rusqlite::Connection>>,
     handles: HashMap<Handle, CursorState>,
     next_handle_id: u64,
+}
+
+use delightql_backends::sqlite::error::engine_refusal as engine_error;
+
+/// Append the DQL-side remedy to an engine message that has one, keeping
+/// the identity the engine's code determined.
+fn teach(diagnostic: DelightQLError) -> DelightQLError {
+    match diagnostic {
+        DelightQLError::Target(delightql_types::diagnostic::Target::Sqlite(Sqlite::Native(
+            native,
+        ))) => {
+            let taught = delightql_types::teach_runtime_message(native.message().to_string());
+            match SqliteNative::new(native.extended_code(), taught) {
+                Some(native) => Sqlite::Native(native).into(),
+                None => Sqlite::Native(native).into(),
+            }
+        }
+        DelightQLError::Target(delightql_types::diagnostic::Target::Sqlite(Sqlite::Engine {
+            message,
+        })) => Sqlite::Engine {
+            message: delightql_types::teach_runtime_message(message),
+        }
+        .into(),
+        other => other,
+    }
+}
+
+fn error_term(diagnostic: DelightQLError) -> ServerTerm {
+    ServerTerm::Error(WireError::of(&diagnostic))
 }
 
 /// Convert a sqlite value to a wire cell plus the engine's storage class
@@ -87,11 +117,12 @@ impl SqlParty {
         let sql = match String::from_utf8(text) {
             Ok(s) => s,
             Err(e) => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Syntax,
-                    identity: vec![],
-                    message: format!("invalid UTF-8: {}", e).into_bytes(),
-                }
+                return error_term(
+                    Sqlite::ProtocolText {
+                        message: format!("invalid UTF-8: {}", e),
+                    }
+                    .into(),
+                )
             }
         };
 
@@ -99,7 +130,7 @@ impl SqlParty {
         let (tx, rx) = mpsc::sync_channel::<StreamBatch>(2);
         // Oneshot for column metadata (sync handshake)
         let (col_tx, col_rx) =
-            mpsc::sync_channel::<Result<(Vec<String>, Vec<String>), String>>(1);
+            mpsc::sync_channel::<Result<(Vec<String>, Vec<String>), DelightQLError>>(1);
 
         let conn = Arc::clone(&self.connection);
         thread::spawn(move || {
@@ -107,7 +138,7 @@ impl SqlParty {
             let mut stmt = match guard.prepare(&sql) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = col_tx.send(Err(format!("{}", e)));
+                    let _ = col_tx.send(Err(engine_error(e)));
                     return;
                 }
             };
@@ -133,15 +164,14 @@ impl SqlParty {
                         let _ = tx.send(StreamBatch::Done);
                     }
                     Err(e) => {
-                        let _ = col_tx.send(Err(format!("{}", e)));
+                        let _ = col_tx.send(Err(engine_error(e)));
                     }
                 }
                 return;
             }
 
             // Query: extract column names and declared types, then stream rows.
-            let columns: Vec<String> =
-                stmt.column_names().iter().map(|s| s.to_string()).collect();
+            let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
             let mut declared_types: Vec<String> = (0..stmt.column_count())
                 .map(|i| {
                     stmt.columns()
@@ -155,7 +185,7 @@ impl SqlParty {
             let mut rows = match stmt.query([]) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = col_tx.send(Err(format!("{}", e)));
+                    let _ = col_tx.send(Err(engine_error(e)));
                     return;
                 }
             };
@@ -213,7 +243,7 @@ impl SqlParty {
                         if col_tx.send(Ok((columns, declared_types))).is_err() {
                             return;
                         }
-                        let _ = tx.send(StreamBatch::Error(format!("{}", e)));
+                        let _ = tx.send(StreamBatch::Error(engine_error(e)));
                         return;
                     }
                 }
@@ -244,7 +274,7 @@ impl SqlParty {
                         }
                         Ok(None) => stream_done = true,
                         Err(e) => {
-                            let _ = tx.send(StreamBatch::Error(format!("{}", e)));
+                            let _ = tx.send(StreamBatch::Error(engine_error(e)));
                             return;
                         }
                     }
@@ -269,19 +299,14 @@ impl SqlParty {
         // Wait for column metadata from worker
         let (columns, declared_types) = match col_rx.recv() {
             Ok(Ok(meta)) => meta,
-            Ok(Err(e)) => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Syntax,
-                    identity: vec![],
-                    message: e.into_bytes(),
-                }
-            }
+            Ok(Err(e)) => return error_term(e),
             Err(_) => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: vec![],
-                    message: b"worker thread died before sending columns".to_vec(),
-                }
+                return error_term(
+                    Sqlite::Worker {
+                        message: "worker thread died before sending columns".to_string(),
+                    }
+                    .into(),
+                )
             }
         };
 
@@ -323,13 +348,7 @@ impl SqlParty {
     ) -> ServerTerm {
         let state = match self.handles.get_mut(&handle) {
             Some(s) => s,
-            None => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: vec![],
-                    message: b"unknown handle".to_vec(),
-                }
-            }
+            None => return error_term(Sqlite::UnknownHandle.into()),
         };
 
         let count = count as usize;
@@ -345,17 +364,11 @@ impl SqlParty {
                 Ok(StreamBatch::Done) => {
                     state.exhausted = true;
                 }
-                Ok(StreamBatch::Error(msg)) => {
+                Ok(StreamBatch::Error(diagnostic)) => {
                     // The ENGINE refused a row mid-stream (e.g. a json()
-                    // call hit malformed text) — an execution failure, not
-                    // a channel problem; badge it so the error is
-                    // explainable. The other Connection arms here are
-                    // genuine session-state errors and stay unbadged.
-                    return ServerTerm::Error {
-                        kind: ErrorKind::Connection,
-                        identity: b"delightql-error://runtime/execution".to_vec(),
-                        message: delightql_types::teach_runtime_message(msg).into_bytes(),
-                    };
+                    // call hit malformed text): its own identity, with the
+                    // DQL-side teaching appended where the message has one.
+                    return error_term(teach(diagnostic));
                 }
                 Err(_) => {
                     // Channel closed unexpectedly
@@ -376,19 +389,15 @@ impl SqlParty {
         let cells: Vec<Vec<Cell>> = match orientation {
             Orientation::Rows => rows
                 .iter()
-                .map(|row| {
-                    col_indices
-                        .iter()
-                        .map(|&ci| row[ci].clone())
-                        .collect()
-                })
+                .map(|row| col_indices.iter().map(|&ci| row[ci].clone()).collect())
                 .collect(),
             Orientation::Columns => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: vec![],
-                    message: b"orientation Columns not supported".to_vec(),
-                }
+                return error_term(
+                    Sqlite::Orientation {
+                        message: "orientation Columns not supported".to_string(),
+                    }
+                    .into(),
+                )
             }
         };
 
@@ -397,11 +406,7 @@ impl SqlParty {
 
     fn handle_stat(&self, handle: Handle) -> ServerTerm {
         if !self.handles.contains_key(&handle) {
-            return ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: b"unknown handle".to_vec(),
-            };
+            return error_term(Sqlite::UnknownHandle.into());
         }
         ServerTerm::Metadata {
             items: vec![MetaItem::Backend(
@@ -416,11 +421,7 @@ impl SqlParty {
             // Receiver dropped → worker thread's send() returns Err → thread exits
             ServerTerm::Ok { count_hint: 0 }
         } else {
-            ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: b"unknown handle".to_vec(),
-            }
+            error_term(Sqlite::UnknownHandle.into())
         }
     }
 }
@@ -441,11 +442,12 @@ impl Handler for SqlParty {
                     .filter(|o| supported.contains(o))
                     .collect();
                 if agreed.is_empty() {
-                    ServerTerm::Error {
-                        kind: ErrorKind::Connection,
-                        identity: vec![],
-                        message: b"no common orientation".to_vec(),
-                    }
+                    error_term(
+                        Sqlite::Orientation {
+                            message: "no common orientation".to_string(),
+                        }
+                        .into(),
+                    )
                 } else {
                     ServerTerm::Version {
                         max_message_size,
@@ -469,17 +471,19 @@ impl Handler for SqlParty {
 
             ClientTerm::Close { handle } => self.handle_close(handle),
 
-            ClientTerm::Prepare { .. } => ServerTerm::Error {
-                kind: ErrorKind::Permission,
-                identity: vec![],
-                message: b"Prepare not implemented in SqlParty".to_vec(),
-            },
+            ClientTerm::Prepare { .. } => error_term(
+                Sqlite::Unimplemented {
+                    message: "Prepare not implemented in SqlParty".to_string(),
+                }
+                .into(),
+            ),
 
-            ClientTerm::Offer { .. } => ServerTerm::Error {
-                kind: ErrorKind::Permission,
-                identity: vec![],
-                message: b"Offer not implemented in SqlParty".to_vec(),
-            },
+            ClientTerm::Offer { .. } => error_term(
+                Sqlite::Unimplemented {
+                    message: "Offer not implemented in SqlParty".to_string(),
+                }
+                .into(),
+            ),
         }
     }
 }

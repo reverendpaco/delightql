@@ -50,11 +50,11 @@ is passed to the function; everything after defines the window frame.
 `Examples:`
 
 ```delightql
-  ntile:( 10  <~  %(DepartmentId),#(-Salary), groups(_,_))
-  ntile:( 10  <~  %(DepartmentId),#(-Salary), groups(+1,_))
-  ntile:( 10  <~  %(DepartmentId),#(-Salary), rows(1,.))
-  ntile:( 10  <~  %(DepartmentId),#(-Salary), rows(_,-(upto*2)))
-  ntile:( 10  <~  %(DepartmentId),#(-Salary), range(.,upto*2) )
+  ntile:( 10  <~  %(DepartmentId),#(Salary desc), groups(_,_))
+  ntile:( 10  <~  %(DepartmentId),#(Salary desc), groups(+1,_))
+  ntile:( 10  <~  %(DepartmentId),#(Salary desc), rows(1,.))
+  ntile:( 10  <~  %(DepartmentId),#(Salary desc), rows(_,-(upto*2)))
+  ntile:( 10  <~  %(DepartmentId),#(Salary desc), range(.,upto*2) )
 ```
 
 

@@ -39,7 +39,7 @@ fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn handle_export_artifacts(dir: &Path) -> Result<()> {
-    let mut handle = crate::connection::open_handle()?;
+    let mut handle = crate::connection::open_handle(crate::connection::SessionProfile::client())?;
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
     // A higher-order directive writes both groups: `(arguments)(receipt
     // access)`. A lone group is receipt access by position, so dropping the

@@ -33,10 +33,7 @@ pub struct StdioTransport {
 impl StdioTransport {
     /// Build a transport over arbitrary pipes (no owned process — for
     /// in-memory tests or externally managed peers).
-    pub fn new(
-        writer: impl Write + Send + 'static,
-        reader: impl Read + Send + 'static,
-    ) -> Self {
+    pub fn new(writer: impl Write + Send + 'static, reader: impl Read + Send + 'static) -> Self {
         StdioTransport {
             writer: Box::new(writer),
             reader: Box::new(reader),
@@ -178,7 +175,7 @@ mod tests {
             .unwrap()
         {
             VersionResult::Accepted(s) => s,
-            VersionResult::Rejected { .. } => panic!("expected Accepted"),
+            VersionResult::Rejected(_) => panic!("expected Accepted"),
         };
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
         let handle = match session.query(b("SELECT name FROM t")).unwrap() {

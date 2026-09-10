@@ -6,6 +6,7 @@
 //! The CLI implements this trait — core defines it but never implements it.
 
 use crate::db_traits::DatabaseConnection;
+use crate::diagnostic::DelightQLError;
 use crate::introspect::DatabaseIntrospector;
 use crate::schema::DatabaseSchema;
 use std::sync::{Arc, Mutex};
@@ -45,10 +46,7 @@ pub struct ConnectionComponents {
 /// The CLI implements this — it knows about file paths, delightql-siso:// URIs,
 /// DuckDB files, etc. Core defines the trait but never implements it.
 pub trait ConnectionFactory: Send + Sync {
-    fn create(
-        &self,
-        uri: &str,
-    ) -> std::result::Result<ConnectionComponents, Box<dyn std::error::Error + Send + Sync>>;
+    fn create(&self, uri: &str) -> std::result::Result<ConnectionComponents, DelightQLError>;
 
     /// Enumerate the target's PERSISTENT schemas (R-S2) and produce one `ConnectionComponents` per schema, ALL
     /// backed by ONE underlying connection (one child / one relay) so that
@@ -62,9 +60,11 @@ pub trait ConnectionFactory: Send + Sync {
     fn create_tree(
         &self,
         uri: &str,
-    ) -> std::result::Result<Vec<(String, ConnectionComponents)>, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> std::result::Result<Vec<(String, ConnectionComponents)>, DelightQLError> {
         let _ = uri;
-        Err("mount_tree! is not supported by this connection factory".into())
+        Err(crate::diagnostic::Runtime::Unsupported {
+            message: "mount_tree! is not supported by this connection factory".to_string(),
+        }
+        .into())
     }
 }

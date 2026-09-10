@@ -13,6 +13,7 @@
 //! consolidated grammar and the one normalization; the only thing that makes
 //! it a reconstruction rather than a parse is where the bytes came from.
 
+use crate::diagnostic::{Constraint, Internal};
 use crate::error::{DelightQLError, Result};
 
 use crate::pipeline::asts::core::Query;
@@ -49,10 +50,13 @@ pub fn group(source: &str) -> Result<DefinitionGroup> {
 fn assemble(source: &str) -> Result<DefinitionGroup> {
     let decls = clauses(source)?;
     if decls.is_empty() {
-        return Err(DelightQLError::parse_error(format!(
-            "No definition found in source: '{}'",
-            crate::pipeline::parse::truncate_for_display(source, 60)
-        )));
+        return Err(Internal::invariant(
+            "ddl::reconstruct",
+            format!(
+                "No definition found in source: '{}'",
+                crate::pipeline::parse::truncate_for_display(source, 60)
+            ),
+        ));
     }
     DefinitionGroup::assemble(decls)
 }
@@ -140,30 +144,40 @@ impl Drop for Compilation {
 pub fn bound_body(source: &str, bindings: HoParamBindings) -> Result<Query> {
     let decls = normalized(source, Some(bindings))?.into_definitions();
     let Some(decl) = decls.into_iter().next() else {
-        return Err(DelightQLError::parse_error(format!(
-            "No definition found in source: '{}'",
-            crate::pipeline::parse::truncate_for_display(source, 60)
-        )));
+        return Err(Internal::invariant(
+            "ddl::reconstruct",
+            format!(
+                "No definition found in source: '{}'",
+                crate::pipeline::parse::truncate_for_display(source, 60)
+            ),
+        ));
     };
     match decl.body {
         DdlBody::Relational(query) => Ok(query),
-        DdlBody::FactFunction(_) => Err(DelightQLError::parse_error(
-            "a fact-function mode is not a higher-order relational body",
-        )),
-        DdlBody::Scalar(_) => Err(DelightQLError::parse_error(format!(
-            "'{}' is a value rule; its body is not relational",
-            crate::pipeline::parse::truncate_for_display(source, 60)
-        ))),
-        DdlBody::Truth(_) => Err(DelightQLError::parse_error(format!(
-            "'{}' is a truth rule; its body is not relational",
-            crate::pipeline::parse::truncate_for_display(source, 60)
-        ))),
+        DdlBody::FactFunction(_) => Err(DelightQLError::from(Constraint::General {
+            message: "a fact-function mode is not a higher-order relational body".to_string(),
+        })),
+        DdlBody::Scalar(_) => Err(DelightQLError::from(Constraint::General {
+            message: format!(
+                "'{}' is a value rule; its body is not relational",
+                crate::pipeline::parse::truncate_for_display(source, 60)
+            ),
+        })),
+        DdlBody::Truth(_) => Err(DelightQLError::from(Constraint::General {
+            message: format!(
+                "'{}' is a truth rule; its body is not relational",
+                crate::pipeline::parse::truncate_for_display(source, 60)
+            ),
+        })),
         // A body still awaiting substitution, handed bindings that did not
         // supply what it waits for. Saying so is the honest propagation.
-        DdlBody::Deferred { source } => Err(DelightQLError::parse_error(format!(
-            "the body '{}' still awaits substitution",
-            crate::pipeline::parse::truncate_for_display(&source, 60)
-        ))),
+        DdlBody::Deferred { source } => Err(Internal::invariant(
+            "ddl::reconstruct",
+            format!(
+                "the body '{}' still awaits substitution",
+                crate::pipeline::parse::truncate_for_display(&source, 60)
+            ),
+        )),
     }
 }
 
@@ -179,10 +193,12 @@ pub fn bound_relex(body_source: &str, bindings: HoParamBindings) -> Result<Query
     let normalized = crate::pipeline::normalize::bound_query_sequence(&tree, registry, bindings)?;
     let mut queries = normalized.into_queries();
     if queries.len() != 1 {
-        return Err(DelightQLError::parse_error(format!(
-            "a body is one relational expression: '{}'",
-            crate::pipeline::parse::truncate_for_display(body_source, 60)
-        )));
+        return Err(DelightQLError::from(Constraint::General {
+            message: format!(
+                "a body is one relational expression: '{}'",
+                crate::pipeline::parse::truncate_for_display(body_source, 60)
+            ),
+        }));
     }
     Ok(queries.remove(0).query)
 }

@@ -15,6 +15,7 @@
 //! has no derivation, so nothing here has to refuse one.
 
 use super::{value::comparison_operator, Normalizer};
+use crate::diagnostic::{Internal, Parse, Set};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::{
     Comparison, Crossing, DomainExpression, Existence, FunctionApplication, Membership, Polarity,
@@ -26,42 +27,32 @@ use crate::pipeline::syntax::{cst, TypedNode};
 
 type Truth = TruthExpression<Unresolved>;
 
+/// POSITION OWNS ADMISSION. A whole-heading correlation names two ARMS of a
+/// set operation and cannot be evaluated against one row, so it is not a
+/// truth: the comma member on a set operation admits it, and every truth
+/// position refuses it.
+fn correlation_position() -> DelightQLError {
+    DelightQLError::from(Set::CorrelationPosition {
+        message: "a whole-heading correlation relates two operands of a set operation, \
+                  so it does not stand where a truth is read"
+            .to_string(),
+    })
+}
+
 impl<'t> Normalizer<'t> {
     #[stacksafe::stacksafe]
     pub(crate) fn truth_expression(&mut self, node: cst::TruthExpression<'t>) -> Result<Truth> {
         match node {
             cst::TruthExpression::Comparison(comparison) => self.comparison(comparison),
-            // POSITION OWNS ADMISSION. A whole-heading correlation names two
-            // ARMS of a set operation and cannot be evaluated against one
-            // row, so it is not a truth: the comma member on a set operation
-            // admits it, and every truth position refuses it.
-            cst::TruthExpression::HeadingCorrelation(_) => {
-                Err(DelightQLError::validation_error_categorized(
-                    "set/correlation/position",
-                    "a whole-heading correlation relates two operands of a set operation, \
-                     so it does not stand where a truth is read",
-                    "write it as its own comma member on the set operation: \
-                     `x(*) as a ; y(*) as b, a.* = b.*`",
-                ))
-            }
+            cst::TruthExpression::HeadingCorrelation(_) => Err(correlation_position()),
             cst::TruthExpression::ConjunctionExpression(conjunction) => {
                 self.conjunction(conjunction)
             }
             cst::TruthExpression::DisjunctionExpression(disjunction) => {
                 self.disjunction(disjunction)
             }
-            cst::TruthExpression::Negation(negation) => {
-                let inner = self.require(negation.child(), "a negation encloses a truth")?;
-                Ok(TruthExpression::Not {
-                    expr: Box::new(self.truth_expression(inner)?),
-                })
-            }
-            // Parens are admission at truth level as at value level; the
-            // truth they enclose is the truth.
-            cst::TruthExpression::ParenthesizedTruth(parens) => {
-                let inner = self.require(parens.child(), "parentheses enclose a truth")?;
-                self.truth_expression(inner)
-            }
+            cst::TruthExpression::Negation(negation) => self.negation(negation),
+            cst::TruthExpression::ParenthesizedTruth(parens) => self.parenthesized_truth(parens),
             cst::TruthExpression::Membership(membership) => self.membership(membership),
             cst::TruthExpression::RelationalMembership(membership) => {
                 self.relational_membership(membership)
@@ -70,7 +61,87 @@ impl<'t> Normalizer<'t> {
             cst::TruthExpression::SigmaApplication(application) => {
                 self.sigma_application(application)
             }
+            cst::TruthExpression::MixedConnectiveRun(run) => Err(self.mixed_connective_run(run)),
         }
+    }
+
+    /// THE MIXTURE IS RECOGNIZED TO BE REFUSED. The grammar admits a run that
+    /// mixes `and` and `or` only as this witness, so the refusal can name the
+    /// two words the author wrote, in their order, wherever the run stands —
+    /// and nothing of the run is ever normalized.
+    fn mixed_connective_run(&self, node: cst::MixedConnectiveRun<'t>) -> DelightQLError {
+        use cst::MixedConnectiveRunChild as Child;
+        let mut words: Vec<&str> = Vec::new();
+        for child in node.children() {
+            let word = match child {
+                Child::AndKeyword(word) => self.text(word),
+                Child::OrKeyword(word) => self.text(word),
+                Child::Comparison(_)
+                | Child::HeadingCorrelation(_)
+                | Child::Membership(_)
+                | Child::RelationalMembership(_)
+                | Child::Negation(_)
+                | Child::Existence(_)
+                | Child::SigmaApplication(_)
+                | Child::ParenthesizedTruth(_) => continue,
+            };
+            if !words.iter().any(|seen| seen.eq_ignore_ascii_case(word)) {
+                words.push(word);
+            }
+        }
+        let (first, second) = match words.as_slice() {
+            [first, second, ..] => (*first, *second),
+            _ => {
+                return Internal::invariant(
+                    "normalize::truth",
+                    "a mixed connective run carries both connectives",
+                )
+            }
+        };
+        DelightQLError::from(Parse::Pony {
+            message: format!(
+                "mixed connectives `{first}` and `{second}` without grouping: \
+                 DelightQL has NO precedence between `and` and `or` (no PEMDAS), \
+                 so the truth has no reading. Parenthesize the composition: \
+                 `((a {first} b) {second} c)` or `(a {first} (b {second} c))`."
+            ),
+        })
+    }
+
+    /// One child of a conjunction: an operand read through the same per-kind
+    /// reader `truth_expression` uses, or `None` for a separator. A
+    /// connective's operand is every truth form but a connective — the
+    /// grammar keeps the two connectives from meeting ungrouped, so nothing
+    /// here has to — and the match is exhaustive so a member the grammar adds
+    /// is a member this reader must place.
+    #[stacksafe::stacksafe]
+    fn conjunct(&mut self, child: cst::ConjunctionExpressionChild<'t>) -> Result<Option<Truth>> {
+        use cst::ConjunctionExpressionChild as Child;
+        Ok(Some(match child {
+            Child::AndKeyword(_) | Child::CommaSigil(_) => return Ok(None),
+            Child::Comparison(comparison) => self.comparison(comparison)?,
+            Child::HeadingCorrelation(_) => return Err(correlation_position()),
+            Child::Negation(negation) => self.negation(negation)?,
+            Child::ParenthesizedTruth(parens) => self.parenthesized_truth(parens)?,
+            Child::Membership(membership) => self.membership(membership)?,
+            Child::RelationalMembership(membership) => self.relational_membership(membership)?,
+            Child::Existence(existence) => self.existence(existence)?,
+            Child::SigmaApplication(application) => self.sigma_application(application)?,
+        }))
+    }
+
+    fn negation(&mut self, node: cst::Negation<'t>) -> Result<Truth> {
+        let inner = self.require(node.child(), "a negation encloses a truth")?;
+        Ok(TruthExpression::Not {
+            expr: Box::new(self.truth_expression(inner)?),
+        })
+    }
+
+    /// Parens are admission at truth level as at value level; the truth they
+    /// enclose is the truth.
+    fn parenthesized_truth(&mut self, node: cst::ParenthesizedTruth<'t>) -> Result<Truth> {
+        let inner = self.require(node.child(), "parentheses enclose a truth")?;
+        self.truth_expression(inner)
     }
 
     /// THE ONE MINT. A truth written where a value stands is read as the
@@ -105,7 +176,10 @@ impl<'t> Normalizer<'t> {
         let operator = self.require(operator, "a comparison has an operator")?;
         let text = self.text(operator);
         let operator = comparison_operator(text).ok_or_else(|| {
-            DelightQLError::parse_error(format!("'{text}' is not a comparison operator"))
+            Internal::invariant(
+                "normalize::truth",
+                format!("'{text}' is not a comparison operator"),
+            )
         })?;
         let mut operands = operands.into_iter();
         let left = self.require(operands.next(), "a comparison has a left operand")?;
@@ -149,8 +223,17 @@ impl<'t> Normalizer<'t> {
             }
             cst::TruthExpression::ConjunctionExpression(conjunction) => {
                 for child in conjunction.children() {
-                    if let cst::ConjunctionExpressionChild::TruthExpression(truth) = child {
-                        self.comma_truth_atoms(truth, wholes, terms)?;
+                    match child {
+                        cst::ConjunctionExpressionChild::HeadingCorrelation(correlation) => {
+                            wholes.push(self.heading_correlation(correlation)?);
+                        }
+                        // Parens keep a correlation at the comma's top level.
+                        cst::ConjunctionExpressionChild::ParenthesizedTruth(parens) => {
+                            let inner =
+                                self.require(parens.child(), "parentheses enclose a truth")?;
+                            self.comma_truth_atoms(inner, wholes, terms)?;
+                        }
+                        other => terms.extend(self.conjunct(other)?),
                     }
                 }
             }
@@ -180,13 +263,11 @@ impl<'t> Normalizer<'t> {
         // Within a correlation `=` is null-safe, and it is the ONE spelling:
         // a correlation is not an ordinary comparison wearing globs.
         if !matches!(text, "=") {
-            return Err(DelightQLError::validation_error_categorized(
-                "set/correlation/operator",
-                format!(
+            return Err(DelightQLError::from(Set::CorrelationOperator {
+                message: format!(
                     "a whole-heading correlation is written with '='; this one writes '{text}'"
                 ),
-                "within a correlation `=` is null-safe: a null meets a null",
-            ));
+            }));
         }
         let left = self.require(node.left(), "a correlation has a left operand")?;
         let right = self.require(node.right(), "a correlation has a right operand")?;
@@ -195,11 +276,10 @@ impl<'t> Normalizer<'t> {
         // The two modes never mix: a step aligns by NAME or by POSITION, and
         // an atom that used both would name no alignment at all.
         if left_positional != right_positional {
-            return Err(DelightQLError::validation_error_categorized(
-                "set/correlation/mixed_modes",
-                "a correlation aligns by NAME or by POSITION; this one writes both",
-                "write `x.* = y.*` for the name modes, `x|*| = y|*|` for the positional one",
-            ));
+            return Err(DelightQLError::from(Set::CorrelationMixedModes {
+                message: "a correlation aligns by NAME or by POSITION; this one writes both"
+                    .to_string(),
+            }));
         }
         Ok(if left_positional {
             WholeHeading::ByPosition { left, right }
@@ -219,30 +299,29 @@ impl<'t> Normalizer<'t> {
             cst::HeadingReference::PositionalHeading(heading) => (heading.qualifier(), true),
         };
         let Some(qualifier) = qualifier else {
-            return Err(DelightQLError::validation_error_categorized(
-                "set/correlation/unnamed_arm",
-                "a correlation operand names the arm it addresses; a bare glob names none",
-                "write the arm: `x.* = y.*`",
-            ));
+            return Err(DelightQLError::from(Set::CorrelationUnnamedArm {
+                message: "a correlation operand names the arm it addresses; a bare glob names none"
+                    .to_string(),
+            }));
         };
         Ok((self.qualifier(qualifier)?.spelling(), positional))
     }
 
     /// N-ary in the grammar and n-ary in the carrier: associativity makes
-    /// nesting meaningless, so there is none to build.
+    /// nesting meaningless, so there is none to build. The separators are
+    /// two spellings of one conjunction — `and` everywhere, the comma where a
+    /// truth stands alone — and the carrier records neither.
     fn conjunction(&mut self, node: cst::ConjunctionExpression<'t>) -> Result<Truth> {
         let mut terms = Vec::new();
         for child in node.children() {
-            match child {
-                cst::ConjunctionExpressionChild::TruthExpression(truth) => {
-                    terms.push(self.truth_expression(truth)?)
-                }
-                cst::ConjunctionExpressionChild::AndKeyword(_) => {}
-            }
+            terms.extend(self.conjunct(child)?);
         }
         self.require(TruthExpression::all(terms), "a conjunction has a term")
     }
 
+    /// The `or` run takes connective operands and the `;` form takes whole
+    /// truths inside its own parens; the grammar sorted them, and both arrive
+    /// as truths.
     fn disjunction(&mut self, node: cst::DisjunctionExpression<'t>) -> Result<Truth> {
         let mut terms = Vec::new();
         for child in node.children() {
@@ -284,7 +363,7 @@ impl<'t> Normalizer<'t> {
                     // A value_row has at least one value; the grammar says
                     // so and the carrier says so.
                     let values = Vec1::try_from_vec(values).ok_or_else(|| {
-                        DelightQLError::parse_error("a membership row has a value")
+                        Internal::invariant("normalize::truth", "a membership row has a value")
                     })?;
                     rows.push(ValueRow(values));
                 }
@@ -294,8 +373,9 @@ impl<'t> Normalizer<'t> {
         // A membership has at least one candidate row; the grammar says so
         // and the carrier says so, so the count is proved here and nothing
         // downstream reproves it or invents a meaning for nothing.
-        let rows = Vec1::try_from_vec(rows)
-            .ok_or_else(|| DelightQLError::parse_error("a membership has a candidate row"))?;
+        let rows = Vec1::try_from_vec(rows).ok_or_else(|| {
+            Internal::invariant("normalize::truth", "a membership has a candidate row")
+        })?;
         Ok(TruthExpression::Membership(Membership {
             probe,
             rows,
@@ -318,10 +398,7 @@ impl<'t> Normalizer<'t> {
             RelationalMembership {
                 probe,
                 relation: Box::new(subquery),
-                addressing: ProbeAddressing {
-                    identifier,
-                    using_columns: Vec::new(),
-                },
+                addressing: ProbeAddressing { identifier },
                 negated,
             },
         ))
@@ -350,7 +427,12 @@ impl<'t> Normalizer<'t> {
                 // THE COMMA MAKES THE ROW: one parenthesized element is a
                 // parenthesized operand, which normalized to the bare value.
                 Ok(Probe::Row(Vec2::try_from_vec(elements).ok_or_else(
-                    || DelightQLError::parse_error("a probe row has at least two values"),
+                    || {
+                        Internal::invariant(
+                            "normalize::truth",
+                            "a probe row has at least two values",
+                        )
+                    },
                 )?))
             }
         }
@@ -375,24 +457,15 @@ impl<'t> Normalizer<'t> {
         polarity: Polarity,
     ) -> Result<Truth> {
         let (identifier, _) = self.relation_identifier(callee)?;
+        // A dequalifying access inside the probe — `+orders(*.(status))` —
+        // is the read's own correlation to the row the probe stands in,
+        // and the resolver performs it where it resolves that read; the
+        // access stays on the mention that carries it.
         let subquery = self.interior_relation(callee, ho_part, interior)?;
-        // A dequalifying access inside the probe IS the USING correlation:
-        // `+orders(*.(status))` names the shared columns, and the access the
-        // mention already carries is where they were decided.
-        let using_columns = match (subquery.as_read_relation(), subquery.head_access()) {
-            (
-                Some(crate::pipeline::asts::core::Relation::Ground { .. }),
-                Some(crate::pipeline::asts::core::Access::Dequalify(columns)),
-            ) => columns.clone(),
-            _ => Vec::new(),
-        };
         Ok(TruthExpression::Existence(Existence {
             polarity,
             relation: Box::new(subquery),
-            addressing: ProbeAddressing {
-                identifier,
-                using_columns,
-            },
+            addressing: ProbeAddressing { identifier },
         }))
     }
 
@@ -429,9 +502,10 @@ impl<'t> Normalizer<'t> {
         match self.text(node) {
             "+" => Ok(Polarity::Positive),
             "\\+" => Ok(Polarity::Negative),
-            other => Err(DelightQLError::parse_error(format!(
-                "'{other}' is not a polarity"
-            ))),
+            other => Err(Internal::invariant(
+                "normalize::truth",
+                format!("'{other}' is not a polarity"),
+            )),
         }
     }
 }

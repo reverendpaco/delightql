@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::schema_base::{ColumnInfo, DatabaseSchema, SchemaProvider, TableInfo};
 /// DuckDB Schema Provider Implementation
 ///
 /// This module implements the SchemaProvider trait for DuckDB databases,
 /// providing schema introspection capabilities without exposing DuckDB-specific
 /// details to the rest of the system.
-use crate::schema_base::{ColumnInfo, DatabaseSchema, SchemaProvider, TableInfo};
+use delightql_types::diagnostic::{DuckDb, Resolution, Runtime};
 use delightql_types::{DelightQLError, Result};
 use duckdb::Connection;
 use std::path::Path;
@@ -20,7 +21,9 @@ impl DuckDBSchemaProvider {
     /// Create a new SQLite schema provider from a database path
     pub fn new(database_path: &Path) -> Result<Self> {
         let connection = Connection::open(database_path).map_err(|e| {
-            DelightQLError::parse_error(format!("Failed to open SQLite database: {}", e))
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("Failed to open DuckDB database: {}", e),
+            })
         })?;
 
         Ok(Self {
@@ -47,10 +50,9 @@ impl DuckDBSchemaProvider {
                  ORDER BY ordinal_position",
             )
             .map_err(|e| {
-                DelightQLError::parse_error(format!(
-                    "Failed to query columns for table '{}': {}",
-                    table_name, e
-                ))
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to query columns for table '{}': {}", table_name, e),
+                })
             })?;
 
         let columns = stmt
@@ -63,17 +65,18 @@ impl DuckDBSchemaProvider {
                 })
             })
             .map_err(|e| {
-                DelightQLError::parse_error(format!(
-                    "Failed to read columns for table '{}': {}",
-                    table_name, e
-                ))
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to read columns for table '{}': {}", table_name, e),
+                })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
-                DelightQLError::parse_error(format!(
-                    "Failed to collect columns for table '{}': {}",
-                    table_name, e
-                ))
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!(
+                        "Failed to collect columns for table '{}': {}",
+                        table_name, e
+                    ),
+                })
             })?;
 
         Ok(columns)
@@ -86,7 +89,7 @@ impl SchemaProvider for DuckDBSchemaProvider {
         let conn = self
             .connection
             .lock()
-            .map_err(|e| DelightQLError::parse_error(format!("Failed to acquire lock: {}", e)))?;
+            .map_err(|e| Runtime::poisoned("Failed to acquire lock", e))?;
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT table_name
@@ -94,14 +97,24 @@ impl SchemaProvider for DuckDBSchemaProvider {
                  WHERE table_schema = 'main'
                  ORDER BY table_name",
             )
-            .map_err(|e| DelightQLError::parse_error(format!("Failed to query tables: {}", e)))?;
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to query tables: {}", e),
+                })
+            })?;
 
         let table_names: Vec<String> = stmt
             .query_map([], |row| row.get(0))
-            .map_err(|e| DelightQLError::parse_error(format!("Failed to read table names: {}", e)))?
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to read table names: {}", e),
+                })
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
-                DelightQLError::parse_error(format!("Failed to collect table names: {}", e))
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to collect table names: {}", e),
+                })
             })?;
 
         let mut schema = DatabaseSchema::new();
@@ -122,16 +135,17 @@ impl SchemaProvider for DuckDBSchemaProvider {
     fn get_table_info(&self, table_name: &str) -> Result<TableInfo> {
         // First check if table exists
         if !self.table_exists(table_name)? {
-            return Err(DelightQLError::parse_error(format!(
-                "Table '{}' does not exist",
-                table_name
-            )));
+            return Err(Resolution::Table {
+                table: table_name.to_string(),
+                context: "Table does not exist in database".to_string(),
+            }
+            .into());
         }
 
         let conn = self
             .connection
             .lock()
-            .map_err(|e| DelightQLError::parse_error(format!("Failed to acquire lock: {}", e)))?;
+            .map_err(|e| Runtime::poisoned("Failed to acquire lock", e))?;
         let columns = self.load_table_columns(&conn, table_name)?;
 
         Ok(TableInfo {
@@ -144,7 +158,7 @@ impl SchemaProvider for DuckDBSchemaProvider {
         let conn = self
             .connection
             .lock()
-            .map_err(|e| DelightQLError::parse_error(format!("Failed to acquire lock: {}", e)))?;
+            .map_err(|e| Runtime::poisoned("Failed to acquire lock", e))?;
 
         let mut stmt = conn
             .prepare(
@@ -152,13 +166,17 @@ impl SchemaProvider for DuckDBSchemaProvider {
                  WHERE table_name = ?1 AND table_schema = 'main'",
             )
             .map_err(|e| {
-                DelightQLError::parse_error(format!("Failed to check table existence: {}", e))
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to check table existence: {}", e),
+                })
             })?;
 
         let count: i32 = stmt
             .query_row([table_name], |row| row.get(0))
             .map_err(|e| {
-                DelightQLError::parse_error(format!("Failed to query table existence: {}", e))
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to query table existence: {}", e),
+                })
             })?;
 
         Ok(count > 0)
@@ -168,7 +186,7 @@ impl SchemaProvider for DuckDBSchemaProvider {
         let conn = self
             .connection
             .lock()
-            .map_err(|e| DelightQLError::parse_error(format!("Failed to acquire lock: {}", e)))?;
+            .map_err(|e| Runtime::poisoned("Failed to acquire lock", e))?;
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT table_name
@@ -176,14 +194,24 @@ impl SchemaProvider for DuckDBSchemaProvider {
                  WHERE table_schema = 'main'
                  ORDER BY table_name",
             )
-            .map_err(|e| DelightQLError::parse_error(format!("Failed to list tables: {}", e)))?;
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to list tables: {}", e),
+                })
+            })?;
 
         let tables = stmt
             .query_map([], |row| row.get(0))
-            .map_err(|e| DelightQLError::parse_error(format!("Failed to read table list: {}", e)))?
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to read table list: {}", e),
+                })
+            })?
             .collect::<std::result::Result<Vec<String>, _>>()
             .map_err(|e| {
-                DelightQLError::parse_error(format!("Failed to collect table list: {}", e))
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to collect table list: {}", e),
+                })
             })?;
 
         Ok(tables)

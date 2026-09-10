@@ -150,7 +150,7 @@ Access elements by index:
 ```delightql
 employee(*)
   |> (Department , [LastName,FirstName] as name )
-  |> ( Department, name:[1] as first_name)
+  |> ( Department, name:{.1} as first_name)
 ```
 
 

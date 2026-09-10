@@ -31,7 +31,7 @@ pub fn handle_selftest(json: bool, strict: bool) -> Result<()> {
 
 fn run() -> Result<Vec<DiagnosticFinding>> {
     // Fresh CLI handle — selftest inspects dql itself, not a user database.
-    let handle = crate::connection::open_handle()?;
+    let handle = crate::connection::open_handle(crate::connection::SessionProfile::client())?;
     Ok(handle.selftest())
 }
 

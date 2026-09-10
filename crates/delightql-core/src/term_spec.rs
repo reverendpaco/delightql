@@ -27,25 +27,22 @@
 //! formatter adjudicate identity — determinism, idempotence,
 //! round-trip — are pinned in this module's tests.
 
+use crate::diagnostic::Mention;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::syntax::{cst, TypedNode};
 
 fn not_a_term(detail: String) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "mention/term/not_a_term",
-        format!(
+    DelightQLError::from(Mention::TermNotATerm {
+        message: format!(
             "the term specification admits table functors only — a single relation-access term such as people(*), people(, age >= 30), or orders(id, _, total); {detail}"
         ),
-        "namespace paths, function terms, pipelines, and joins are not terms; new term kinds are admitted by ruling",
-    )
+    })
 }
 
 fn unformattable(detail: String) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "mention/term/unformattable",
-        format!("the canonicalizer cannot emit this term: {detail}"),
-        "the term parses but the format engine takes no position on part of it — unformatted bytes never become a match key or a stored spelling",
-    )
+    DelightQLError::from(Mention::TermUnformattable {
+        message: format!("the canonicalizer cannot emit this term: {detail}"),
+    })
 }
 
 /// The canonical interior of a delimited-mention token (`` :`term` ``),
@@ -59,7 +56,11 @@ pub(crate) fn mention_interior_from_token(token_text: &str) -> Result<String> {
     let interior = token_text
         .strip_prefix(":`")
         .and_then(|t| t.strip_suffix('`'))
-        .ok_or_else(|| DelightQLError::parse_error("malformed delimited mention"))?;
+        .ok_or_else(|| {
+            crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+                message: "malformed delimited mention".to_string(),
+            })
+        })?;
     let trimmed = interior.trim();
     let identifier_shaped = !trimmed.is_empty()
         && trimmed
@@ -70,13 +71,11 @@ pub(crate) fn mention_interior_from_token(token_text: &str) -> Result<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_');
     if identifier_shaped {
-        return Err(DelightQLError::validation_error_categorized(
-            "mention/identifier_interior",
-            format!(
+        return Err(DelightQLError::from(Mention::IdentifierInterior {
+    message: format!(
                 "an identifier mention is spelled ::{trimmed} — the delimited spelling is for terms, and identifier terms are not yet admitted by the term specification"
             ),
-            "write the light spelling; the delimited form may admit identifier terms later, by ruling",
-        ));
+}));
     }
     canonicalize_term(interior)
 }
@@ -170,28 +169,122 @@ fn fold_unstropped_identifiers(tree: &crate::pipeline::syntax::SyntaxTree) -> St
     String::from_utf8(bytes).expect("ASCII folding preserves UTF-8")
 }
 
-/// Whether the submission is exactly one chain headed by a named relation
-/// access, with no preamble and no continuation.
-fn is_single_relation_access(tree: &crate::pipeline::syntax::SyntaxTree, source: &str) -> bool {
-    use crate::pipeline::syntax::cst;
+/// THE READS OF A BODY, HELD TO THE TERM LAW: the canonical spelling of
+/// the body's head read and of each comma member written as a read, in
+/// written order — `None` where the text is not a term (an aliased or
+/// outer-marked read, an anonymous table) — so that whether a body reads
+/// an endpoint AS ITS TERM is the identity question the language already
+/// answers: byte-equal canonical spellings, same term. Spelled from the
+/// body's own bytes, so no normalization registry stands between the two
+/// sides. What a body may carry beyond its reads is judged on the
+/// normalized body; a member that is not a read (a condition, a probe)
+/// contributes nothing here.
+pub(crate) struct BodyReads {
+    pub(crate) head: Option<String>,
+    pub(crate) members: Vec<Option<String>>,
+}
+
+pub(crate) fn body_reads(
+    tree: &crate::pipeline::syntax::SyntaxTree,
+    relex: cst::Relex<'_>,
+) -> BodyReads {
+    let Some(body) = relex.body() else {
+        return BodyReads {
+            head: None,
+            members: Vec::new(),
+        };
+    };
+    let head = body.grelex().and_then(|read| term_of(tree, read));
+    let mut members = Vec::new();
+    for child in body.children() {
+        let cst::LetFreeRelexChild::Continuation(cst::Continuation::BinaryContinuation(
+            cst::BinaryContinuation::CommaContinuation(comma),
+        )) = child
+        else {
+            continue;
+        };
+        // The members the normalizer reads as relations, in its order: a
+        // probe becomes a condition and is not among them.
+        match comma.member() {
+            Some(cst::CommaContinuationMember::GrelexLikeMember(
+                cst::GrelexLikeMember::Grelex(read),
+            )) => members.push(term_of(tree, read)),
+            Some(cst::CommaContinuationMember::GrelexLikeMember(
+                cst::GrelexLikeMember::OuterGrelex(_) | cst::GrelexLikeMember::OuterAnonGrelex(_),
+            )) => members.push(None),
+            _ => {}
+        }
+    }
+    BodyReads { head, members }
+}
+
+/// The canonical spelling of one read's bytes, if they are a term.
+fn term_of<'t>(
+    tree: &crate::pipeline::syntax::SyntaxTree,
+    node: impl TypedNode<'t>,
+) -> Option<String> {
+    let range = tree.byte_range(node)?;
+    canonicalize_term(&tree.source()[range]).ok()
+}
+
+/// The reads of a STORED edge declaration's body, from its own bytes: at
+/// use the same question is asked of the same text as at declaration.
+pub(crate) fn edge_body_reads(source: &str) -> Result<BodyReads> {
+    let tree = crate::pipeline::parse::definition_file(source)?;
+    let edge = crate::pipeline::syntax::walk(&tree)
+        .find_map(|node| cst::EdgeDeclaration::cast(node.node()))
+        .ok_or_else(|| {
+            crate::diagnostic::Internal::invariant(
+                "er edge",
+                "a stored edge definition is an edge declaration",
+            )
+        })?;
+    let body = edge.body().ok_or_else(|| {
+        crate::diagnostic::Internal::invariant("er edge", "an edge declaration has a body")
+    })?;
+    Ok(body_reads(&tree, body))
+}
+
+/// The reads of a query submitted as one relex — the shape judgment's
+/// witnesses spell a body this way.
+#[cfg(test)]
+pub(crate) fn query_body_reads(source: &str) -> Option<BodyReads> {
+    let tree = crate::pipeline::parse::query_sequence(source).ok()?;
+    let relex = sole_relex(&tree)?;
+    Some(body_reads(&tree, relex))
+}
+
+/// The one relex a submission is, when it is exactly one: no header, no
+/// second statement.
+fn sole_relex(tree: &crate::pipeline::syntax::SyntaxTree) -> Option<cst::Relex<'_>> {
     let Some(cst::SourceFileChild::QuerySequenceRoot(root)) = tree.root_branch() else {
-        return false;
+        return None;
     };
     let mut forms = root.children().filter_map(|child| match child {
         cst::QuerySequenceRootChild::QuerySequence(sequence) => Some(sequence),
         cst::QuerySequenceRootChild::QuerySequenceHeader(_) => None,
     });
-    let Some(sequence) = forms.next() else {
-        return false;
-    };
+    let sequence = forms.next()?;
     if forms.next().is_some() {
-        return false;
+        return None;
     }
     let mut members = sequence.children();
     let Some(cst::QuerySequenceChild::Relex(relex)) = members.next() else {
+        return None;
+    };
+    if members.next().is_some() {
+        return None;
+    }
+    Some(relex)
+}
+
+/// Whether the submission is exactly one chain headed by a named relation
+/// access, with no preamble and no continuation.
+fn is_single_relation_access(tree: &crate::pipeline::syntax::SyntaxTree, source: &str) -> bool {
+    let Some(relex) = sole_relex(tree) else {
         return false;
     };
-    if members.next().is_some() || relex.let_block().is_some() {
+    if relex.let_block().is_some() {
         return false;
     }
     let Some(body) = relex.body() else {

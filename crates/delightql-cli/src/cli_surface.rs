@@ -372,6 +372,8 @@ fn serialize_surface() -> Result<Vec<u8>> {
     Ok(data.to_vec())
 }
 
+/// Mount the live Clap surface as `cli::surface`. Performed by the client
+/// profile alone; a server handle never carries it.
 pub fn attach(mut inner: Box<dyn DqlHandle>) -> Result<Box<dyn DqlHandle>> {
     let image = serialize_surface()?;
     inner

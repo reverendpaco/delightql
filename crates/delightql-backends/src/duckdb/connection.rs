@@ -4,6 +4,7 @@
 ///
 /// Provides thread-safe connection management for DuckDB databases,
 /// supporting both in-memory and file-based databases.
+use delightql_types::diagnostic::{DuckDb, Runtime};
 use delightql_types::{DelightQLError, Result};
 use duckdb::Connection;
 use std::path::Path;
@@ -28,7 +29,11 @@ pub struct DuckDBConnectionManager {
 impl DuckDBConnectionManager {
     /// Create a new connection to an in-memory DuckDB database
     pub fn new_memory() -> Result<Self> {
-        let connection = Connection::open_in_memory().map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        let connection = Connection::open_in_memory().map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("DuckDB error: {}", e),
+            })
+        })?;
 
         let connection = Arc::new(Mutex::new(connection));
         let info = ConnectionInfo {
@@ -46,11 +51,15 @@ impl DuckDBConnectionManager {
         // Ensure the parent directory exists if creating a new database
         if let Some(parent) = Path::new(path).parent() {
             if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(DelightQLError::IoError)?;
+                std::fs::create_dir_all(parent).map_err(DelightQLError::from)?;
             }
         }
 
-        let connection = Connection::open(path).map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        let connection = Connection::open(path).map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("DuckDB error: {}", e),
+            })
+        })?;
 
         let connection = Arc::new(Mutex::new(connection));
         let info = ConnectionInfo {
@@ -68,17 +77,20 @@ impl DuckDBConnectionManager {
     pub fn new_file_existing(path: &str) -> Result<Self> {
         // Check if database file exists
         if !Path::new(path).exists() {
-            return Err(DelightQLError::ParseError {
+            return Err(Runtime::Io {
                 message: format!(
                     "Database file '{}' does not exist. Use --make-new-db-if-missing to create it.",
                     path
                 ),
-                source: None,
-                subcategory: None,
-            });
+            }
+            .into());
         }
 
-        let connection = Connection::open(path).map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        let connection = Connection::open(path).map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("DuckDB error: {}", e),
+            })
+        })?;
 
         let connection = Arc::new(Mutex::new(connection));
         let info = ConnectionInfo {
@@ -101,23 +113,23 @@ impl DuckDBConnectionManager {
     /// so read-only loses nothing.
     pub fn new_file_readonly(path: &str) -> Result<Self> {
         if !Path::new(path).exists() {
-            return Err(DelightQLError::ParseError {
+            return Err(Runtime::Io {
                 message: format!("Database file '{}' does not exist.", path),
-                source: None,
-                subcategory: None,
-            });
+            }
+            .into());
         }
 
         let config = duckdb::Config::default()
             .access_mode(duckdb::AccessMode::ReadOnly)
             .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("DuckDB config error: {}", e),
-                    String::new(),
-                )
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("DuckDB config error: {}", e),
+                })
             })?;
         let connection = Connection::open_with_flags(path, config).map_err(|e| {
-            DelightQLError::database_error(format!("DuckDB error: {}", e), String::new())
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("DuckDB error: {}", e),
+            })
         })?;
 
         let connection = Arc::new(Mutex::new(connection));
@@ -162,14 +174,17 @@ impl DuckDBConnectionManager {
         let conn = self.connection.lock().map_err(|poison_err| {
             // Attempt to recover from poison by using the data anyway
             // In production, you might want to reinitialize the connection instead
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!("Previous operation panicked. Error: {}", poison_err),
             )
         })?;
 
-        conn.query_row("SELECT 1", [], |_| Ok(()))
-            .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        conn.query_row("SELECT 1", [], |_| Ok(())).map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("DuckDB error: {}", e),
+            })
+        })?;
 
         Ok(())
     }

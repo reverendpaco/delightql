@@ -9,7 +9,8 @@ const BLOCK: &str = "(~~ddl:\"scr\"\npair(*) :- _(a, b @ 1, \"x\")\n~~)\n";
 
 #[test]
 fn a_reset_session_forgets_the_enlist_set_and_scratch() {
-    let mut handle = delightql_cli::connection::open_handle().expect("handle");
+    let mut handle = delightql_cli::connection::open_handle(delightql_cli::connection::SessionProfile::client())
+        .expect("handle");
     {
         let mut session = handle.session().expect("session");
         run_dql_query(&format!("{BLOCK}enlist!(\"scr\")(*)"), &mut *session).expect("enlist scr");
@@ -36,7 +37,8 @@ fn a_reset_session_forgets_the_enlist_set_and_scratch() {
 /// them, or the next session's bare names answer from a previous session.
 #[test]
 fn a_reset_session_forgets_home_scratch() {
-    let mut handle = delightql_cli::connection::open_handle().expect("handle");
+    let mut handle = delightql_cli::connection::open_handle(delightql_cli::connection::SessionProfile::client())
+        .expect("handle");
     {
         let mut session = handle.session().expect("session");
         run_dql_query("(~~ddl\nghost(*) :- _(a @ 1)\n~~)\nghost(*)", &mut *session)

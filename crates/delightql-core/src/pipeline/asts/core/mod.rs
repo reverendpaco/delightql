@@ -38,10 +38,10 @@ pub use operators::{FrameBound, JoinType, PipeOp, WindowFrame};
 pub use phases::{Phase, Refined, Resolved, Unresolved};
 pub use provenance::CteOrigin;
 pub use queries::{
-    AuthoredCteSubject, CfeDefinition, CfeFormals, ContextMode, CteAuthority, CteBinding,
-    CteEffectDeclaration, CteSubjectView, DangerSpec, DangerState, ErContextSpec, HoDefinition,
-    InlineDdlBody, InlineDdlSpec, LexicalHorizon, OptionSpec, OptionState, Query, QueryLocalBlock,
-    QueryLocalNames, QueryLocals,
+    AuthoredCteSubject, CfeDefinition, CfeFormal, CfeFormals, ContextMode, CteAuthority,
+    CteBinding, CteEffectDeclaration, CteSubjectView, DangerSpec, DangerState, ErContextSpec,
+    HoDefinition, InlineDdlBody, InlineDdlSpec, LexicalHorizon, OptionSpec, OptionState, Query,
+    QueryLocalBlock, QueryLocalNames, QueryLocals,
 };
 pub(crate) use queries::{QueryLocalDemand, QueryLocalKind};
 pub use specs::{

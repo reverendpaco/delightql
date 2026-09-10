@@ -23,11 +23,12 @@
 
 use super::{resolve_query_with, ResolutionConfig};
 use crate::bin_cartridge::prelude::consult::execute_consult;
+use crate::diagnostic::{Constraint, DelightQLError};
 use crate::pipeline::compiled_query::{CompiledPlan, PlanEntry};
 use crate::pipeline::effect_transformer::compile_namespace_main;
 use crate::pipeline::{ast_unresolved, danger_gates, generator, refiner, transformer};
 use crate::resolution::ResolverCore;
-use crate::system::DelightQLSystem;
+use crate::system::{DelightQLSystem, ReadySystem};
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 use std::sync::{Arc, Mutex};
@@ -73,9 +74,9 @@ impl DatabaseIntrospector for MountIntrospector {
     }
 }
 
-fn enlisted_world() -> DelightQLSystem {
+fn enlisted_world() -> ReadySystem {
     let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-    let mut system = DelightQLSystem::new(conn, Box::new(MountIntrospector), "sqlite")
+    let mut system = ReadySystem::new(conn, Box::new(MountIntrospector), "sqlite")
         .expect("fresh in-memory system should build");
     // mount_database wants the file to exist; the mock never reads it.
     static MOUNT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
@@ -166,10 +167,9 @@ fn compile_plain(source: &str, system: &DelightQLSystem) -> crate::error::Result
     generator::SqlGenerator::new(&names)
         .generate_statement(&sql_ast)
         .map_err(|e| {
-            crate::error::DelightQLError::validation_error(
-                format!("SQL generation failed: {e}"),
-                "sigma-guard test chain",
-            )
+            DelightQLError::from(Constraint::General {
+                message: format!("SQL generation failed: {e}"),
+            })
         })
 }
 

@@ -2,6 +2,7 @@
 // Copyright 2026 Daniel Eklund
 //! Physical SQL columns and their total semantic-site binding.
 
+use crate::diagnostic::Internal;
 use crate::error::{DelightQLError, Result};
 use crate::names::{ColId, Registry, ScopeId};
 use crate::pipeline::asts::core::ColumnMetadata;
@@ -93,28 +94,47 @@ impl SqlLayout {
         // here, one at a time, rather than carved out of the row by a width
         // test that guessed whether the dependencies were present.
         let ports = sealed.interface(relation)?.ports().to_vec();
-        let ports_len = ports.len();
+        // A POSITION THE ENCLOSING JOIN COMPUTES has no slot at this level:
+        // the level emits every other position in order and accounts for
+        // that one without placing it.
+        let ports_len = ports
+            .iter()
+            .filter(|port| !sealed.unemitted_here(**port))
+            .count();
         let dependencies = sealed.dependencies(relation)?;
         if columns.len() < ports_len {
-            return Err(DelightQLError::transformation_error(
-                "a SQL level emits fewer positions than the relation it realizes publishes",
+            return Err(Internal::invariant(
                 "sql binding",
+                "a SQL level emits fewer positions than the relation it realizes publishes",
             ));
         }
         let mut row = identities.bindings().emitting(sealed, relation)?;
         let mut emitted = columns.iter().copied();
         for port in ports {
+            if sealed.unemitted_here(port) {
+                row.defers(port)?;
+                continue;
+            }
             let slot = emitted.next().expect("the width was checked above");
             row.publishes(slot, port)?;
         }
         // THE SUPPORT IS THE NEXT RUN, and only where the level emitted it.
-        // A level narrower than interface-plus-support emitted none: the
-        // dependency was spent below it and nothing above names the slot.
+        // A level narrower than interface-plus-support emitted none: a
+        // constraint dependency was spent below it and nothing above names
+        // the slot. CORRELATION SUPPORT IS NEVER SPENT THAT WAY: the
+        // enclosing join reads it through every level up to the boundary,
+        // so a level that owes it and did not emit it has dropped an
+        // obligation, and that is a refusal here rather than a scaffold.
         if columns.len() >= ports_len + dependencies.len() {
             for port in dependencies {
                 let slot = emitted.next().expect("the width was checked above");
                 row.supports(slot, port)?;
             }
+        } else if !sealed.correlation_support(relation)?.is_empty() {
+            return Err(Internal::invariant(
+                "sql binding",
+                "a SQL level owes correlation support it did not emit beside its heading",
+            ));
         }
         for slot in emitted {
             row.scaffolds(slot);
@@ -329,9 +349,5 @@ fn is_hygienic(identities: &Registry, column: ColId) -> bool {
 }
 
 fn disagreement(message: String) -> DelightQLError {
-    DelightQLError::ParseError {
-        message: format!("SQL layout: {message}"),
-        source: None,
-        subcategory: None,
-    }
+    Internal::invariant("transformer::builder", format!("SQL layout: {message}"))
 }

@@ -198,6 +198,7 @@ mod tests {
                         position: 0,
                         named: Some(named),
                         declared_type: None,
+                        interior: false,
                     }],
                     answers_to: Some(answer),
                 },

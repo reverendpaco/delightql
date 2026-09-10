@@ -40,6 +40,7 @@ impl DatabaseSchema for TwoTableSchema {
                     nullable: true,
                     position: i,
                     declared_type: Some("TEXT".to_string()),
+                    interior: false,
                 })
                 .collect(),
         ))

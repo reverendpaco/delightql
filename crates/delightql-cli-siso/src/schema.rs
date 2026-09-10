@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use delightql_types::diagnostic::Siso;
 use std::sync::Arc;
 
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
-use delightql_types::{DelightQLError, Result};
+use delightql_types::Result;
 
 use crate::coprocess::SharedCoprocess;
 use crate::profile::SchemaMode;
@@ -31,9 +32,10 @@ impl DatabaseSchema for PipeSchema {
             SchemaMode::Pragma => format!("PRAGMA table_info({})", table_name),
             SchemaMode::Query(template) => template.replace("{table}", table_name),
         };
-        let (columns, rows) = self.shared.execute_query_raw(&sql).map_err(|error| {
-            DelightQLError::database_error("Pipe schema query failed", error.to_string())
-        })?;
+        let (columns, rows) = self
+            .shared
+            .execute_query_raw(&sql)
+            .map_err(|error| crate::error::diagnostic("Pipe schema query failed", error))?;
 
         if rows.is_empty() {
             return Ok(None);
@@ -42,12 +44,15 @@ impl DatabaseSchema for PipeSchema {
         // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
         // Find column indices by name
         let Some(name_idx) = columns.iter().position(|c| c.eq_ignore_ascii_case("name")) else {
-            return Err(DelightQLError::database_error(
-                "Pipe schema metadata is malformed",
-                "missing required column 'name'",
-            ));
+            return Err(Siso::Output {
+                message: "Pipe schema metadata is malformed: missing required column 'name'"
+                    .to_string(),
+            }
+            .into());
         };
-        let notnull_idx = columns.iter().position(|c| c.eq_ignore_ascii_case("notnull"));
+        let notnull_idx = columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case("notnull"));
         let cid_idx = columns.iter().position(|c| c.eq_ignore_ascii_case("cid"));
 
         let column_infos: Vec<ColumnInfo> = rows
@@ -69,6 +74,7 @@ impl DatabaseSchema for PipeSchema {
                     nullable,
                     position,
                     declared_type: None,
+                    interior: false,
                 }
             })
             .collect();

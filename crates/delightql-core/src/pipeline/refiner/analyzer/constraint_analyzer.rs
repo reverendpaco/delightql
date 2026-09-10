@@ -4,6 +4,7 @@
 //
 // This module handles constraint extraction from positional patterns and anonymous table processing
 
+use crate::diagnostic::{DelightQLError, Join};
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::asts::core::Comparison;
 use crate::pipeline::asts::core::{NamedReference, Reference};
@@ -238,12 +239,11 @@ pub(super) fn process_glob_with_using(
             // so there is no combination of the two to write. Refuse rather
             // than pick one and lose the other in silence.
             if correlation.condition().is_some() {
-                return Err(crate::error::DelightQLError::validation_error_categorized(
-                    "join/using/stated_condition",
-                    "this join already carries a stated correlation, and a \
-dequalifying access asks it to merge headings as well",
-                    "write one correlation: either the shared names or the explicit condition",
-                ));
+                return Err(DelightQLError::from(Join::UsingStatedCondition {
+                    message: "this join already carries a stated correlation, and a \
+dequalifying access asks it to merge headings as well"
+                        .to_string(),
+                }));
             }
             *correlation = resolved::MemberCorrelation::Correspond(exact);
         }

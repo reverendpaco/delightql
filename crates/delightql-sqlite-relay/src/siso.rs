@@ -10,11 +10,16 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use delightql_protocol::{
-    ByteSeq, Cell, ClientTerm, Dimension, ErrorKind, Handle, Handler, MetaItem, Orientation,
-    Projection, ServerTerm, resolve_projection,
+    resolve_projection, ByteSeq, Cell, ClientTerm, Dimension, Handle, Handler, MetaItem,
+    Orientation, Projection, ServerTerm, WireError,
 };
 
+use delightql_types::diagnostic::{DelightQLError, Siso};
 use delightql_types::DatabaseConnection;
+
+fn error_term(diagnostic: DelightQLError) -> ServerTerm {
+    ServerTerm::Error(WireError::of(&diagnostic))
+}
 
 // --- BufferedCursor ---
 
@@ -44,11 +49,12 @@ impl SisoParty {
         let sql = match String::from_utf8(text) {
             Ok(s) => s,
             Err(e) => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Syntax,
-                    identity: vec![],
-                    message: format!("invalid UTF-8: {}", e).into_bytes(),
-                }
+                return error_term(
+                    Siso::ProtocolText {
+                        message: format!("invalid UTF-8: {}", e),
+                    }
+                    .into(),
+                )
             }
         };
 
@@ -72,13 +78,8 @@ impl SisoParty {
                         rows.push_back(vec![Some(affected.to_string().into_bytes())]);
                         (vec!["affected_rows".to_string()], rows)
                     }
-                    Err(e) => {
-                        return ServerTerm::Error {
-                            kind: ErrorKind::Syntax,
-                            identity: vec![],
-                            message: format!("{}", e).into_bytes(),
-                        }
-                    }
+                    // The connection's own typed refusal crosses whole.
+                    Err(e) => return error_term(e),
                 }
             }
         };
@@ -98,10 +99,8 @@ impl SisoParty {
             })
             .collect();
 
-        self.handles.insert(
-            handle.clone(),
-            BufferedCursor { columns, rows },
-        );
+        self.handles
+            .insert(handle.clone(), BufferedCursor { columns, rows });
 
         ServerTerm::Header { handle, dimensions }
     }
@@ -115,13 +114,7 @@ impl SisoParty {
     ) -> ServerTerm {
         let state = match self.handles.get_mut(&handle) {
             Some(s) => s,
-            None => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: vec![],
-                    message: b"unknown handle".to_vec(),
-                }
-            }
+            None => return error_term(Siso::UnknownHandle.into()),
         };
 
         let count = count as usize;
@@ -141,11 +134,12 @@ impl SisoParty {
                 .map(|row| col_indices.iter().map(|&ci| row[ci].clone()).collect())
                 .collect(),
             Orientation::Columns => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: vec![],
-                    message: b"orientation Columns not supported".to_vec(),
-                }
+                return error_term(
+                    Siso::Orientation {
+                        message: "orientation Columns not supported".to_string(),
+                    }
+                    .into(),
+                )
             }
         };
 
@@ -154,17 +148,10 @@ impl SisoParty {
 
     fn handle_stat(&self, handle: Handle) -> ServerTerm {
         if !self.handles.contains_key(&handle) {
-            return ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: b"unknown handle".to_vec(),
-            };
+            return error_term(Siso::UnknownHandle.into());
         }
         ServerTerm::Metadata {
-            items: vec![MetaItem::Backend(
-                b"siso".to_vec(),
-                b"siso-party".to_vec(),
-            )],
+            items: vec![MetaItem::Backend(b"siso".to_vec(), b"siso-party".to_vec())],
         }
     }
 
@@ -172,11 +159,7 @@ impl SisoParty {
         if self.handles.remove(&handle).is_some() {
             ServerTerm::Ok { count_hint: 0 }
         } else {
-            ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: b"unknown handle".to_vec(),
-            }
+            error_term(Siso::UnknownHandle.into())
         }
     }
 }
@@ -197,11 +180,12 @@ impl Handler for SisoParty {
                     .filter(|o| supported.contains(o))
                     .collect();
                 if agreed.is_empty() {
-                    ServerTerm::Error {
-                        kind: ErrorKind::Connection,
-                        identity: vec![],
-                        message: b"no common orientation".to_vec(),
-                    }
+                    error_term(
+                        Siso::Orientation {
+                            message: "no common orientation".to_string(),
+                        }
+                        .into(),
+                    )
                 } else {
                     ServerTerm::Version {
                         max_message_size,
@@ -225,17 +209,19 @@ impl Handler for SisoParty {
 
             ClientTerm::Close { handle } => self.handle_close(handle),
 
-            ClientTerm::Prepare { .. } => ServerTerm::Error {
-                kind: ErrorKind::Permission,
-                identity: vec![],
-                message: b"Prepare not implemented in SisoParty".to_vec(),
-            },
+            ClientTerm::Prepare { .. } => error_term(
+                Siso::Unimplemented {
+                    message: "Prepare not implemented in SisoParty".to_string(),
+                }
+                .into(),
+            ),
 
-            ClientTerm::Offer { .. } => ServerTerm::Error {
-                kind: ErrorKind::Permission,
-                identity: vec![],
-                message: b"Offer not implemented in SisoParty".to_vec(),
-            },
+            ClientTerm::Offer { .. } => error_term(
+                Siso::Unimplemented {
+                    message: "Offer not implemented in SisoParty".to_string(),
+                }
+                .into(),
+            ),
         }
     }
 }

@@ -17,6 +17,7 @@
 //! join, a projection, a name, a bound, or a shape nobody has thought of yet
 //! all reach the statement the same way — whole.
 
+use crate::diagnostic::{Dml, DmlShape, Internal};
 use crate::error::{DelightQLError, Result};
 use crate::names::{ColId, ScopeId};
 use crate::pipeline::asts::core::ColumnMetadata;
@@ -209,12 +210,9 @@ fn lower_mutation(
     // A restriction or bound taken off above the terminal constrains the rows
     // the mutation touches, and the relation those rows come from is its
     // source: it moves there whole.
-    let mut source = call
-        .call()
-        .relations()
-        .nth(1)
-        .cloned()
-        .ok_or_else(|| DelightQLError::parse_error("DML call has no source relation"))?;
+    let mut source = call.call().relations().nth(1).cloned().ok_or_else(|| {
+        Internal::invariant("transformer::dml", "DML call has no source relation")
+    })?;
     for restriction in trailing.into_iter().rev() {
         source = source.transparently(restriction);
     }
@@ -223,18 +221,14 @@ fn lower_mutation(
     // comes out of.
     let operand = Operand::lower(source, names, ctx)?;
 
-    let target_relation = call
-        .call()
-        .relations()
-        .next()
-        .cloned()
-        .ok_or_else(|| DelightQLError::parse_error("DML call has no target relation"))?;
+    let target_relation = call.call().relations().next().cloned().ok_or_else(|| {
+        Internal::invariant("transformer::dml", "DML call has no target relation")
+    })?;
     let target_semantic = target_relation.semantic_relation();
     let target_scope = target_semantic.scope();
-    let target = ctx
-        .relations
-        .entity(&target_semantic)?
-        .ok_or_else(|| DelightQLError::parse_error("DML target has no registry entity"))?;
+    let target = ctx.relations.entity(&target_semantic)?.ok_or_else(|| {
+        Internal::invariant("transformer::dml", "DML target has no registry entity")
+    })?;
     let callable = call.call().callee;
     // The statement names the relation and its correlated reads name it
     // again. Those are the same characters or the statement is malformed,
@@ -249,7 +243,12 @@ fn lower_mutation(
         stage,
         receipt.unwrap_or(ast_refined::Access::Unasked),
     )
-    .map_err(|error| DelightQLError::parse_error(format!("DML mutation boundary: {error:?}")))?;
+    .map_err(|error| {
+        Internal::invariant(
+            "transformer::dml",
+            format!("DML mutation boundary: {error:?}"),
+        )
+    })?;
 
     refuse_bounded_mutation(&mutation, ctx)?;
 
@@ -285,16 +284,13 @@ fn refuse_bounded_mutation(mutation: &Mutation<Operand>, ctx: &TransformCtx) -> 
     if !ctx.relations.is_row_bounded(&mutation.source().relation)? {
         return Ok(());
     }
-    Err(DelightQLError::validation_error_categorized(
-        "dml/shape/bounded_mutation",
-        format!(
+    Err(DelightQLError::from(DmlShape::BoundedMutation {
+        message: format!(
             "{verb} cannot consume a relation bounded by position (`# < N`): the \
              bound chooses rows by position and the mutation reaches them by \
              value, so two rows the bound tells apart are one row to the statement"
         ),
-        "restrict the source by a condition its rows carry, or read the bounded \
-         rows and mutate by a key you name",
-    ))
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -342,10 +338,9 @@ fn build_insert(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<SqlSt
         columns.push(names_one_target_column(
             source,
             &heading,
-            "dml/insert/unnamed_column",
-            "an inserted value names no column of its target",
-            "every data column the source publishes must name one column of the \
-             relation being inserted into",
+            |message| Dml::InsertUnnamedColumn { message }.into(),
+            "an inserted value names no column of its target: every data column the \
+             source publishes must name one column of the relation being inserted into",
             ctx,
         )?);
         data.push(source);
@@ -405,7 +400,7 @@ fn build_delete(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<SqlSt
         &columns,
         &mutation.source().relation,
         &mutation.source().builder,
-        "dml/shape/delete_column_identity",
+        |message| DmlShape::DeleteColumnIdentity { message }.into(),
         "delete!",
         ctx,
     )?;
@@ -466,7 +461,7 @@ fn build_update(mutation: Mutation<Operand>, ctx: &TransformCtx) -> Result<Lower
         &match_columns,
         &mutation.source().relation,
         &mutation.source().builder,
-        "dml/shape/update_column_identity",
+        |message| DmlShape::UpdateColumnIdentity { message }.into(),
         "update!",
         ctx,
     )?;
@@ -604,7 +599,7 @@ fn single_valued_obligation(
             )),
         ))
     .standing_at(grouped)
-    .map_err(crate::error::DelightQLError::parse_error)?;
+    .map_err(|e| Internal::invariant("transformer::dml", e))?;
 
     let verdict = ctx.identities.anonymous_scope(None);
     let statement = (SelectStatement::builder()
@@ -618,21 +613,21 @@ fn single_valued_obligation(
             Box::new(ambiguous),
         ))))
     .standing_at(verdict)
-    .map_err(crate::error::DelightQLError::parse_error)?;
+    .map_err(|e| Internal::invariant("transformer::dml", e))?;
     Ok(Obligation {
         statement: SqlStatement::Query {
             with_clause: None,
             query: QueryExpression::Select(Box::new(statement)),
         },
-        refusal: crate::pipeline::compiled_query::Refusal {
-            identity: "dml/shape/update_ambiguous_source".to_string(),
+        refusal: crate::diagnostic::DmlShape::UpdateAmbiguousSource {
             message: "update! refuses: the source offers more than one row for a row of \
                       the relation being updated, so the statement does not say what \
                       that row becomes. Two rows that agree are still two rows — \
                       agreement is not evidence of one row. Narrow the source so each \
                       row of the target is described once."
                 .to_string(),
-        },
+        }
+        .into(),
     })
 }
 
@@ -662,33 +657,30 @@ fn classify_update_heading(
         let target_column = names_one_target_column(
             source,
             heading,
-            "dml/shape/update_unnamed_column",
-            "a written value names no column of the relation being updated",
-            "name the assignment after a column of the target: `$$(expr as column)`",
+            |message| DmlShape::UpdateUnnamedColumn { message }.into(),
+            "a written value names no column of the relation being updated: name the \
+             assignment after a column of the target: `$$(expr as column)`",
             ctx,
         )?;
         if assignments
             .iter()
             .any(|(assigned, _)| *assigned == target_column)
         {
-            return Err(DelightQLError::validation_error_categorized(
-                "dml/shape/update_ambiguous_assignment",
-                format!(
+            return Err(DelightQLError::from(DmlShape::UpdateAmbiguousAssignment {
+                message: format!(
                     "two written values name '{}', so the statement does not say \
                      which one the column becomes",
                     describe_column(target_column, ctx)
                 ),
-                "write each target column once in the cover",
-            ));
+            }));
         }
         assignments.push((target_column, source));
     }
     if assignments.is_empty() {
-        return Err(DelightQLError::validation_error_categorized(
-            "dml/shape/update_no_cover",
-            "UPDATE requires at least one column assignment via $$(expr as col)",
-            "Use $$(new_value as column_name) to specify what to change",
-        ));
+        return Err(DelightQLError::from(DmlShape::UpdateNoCover {
+            message: "UPDATE requires at least one column assignment via $$(expr as col)"
+                .to_string(),
+        }));
     }
     let match_columns: Vec<ColId> = heading
         .iter()
@@ -696,13 +688,11 @@ fn classify_update_heading(
         .filter(|column| !assignments.iter().any(|(assigned, _)| assigned == column))
         .collect();
     if match_columns.is_empty() {
-        return Err(DelightQLError::validation_error_categorized(
-            "dml/shape/update_join_identity",
-            "update! cannot identify the source's rows after its assignments: \
-             every target column is being replaced",
-            "leave at least one target identity column in the source so update! \
-             can match each row without broadening the mutation",
-        ));
+        return Err(DelightQLError::from(DmlShape::UpdateJoinIdentity {
+            message: "update! cannot identify the source's rows after its assignments: \
+             every target column is being replaced"
+                .to_string(),
+        }));
     }
     Ok((assignments, match_columns))
 }
@@ -711,9 +701,8 @@ fn classify_update_heading(
 fn names_one_target_column(
     source: ColId,
     heading: &[ColId],
-    category: &'static str,
+    refuse: fn(String) -> DelightQLError,
     refusal: &'static str,
-    remedy: &'static str,
     ctx: &TransformCtx,
 ) -> Result<ColId> {
     let name = ctx.identities.published_sym(source);
@@ -723,20 +712,13 @@ fn names_one_target_column(
         .filter(|column| name.is_some() && ctx.identities.published_sym(*column) == name);
     match (matching.next(), matching.next()) {
         (Some(column), None) => Ok(column),
-        (None, _) => Err(DelightQLError::validation_error_categorized(
-            category,
-            refusal.to_string(),
-            remedy,
-        )),
-        (Some(_), Some(_)) => Err(DelightQLError::validation_error_categorized(
-            category,
-            format!(
-                "'{}' names more than one column of its target",
-                describe_column(source, ctx)
-            ),
-            "the relation being written publishes that name twice, so the value \
-             does not say which column it is for",
-        )),
+        (None, _) => Err(refuse(refusal.to_string())),
+        (Some(_), Some(_)) => Err(refuse(format!(
+            "'{}' names more than one column of its target: the relation being \
+             written publishes that name twice, so the value does not say which \
+             column it is for",
+            describe_column(source, ctx)
+        ))),
     }
 }
 
@@ -769,7 +751,7 @@ fn read_source(
         .from_tables(vec![TableExpression::Scope(source)])
         .where_clause(matched))
     .standing_at(emitting)
-    .map_err(crate::error::DelightQLError::parse_error)?;
+    .map_err(|e| Internal::invariant("transformer::dml", e))?;
     Ok(QueryExpression::Select(Box::new(select)))
 }
 
@@ -794,12 +776,15 @@ fn pair_target_ports(
     columns: &[ColId],
     source_relation: &crate::relation::SemanticRelation,
     source: &dyn Qualify,
-    error_category: &'static str,
+    refuse: fn(String) -> DelightQLError,
     operation: &'static str,
     ctx: &TransformCtx,
 ) -> Result<Vec<(ColId, ColId)>> {
     let target_storage = ctx.relations.storage(target_relation)?.ok_or_else(|| {
-        DelightQLError::parse_error("a DML target has no semantic storage identity")
+        Internal::invariant(
+            "transformer::dml",
+            "a DML target has no semantic storage identity",
+        )
     })?;
     let target_ports = ctx.relations.interface(target_relation)?;
     let mut pending = vec![*source_relation];
@@ -832,7 +817,8 @@ fn pair_target_ports(
                 .iter()
                 .position(|port| port.column() == *target_column)
                 .ok_or_else(|| {
-                    DelightQLError::parse_error(
+                    Internal::invariant(
+                        "transformer::dml",
                         "a DML target column is absent from its semantic interface",
                     )
                 })?;
@@ -857,8 +843,8 @@ fn pair_target_ports(
             matches.dedup();
             match matches.as_slice() {
                 [source] => Ok((*target_column, *source)),
-                [] => Err(DelightQLError::validation_error_categorized(
-                    error_category,
+                [] => Err(refuse(format!(
+                    "{}: {}",
                     format!(
                         "the source of this {operation} does not carry '{}', a column of \
                          the {relation_text} the \
@@ -869,17 +855,17 @@ fn pair_target_ports(
                     ),
                     "project the target's own columns through the shaping pipes \
                      (`emp.id`, not a computed value aliased to `id`), or drop the \
-                     shaping and filter instead",
-                )),
-                _ => Err(DelightQLError::validation_error_categorized(
-                    error_category,
+                     shaping and filter instead"
+                ))),
+                _ => Err(refuse(format!(
+                    "{}: {}",
                     format!(
                         "the source of this {operation} carries '{}' more than once, so it \
                          does not say which occurrence identifies the rows to {action}",
                         describe_column(*target_column, ctx)
                     ),
-                    "narrow the source so each of the target's columns reaches it once",
-                )),
+                    "narrow the source so each of the target's columns reaches it once"
+                ))),
             }
         })
         .collect()
@@ -899,12 +885,17 @@ fn exact_republication(
             .get(position)
             .map(ColumnMetadata::identity)
             .ok_or_else(|| {
-                DelightQLError::parse_error("a DML republication dropped a source slot")
+                Internal::invariant(
+                    "transformer::dml",
+                    "a DML republication dropped a source slot",
+                )
             }),
-        (None, _) => Err(DelightQLError::parse_error(
+        (None, _) => Err(Internal::invariant(
+            "transformer::dml",
             "a DML republication does not carry its exact source slot",
         )),
-        (Some(_), Some(_)) => Err(DelightQLError::parse_error(
+        (Some(_), Some(_)) => Err(Internal::invariant(
+            "transformer::dml",
             "a DML source occurrence occupies more than one slot",
         )),
     }
@@ -968,7 +959,7 @@ fn build_exists_match(
         .from_tables(vec![from_table])
         .where_clause(where_expr))
     .standing_at(emitting_scope)
-    .map_err(crate::error::DelightQLError::parse_error)?;
+    .map_err(|e| Internal::invariant("transformer::dml", e))?;
 
     let inner_query = QueryExpression::Select(Box::new(inner_select));
 

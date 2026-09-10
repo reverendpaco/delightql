@@ -106,7 +106,10 @@ pub enum SessionHealthReport {
     /// The ruled incident (`runtime/session_health/external_effect`): an
     /// external effect's recovery became uncertain. `operation` names what
     /// was being compensated; `message` carries the primary failure.
-    Quarantined { operation: String, message: String },
+    Quarantined {
+        operation: String,
+        message: String,
+    },
 }
 
 /// What a successful `recover_session` did, as plain data the host can
@@ -125,21 +128,76 @@ pub struct SessionRecovery {
 /// for its lifetime.
 pub trait DqlSession {
     /// Send a DQL query. Returns column metadata + an opaque handle.
-    fn query(&mut self, text: &str) -> Result<QueryResult, String>;
+    fn query(&mut self, text: &str) -> Result<QueryResult, ApiError>;
 
     /// Fetch rows from an open query handle.
-    fn fetch(&mut self, handle: &QueryHandle, count: u64) -> Result<FetchResult, String>;
+    fn fetch(&mut self, handle: &QueryHandle, count: u64) -> Result<FetchResult, ApiError>;
 
     /// Close a query handle.
-    fn close(&mut self, handle: QueryHandle) -> Result<(), String>;
+    fn close(&mut self, handle: QueryHandle) -> Result<(), ApiError>;
 }
+
+/// An error crossing the embedding API. A received wire error keeps the
+/// identity and class the server answered with — decoded once from the
+/// bytes, never re-derived from prose; a client-side failure carries prose
+/// alone. Hosts that read the rendered form see what they always saw:
+/// `[identity] Kind: message`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiError {
+    pub identity: Option<String>,
+    pub kind: Option<delightql_protocol::ErrorKind>,
+    pub message: String,
+}
+
+impl ApiError {
+    pub fn received(error: &delightql_protocol::ReceivedError) -> Self {
+        let identity = String::from_utf8_lossy(error.identity()).into_owned();
+        ApiError {
+            identity: (!identity.is_empty()).then_some(identity),
+            kind: Some(error.kind()),
+            message: String::from_utf8_lossy(error.message()).into_owned(),
+        }
+    }
+}
+
+impl From<String> for ApiError {
+    fn from(message: String) -> Self {
+        ApiError {
+            identity: None,
+            kind: None,
+            message,
+        }
+    }
+}
+
+impl From<&str> for ApiError {
+    fn from(message: &str) -> Self {
+        ApiError::from(message.to_string())
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.identity, self.kind) {
+            (Some(identity), Some(kind)) => {
+                write!(f, "[{identity}] {kind:?}: {}", self.message)
+            }
+            (None, Some(kind)) => write!(f, "{kind:?}: {}", self.message),
+            _ => f.write_str(&self.message),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 /// A relay for raw protocol handling (server use).
 ///
 /// Extends `Handler` (from delightql-protocol) with reset capability.
 pub trait ServerRelay: Handler {
-    /// Close all open handles and reinitialize the system.
-    fn handle_reset(&mut self) -> Result<(), String>;
+    /// Close all open handles and reinitialize the system. A failure is the
+    /// typed diagnostic that occurred: the server projects it onto the
+    /// control wire, never as authored prose.
+    fn handle_reset(&mut self) -> Result<(), crate::error::DelightQLError>;
 }
 
 // --- Session hooks (plain data across the boundary) ---
@@ -213,7 +271,7 @@ pub trait ConnectionFactory: Send + Sync {
     fn create(
         &self,
         uri: &str,
-    ) -> std::result::Result<CreatedConnection, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> std::result::Result<CreatedConnection, crate::error::DelightQLError>;
 }
 
 // --- Entry point ---

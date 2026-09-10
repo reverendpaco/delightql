@@ -19,6 +19,7 @@ use super::phases::{Phase, Unresolved};
 use super::queries::ContextMode;
 use super::specs::GroupSpec;
 use super::{Chain, DomainExpression, GroundForm, TruthExpression};
+use crate::diagnostic::DdlHead;
 use crate::error::{DelightQLError, Result};
 use delightql_types::SqlIdentifier;
 
@@ -421,17 +422,15 @@ pub fn name_conflict(
              spell one name — drop the label, or write {first_name} in both places."
         ),
     };
-    DelightQLError::validation_error_categorized(
-        "ddl/head/name_conflict",
-        format!(
+    DelightQLError::from(DdlHead::NameConflict {
+        message: format!(
             "Entity '{subject}': position {} carries conflicting name offers \
              '{first_name}' ({first_from}) and '{second_name}' ({second_from}). A position's public \
              name must be singular, deterministic, and independent of \
              clause order. {conform}",
             position + 1,
         ),
-        "Head name conflict",
-    )
+    })
 }
 
 /// What an all-ground unnamed position receives.
@@ -471,14 +470,12 @@ pub fn assemble(
     // subject cannot be both.
     let globs = heads.iter().filter(|h| h.is_glob()).count();
     if globs != 0 && globs != heads.len() {
-        return Err(DelightQLError::validation_error_categorized(
-            "ddl/head/mixed_forms",
-            format!(
+        return Err(DelightQLError::from(DdlHead::MixedForms {
+            message: format!(
                 "Entity '{subject}': cannot mix glob (*) and argumentative head forms \
                  across clauses. Use all glob or all argumentative."
             ),
-            "Head form mismatch",
-        ));
+        }));
     }
     if first.is_glob() {
         return Ok(HeadAssembly::glob());
@@ -492,9 +489,8 @@ pub fn assemble(
     let arity = listed[0].len();
     for (idx, items) in listed.iter().enumerate().skip(1) {
         if items.len() != arity {
-            return Err(DelightQLError::validation_error_categorized(
-                "ddl/head/arity",
-                format!(
+            return Err(DelightQLError::from(DdlHead::Arity {
+                message: format!(
                     "Entity '{}': clause {} has {} head item(s) but clause 1 has {}. \
                      All argumentative clauses must have the same arity.",
                     subject,
@@ -502,8 +498,7 @@ pub fn assemble(
                     items.len(),
                     arity
                 ),
-                "Head arity mismatch",
-            ));
+            }));
         }
     }
 
@@ -543,9 +538,8 @@ pub fn assemble(
                 continue;
             }
             let n = heads.len();
-            return Err(DelightQLError::validation_error_categorized(
-                "ddl/head/unnamed_ground_position",
-                format!(
+            return Err(DelightQLError::from(DdlHead::UnnamedGroundPosition {
+                message: format!(
                     "Entity '{}': head position {} is supplied only by ground terms — \
                      every one of its {} {} abstains from naming it (no lvar, no \
                      `as`-label). A position supplied only by ground terms must carry a \
@@ -562,8 +556,7 @@ pub fn assemble(
                     if n == 1 { "clause" } else { "clauses" },
                     listed[0][pos].supply.spelling(),
                 ),
-                "Unnamed ground position",
-            ));
+            }));
         };
         canonical.push(name.clone());
     }
@@ -573,9 +566,8 @@ pub fn assemble(
     // decided at the head rather than discovered inside a projection.
     for (pos, name) in canonical.iter().enumerate() {
         if let Some(earlier) = canonical[..pos].iter().position(|seen| seen == name) {
-            return Err(DelightQLError::validation_error_categorized(
-                "ddl/head/name_collision",
-                format!(
+            return Err(DelightQLError::from(DdlHead::NameCollision {
+                message: format!(
                     "Entity '{}': head positions {} and {} both publish the name '{}'. \
                      A heading names each column once. Name one of them differently in \
                      the head, e.g. `{} as {}_2`.",
@@ -586,8 +578,7 @@ pub fn assemble(
                     name,
                     name,
                 ),
-                "Head name collision",
-            ));
+            }));
         }
     }
 
@@ -648,9 +639,11 @@ pub fn chain_publishes_names<P: Phase>(chain: &Chain<P>) -> bool {
             // where the operand had none.
             Continuation::Access { .. } => publishes,
             // Codd's σ: it chooses rows. Every column it hands on is a
-            // column it received, under the name it received it with.
+            // column it received, under the name it received it with — the
+            // restriction the enclosing join evaluates included.
             // A correlation names two arms; like σ it publishes nothing new.
             Continuation::Restrict { .. }
+            | Continuation::Correlated(_)
             | Continuation::Bound { .. }
             | Continuation::Correlate { .. } => publishes,
             // A destructure ADDS columns, and it names every one of them.
@@ -754,9 +747,8 @@ fn unreachable_head_reference(subject: &str, items: &[HeadItem]) -> DelightQLErr
             Supply::Ground(_) => None,
         })
         .collect();
-    DelightQLError::validation_error_categorized(
-        "ddl/head/unresolved_reference",
-        format!(
+    DelightQLError::from(DdlHead::UnresolvedReference {
+        message: format!(
             "Entity '{subject}': the head names {names} but its body answers to no \
              name — an anonymous table written without a header publishes columns \
              nothing can reach. A head is a REFERENCE into its body, never a binder. \
@@ -769,8 +761,7 @@ fn unreachable_head_reference(subject: &str, items: &[HeadItem]) -> DelightQLErr
                 .join(", "),
             remedy = named.join(", ")
         ),
-        "clause heads are reference-only",
-    )
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -51,6 +51,7 @@
 //! unadmitted world is a value only this module can consume, and a refusal
 //! rolls the derivation back whole: nothing unadmitted is ever published.
 
+use crate::diagnostic::{Ground, Internal, Runtime};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::error::{DelightQLError, Result};
@@ -160,9 +161,9 @@ impl DerivedWorld {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "corrupt catalog: a grounded root has no grounding row",
-                    e.to_string(),
+                Internal::invariant(
+                    "defuse::grounded_world",
+                    format!("corrupt catalog: a grounded root has no grounding row: {e}"),
                 )
             })?;
         // The closure record IS the identity relationship: which row stood
@@ -175,16 +176,14 @@ impl DerivedWorld {
                     "SELECT lib_namespace_id, grounded_namespace_id FROM grounding
                      WHERE root_namespace_id = ?1",
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("prepare closure listing", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("prepare closure listing", e.to_string()))?;
             let rows = stmt
                 .query_map([root_id], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                 })
-                .map_err(|e| DelightQLError::database_error("list the closure", e.to_string()))?
+                .map_err(|e| Runtime::catalog("list the closure", e.to_string()))?
                 .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| DelightQLError::database_error("decode the closure", e.to_string()))?;
+                .map_err(|e| Runtime::catalog("decode the closure", e.to_string()))?;
             rows.into_iter().collect()
         };
         for derived_id in previous.values() {
@@ -193,15 +192,13 @@ impl DerivedWorld {
                 "DELETE FROM exposed_namespace WHERE exposing_namespace_id = ?1",
                 [derived_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("clear a derivative's exposures", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("clear a derivative's exposures", e.to_string()))?;
         }
         conn.execute(
             "DELETE FROM grounding WHERE root_namespace_id = ?1",
             [root_id],
         )
-        .map_err(|e| DelightQLError::database_error("clear the closure record", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("clear the closure record", e.to_string()))?;
 
         Self::derive_reusing(conn, root_id, lib_id, data_id, previous)
     }
@@ -217,12 +214,12 @@ impl DerivedWorld {
                  WHERE g.root_namespace_id = ?1
                  ORDER BY g.id",
             )
-            .map_err(|e| DelightQLError::database_error("prepare closure load", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("prepare closure load", e.to_string()))?;
         let rows: Vec<(i64, i64, i64)> = stmt
             .query_map([root_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|e| DelightQLError::database_error("load the closure", e.to_string()))?
+            .map_err(|e| Runtime::catalog("load the closure", e.to_string()))?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| DelightQLError::database_error("decode the closure", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("decode the closure", e.to_string()))?;
         let mut root = None;
         let mut data_id = None;
         let mut members = BTreeMap::new();
@@ -244,9 +241,9 @@ impl DerivedWorld {
             members.insert(source_id, derivative);
         }
         let (Some(root), Some(data_id)) = (root, data_id) else {
-            return Err(DelightQLError::database_error(
+            return Err(Internal::invariant(
+                "defuse::grounded_world",
                 "corrupt catalog: a grounded root has no grounding row",
-                format!("namespace id {root_id}"),
             ));
         };
         let (data_fq, _, _) = namespace_facts(conn, data_id)?;
@@ -335,9 +332,7 @@ impl DerivedWorld {
                      WHERE id = ?3",
                     rusqlite::params![self.root.derived_id, &self.data_fq, id],
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("rebind a derivative", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("rebind a derivative", e.to_string()))?;
                 let (fq, _, _) = namespace_facts(conn, id)?;
                 (id, fq)
             }
@@ -355,23 +350,18 @@ impl DerivedWorld {
                         |row| row.get(0),
                     )
                     .optional()
-                    .map_err(|e| {
-                        DelightQLError::database_error(
-                            "look up a derivative address",
-                            e.to_string(),
-                        )
-                    })?;
+                    .map_err(|e| Runtime::catalog("look up a derivative address", e.to_string()))?;
                 if taken.is_some() {
                     // The address is minted from the source id under a
                     // fresh or emptied root, and `_` names refuse user
                     // creation: an occupant is a defect, not a collision to
                     // escape.
-                    return Err(DelightQLError::database_error(
+                    return Err(Internal::invariant(
+                        "defuse::grounded_world",
                         format!(
                             "ground!() derivation defect: address '{derived_fq}' is occupied \
                              by a namespace the closure record does not pair with '{source_fq}'"
                         ),
-                        "derivative address occupied",
                     ));
                 }
                 conn.execute(
@@ -379,9 +369,7 @@ impl DerivedWorld {
                      VALUES (?1, ?2, ?3, ?4, 'grounded', 'ground')",
                     rusqlite::params![name, self.root.derived_id, &derived_fq, &self.data_fq],
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("create a derivative", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("create a derivative", e.to_string()))?;
                 (conn.last_insert_rowid(), derived_fq)
             }
         };
@@ -410,7 +398,7 @@ impl DerivedWorld {
                 self.root.derived_id
             ],
         )
-        .map_err(|e| DelightQLError::database_error("record a derivative", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("record a derivative", e.to_string()))?;
         self.members.insert(member.source_id, member.clone());
         self.unadmitted.push_back(member.source_id);
         Ok(())
@@ -435,9 +423,7 @@ impl DerivedWorld {
                      WHERE ae.namespace_id = ?1
                      ORDER BY e.id",
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("prepare source family listing", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("prepare source family listing", e.to_string()))?;
             let rows = stmt
                 .query_map([member.source_id], |row| {
                     Ok((
@@ -448,11 +434,9 @@ impl DerivedWorld {
                         row.get(4)?,
                     ))
                 })
-                .map_err(|e| DelightQLError::database_error("list source families", e.to_string()))?
+                .map_err(|e| Runtime::catalog("list source families", e.to_string()))?
                 .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| {
-                    DelightQLError::database_error("decode a source family", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("decode a source family", e.to_string()))?;
             rows
         };
         if entities.is_empty() {
@@ -465,9 +449,7 @@ impl DerivedWorld {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![name, stropped, kind, cartridge_id, doc],
             )
-            .map_err(|e| {
-                DelightQLError::database_error(format!("derive family '{name}'"), e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog(format!("derive family '{name}'"), e.to_string()))?;
             let new_entity_id = conn.last_insert_rowid() as i32;
             crate::system::DelightQLSystem::copy_entity_subtables(
                 conn,
@@ -480,10 +462,7 @@ impl DerivedWorld {
                 rusqlite::params![new_entity_id, member.derived_id, cartridge_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("activate derived family '{name}'"),
-                    e.to_string(),
-                )
+                Runtime::catalog(format!("activate derived family '{name}'"), e.to_string())
             })?;
         }
         self.families += entities.len();
@@ -506,7 +485,7 @@ impl DerivedWorld {
                  VALUES (?1, ?2)",
                 rusqlite::params![member.derived_id, target],
             )
-            .map_err(|e| DelightQLError::database_error("derive an enlistment", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("derive an enlistment", e.to_string()))?;
         }
         let aliases: Vec<(String, i64)> = {
             let mut stmt = conn
@@ -514,14 +493,12 @@ impl DerivedWorld {
                     "SELECT alias, target_namespace_id FROM namespace_local_alias
                      WHERE namespace_id = ?1 ORDER BY alias",
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("prepare alias listing", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("prepare alias listing", e.to_string()))?;
             let rows = stmt
                 .query_map([member.source_id], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| DelightQLError::database_error("list aliases", e.to_string()))?
+                .map_err(|e| Runtime::catalog("list aliases", e.to_string()))?
                 .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| DelightQLError::database_error("decode an alias", e.to_string()))?;
+                .map_err(|e| Runtime::catalog("decode an alias", e.to_string()))?;
             rows
         };
         for (alias, target) in aliases {
@@ -531,7 +508,7 @@ impl DerivedWorld {
                  VALUES (?1, ?2, ?3)",
                 rusqlite::params![member.derived_id, alias, target],
             )
-            .map_err(|e| DelightQLError::database_error("derive an alias", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("derive an alias", e.to_string()))?;
         }
         let exposures = id_list(
             conn,
@@ -546,7 +523,7 @@ impl DerivedWorld {
                  VALUES (?1, ?2)",
                 rusqlite::params![member.derived_id, target],
             )
-            .map_err(|e| DelightQLError::database_error("derive an exposure", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("derive an exposure", e.to_string()))?;
         }
         Ok(())
     }
@@ -585,24 +562,16 @@ impl DerivedWorld {
                      ORDER BY e.id, re.id",
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to prepare grounding admission",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to prepare grounding admission", e.to_string())
                 })?;
             let rows = stmt
                 .query_map([member.derived_id], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to run grounding admission",
-                        e.to_string(),
-                    )
-                })?
+                .map_err(|e| Runtime::catalog("Failed to run grounding admission", e.to_string()))?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         "Failed to decode a grounding admission reference",
                         e.to_string(),
                     )
@@ -636,14 +605,13 @@ impl DerivedWorld {
                             return Err(super::select::ambiguity_refusal(&ref_name, &candidates));
                         }
                         Link::Hole(Some(Selection::Missing)) | Link::Hole(None) => {
-                            return Err(DelightQLError::database_error(
-                                format!(
+                            return Err(DelightQLError::from(Ground::UnresolvedReference {
+                                message: format!(
                                     "ground!() validation failed: entity '{entity}' references \
                                      '{ref_name}' which does not exist in data namespace '{}'",
                                     self.data_fq
                                 ),
-                                "Unresolved reference",
-                            ));
+                            }));
                         }
                     }
                 }
@@ -688,16 +656,14 @@ impl DerivedWorld {
                             return Err(super::select::ambiguity_refusal(&ref_name, &candidates));
                         }
                         Selection::Missing => {
-                            return Err(DelightQLError::validation_error_categorized(
-                                crate::uri_registry::subcat::GROUND_UNRESOLVED_REFERENCE,
-                                format!(
+                            return Err(DelightQLError::from(Ground::UnresolvedReference {
+                                message: format!(
                                     "ground!() validation failed: entity '{entity}' \
                                      references '{fq}.{ref_name}', which resolves to \
                                      nothing in this session. Strict validation covers \
                                      qualified references too — nothing is created."
                                 ),
-                                "unresolved qualified reference",
-                            ));
+                            }));
                         }
                     }
                 }
@@ -726,24 +692,23 @@ impl DerivedWorld {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| {
-                DelightQLError::database_error("look up a reached namespace", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("look up a reached namespace", e.to_string()))?;
         let Some(id) = namespace_id else {
-            return Err(DelightQLError::database_error(
+            return Err(Internal::invariant(
+                "defuse::grounded_world",
                 format!(
                     "corrupt catalog: '{}' selected from namespace '{}', which has no row",
                     family.name(),
                     family.namespace()
                 ),
-                "reached namespace missing",
             ));
         };
         let is_derivative = self.members.values().any(|member| member.derived_id == id);
         if is_derivative || derivable(conn, id)?.is_none() {
             return Ok(());
         }
-        Err(DelightQLError::database_error(
+        Err(Internal::invariant(
+            "defuse::grounded_world",
             format!(
                 "ground!() derivation defect: '{}' of the source '{}' was reached from '{}' \
                  instead of a derivative",
@@ -751,7 +716,6 @@ impl DerivedWorld {
                 family.namespace(),
                 self.root.derived_fq
             ),
-            "source reached from a derived world",
         ))
     }
 }
@@ -773,7 +737,7 @@ pub(crate) fn derivation_cartridge(
             &format!("ground://{source_fq}<-{data_fq}"),
         ],
     )
-    .map_err(|e| DelightQLError::database_error("create a derivation cartridge", e.to_string()))?;
+    .map_err(|e| Runtime::catalog("create a derivation cartridge", e.to_string()))?;
     Ok(conn.last_insert_rowid() as i32)
 }
 
@@ -825,12 +789,12 @@ pub(in crate::defuse) fn closure_of(
              WHERE root_namespace_id = (SELECT root_namespace_id FROM grounding
                                         WHERE grounded_namespace_id = ?1)",
         )
-        .map_err(|e| DelightQLError::database_error("prepare closure lookup", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("prepare closure lookup", e.to_string()))?;
     let rows = stmt
         .query_map([namespace_id], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(|e| DelightQLError::database_error("look up the closure", e.to_string()))?
+        .map_err(|e| Runtime::catalog("look up the closure", e.to_string()))?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| DelightQLError::database_error("decode the closure", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("decode the closure", e.to_string()))?;
     Ok(rows)
 }
 
@@ -844,7 +808,7 @@ fn derivable(conn: &rusqlite::Connection, namespace_id: i64) -> Result<Option<St
     if default_data_ns.is_some() || !matches!(kind.as_str(), "lib" | "scratch" | "unknown") {
         return Ok(None);
     }
-    if crate::system::blueprint_shadowing(conn, &fq)?.is_some() {
+    if crate::ddl::lifecycle::blueprint_shadowing(conn, &fq)?.is_some() {
         return Ok(None);
     }
     Ok(Some(fq))
@@ -860,9 +824,9 @@ fn namespace_facts(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .map_err(|e| {
-        DelightQLError::database_error(
-            format!("corrupt catalog: namespace id {namespace_id} has no row"),
-            e.to_string(),
+        Internal::invariant(
+            "defuse::grounded_world",
+            format!("corrupt catalog: namespace id {namespace_id} has no row: {e}"),
         )
     })
 }
@@ -870,12 +834,12 @@ fn namespace_facts(
 fn id_list(conn: &rusqlite::Connection, sql: &str, param: i64) -> Result<Vec<i64>> {
     let mut stmt = conn
         .prepare(sql)
-        .map_err(|e| DelightQLError::database_error("prepare an id listing", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("prepare an id listing", e.to_string()))?;
     let rows = stmt
         .query_map([param], |row| row.get::<_, i64>(0))
-        .map_err(|e| DelightQLError::database_error("run an id listing", e.to_string()))?
+        .map_err(|e| Runtime::catalog("run an id listing", e.to_string()))?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| DelightQLError::database_error("decode an id listing", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("decode an id listing", e.to_string()))?;
     Ok(rows)
 }
 
@@ -892,7 +856,7 @@ fn destroy_derivative(conn: &rusqlite::Connection, derived_id: i64) -> Result<()
         "DELETE FROM namespace WHERE id = ?1",
     ] {
         conn.execute(sql, [derived_id]).map_err(|e| {
-            DelightQLError::database_error("destroy a stale derivative", e.to_string())
+            Runtime::catalog("destroy a stale derivative", e.to_string())
         })?;
     }
     Ok(())

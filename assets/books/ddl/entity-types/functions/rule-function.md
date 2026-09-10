@@ -16,6 +16,31 @@ The body is any domain expression. The function returns its evaluation.
 
 
 
+## Zero-Argument Functions and Citations {.dqlh}
+
+A function with no parameters is defined with an empty head or, as shorthand,
+with no parentheses at all. The two spellings define the same kind of value
+function:
+```delightql
+greeting:() :- "hello"
+tab :- char:(9)
+```
+
+Either is invoked as an ordinary application or, as shorthand, as a
+**citation** — the name marked with a leading `:`{.delightql .sigil}:
+```delightql
+users(*) |> +(greeting:() as g, :tab as sep)
+```
+
+The body is any domain expression, not only a literal. The usual arity and
+clause laws apply: `greeting:("x")` refuses, and defining `greeting` twice
+without guards refuses whichever spelling each definition used.
+
+A qualified citation puts the mark on the leaf, where the application form
+puts its own mark: `lib::text.:greeting` invokes the same function as
+`lib::text.greeting:()`. `:lib::text.greeting` is not a spelling.
+
+
 ## Disjunctive Clauses {.dqlh}
 
 Multiple clauses create conditional functions. Clauses are evaluated top-to-bottom; first match wins:

@@ -75,7 +75,7 @@ users(uid, name, age), age > 30
 .SS The join IS the shared variable
 Two patterns binding the same bare name unify \(em no JOIN, no ON:
 .EX
-_(uid, name @ 1, "ada") as u, _(uid, total @ 1, 9.5) as o
+_(uid, name @ 1, "ada"), _(uid, total @ 1, 9.5)
 uid  name  total
 1    ada   9.5
 .EE
@@ -113,7 +113,7 @@ _(n @ 1 ; 2 ; 3) ~> count:(n | n > 1)    # | filters the aggregate
 _(n @ 2 ; 5) |> +( _:( n > 3 -> "big"; _ -> "small") as size )
 .EE
 .SS Null is spelled with = (there is no `is null`)
-\fB=\fR is the null\-safe equality (IS NOT DISTINCT FROM); \fB==\fR is
+\fB=\fR is the null\-safe equality (IS NOT DISTINCT FROM); \fB+sql_eq(x,y)\fR is
 traditional SQL equality where NULL never matches:
 .EX
 _(x @ 1), x != null          # "x is not null"
@@ -148,16 +148,26 @@ _(dept, n @ "eng", 1 ; "eng", 2 ; "ops", 5)
  {"dept":"ops","items":[{"n":5}]}]
 .EE
 .SH RULES AND EFFECTS
-Rule definitions live in files, not at the prompt. Given
+A directive writes \fBtwo\fR groups \(em \fB(arguments)(receipt
+access)\fR. A lone group is receipt access by position, so
+\fBconsult!("mylib.dql", "mylib")\fR binds no arguments and refuses;
+write the trailing \fB(*)\fR.
+.PP
+Rule definitions live in files, not at the prompt. A consulted file
+reads its \fBown\fR data world \(em never the caller's tables, CTEs,
+or session database ambiently \(em so it mounts what it reads. Given
 \fBmylib.dql\fR:
 .EX
+?- mount!("app.db", "data::app")(*)
+?- enlist!("data::app")(*)
+
 adults(uid, name) :- people(uid, name, age), age >= 18
 .EE
 consult it, enlist it, call it:
 .EX
 $ dql query --db app.db --sequential '
-consult!("mylib.dql", "mylib")
-enlist!("mylib")
+consult!("mylib.dql", "mylib")(*)
+enlist!("mylib")(*)
 adults(_, name)'
 .EE
 A write is a relation too \(em evaluate it, get a receipt back:
@@ -170,12 +180,15 @@ User \fBeffect rules\fR (rules whose evaluation writes) also live in
 files and execute inside a run \(em never as a bare prompt invocation.
 Given \fBjob.dql\fR:
 .EX
+?- mount!("app.db", "data::app")(*)
+?- enlist!("data::app")(*)
+
 route!(*) :- people(_, name, age), age >= 18 |> insert!(grownups(*))(*)
 main!(*)  :- route!(*)
 .EE
 .EX
 $ dql query --db app.db --sequential '
-consult!("job.dql", "job")
+consult!("job.dql", "job")(*)
 run_namespace!(job)(*)'
 .EE
 .SH MENTIONS, GROUNDED HEADS, AND ER EDGES
@@ -188,8 +201,8 @@ speed(::slow, y)(*) :- _(m @ "s1") |> (m, y as bound)
 .EE
 .EX
 $ dql query --db app.db --sequential '
-consult!("speed.dql", "ns")
-enlist!("ns")
+consult!("speed.dql", "ns")(*)
+enlist!("ns")(*)
 speed(::fast, "z")(*)'
 m   bound
 f1  z
@@ -203,8 +216,12 @@ spellings, one thing: light \fB::people(*)\fR and delimited
 matters and a head declared with one is selected by the other.
 .PP
 \fBER edges\fR are declared ground-instance clauses; the context is a
-symbol on the operator. Given \fBer.dql\fR:
+symbol on the operator. Given \fBer.dql\fR (mounting its own data,
+like every consulted file):
 .EX
+?- mount!("app.db", "data::app")(*)
+?- enlist!("data::app")(*)
+
 people(*) &(::normal) orders(*) :-
   people(*), orders(*), people.pid = orders.o_pid
 .EE
@@ -213,17 +230,17 @@ people(*) &(::normal) orders(*)         direct edge: reduces to its join
 users(*) &&(::normal) items(*)          transitive walk: endpoints only
 people(*) as p &(::normal) orders(*)    alias is OUTSIDE the term
 .EE
-Selection is by the term''s exact canonical spelling; an unknown
+Selection is by the term's exact canonical spelling; an unknown
 context or an undeclared pair is a hard error naming what IS declared.
 .PP
-\fBPipe landing is strict\fR: a piped relation lands at the FIRST
+\fBPipe landing is strict\fR: a piped relation lands at the LAST
 parameter of a parameterized rule, or at exactly one explicit \fB@\fR:
 .EX
-_(x @ 1; 2) |> first_table("young")(*)   lands at T(*), first param
-_(x @ 1; 2) |> tagged("young", @)(*)     @ says where the pipe goes
+_(x @ 1; 2) |> first_table("young")(*)   lands at T(*), last param
+_(x @ 1; 2) |> tagged(@,"young")(*)     @ says where the pipe goes
 .EE
-.SH THE FIVE TRAPS
-The mistakes every newcomer makes, in one place:
+.SH FIVE GOTCHAS
+The following are standard learning issues:
 .IP 1. 3
 \fBPatterns are not projections.\fR \fBusers(name, age)\fR on a
 3\-column table is an arity error \(em cover every position

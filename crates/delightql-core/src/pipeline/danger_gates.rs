@@ -8,6 +8,7 @@
 // Annotations and flags carry the bare hierarchy (their sigil declares
 // the kind); canonical_danger_uri() normalizes.
 
+use crate::diagnostic::{DelightQLError, Parse};
 use std::collections::HashMap;
 
 use super::asts::core::{DangerSpec, DangerState};
@@ -112,37 +113,34 @@ pub fn is_cli_overridable(uri: &str) -> bool {
 /// safety flag is worse than no flag.
 pub fn parse_cli_danger_spec(input: &str) -> crate::error::Result<DangerSpec> {
     let (hierarchy, state_text) = input.split_once('=').ok_or_else(|| {
-        crate::error::DelightQLError::validation_error(
-            format!(
+        DelightQLError::from(Parse::DangerUnknown {
+            message: format!(
                 "--danger takes hierarchy=STATE (e.g. cardinality/cartesian=ON), got '{input}'"
             ),
-            "parse_cli_danger_spec",
-        )
+        })
     })?;
     let uri = canonical_danger_uri(hierarchy.trim());
 
     if !KNOWN_DANGERS.iter().any(|(known, _, _)| *known == uri) {
-        return Err(crate::error::DelightQLError::validation_error(
-            format!(
+        return Err(DelightQLError::from(Parse::DangerUnknown {
+            message: format!(
                 "unknown danger '{}'. Known dangers: {}",
                 hierarchy.trim(),
                 known_danger_hierarchies().join(", ")
             ),
-            "parse_cli_danger_spec",
-        ));
+        }));
     }
 
     if !is_cli_overridable(&uri) {
-        return Err(crate::error::DelightQLError::validation_error(
-            format!(
+        return Err(DelightQLError::from(Parse::DangerUnknown {
+            message: format!(
                 "danger '{}' cannot be opened from the CLI: it changes what the \
                  query MEANS, so it must be visible in the query text — spell it \
                  inline: (~~danger://{}~~)",
                 hierarchy.trim(),
                 hierarchy.trim(),
             ),
-            "parse_cli_danger_spec",
-        ));
+        }));
     }
 
     let state = match state_text.trim().to_ascii_uppercase().as_str() {
@@ -152,13 +150,12 @@ pub fn parse_cli_danger_spec(input: &str) -> crate::error::Result<DangerSpec> {
         other => match other.parse::<u8>() {
             Ok(n @ 1..=9) => DangerState::Severity(n),
             _ => {
-                return Err(crate::error::DelightQLError::validation_error(
-                    format!(
+                return Err(DelightQLError::from(Parse::DangerUnknown {
+                    message: format!(
                         "--danger state must be ON, OFF, ALLOW, or a severity 1-9, \
                          got '{state_text}'"
                     ),
-                    "parse_cli_danger_spec",
-                ))
+                }))
             }
         },
     };

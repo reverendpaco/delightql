@@ -9,6 +9,7 @@
 //! authority answers both, so a one-output mode and a wider one travel the
 //! same road and no width has a second semantics.
 
+use crate::diagnostic::Mode;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::{AuthoredColumn, ColumnOccurrence, FieldSelect, ModeWitness};
 use crate::pipeline::asts::{resolved as ast_resolved, unresolved as ast_unresolved};
@@ -49,16 +50,12 @@ pub(in crate::pipeline::resolver) fn resolve_mode_call(
             // An ordinary call. The pick is what makes a declaration
             // mandatory, and there is none here.
             Picked::Whole => Ok(None),
-            Picked::Named(column) => Err(DelightQLError::validation_error_categorized(
-                "mode/undeclared",
-                format!(
+            Picked::Named(column) => Err(DelightQLError::from(Mode::Undeclared {
+    message: format!(
                     "'{name}' declares no functional mode, so there is no row for '.{}' to pick from",
                     column.name
                 ),
-                "a bare `.name` after a call picks an output of a fact function's declared \
-                 mode — `f(a -> b, c ---- …)`; an ordinary function returns its one value \
-                 and is written without a suffix",
-            )),
+})),
         };
     };
 
@@ -66,9 +63,8 @@ pub(in crate::pipeline::resolver) fn resolve_mode_call(
     let entity_identity = mode_use.identity.clone();
     let arguments = application.call().arguments.scalar_members().len();
     if arguments != declaration.inputs.len() {
-        return Err(DelightQLError::validation_error_categorized(
-            "mode/arity",
-            format!(
+        return Err(DelightQLError::from(Mode::Arity {
+            message: format!(
                 "'{name}' declares {} input{}, and the call supplies {arguments}",
                 declaration.inputs.len(),
                 if declaration.inputs.len() == 1 {
@@ -77,23 +73,20 @@ pub(in crate::pipeline::resolver) fn resolve_mode_call(
                     "s"
                 }
             ),
-            "a mode-compressed call supplies exactly the declared inputs, in order",
-        ));
+        }));
     }
 
     let selected = match &picked {
         Picked::Named(column) => match declaration.output_position(&column.name) {
             Some(position) => position,
             None => {
-                return Err(DelightQLError::validation_error_categorized(
-                    "mode/unknown_output",
-                    format!(
+                return Err(DelightQLError::from(Mode::UnknownOutput {
+                    message: format!(
                         "'{name}' declares no output '{}' — its outputs are {}",
                         column.name,
                         declaration.output_spellings()
                     ),
-                    "a pick names one of the declared outputs, by its exact spelling",
-                ))
+                }))
             }
         },
         // A WIDER RESULT IS NOT A SCALAR VALUE MERELY BECAUSE IT IS ONE ROW.
@@ -102,17 +95,14 @@ pub(in crate::pipeline::resolver) fn resolve_mode_call(
         // give.
         Picked::Whole => {
             if declaration.outputs.len() != 1 {
-                return Err(DelightQLError::validation_error_categorized(
-                    "mode/degree",
-                    format!(
+                return Err(DelightQLError::from(Mode::Degree {
+                    message: format!(
                         "'{name}' is one ROW of {} outputs, and a value position holds one \
                          column — pick one: {}",
                         declaration.outputs.len(),
                         declaration.output_spellings()
                     ),
-                    "a declared mode compresses a call to one row; a `.field` after it \
-                     selects the column",
-                ));
+                }));
             }
             0
         }
@@ -174,11 +164,11 @@ fn declare_rows(
     };
     let input_slots = slots(&declaration.inputs);
     let input_row = crate::pipeline::resolver::ResolvedRelation::declared_row(
-        crate::relation::form::AnonymousSpec {
-            shape: crate::relation::form::AnonymousShape::ArgumentRow,
-            slots: &input_slots,
-            answers_to: Some(hint),
-        },
+        crate::relation::form::AnonymousSpec::plain(
+            crate::relation::form::AnonymousShape::ArgumentRow,
+            &input_slots,
+            Some(hint),
+        ),
         identities,
     )?;
     let inputs = crate::relation::published_ports(identities, &input_row.semantic_relation())?;
@@ -186,11 +176,11 @@ fn declare_rows(
     let output_row = identities
         .authority()
         .derive(crate::relation::RelForm::Anonymous(
-            crate::relation::form::AnonymousSpec {
-                shape: crate::relation::form::AnonymousShape::ArgumentRow,
-                slots: &output_slots,
-                answers_to: Some(hint),
-            },
+            crate::relation::form::AnonymousSpec::plain(
+                crate::relation::form::AnonymousShape::ArgumentRow,
+                &output_slots,
+                Some(hint),
+            ),
         ))?;
     let outputs = crate::relation::published_ports(identities, &output_row)?;
     Ok((input_row, inputs, outputs))

@@ -15,12 +15,8 @@ use delightql_sqlite_relay::SqlParty;
 pub struct CabiConnectionFactory;
 
 impl delightql_core::api::ConnectionFactory for CabiConnectionFactory {
-    fn create(
-        &self,
-        uri: &str,
-    ) -> Result<CreatedConnection, Box<dyn std::error::Error + Send + Sync>> {
-        let sqlite_conn = SqliteConnectionManager::new_file(uri)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+    fn create(&self, uri: &str) -> Result<CreatedConnection, delightql_types::DelightQLError> {
+        let sqlite_conn = SqliteConnectionManager::new_file(uri)?;
 
         let arc = sqlite_conn.get_connection_arc();
         let handler: Box<dyn Handler + Send> = Box::new(SqlParty::new(arc.clone()));
@@ -50,10 +46,8 @@ impl delightql_types::ConnectionFactory for CabiConnectionFactory {
     fn create(
         &self,
         uri: &str,
-    ) -> Result<delightql_types::ConnectionComponents, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let sqlite_conn = SqliteConnectionManager::new_file(uri)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+    ) -> Result<delightql_types::ConnectionComponents, delightql_types::DelightQLError> {
+        let sqlite_conn = SqliteConnectionManager::new_file(uri)?;
 
         let arc = sqlite_conn.get_connection_arc();
 

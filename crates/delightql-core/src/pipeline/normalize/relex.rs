@@ -18,6 +18,10 @@
 //! the fold stops.
 
 use super::{gap, Deferred, Normalizer};
+use crate::diagnostic::{
+    Anon, AnonBinding, Cfe, Constraint, Cte, DdlHead, Er, Internal, Parse, ParseAnon, Pipe,
+    Semantic,
+};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::definitions::Head;
 use crate::pipeline::asts::core::expressions::pipes::DestructureMode;
@@ -82,12 +86,9 @@ pub(crate) enum LetBinding {
 }
 
 fn nested_preamble_refusal() -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "cte/nested_preamble",
-        "only a relation binding may stand in a source's own preamble".to_string(),
-        "declare the function, the common higher-order expression, or the DDL block \
-         on the statement itself",
-    )
+    DelightQLError::from(Cte::NestedPreamble {
+        message: "only a relation binding may stand in a source's own preamble".to_string(),
+    })
 }
 
 /// What a heading says: the output head, and the fixpoint flavor the subject
@@ -104,8 +105,13 @@ impl<'t> Normalizer<'t> {
 
     pub(crate) fn relex_query(&mut self, node: cst::Relex<'t>) -> Result<Query<Unresolved>> {
         let body = self.require(node.body(), "a relex has a body")?;
-        let chain = self.let_free_relex(body)?;
-        self.wrap_let_block(node.let_block(), chain)
+        // THE BLOCK IS READ BEFORE THE BODY, because that is the order the
+        // two were written. A body may declare a preamble of its own, and
+        // that preamble stands where the body stands — after this block —
+        // so building the body first would give its bindings the block's
+        // own opening positions and every horizon here would be judged
+        // against an order no one wrote.
+        self.wrap_let_block(node.let_block(), |me| me.let_free_relex(body))
     }
 
     /// The let block is ONE block: ctes, cfes, choes, effect ctes and inline
@@ -116,7 +122,7 @@ impl<'t> Normalizer<'t> {
     pub(crate) fn wrap_let_block(
         &mut self,
         block: Option<cst::LetBlock<'t>>,
-        chain: Chain<Unresolved>,
+        body: impl FnOnce(&mut Self) -> Result<Chain<Unresolved>>,
     ) -> Result<Query<Unresolved>> {
         use crate::pipeline::asts::core::QueryLocalBlock;
 
@@ -165,6 +171,12 @@ impl<'t> Normalizer<'t> {
                     }
                 }
             }
+        }
+        // THE BODY, and the preamble it declares: its bindings were written
+        // where the body is, so they follow the block's own children.
+        let chain = body(self)?;
+        for hoisted in std::mem::take(&mut self.hoisted_ctes) {
+            admit(&mut read, hoisted)?;
         }
         Ok(Query::binding(read.seal()?, chain))
     }
@@ -287,11 +299,9 @@ impl<'t> Normalizer<'t> {
         let text = self.text(node).to_string();
         let read = self.named_grelex(node)?;
         if read.has_steps() || !matches!(read.head().form(), GroundForm::Reference(_)) {
-            return Err(DelightQLError::validation_error_categorized(
-                "grounding/er/endpoint",
-                format!("'{text}' shapes its interior, so it names no single term"),
-                "an edge selects by the term's exact canonical spelling",
-            ));
+            return Err(DelightQLError::from(Er::Endpoint {
+                message: format!("'{text}' shapes its interior, so it names no single term"),
+            }));
         }
         Ok(read)
     }
@@ -314,10 +324,14 @@ impl<'t> Normalizer<'t> {
             // Comma normalization consumes it directly into membership, so a
             // road that asks for a relational member refuses here.
             cst::GrelexLikeMember::ExistsAnonGrelex(probe) => {
-                return Err(DelightQLError::parse_error(format!(
-                    "'{}' is truth and must stand in comma truth position",
-                    self.text(probe)
-                )))
+                return Err(crate::diagnostic::DelightQLError::from(
+                    crate::diagnostic::Parse::General {
+                        message: format!(
+                            "'{}' is truth and must stand in comma truth position",
+                            self.text(probe)
+                        ),
+                    },
+                ))
             }
         })
     }
@@ -405,7 +419,10 @@ impl<'t> Normalizer<'t> {
         let identifier = QualifiedName {
             namespace_path: NamespacePath::from_parts(vec!["sys".to_string(), "meta".to_string()])
                 .map_err(|error| {
-                    DelightQLError::parse_error(format!("invalid catalog namespace: {error:?}"))
+                    Internal::invariant(
+                        "normalize::relex",
+                        format!("invalid catalog namespace: {error:?}"),
+                    )
                 })?,
             name: SqlIdentifier::new(format!(
                 "{}::",
@@ -468,13 +485,11 @@ impl<'t> Normalizer<'t> {
         )
     }
 
-    /// Three bindings reach a ground read:
-    ///
-    /// - a compiler-owned carrier, read by IDENTITY — an interior CTE the
-    ///   invocation materialized reaches the body exactly here, and its
-    ///   declared column names become the caller pattern;
-    /// - a supplied relation EXPRESSION, which arrives whole;
-    /// - a supplied NAME, which swaps the spelling and nothing else.
+    /// A RELATION FORMAL reaches a ground read here: what it reads is the
+    /// carrier authority's bound formal — a carrier addressed by IDENTITY,
+    /// or an inline lift standing whole — under the access the body wrote.
+    /// The formal's receiving interface was applied when it was bound; this
+    /// read reconstructs nothing.
     fn bound_relation(
         &mut self,
         identifier: &QualifiedName,
@@ -485,12 +500,8 @@ impl<'t> Normalizer<'t> {
         if !identifier.namespace_path.is_empty() {
             return None;
         }
-        let bindings = self.bindings()?.clone();
-        let formal = identifier.name.as_str();
-        if let Some(chain) = bindings.table_scope_relation(formal, access.clone(), None, outer) {
-            return Some(chain);
-        }
-        bindings.table_expr_params.get(formal).cloned()
+        self.bindings()?
+            .formal_read(&identifier.name, access, None, outer)
     }
 
     fn interior_read(
@@ -831,14 +842,12 @@ impl<'t> Normalizer<'t> {
             .alias()
             .map(|name| self.tree.text(name).to_string())
             .unwrap_or_default();
-        DelightQLError::validation_error_categorized(
-            crate::uri_registry::subcat::CONSTRAINT_POSITIONAL_ALIAS,
-            format!(
+        DelightQLError::from(Constraint::PositionalAlias {
+            message: format!(
                 "Alias '{alias}' is not allowed in positional binding — a slot binds by \
                  position and publishes no name to rename"
             ),
-            "rename in a projection — `f(…) |> (col as name)`",
-        )
+        })
     }
 
     pub(crate) fn function_application_expression(
@@ -940,9 +949,8 @@ impl<'t> Normalizer<'t> {
         let declared = column_headers.as_ref().map(|_| width);
         if let Some(expected) = declared.or_else(|| assembled.first().map(TabularRow::len)) {
             if let Some(row) = assembled.iter().find(|row| row.len() != expected) {
-                return Err(DelightQLError::parse_error_categorized(
-                    "anon",
-                    format!(
+                return Err(DelightQLError::from(ParseAnon::General {
+                    message: format!(
                         "a row of this {subject} carries {} cell(s); {} carries {expected}",
                         row.len(),
                         if declared.is_some() {
@@ -951,11 +959,13 @@ impl<'t> Normalizer<'t> {
                             "its first row"
                         }
                     ),
-                ));
+                }));
             }
         }
         Vec1::try_from_vec(assembled).ok_or_else(|| {
-            DelightQLError::parse_error_categorized("anon", format!("a {subject} body has no rows"))
+            DelightQLError::from(ParseAnon::General {
+                message: format!("a {subject} body has no rows"),
+            })
         })
     }
 
@@ -1000,11 +1010,10 @@ impl<'t> Normalizer<'t> {
             if marked {
                 let DomainExpression::Reference(Reference::Named(NamedReference(column))) = &term
                 else {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "anon/sparse_header",
-                        "a sparse column is filled by name, so the header must be one".to_string(),
-                        "drop the `?`, or write the column's name",
-                    ));
+                    return Err(DelightQLError::from(Anon::SparseHeader {
+                        message: "a sparse column is filled by name, so the header must be one"
+                            .to_string(),
+                    }));
                 };
                 sparse.push((headers.len(), column.name.clone()));
             }
@@ -1015,17 +1024,16 @@ impl<'t> Normalizer<'t> {
         }
         let headers = Vec1::try_from_vec(headers)
             .map(|row| TabularRow(Box::new(row)))
-            .ok_or_else(|| DelightQLError::parse_error("a tabular header names a column"))?;
+            .ok_or_else(|| {
+                Internal::invariant("normalize::relex", "a tabular header names a column")
+            })?;
         // SPARSE COLUMNS FORM A SUFFIX: positional omission is unambiguous
         // only when the omittable columns come last.
         if let Some(&(first_sparse, _)) = sparse.first() {
             if (first_sparse..headers.len()).any(|at| !sparse.iter().any(|(p, _)| *p == at)) {
-                return Err(DelightQLError::validation_error_categorized(
-                    "anon/sparse_suffix",
-                    "a required column cannot follow a sparse column".to_string(),
-                    "move the sparse columns to the end of the heading, or mark \
-                     the trailing columns sparse too",
-                ));
+                return Err(DelightQLError::from(Anon::SparseSuffix {
+                    message: "a required column cannot follow a sparse column".to_string(),
+                }));
             }
         }
         Ok((headers, sparse))
@@ -1053,12 +1061,10 @@ impl<'t> Normalizer<'t> {
                     // value standing after a fill would leave the written
                     // order no longer saying which position got which value.
                     if !fills.is_empty() {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "anon/sparse_fill_position",
-                            "a sparse fill must follow every positional value in its row"
+                        return Err(DelightQLError::from(Anon::SparseFillPosition {
+                            message: "a sparse fill must follow every positional value in its row"
                                 .to_string(),
-                            "write the positional values first, then the named fills",
-                        ));
+                        }));
                     }
                     values.push(self.domain_expression(expression)?)
                 }
@@ -1076,15 +1082,13 @@ impl<'t> Normalizer<'t> {
         let columns: Vec<_> = fill.column().collect();
         let supplied: Vec<_> = fill.value().collect();
         if columns.len() != supplied.len() {
-            return Err(DelightQLError::validation_error_categorized(
-                "anon/sparse_arity",
-                format!(
+            return Err(DelightQLError::from(Anon::SparseArity {
+                message: format!(
                     "a fill names {} column(s) and supplies {} value(s)",
                     columns.len(),
                     supplied.len()
                 ),
-                "give every named column exactly one value",
-            ));
+            }));
         }
         let mut fills = Vec::with_capacity(columns.len());
         for (column, ground) in columns.into_iter().zip(supplied) {
@@ -1471,19 +1475,18 @@ impl<'t> Normalizer<'t> {
                     self.anon_body(self.require(body, "an anonymous membership has a body")?)?;
                 let opener = self.require(opener, "an anonymous membership carries polarity")?;
                 let header = table.body.header.ok_or_else(|| {
-                    DelightQLError::validation_error_categorized(
-                        "resolution/anon/witness_shape",
-                        "a witness anonymous table is a membership test and needs headers"
+                    DelightQLError::from(AnonBinding::WitnessShape {
+                        message: "a witness anonymous table is a membership test and needs headers"
                             .to_string(),
-                        "provide a probe and candidate rows, or drop the witness marker",
-                    )
+                    })
                 })?;
                 let mut probes = header
                     .into_vec()
                     .into_iter()
                     .map(|item| {
                         item.slot.into_term().ok_or_else(|| {
-                            DelightQLError::parse_error(
+                            Internal::invariant(
+                                "normalize::relex",
                                 "an anonymous membership header has a value",
                             )
                         })
@@ -1493,7 +1496,10 @@ impl<'t> Normalizer<'t> {
                     Probe::Value(Box::new(probes.pop().expect("one probe")))
                 } else {
                     Probe::Row(Vec2::try_from_vec(probes).ok_or_else(|| {
-                        DelightQLError::parse_error("an anonymous membership has a probe")
+                        Internal::invariant(
+                            "normalize::relex",
+                            "an anonymous membership has a probe",
+                        )
                     })?)
                 };
                 let rows = table
@@ -1606,7 +1612,8 @@ impl<'t> Normalizer<'t> {
 
     /// `&` holds only DECLARED edges and selects by the term's exact
     /// canonical spelling; `&&` composes edge relations. The context is a
-    /// light mention riding on the operator.
+    /// light mention riding on the operator; omitted, it is `::normal`,
+    /// decided here so the resolver never sees an absence.
     fn edge(
         &mut self,
         node: cst::EdgeContinuation<'t>,
@@ -1620,9 +1627,9 @@ impl<'t> Normalizer<'t> {
         let context = match node.context() {
             Some(context) => {
                 let symbol = self.require(context.child(), "an edge context is a symbol")?;
-                Some(self.text(symbol).trim_start_matches("::").to_string())
+                self.text(symbol).trim_start_matches("::").to_string()
             }
-            None => None,
+            None => crate::defuse::er::DEFAULT_CONTEXT.to_string(),
         };
         let term = self.require(node.term(), "an edge names a term")?;
         // THE OUTER MARK IS ON THE ACCESS, NOT IN THE TERM: `orders_t?(*)`
@@ -1634,27 +1641,24 @@ impl<'t> Normalizer<'t> {
             }
             cst::EdgeContinuationTerm::OuterGrelex(outer) => {
                 if transitive {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "grounding/er/transitive_outer",
-                        format!(
+                    return Err(DelightQLError::from(Er::TransitiveOuter {
+                        message: format!(
                             "'{}' marks a composed walk's peer outer; the walk \
                              cannot yet compose an outer step",
                             self.text(outer)
                         ),
-                        "mark a direct edge peer, or compose the walk and join \
-                         the marked access separately",
-                    ));
+                    }));
                 }
                 let name = self.require(outer.relation(), "an outer access names a relation")?;
                 let interior = self.require(outer.interior(), "an outer access has an interior")?;
                 let text = format!("{}({})", self.text(name), self.text(interior));
                 let read = self.outer_grelex(outer)?;
                 if read.has_steps() || !matches!(read.head().form(), GroundForm::Reference(_)) {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "grounding/er/endpoint",
-                        format!("'{text}' shapes its interior, so it names no single term"),
-                        "an edge selects by the term's exact canonical spelling",
-                    ));
+                    return Err(DelightQLError::from(Er::Endpoint {
+                        message: format!(
+                            "'{text}' shapes its interior, so it names no single term"
+                        ),
+                    }));
                 }
                 (text, read)
             }
@@ -1682,11 +1686,10 @@ impl<'t> Normalizer<'t> {
     /// so each step names both of its own ends.
     fn edge_endpoint(&self) -> Result<String> {
         let Some(term) = self.last_term.as_deref() else {
-            return Err(DelightQLError::validation_error_categorized(
-                "grounding/er/endpoint",
-                "an edge operator joins two DECLARED terms; the left side is not one",
-                "write the edge between two relation accesses, e.g. `a(*) &(::ctx) b(*)`",
-            ));
+            return Err(DelightQLError::from(Er::Endpoint {
+                message: "an edge operator joins two DECLARED terms; the left side is not one"
+                    .to_string(),
+            }));
         };
         crate::term_spec::canonicalize_term(term)
     }
@@ -1724,7 +1727,10 @@ impl<'t> Normalizer<'t> {
                                 self.require(binding.index(), "an indexed binding has an index")?;
                             let text = self.text(index);
                             let value = text.parse::<i64>().map_err(|_| {
-                                DelightQLError::parse_error(format!("'{text}' is not an index"))
+                                Internal::invariant(
+                                    "normalize::relex",
+                                    format!("'{text}' is not an index"),
+                                )
                             })?;
                             let mut steps =
                                 vec![crate::pipeline::asts::core::PathStep::Index(value)];
@@ -2178,13 +2184,12 @@ impl<'t> Normalizer<'t> {
         for (leads, param) in positioned {
             if let cst::CfeParam::ContextMarker(marker) = param {
                 if context_mode != ContextMode::None {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "ddl/head/duplicate_context_marker",
-                        "a signature declares its capture once — a second context \
+                    return Err(DelightQLError::from(DdlHead::DuplicateContextMarker {
+                        message: "a signature declares its capture once — a second context \
                          marker has nothing to add and would silently replace the \
-                         first. Keep one marker",
-                        "one context capture per signature",
-                    ));
+                         first. Keep one marker"
+                            .to_string(),
+                    }));
                 }
                 if !leads {
                     return Err(Self::context_marker_position_refusal());
@@ -2255,14 +2260,12 @@ impl<'t> Normalizer<'t> {
         let mut seen: std::collections::HashSet<&SqlIdentifier> = std::collections::HashSet::new();
         for declared in declared_names {
             if !seen.insert(declared) {
-                return Err(crate::error::DelightQLError::validation_error_categorized(
-                    "cfe/parameter/duplicate",
-                    format!(
+                return Err(DelightQLError::from(Cfe::ParameterDuplicate {
+                    message: format!(
                         "'{name}' declares '{declared}' twice; every binding to either \
                          occurrence would land on one slot, leaving the other unreachable"
                     ),
-                    "give each parameter and declared capture a distinct name",
-                ));
+                }));
             }
         }
 
@@ -2290,11 +2293,9 @@ impl<'t> Normalizer<'t> {
             // Reserved room, recognized so the refusal can teach rather than
             // read as a typo.
             cst::Annotation::ReservedAnnotation(_) => {
-                return Err(DelightQLError::validation_error_categorized(
-                    "annotation/reserved",
-                    "emit annotations are reserved room and do nothing yet",
-                    "route rows with a directive: `q |> emit!(\"sink\")(*)` when one exists",
-                ))
+                return Err(DelightQLError::from(Semantic::AnnotationReserved {
+                    message: "emit annotations are reserved room and do nothing yet".to_string(),
+                }))
             }
             cst::Annotation::DefinitionAnnotation(annotation) => {
                 self.definition_annotation(annotation)?
@@ -2318,16 +2319,15 @@ impl<'t> Normalizer<'t> {
                     .iter()
                     .all(|known| uri != crate::pipeline::danger_gates::canonical_danger_uri(known))
                 {
-                    return Err(DelightQLError::parse_error_categorized(
-                        "danger/unknown",
-                        format!(
+                    return Err(DelightQLError::from(Parse::DangerUnknown {
+                        message: format!(
                             "unknown danger gate '{}'. Known gates: {}",
                             uri.trim_start_matches(
                                 crate::pipeline::danger_gates::DANGER_URI_SCHEME
                             ),
                             crate::pipeline::danger_gates::known_danger_hierarchies().join(", ")
                         ),
-                    ));
+                    }));
                 }
                 // A danger gate takes the URI ALONE: acknowledging it beside
                 // the query IS the acknowledgment, so there is no state word
@@ -2345,14 +2345,13 @@ impl<'t> Normalizer<'t> {
                     .iter()
                     .all(|known| uri != crate::pipeline::option_map::canonical_config_uri(known))
                 {
-                    return Err(DelightQLError::parse_error_categorized(
-                        "config/unknown",
-                        format!(
+                    return Err(DelightQLError::from(Parse::ConfigUnknown {
+                        message: format!(
                             "unknown config option '{}'. Known options: {}",
                             uri,
                             crate::pipeline::option_map::known_config_hierarchies().join(", ")
                         ),
-                    ));
+                    }));
                 }
                 let state = match config.value() {
                     None => OptionState::On,
@@ -2370,20 +2369,16 @@ impl<'t> Normalizer<'t> {
             // nothing: the runner compares the refusal against it, so it is
             // collected here rather than re-scanned from raw nodes.
             cst::DefinitionAnnotation::ErrorAnnotation(hook) => {
-                let expected = crate::pipeline::verdict::ExpectedError {
-                    uri_segments: match hook.uri() {
-                        None => Vec::new(),
-                        Some(uri) => uri
-                            .children()
-                            .map(|segment| self.text(segment).to_string())
-                            .collect(),
-                    },
+                let segments: Vec<String> = match hook.uri() {
+                    None => Vec::new(),
+                    Some(uri) => uri
+                        .children()
+                        .map(|segment| self.text(segment).to_string())
+                        .collect(),
                 };
+                let expected = super::selector_of(&segments)?;
                 if self.pending_error.is_some() {
-                    return Err(DelightQLError::parse_error_categorized(
-                        "error_hook/repeated",
-                        "one goal declares one expected error; this one declares two",
-                    ));
+                    return Err(crate::diagnostic::Parse::ErrorHookRepeated.into());
                 }
                 self.pending_error = Some(expected);
             }
@@ -2662,6 +2657,8 @@ fn name_the_stage(mut chain: Chain<Unresolved>, alias: SqlIdentifier) -> Result<
             *arm = name_the_stage(arm.clone(), alias)?;
             Ok(chain)
         }
+        // Nothing is correlated before names resolve.
+        Some(Continuation::Correlated(never)) => match *never {},
         // An existence probe DOES publish something to name: the relation it
         // probes, which a correlation in the same chain then addresses. The
         // name lands on the relation the probe reads — its head, whatever
@@ -2736,6 +2733,8 @@ fn pattern_the_stage(
             *arm = pattern_the_stage(arm.clone(), alias, access)?;
             Ok(chain)
         }
+        // Nothing is correlated before names resolve.
+        Some(Continuation::Correlated(never)) => match *never {},
         Some(Continuation::Restrict {
             condition:
                 crate::pipeline::asts::core::TruthExpression::Existence(Existence {
@@ -2750,13 +2749,11 @@ fn pattern_the_stage(
         // An edge composes its endpoints by their catalog headings; a slot
         // row over an endpoint would compose a relation the edge does not
         // name. The boundary the edge publishes is the occurrence to pattern.
-        Some(Continuation::ErJoin(_)) => Err(DelightQLError::validation_error_categorized(
-            "resolution/pipe/no_unnamed_pipe",
-            format!(
+        Some(Continuation::ErJoin(_)) => Err(DelightQLError::from(Pipe::NoUnnamedPipe {
+            message: format!(
                 "`as {alias}(…)` here patterns an edge endpoint, which is read whole by the edge"
             ),
-            "pattern the relation the edge publishes: `… && … as x |> … as u(…)`",
-        )),
+        })),
         Some(Continuation::Restrict {
             condition:
                 crate::pipeline::asts::core::TruthExpression::Membership(Membership {
@@ -2782,19 +2779,17 @@ fn pattern_the_stage(
 }
 
 fn witness_alias_refusal() -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "resolution/anon/membership_alias",
-        "a witness anonymous table (+_ or \\+_) is a membership test and exports no columns",
-        "drop the alias; predicates may refer to columns from the outer relation",
-    )
+    DelightQLError::from(AnonBinding::MembershipAlias {
+        message:
+            "a witness anonymous table (+_ or \\+_) is a membership test and exports no columns"
+                .to_string(),
+    })
 }
 
 fn names_no_stage(alias: &SqlIdentifier) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "resolution/pipe/no_unnamed_pipe",
-        format!("`as {alias}` here names nothing: this operator publishes no pipe stage"),
-        "naming a pipe",
-    )
+    DelightQLError::from(Pipe::NoUnnamedPipe {
+        message: format!("`as {alias}` here names nothing: this operator publishes no pipe stage"),
+    })
 }
 
 /// The alias a bare head carries. A head is not a stage — there is none yet
@@ -2883,21 +2878,29 @@ fn option_state(value: LiteralValue) -> Result<OptionState> {
             "ON" | "on" => Ok(OptionState::On),
             "OFF" | "off" => Ok(OptionState::Off),
             "ALLOW" | "allow" => Ok(OptionState::Allow),
-            other => Err(DelightQLError::parse_error(format!(
-                "invalid option state '{other}'; expected ON, OFF, ALLOW, or 1-9"
-            ))),
+            other => Err(crate::diagnostic::DelightQLError::from(
+                crate::diagnostic::Parse::General {
+                    message: format!(
+                        "invalid option state '{other}'; expected ON, OFF, ALLOW, or 1-9"
+                    ),
+                },
+            )),
         },
         LiteralValue::Number(number) => match number.parse::<u8>() {
             Ok(level @ 1..=9) => Ok(OptionState::Severity(level)),
-            _ => Err(DelightQLError::parse_error(format!(
-                "invalid option level '{number}'; expected 1-9"
-            ))),
+            _ => Err(crate::diagnostic::DelightQLError::from(
+                crate::diagnostic::Parse::General {
+                    message: format!("invalid option level '{number}'; expected 1-9"),
+                },
+            )),
         },
         LiteralValue::Boolean(true) => Ok(OptionState::On),
         LiteralValue::Boolean(false) => Ok(OptionState::Off),
-        LiteralValue::Null | LiteralValue::Mention(_) => Err(DelightQLError::parse_error(format!(
-            "invalid option state '{value}'; expected ON, OFF, ALLOW, or 1-9"
-        ))),
+        LiteralValue::Null | LiteralValue::Mention(_) => Err(
+            crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+                message: format!("invalid option state '{value}'; expected ON, OFF, ALLOW, or 1-9"),
+            }),
+        ),
     }
 }
 
@@ -2920,15 +2923,13 @@ pub(crate) fn tabular_row(
 ) -> Result<TabularRow<Datum<Unresolved>>> {
     if sparse.is_empty() {
         if let Some((name, _)) = fills.first() {
-            return Err(DelightQLError::validation_error_categorized(
-                "anon/sparse_fill_position",
-                format!("'{name}' is filled where no column is sparse"),
-                "mark the column sparse in the header (`{name}?`), or write the value in place",
-            ));
+            return Err(DelightQLError::from(Anon::SparseFillPosition {
+                message: format!("'{name}' is filled where no column is sparse"),
+            }));
         }
         return Vec1::try_from_vec(positional.into_iter().map(Datum::Value).collect())
             .map(|row| TabularRow(Box::new(row)))
-            .ok_or_else(|| DelightQLError::parse_error("a tabular row has a datum"));
+            .ok_or_else(|| Internal::invariant("normalize::relex", "a tabular row has a datum"));
     }
     let dense = width - sparse.len();
     // A POSITIONAL VALUE MAY FILL A SPARSE COLUMN: optional means the
@@ -2936,24 +2937,19 @@ pub(crate) fn tabular_row(
     // fill left to right — the dense prefix first, then as far into the
     // sparse suffix as the row wrote.
     if positional.len() < dense || positional.len() > width {
-        return Err(DelightQLError::validation_error_categorized(
-            "anon/sparse_arity",
-            format!(
+        return Err(DelightQLError::from(Anon::SparseArity {
+            message: format!(
                 "a row of this table writes {} positional cell(s); the heading \
                  takes {dense} required and up to {width}",
                 positional.len()
             ),
-            "every column without `?` is written in every row; positions fill \
-             left to right",
-        ));
+        }));
     }
     for (name, _) in &fills {
         if !sparse.iter().any(|(_, column)| column == name) {
-            return Err(DelightQLError::validation_error_categorized(
-                "anon/sparse_fill_position",
-                format!("'{name}' is filled but is not a sparse column of this table"),
-                "mark it sparse in the header, or write its value in place",
-            ));
+            return Err(DelightQLError::from(Anon::SparseFillPosition {
+                message: format!("'{name}' is filled but is not a sparse column of this table"),
+            }));
         }
     }
     let filled_by_position = positional.len();
@@ -2972,14 +2968,12 @@ pub(crate) fn tabular_row(
         // also be filled by name: two values and no choosing rule.
         if position < filled_by_position {
             if fills.iter().any(|(name, _)| name == column) {
-                return Err(DelightQLError::validation_error_categorized(
-                    "anon/sparse_duplicate",
-                    format!(
+                return Err(DelightQLError::from(Anon::SparseDuplicate {
+                    message: format!(
                         "Duplicate sparse fill for column '{column}': a column filled \
                          twice in one row has two values and no rule for choosing"
                     ),
-                    "each sparse column takes at most one fill per row",
-                ));
+                }));
             }
             values.push(Datum::Value(
                 positional
@@ -2993,14 +2987,12 @@ pub(crate) fn tabular_row(
         let mut found = fills.iter().filter(|(name, _)| name == column);
         let filled = found.next();
         if found.next().is_some() {
-            return Err(DelightQLError::validation_error_categorized(
-                "anon/sparse_duplicate",
-                format!(
+            return Err(DelightQLError::from(Anon::SparseDuplicate {
+                message: format!(
                     "Duplicate sparse fill for column '{column}': a column filled \
                      twice in one row has two values and no rule for choosing"
                 ),
-                "each sparse column takes at most one fill per row",
-            ));
+            }));
         }
         let fallback = match filled {
             Some((

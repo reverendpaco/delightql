@@ -13,6 +13,7 @@
 //! in the declaration environment the family itself names. No caller
 //! receives a raw body string beside a namespace string to re-pair.
 
+use crate::diagnostic::{Internal, Resolution, Runtime};
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::resolution::HoParamInfo;
@@ -193,16 +194,14 @@ pub(in crate::defuse) fn ambiguity_refusal(name: &str, candidates: &[Candidate])
             description
         })
         .collect();
-    DelightQLError::validation_error_categorized(
-        "resolution/ambiguous",
-        format!(
+    DelightQLError::from(Resolution::Ambiguous {
+        message: format!(
             "Ambiguous entity '{}': found in namespaces {}. \
              Qualify the reference to choose one.",
             name,
             listed.join(", ")
         ),
-        "Ambiguous definition selection",
-    )
+    })
 }
 
 /// Judge a complete candidate set against one use position's capability.
@@ -380,7 +379,7 @@ mod native {
         // live at the front doors.
         let mut visible = Vec::with_capacity(rows.len());
         for row in rows {
-            if crate::system::blueprint_shadowing(&conn, &row.namespace)?.is_none() {
+            if crate::ddl::lifecycle::blueprint_shadowing(&conn, &row.namespace)?.is_none() {
                 visible.push(row);
             }
         }
@@ -563,9 +562,9 @@ mod native {
                AND ae.namespace_id IN {namespaces}
              ORDER BY n.fq_name, e.id"
         );
-        let mut stmt = conn.prepare(&sql).map_err(|e| {
-            DelightQLError::database_error("Failed to prepare reach selection", e.to_string())
-        })?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Runtime::catalog("Failed to prepare reach selection", e.to_string()))?;
         let mapped = stmt
             .query_map(rusqlite::params![canonical], |row| {
                 Ok((
@@ -578,14 +577,12 @@ mod native {
                     row.get::<_, Option<String>>(6)?,
                 ))
             })
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to run reach selection", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to run reach selection", e.to_string()))?;
         // EVERY CANDIDATE, OR NONE: a row that fails to decode is an
         // error, because dropping it here would turn an ambiguous lookup
         // into a unique winner.
         let raw: Vec<_> = mapped.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 "Failed to decode a reach-selection candidate",
                 e.to_string(),
             )
@@ -593,12 +590,9 @@ mod native {
         let mut rows = Vec::with_capacity(raw.len());
         for (entity_id, name, stropped, kind_raw, definition, namespace, source_uri) in raw {
             let kind = EntityType::from_i32(kind_raw).map_err(|_| {
-                DelightQLError::database_error(
-                    format!(
+                Internal::invariant("defuse::select", format!(
                         "catalog row for '{name}' in '{namespace}' carries unknown entity type {kind_raw}"
-                    ),
-                    "catalog corruption",
-                )
+                    ))
             })?;
             rows.push(CandidateRow {
                 entity_id,
@@ -661,7 +655,7 @@ mod native {
                AND EXISTS (SELECT 1 FROM functional_dependency fd WHERE fd.entity_id = e.id)"
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| {
-            DelightQLError::database_error("Failed to prepare declared mode lookup", e.to_string())
+            Runtime::catalog("Failed to prepare declared mode lookup", e.to_string())
         })?;
         // EVERY CANDIDATE, OR NONE. A row that will not decode is not
         // evidence of absence: dropping it here would turn an ambiguous
@@ -685,14 +679,14 @@ mod native {
                     ))
                 },
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to query declared modes", e.to_string())
-            })?
+            .map_err(|e| Runtime::catalog("Failed to query declared modes", e.to_string()))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "corrupt catalog: a declared-mode candidate row could not be read",
-                    e.to_string(),
+                Internal::invariant(
+                    "defuse::select",
+                    format!(
+                        "corrupt catalog: a declared-mode candidate row could not be read: {e}"
+                    ),
                 )
             })?;
 
@@ -702,9 +696,9 @@ mod native {
                 let (entity_id, entity_name, entity_type_id, definition, ns) =
                     rows.into_iter().next().expect("len checked");
                 let entity_type = EntityType::from_i32(entity_type_id).map_err(|error| {
-                    DelightQLError::database_error(
-                        "corrupt catalog: declared-mode entity type is unknown",
-                        error.to_string(),
+                    Internal::invariant(
+                        "defuse::select",
+                        format!("corrupt catalog: declared-mode entity type is unknown: {error}"),
                     )
                 })?;
                 // THE ENTITY HAS ALREADY ADVERTISED THE CAPABILITY — it was
@@ -724,13 +718,12 @@ mod native {
                     mode,
                 )))
             }
-            _ => Err(DelightQLError::validation_error(
-                format!(
+            _ => Err(DelightQLError::from(Resolution::Ambiguous {
+                message: format!(
                     "Ambiguous unqualified fact function '{name}': it declares a mode in \
                      several enlisted namespaces. Qualify the call to say which."
                 ),
-                "Ambiguous declared mode",
-            )),
+            })),
         }
     }
 
@@ -792,7 +785,7 @@ mod native {
             bin = EntityType::BinRelation.as_i32(),
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("runtime-served lookup prepare failed: {e}"),
                 e.to_string(),
             )
@@ -817,14 +810,14 @@ mod native {
                 },
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("runtime-served lookup query failed: {e}"),
                     e.to_string(),
                 )
             })?
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("runtime-served lookup row decode failed: {e}"),
                     e.to_string(),
                 )
@@ -836,13 +829,10 @@ mod native {
             match definition {
                 Some(definition) => {
                     let kind = crate::enums::EntityType::from_i32(kind_raw).map_err(|_| {
-                        DelightQLError::database_error(
-                            format!(
+                        Internal::invariant("defuse::select", format!(
                                 "catalog row for '{}' in '{fq}' carries unknown entity type {kind_raw}",
                                 name.as_str()
-                            ),
-                            "catalog corruption",
-                        )
+                            ))
                     })?;
                     found.push(LinkedFamily::linked(
                         catalog,
@@ -854,13 +844,13 @@ mod native {
                     ));
                 }
                 None => {
-                    return Err(DelightQLError::database_error(
+                    return Err(Internal::invariant(
+                        "defuse::select",
                         format!(
                             "corrupt catalog: view '{}' in namespace '{fq}' has no \
                              entity_clause rows",
                             name.as_str()
                         ),
-                        "runtime_served_lookup".to_string(),
                     ))
                 }
             }
@@ -871,19 +861,13 @@ mod native {
             _ => {
                 let mut namespaces: Vec<&str> = found.iter().map(|f| f.namespace()).collect();
                 namespaces.sort_unstable();
-                Err(DelightQLError::validation_error_categorized(
-                    "resolution/ambiguous",
-                    format!(
+                Err(DelightQLError::from(Resolution::Ambiguous {
+    message: format!(
                         "Ambiguous entity '{}': found in namespaces {}. enlist!() brought overlapping names into scope.",
                         name.as_str(),
                         namespaces.join(", ")
                     ),
-                    format!(
-                        "use qualified access ({}.{}(*))",
-                        namespaces.first().expect("several candidates"),
-                        name.as_str()
-                    ),
-                ))
+}))
             }
         }
     }
@@ -968,9 +952,9 @@ mod native {
         );
 
         let entity_type = EntityType::DqlErContextRule.as_i32();
-        let mut stmt = conn.prepare(&sql).map_err(|e| {
-            DelightQLError::database_error("Failed to prepare ER-rule lookup", e.to_string())
-        })?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Runtime::catalog("Failed to prepare ER-rule lookup", e.to_string()))?;
 
         let row_mapper = |row: &rusqlite::Row| {
             Ok((
@@ -986,13 +970,10 @@ mod native {
                 rusqlite::params![context, left, right, entity_type],
                 row_mapper,
             )
-            .map_err(|e| DelightQLError::database_error("Failed to query ER-rules", e.to_string()))?
+            .map_err(|e| Runtime::catalog("Failed to query ER-rules", e.to_string()))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to decode an ER-rule candidate",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to decode an ER-rule candidate", e.to_string())
             })?;
 
         // Ambiguity is a property of the ROW COUNT, not of how the rows
@@ -1007,8 +988,8 @@ mod native {
                 .map(|(name, _, _, ns)| format!("{}::{}", ns, name))
                 .collect();
             sources.sort();
-            return Err(DelightQLError::validation_error(
-                format!(
+            return Err(DelightQLError::from(Resolution::Ambiguous {
+    message: format!(
                     "Ambiguous ER-rule for ({}, {}) in context '{}': {} rules cover this pair [{}].",
                     table_a,
                     table_b,
@@ -1016,17 +997,16 @@ mod native {
                     sources.len(),
                     sources.join(", "),
                 ),
-                "Ambiguous ER-rule",
-            ));
+}));
         }
 
         match rows.into_iter().next() {
             None => Ok(None),
             Some((entity_name, entity_type, definition, namespace)) => {
                 let kind = EntityType::from_i32(entity_type).map_err(|e| {
-                    DelightQLError::database_error(
-                        "corrupt catalog: unknown entity_type",
-                        e.to_string(),
+                    Internal::invariant(
+                        "defuse::select",
+                        format!("corrupt catalog: unknown entity_type: {e}"),
                     )
                 })?;
                 Ok(Some(LinkedFamily::linked(
@@ -1065,9 +1045,9 @@ mod native {
         );
 
         let entity_type = EntityType::DqlErContextRule.as_i32();
-        let mut stmt = conn.prepare(&sql).map_err(|e| {
-            DelightQLError::database_error("Failed to prepare ER-rules lookup", e.to_string())
-        })?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Runtime::catalog("Failed to prepare ER-rules lookup", e.to_string()))?;
 
         let row_mapper = |row: &rusqlite::Row| {
             Ok((
@@ -1082,13 +1062,10 @@ mod native {
 
         let rows: Vec<(String, i32, Option<String>, String, String, String)> = stmt
             .query_map(rusqlite::params![context, entity_type], row_mapper)
-            .map_err(|e| DelightQLError::database_error("Failed to query ER-rules", e.to_string()))?
+            .map_err(|e| Runtime::catalog("Failed to query ER-rules", e.to_string()))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to decode an ER-rule candidate",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to decode an ER-rule candidate", e.to_string())
             })?;
 
         // Unknown entity_type is catalog corruption and refuses rather
@@ -1096,9 +1073,9 @@ mod native {
         let mut out = Vec::with_capacity(rows.len());
         for (entity_name, entity_type, definition, namespace, left, right) in rows {
             let kind = EntityType::from_i32(entity_type).map_err(|e| {
-                DelightQLError::database_error(
-                    "corrupt catalog: unknown entity_type",
-                    e.to_string(),
+                Internal::invariant(
+                    "defuse::select",
+                    format!("corrupt catalog: unknown entity_type: {e}"),
                 )
             })?;
             out.push((
@@ -1185,7 +1162,7 @@ impl<'s> crate::resolution::registry::ConsultRegistry<'s> {
             let Ok(conn) = catalog.connection("blueprint refusal") else {
                 return Ok(());
             };
-            crate::system::refuse_if_blueprint(&conn, fq)
+            crate::ddl::lifecycle::refuse_if_blueprint(&conn, fq)
         }
     }
 
@@ -1333,13 +1310,11 @@ impl<'s> crate::resolution::registry::ConsultRegistry<'s> {
                 reach.namespace_id_list()
             );
             let mut stmt = conn.prepare(&sql).map_err(|e| {
-                DelightQLError::database_error("Failed to prepare context listing", e.to_string())
+                Runtime::catalog("Failed to prepare context listing", e.to_string())
             })?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| {
-                    DelightQLError::database_error("Failed to list contexts", e.to_string())
-                })?
+                .map_err(|e| Runtime::catalog("Failed to list contexts", e.to_string()))?
                 .filter_map(|r| r.ok())
                 .collect();
             Ok(rows)

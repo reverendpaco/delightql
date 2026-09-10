@@ -40,6 +40,11 @@ pub struct FlatTable {
     pub outer: bool,              // Has ? prefix for outer joins
     // For anonymous tables - preserve the data
     pub anonymous_data: Option<AnonymousTableData>,
+    /// THE ZERO-WIDTH NARROWING the resolver put on an anonymous read whose
+    /// every header position was consumed. The segment's join stood over
+    /// this relation, not over the grid it narrows; the grid stays in
+    /// `relation` because its cells are what the constraints read.
+    pub narrowed: Option<crate::relation::SemanticRelation>,
     /// THE HEAD THIS TABLE WAS FLATTENED OUT OF, where it had one.
     ///
     /// A node, not its parts. The rebuilder CROSSES it into the refined
@@ -69,9 +74,10 @@ impl FlatTable {
     /// flattener recorded the wrapper rather than the body. A rebuild stands
     /// over what the node publishes, so this is what it stood over.
     pub fn stood_over(&self) -> crate::relation::SemanticRelation {
-        self.pipe_expr
-            .as_ref()
-            .map_or(self.relation, |pipe| pipe.semantic_relation())
+        if let Some(pipe) = &self.pipe_expr {
+            return pipe.semantic_relation();
+        }
+        self.narrowed.unwrap_or(self.relation)
     }
 
     /// THE HEAD, WHERE IT IS A CONSULTED EXPANSION.
@@ -132,6 +138,12 @@ pub struct FlatPredicate {
 #[derive(Debug, Clone)]
 pub struct FlatOperator {
     pub position: usize,
+    /// THE RELATION THE RESOLVED STEP PRODUCED. A rebuild of this operator
+    /// stands over the operand's sources rather than over this relation,
+    /// and the next operator's correspondence was written against it; the
+    /// rebuild records what it replaced under this identity so that pair
+    /// translates onto the rebuilt operand.
+    pub result: crate::relation::SemanticRelation,
     pub kind: FlatOperatorKind,
     pub left_tables: Vec<crate::names::ScopeId>,
     pub right_tables: Vec<crate::names::ScopeId>,

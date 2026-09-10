@@ -24,6 +24,7 @@
 //    buried form happens to PARSE on postgres, but means per-iteration
 //    limit there: non-terminating. Worse than refusing.)
 
+use crate::diagnostic::Recursion;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::generator::SqlDialect;
 use crate::pipeline::sql_ast::{
@@ -298,13 +299,11 @@ fn inline_limit_wrapper(
     if let Some(lim) = inner.limit() {
         builder = builder.limit_from(lim.clone());
     }
-    builder
-        .restructuring(inner.at(), outer)
-        .map_err(|e| DelightQLError::ValidationError {
+    builder.restructuring(inner.at(), outer).map_err(|e| {
+        DelightQLError::from(Recursion::LimitBound {
             message: format!("recursive limit legalization rebuild: {}", e),
-            context: "sql_rewriter::recursive_cte".to_string(),
-            subcategory: Some(crate::uri_registry::subcat::RECURSION_LIMIT_BOUND),
         })
+    })
 }
 
 /// Does this SELECT's FROM tree (including nested subqueries) reference
@@ -364,7 +363,7 @@ fn statement_with_clause_mut(stmt: &mut SqlStatement) -> Option<&mut Vec<Cte>> {
 }
 
 fn limit_bound_error(dialect: SqlDialect) -> DelightQLError {
-    DelightQLError::ValidationError {
+    DelightQLError::from(Recursion::LimitBound {
         message: format!(
             "this recursive rule bounds its recursion with a row limit (#<N). DelightQL \
              defines this as a total-row cap on the fixpoint, but {dialect:?} has \
@@ -372,20 +371,16 @@ fn limit_bound_error(dialect: SqlDialect) -> DelightQLError {
              filter-based bounds. Rewrite the bound as a filter condition on the \
              recursive rule (e.g. a depth or value predicate)."
         ),
-        context: "sql_rewriter::recursive_cte".to_string(),
-        subcategory: Some(crate::uri_registry::subcat::RECURSION_LIMIT_BOUND),
-    }
+    })
 }
 
 fn shape_error(detail: &str) -> DelightQLError {
-    DelightQLError::ValidationError {
+    DelightQLError::from(Recursion::LimitBound {
         message: format!(
             "cannot legalize the row limit inside this recursive rule ({detail}). \
              Rewrite the bound as a filter condition on the recursive rule."
         ),
-        context: "sql_rewriter::recursive_cte".to_string(),
-        subcategory: Some(crate::uri_registry::subcat::RECURSION_LIMIT_BOUND),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -754,15 +749,14 @@ fn validate_member(q: &mut QueryExpression, cte_scope: crate::names::ScopeId) ->
 
     // N1 — non-linear recursion: the frontier cannot join with itself.
     if direct > 1 {
-        return Err(recursion_error(
-            "nonlinear",
-            format!(
+        return Err(DelightQLError::from(Recursion::Nonlinear {
+            message: format!(
                 "the recursive rule references its frontier {direct} times — the \
                  frontier cannot join with itself. Carry the values you need as \
                  columns of one frontier row instead (tupling: fib-style \
                  `(a, b) -> (b, a+b)`). SEMANTICS/recursion-contract-law.md N1."
             ),
-        ));
+        }));
     }
 
     // N4 — self-reference buried in a subquery (semi/anti-join, IN, scalar,
@@ -772,28 +766,26 @@ fn validate_member(q: &mut QueryExpression, cte_scope: crate::names::ScopeId) ->
             "N4 firing: cte={cte_scope:?} total={total} direct={direct} member={:#?}",
             q
         );
-        return Err(recursion_error(
-            "self_subquery",
-            format!(
+        return Err(DelightQLError::from(Recursion::SelfSubquery {
+            message: format!(
                 "the recursive relation is referenced inside a subquery of its own recursive \
                  rule — a recursive rule sees only the previous iteration's rows, \
                  as a direct source. Track visited state in the frontier row, or \
                  deduplicate/filter after the fixpoint. SEMANTICS/recursion-contract-law.md N4."
             ),
-        ));
+        }));
     }
 
     // N3 — aggregation over the frontier.
     if member_has_aggregation(select) {
-        return Err(recursion_error(
-            "aggregate",
-            format!(
+        return Err(DelightQLError::from(Recursion::Aggregate {
+            message: format!(
                 "aggregation inside the recursive rule would need \
                  the accumulated set. Aggregate after the fixpoint (a later pipe \
                  stage — strata are textual), or carry a running value in the \
                  frontier row. SEMANTICS/recursion-contract-law.md N3."
             ),
-        ));
+        }));
     }
 
     Ok(())
@@ -877,21 +869,6 @@ fn is_aggregate_fn(name: &str) -> bool {
     )
 }
 
-fn recursion_error(leaf: &str, message: String) -> DelightQLError {
-    let subcategory = match leaf {
-        "nonlinear" => "recursion/nonlinear",
-        "aggregate" => "recursion/aggregate",
-        "self_subquery" => "recursion/self_subquery",
-        "set_operator" => crate::uri_registry::subcat::RECURSION_SET_OPERATOR,
-        other => unreachable!("unknown recursion refusal leaf: {other}"),
-    };
-    DelightQLError::ValidationError {
-        message,
-        context: "sql_rewriter::recursive_cte".to_string(),
-        subcategory: Some(subcategory),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -951,7 +928,9 @@ mod tests {
         ) -> SelectStatement {
             (select)
                 .standing_at(at)
-                .map_err(crate::error::DelightQLError::parse_error)
+                .map_err(|e| {
+                    crate::diagnostic::Internal::invariant("sql_rewriter::recursive_cte", e)
+                })
                 .expect("a fixture publishes exactly what it names")
         }
 

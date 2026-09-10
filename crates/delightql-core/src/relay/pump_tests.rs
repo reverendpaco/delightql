@@ -13,21 +13,29 @@ use std::sync::{Arc, Mutex};
 
 use delightql_protocol::{
     Cell, Client, ClientTerm, Dimension, DirectTransport, ErrorKind, Handler, Orientation,
-    Projection, ServerTerm, Session, VersionResult,
+    Projection, ServerTerm, Session, VersionResult, WireError,
 };
+
+use crate::diagnostic::{DelightQLError, Runtime};
 
 use super::RelayParty;
 use crate::external_effects::CreatedObjectCatalog;
 use crate::external_effects::CreatedObjectRegistration;
 use crate::pipeline::compiled_query::{CompiledPlan, PlanEntry, PlanStatement};
 use crate::relay::RelayHooks;
-use crate::system::DelightQLSystem;
+use crate::system::{DelightQLSystem, ReadySystem};
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 
 // ---------------------------------------------------------------------
 // Test backend: an eager protocol Handler over a real rusqlite connection.
 // ---------------------------------------------------------------------
+
+/// The backend's refusals travel as wire errors of typed diagnostics, the
+/// same way a production party's do.
+fn wire_error(error: impl Into<DelightQLError>) -> ServerTerm {
+    ServerTerm::Error(WireError::of(&error.into()))
+}
 
 pub(super) struct EagerSqliteHandler {
     conn: Arc<Mutex<rusqlite::Connection>>,
@@ -97,11 +105,7 @@ impl EagerSqliteHandler {
 
         match executed {
             Ok((dimensions, rows)) => self.store(dimensions, rows),
-            Err(msg) => ServerTerm::Error {
-                kind: ErrorKind::Constraint,
-                identity: vec![],
-                message: msg.into_bytes(),
-            },
+            Err(message) => wire_error(Runtime::Execution { message }),
         }
     }
 
@@ -145,22 +149,20 @@ impl Handler for EagerSqliteHandler {
                         ServerTerm::Data { cells: batch }
                     }
                 }
-                None => ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: vec![],
-                    message: b"unknown handle".to_vec(),
-                },
+                None => wire_error(Runtime::Protocol {
+                    message: "unknown handle".to_string(),
+                }),
             },
             ClientTerm::Close { handle } => {
                 self.buffers.remove(&handle);
                 ServerTerm::Ok { count_hint: 0 }
             }
             ClientTerm::Stat { .. } => ServerTerm::Metadata { items: vec![] },
-            ClientTerm::Prepare { .. } | ClientTerm::Offer { .. } => ServerTerm::Error {
-                kind: ErrorKind::Permission,
-                identity: vec![],
-                message: b"not implemented".to_vec(),
-            },
+            ClientTerm::Prepare { .. } | ClientTerm::Offer { .. } => {
+                wire_error(Runtime::Unsupported {
+                    message: "not implemented".to_string(),
+                })
+            }
         }
     }
 }
@@ -184,9 +186,9 @@ impl DatabaseIntrospector for EmptyIntrospector {
     }
 }
 
-pub(super) fn fresh_system() -> DelightQLSystem {
+pub(super) fn fresh_system() -> ReadySystem {
     let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-    DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+    ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
         .expect("fresh in-memory system should build")
 }
 
@@ -195,7 +197,7 @@ pub(super) type TestRelay<'a> = RelayParty<'a, DirectTransport<EagerSqliteHandle
 /// Build a relay whose default (connection 2) backend is `conn` — a REAL
 /// rusqlite connection the caller keeps a clone of for state inspection.
 pub(super) fn relay_over(
-    system: &mut DelightQLSystem,
+    system: &mut ReadySystem,
     conn: Arc<Mutex<rusqlite::Connection>>,
 ) -> TestRelay<'_> {
     relay_over_with_log(system, conn).0
@@ -203,7 +205,7 @@ pub(super) fn relay_over(
 
 /// `relay_over` plus a clone of the backend's SQL log (for the peek pins).
 fn relay_over_with_log(
-    system: &mut DelightQLSystem,
+    system: &mut ReadySystem,
     conn: Arc<Mutex<rusqlite::Connection>>,
 ) -> (TestRelay<'_>, Arc<Mutex<Vec<String>>>) {
     let handler = EagerSqliteHandler::new(conn);
@@ -220,10 +222,9 @@ fn relay_over_with_log(
         .expect("in-process handshake cannot fail at transport level")
     {
         VersionResult::Accepted(s) => s,
-        VersionResult::Rejected { message, .. } => panic!(
-            "test backend rejected version: {}",
-            String::from_utf8_lossy(&message)
-        ),
+        VersionResult::Rejected(error) => {
+            panic!("test backend rejected version: {}", error.message_str())
+        }
     };
     (RelayParty::new(system, session), sql_log)
 }
@@ -245,17 +246,13 @@ fn quarantined_session_refuses_a_new_query_before_compilation() {
         text: b"select 1".to_vec(),
     });
     match response {
-        ServerTerm::Error {
-            kind,
-            identity,
-            message,
-        } => {
-            assert_eq!(kind, ErrorKind::Connection);
+        ServerTerm::Error(error) => {
+            assert_eq!(error.kind(), ErrorKind::Connection);
             assert_eq!(
-                identity,
-                b"delightql-error://runtime/session_health/external_effect".to_vec()
+                error.identity(),
+                b"delightql-error://runtime/session_health/external_effect"
             );
-            assert!(String::from_utf8_lossy(&message).contains("reset or reconnect"));
+            assert!(String::from_utf8_lossy(error.message()).contains("reset or reconnect"));
         }
         other => panic!("quarantined query must be refused, got {other:?}"),
     }
@@ -305,7 +302,7 @@ fn post_run_unsupported_registration_is_a_quarantine_invariant_breach() {
     let conn = shared_sqlite();
     // Bypass the planner's pre-flight only to exercise the invariant-breach
     // branch: a target approved earlier must never abstain during read-back.
-    let mut system = DelightQLSystem::new(
+    let mut system = ReadySystem::new(
         Arc::new(Mutex::new(MockDatabaseConnection::new())),
         Box::new(EmptyIntrospector),
         "postgres",
@@ -319,6 +316,7 @@ fn post_run_unsupported_registration_is_a_quarantine_invariant_breach() {
             name: "created".to_string(),
             is_view: false,
             connection_id: None,
+            interior_positions: Vec::new(),
         }],
         typed: None,
     };
@@ -407,9 +405,10 @@ fn fetch_all(relay: &mut TestRelay<'_>, term: ServerTerm) -> (Vec<String>, Vec<V
 
 fn error_message(term: ServerTerm) -> (Vec<u8>, String) {
     match term {
-        ServerTerm::Error {
-            identity, message, ..
-        } => (identity, String::from_utf8_lossy(&message).to_string()),
+        ServerTerm::Error(error) => (
+            error.identity().to_vec(),
+            String::from_utf8_lossy(error.message()).to_string(),
+        ),
         other => panic!("expected Error, got {:?}", other),
     }
 }
@@ -457,6 +456,7 @@ fn created_object_registration_failure_retires_the_unsent_final_handle() {
             name: "created".to_string(),
             is_view: false,
             connection_id: None,
+            interior_positions: Vec::new(),
         }],
         typed: None,
     };
@@ -1006,10 +1006,12 @@ fn compiler_check_failure_mid_plan_refuses_and_rolls_back() {
             statement: PlanStatement::bare("SELECT 1"),
         },
         PlanEntry::Check {
-            refusal: Some(crate::pipeline::compiled_query::Refusal {
-                identity: "runtime/precondition".to_string(),
-                message: "precondition failed".to_string(),
-            }),
+            refusal: Some(
+                Runtime::Precondition {
+                    message: "precondition failed".to_string(),
+                }
+                .into(),
+            ),
             statement: PlanStatement::bare("SELECT 0"),
         },
         bare("INSERT INTO t VALUES ('never reached')"),
@@ -1050,10 +1052,12 @@ fn compiler_check_refusal_skips_later_entries_without_bracket() {
     let p = plan(vec![
         bare("INSERT INTO t VALUES ('a')"),
         PlanEntry::Check {
-            refusal: Some(crate::pipeline::compiled_query::Refusal {
-                identity: "runtime/precondition".to_string(),
-                message: "precondition failed".to_string(),
-            }),
+            refusal: Some(
+                Runtime::Precondition {
+                    message: "precondition failed".to_string(),
+                }
+                .into(),
+            ),
             statement: PlanStatement::bare("SELECT 0"),
         },
         bare("INSERT INTO t VALUES ('b')"),
@@ -1128,7 +1132,7 @@ fn assertion_abort_rolls_back_skips_the_tail_and_persists_its_verdict() {
         vec![],
     );
     let (identity, message) = error_message(relay.handle_plan(&p));
-    assert_eq!(identity, b"delightql-error://runtime/assertion".to_vec());
+    assert_eq!(identity, b"delightql-error://authored/abort".to_vec());
     assert!(message.contains("authored label"));
     assert!(conn.lock().unwrap().is_autocommit());
     assert_eq!(count_rows(&conn, "t"), 0);
@@ -1234,7 +1238,7 @@ fn failed_assertion_keeps_primary_identity_when_observation_quarantines() {
     );
 
     let (identity, message) = error_message(relay.handle_plan(&plan));
-    assert_eq!(identity, b"delightql-error://runtime/assertion".to_vec());
+    assert_eq!(identity, b"delightql-error://authored/abort".to_vec());
     assert!(message.contains("primary assertion"), "{message}");
     assert!(message.contains("session quarantined"), "{message}");
     assert!(relay.system.health_incident().is_some());
@@ -1275,7 +1279,6 @@ fn committed_run_survives_abort_and_the_session_remains_usable() {
             step(
                 EffectAction::Terminal(TerminalAction::Abort {
                     provenance: AbortProvenance::Authored {
-                        identity: "runtime/abort-test".to_string(),
                         label: "stop".to_string(),
                     },
                     statements: Vec::new(),
@@ -1290,7 +1293,7 @@ fn committed_run_survives_abort_and_the_session_remains_usable() {
         vec![],
     );
     let (identity, _) = error_message(relay.handle_plan(&aborted));
-    assert_eq!(identity, b"delightql-error://runtime/abort-test".to_vec());
+    assert_eq!(identity, b"delightql-error://authored/abort".to_vec());
 
     let response = relay.handle_plan(&plan(vec![ship("SELECT v FROM t ORDER BY v")]));
     let (_, rows) = fetch_all(&mut relay, response);
@@ -1306,7 +1309,6 @@ fn abort_probe_execution_error_keeps_the_runtime_execution_identity() {
         vec![step(
             EffectAction::Terminal(TerminalAction::Abort {
                 provenance: AbortProvenance::Authored {
-                    identity: "runtime/should-not-replace".to_string(),
                     label: "unreached".to_string(),
                 },
                 statements: Vec::new(),
@@ -1331,15 +1333,15 @@ fn authored_abort_reaches_only_on_nonempty_input_and_keeps_the_session_usable() 
     let mut relay = relay_over(&mut system, conn);
 
     let empty = relay.handle(ClientTerm::Query {
-        text: b"_(x @ 1), x = 99 |> abort!(\"runtime/abort-test\", \"empty\")(*)".to_vec(),
+        text: b"_(x @ 1), x = 99 |> abort!(\"empty\")(*)".to_vec(),
     });
     let _ = fetch_all(&mut relay, empty);
 
     let reached = relay.handle(ClientTerm::Query {
-        text: b"_(x @ 1) |> abort!(\"runtime/abort-test\", \"reached\")(*)".to_vec(),
+        text: b"_(x @ 1) |> abort!(\"reached\")(*)".to_vec(),
     });
     let (identity, message) = error_message(reached);
-    assert_eq!(identity, b"delightql-error://runtime/abort-test".to_vec());
+    assert_eq!(identity, b"delightql-error://authored/abort".to_vec());
     assert!(message.contains("reached"));
 
     let usable = relay.handle(ClientTerm::Query {
@@ -1377,7 +1379,7 @@ fn qualified_builtin_identity_is_preserved_at_the_runtime_entry() {
         let (identity, message) = error_message(relay.handle(ClientTerm::Query {
             text: source.as_bytes().to_vec(),
         }));
-        assert_ne!(identity, b"delightql-error://runtime/assertion".to_vec());
+        assert_ne!(identity, b"delightql-error://authored/abort".to_vec());
         assert_ne!(identity, b"delightql-error://runtime/must-not-run".to_vec());
         assert!(
             message.contains("no effect rule")
@@ -1474,7 +1476,7 @@ fn volatile_assert_input_is_one_occurrence_in_witness_and_returned_payloads() {
 }
 
 #[test]
-fn empty_assertion_witness_uses_runtime_assertion_and_explicit_label() {
+fn empty_assertion_witness_uses_authored_abort_and_explicit_label() {
     let conn = shared_sqlite();
     let mut system = fresh_system();
     let mut relay = relay_over(&mut system, conn);
@@ -1485,7 +1487,7 @@ fn empty_assertion_witness_uses_runtime_assertion_and_explicit_label() {
         text: dql.as_bytes().to_vec(),
     });
     let (identity, message) = error_message(response);
-    assert_eq!(identity, b"delightql-error://runtime/assertion".to_vec());
+    assert_eq!(identity, b"delightql-error://authored/abort".to_vec());
     assert!(message.contains("no 99"));
 }
 
@@ -1684,6 +1686,7 @@ fn recovery_replaces_a_quarantined_session_and_the_next_query_succeeds() {
                 name: "created".to_string(),
                 is_view: false,
                 connection_id: None,
+                interior_positions: Vec::new(),
             }],
             typed: None,
         };
@@ -1806,4 +1809,227 @@ fn an_ordinary_error_does_not_trigger_the_recovery_boundary() {
     });
     let (_columns, rows) = fetch_all(&mut relay, resp);
     assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+/// Wire ingress on the ORDINARY streaming roads: a party of another build
+/// answers a query, then a fetch, with identities this build does not
+/// declare; both leave the relay as its own typed protocol refusal, the
+/// findings ledger records only that admitted identity, and a lawful
+/// provider occurrence remains itself.
+mod foreign_ingress {
+    use super::*;
+    use delightql_protocol::{ErrorKind, Handle};
+
+    /// The bytes a foreign party could put on the wire, decoded exactly as a
+    /// transport would decode them: not a `WireError` this process built.
+    fn foreign_error_term(identity: &str, message: &str) -> ServerTerm {
+        #[derive(serde::Serialize)]
+        enum Term {
+            Error((String, Vec<u8>, Vec<u8>)),
+        }
+        let payload = rmp_serde::to_vec(&Term::Error((
+            "Syntax".to_string(),
+            identity.as_bytes().to_vec(),
+            message.as_bytes().to_vec(),
+        )))
+        .expect("a term serializes");
+        let term = delightql_protocol::manifest::decode_server(&payload)
+            .expect("the shape a foreign party sends decodes");
+        match &term {
+            ServerTerm::Error(wire) => assert_eq!(wire.identity(), identity.as_bytes()),
+            other => panic!("expected an Error term, decoded {other:?}"),
+        }
+        term
+    }
+
+    struct ForeignParty {
+        on_query: Option<ServerTerm>,
+        on_fetch: Option<ServerTerm>,
+    }
+
+    impl Handler for ForeignParty {
+        fn handle(&mut self, term: ClientTerm) -> ServerTerm {
+            match term {
+                ClientTerm::Version {
+                    max_message_size,
+                    protocol_version,
+                    lease_ms,
+                    orientations,
+                } => ServerTerm::Version {
+                    max_message_size,
+                    protocol_version,
+                    lease_ms,
+                    orientations,
+                },
+                ClientTerm::Query { .. } => self.on_query.take().unwrap_or(ServerTerm::Header {
+                    handle: b"foreign-1".to_vec(),
+                    dimensions: vec![Dimension {
+                        position: 1,
+                        name: b"x".to_vec(),
+                        descriptor: Vec::new(),
+                    }],
+                }),
+                ClientTerm::Fetch { .. } => self.on_fetch.take().unwrap_or(ServerTerm::End),
+                ClientTerm::Close { .. } => ServerTerm::Ok { count_hint: 0 },
+                ClientTerm::Stat { .. } => ServerTerm::Metadata { items: vec![] },
+                ClientTerm::Prepare { .. } | ClientTerm::Offer { .. } => {
+                    wire_error(Runtime::Unsupported {
+                        message: "not implemented".to_string(),
+                    })
+                }
+            }
+        }
+    }
+
+    fn relay_over_foreign(
+        system: &mut ReadySystem,
+        party: ForeignParty,
+    ) -> RelayParty<'_, DirectTransport<ForeignParty>> {
+        let client = Client::new(DirectTransport::new(party));
+        let session = match client
+            .version(
+                1_000_000,
+                b"relay0".to_vec(),
+                300_000,
+                vec![Orientation::Rows],
+            )
+            .expect("in-process handshake")
+        {
+            VersionResult::Accepted(s) => s,
+            VersionResult::Rejected(error) => {
+                panic!("rejected: {}", error.message_str())
+            }
+        };
+        RelayParty::new(system, session)
+    }
+
+    fn findings(relay: &mut RelayParty<'_, DirectTransport<ForeignParty>>) -> Vec<String> {
+        let term = relay.handle(ClientTerm::Query {
+            text: b"sys::diagnostics.finding(*) |> (uri)".to_vec(),
+        });
+        let handle: Handle = match term {
+            ServerTerm::Header { handle, .. } => handle,
+            other => panic!("expected Header, got {other:?}"),
+        };
+        let mut out = Vec::new();
+        loop {
+            match relay.handle(ClientTerm::Fetch {
+                handle: handle.clone(),
+                projection: Projection::All,
+                count: 1000,
+                orientation: Orientation::Rows,
+            }) {
+                ServerTerm::Data { cells } => {
+                    for row in cells {
+                        out.push(
+                            String::from_utf8_lossy(&row[0].clone().unwrap_or_default())
+                                .to_string(),
+                        );
+                    }
+                }
+                ServerTerm::End => break,
+                other => panic!("expected Data or End, got {other:?}"),
+            }
+        }
+        let _ = relay.handle(ClientTerm::Close { handle });
+        out
+    }
+
+    #[test]
+    fn an_undeclared_identity_on_a_streaming_query_is_the_relays_protocol_refusal() {
+        let mut system = fresh_system();
+        let party = ForeignParty {
+            on_query: Some(foreign_error_term(
+                "delightql-error://semantic/invented",
+                "peer text",
+            )),
+            on_fetch: None,
+        };
+        let mut relay = relay_over_foreign(&mut system, party);
+        let (identity, message) = error_message(relay.handle(ClientTerm::Query {
+            text: b"_(x @ 1)".to_vec(),
+        }));
+        assert_eq!(
+            identity,
+            b"delightql-error://runtime/relay/protocol".to_vec()
+        );
+        assert!(message.contains("semantic/invented"), "{message}");
+        let recorded = findings(&mut relay);
+        assert!(
+            recorded
+                .iter()
+                .any(|u| u == "delightql-error://runtime/relay/protocol"),
+            "{recorded:?}"
+        );
+        assert!(
+            !recorded.iter().any(|u| u.contains("semantic/invented")),
+            "the peer's spelling is not a finding: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn a_contradictory_provider_tail_on_a_later_fetch_is_the_relays_protocol_refusal() {
+        let mut system = fresh_system();
+        let party = ForeignParty {
+            on_query: None,
+            on_fetch: Some(foreign_error_term(
+                "delightql-error://target/sqlite/syntax/2067",
+                "a constraint code wearing a syntax class",
+            )),
+        };
+        let mut relay = relay_over_foreign(&mut system, party);
+        let handle = match relay.handle(ClientTerm::Query {
+            text: b"_(x @ 1)".to_vec(),
+        }) {
+            ServerTerm::Header { handle, .. } => handle,
+            other => panic!("expected Header, got {other:?}"),
+        };
+        let (identity, _) = error_message(relay.handle(ClientTerm::Fetch {
+            handle,
+            projection: Projection::All,
+            count: 1000,
+            orientation: Orientation::Rows,
+        }));
+        assert_eq!(
+            identity,
+            b"delightql-error://runtime/relay/protocol".to_vec()
+        );
+        let recorded = findings(&mut relay);
+        assert!(recorded
+            .iter()
+            .any(|u| u == "delightql-error://runtime/relay/protocol"));
+        assert!(!recorded
+            .iter()
+            .any(|u| u.contains("target/sqlite/syntax/2067")));
+    }
+
+    #[test]
+    fn a_lawful_provider_occurrence_remains_itself() {
+        let mut system = fresh_system();
+        let party = ForeignParty {
+            on_query: Some(foreign_error_term(
+                "delightql-error://target/sqlite/constraint/2067",
+                "UNIQUE constraint failed",
+            )),
+            on_fetch: None,
+        };
+        let mut relay = relay_over_foreign(&mut system, party);
+        match relay.handle(ClientTerm::Query {
+            text: b"_(x @ 1)".to_vec(),
+        }) {
+            ServerTerm::Error(wire) => {
+                assert_eq!(
+                    wire.identity(),
+                    b"delightql-error://target/sqlite/constraint/2067"
+                );
+                assert_eq!(wire.kind(), ErrorKind::Constraint);
+                assert_eq!(wire.message(), b"UNIQUE constraint failed");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let recorded = findings(&mut relay);
+        assert!(recorded
+            .iter()
+            .any(|u| u == "delightql-error://target/sqlite/constraint/2067"));
+    }
 }

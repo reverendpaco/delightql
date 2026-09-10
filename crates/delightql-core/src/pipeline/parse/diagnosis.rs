@@ -14,22 +14,32 @@
 //! generic true one. Each diagnosis mints its own badge under `parse/` so it
 //! is explainable and annotation-matchable.
 
+use crate::diagnostic::{DelightQLError, DmlMarker, Effect, Parse, ParseAnon};
 use crate::pipeline::syntax::Token;
 
-pub(crate) struct ParseDiagnosis {
-    pub subcategory: &'static str,
-    pub message: String,
-}
-
-/// Every operator the PONY rule counts: arithmetic and comparison alike. A
-/// comparison composes with arithmetic (`a / b > c`) exactly as arithmetic
-/// composes with itself, and the reading is missing for the same reason.
+/// Every operator the PONY rule counts at the value tier: arithmetic and
+/// comparison alike. A comparison composes with arithmetic (`a / b > c`)
+/// exactly as arithmetic composes with itself, and the reading is missing
+/// for the same reason.
 const INFIX_OPS: &[&str] = &[
     "+", "-", "*", "/", "%", "++", ">", "<", ">=", "<=", "!=", "<>",
 ];
-/// Tokens that end an "expression window" — two infix operators are only
-/// a PONY violation when nothing on this list separates them.
-const WINDOW_BREAKERS: &[&str] = &["(", ")", ",", ";", "|>", "~>", ":", "|", "{", "}", "[", "]"];
+/// The truth connectives. They end the value tier's window: `a > 1 and b > 2`
+/// is two comparisons of one operator each. (A mixture of the two words is
+/// the grammar's business — its refusal witness — not this reader's.)
+const CONNECTIVE_WORDS: &[&str] = &["and", "AND", "or", "OR"];
+/// Tokens that end an "expression window" — two infix operators are only a
+/// PONY violation when nothing on this list separates them. The neck and the
+/// goal marker end one because a head and its body, and one clause and the
+/// next, are not one expression; the boundary between two top-level FORMS
+/// has no token, and is drawn by attribution before the tokens reach here.
+const WINDOW_BREAKERS: &[&str] = &[
+    "(", ")", ",", ";", "|>", "~>", ":", "|", "{", "}", "[", "]", "->", ":-", "?-",
+];
+
+fn is_connective(token: &Token) -> bool {
+    CONNECTIVE_WORDS.contains(&token.text.as_str())
+}
 
 /// The tokens a content-keyed pattern may read: the author's QUERY, with
 /// every annotation's own span and the file's reader directive removed.
@@ -65,7 +75,7 @@ fn query_tokens(tokens: &[Token]) -> Vec<Token> {
     kept
 }
 
-pub(crate) fn diagnose(tokens: &[Token], source: &str) -> Option<ParseDiagnosis> {
+pub(crate) fn diagnose(tokens: &[Token], source: &str) -> Option<DelightQLError> {
     // Dash-comment MUST run first: comment text is arbitrary prose, so a
     // `-- check x is null` line would otherwise feed the other patterns
     // words they would misread as the user's query.
@@ -103,12 +113,11 @@ pub(crate) fn diagnose(tokens: &[Token], source: &str) -> Option<ParseDiagnosis>
         .or_else(|| diagnose_pony(&query_tokens(tokens)))
 }
 
-fn diagnose_retired_assertion_annotation(source: &str) -> Option<ParseDiagnosis> {
-    source.contains("(~~assert").then(|| ParseDiagnosis {
-            subcategory: crate::uri_registry::subcat::PARSE_ASSERTION_RETIRED,
-            message: "the `(~~assert … ~~)` annotation has been removed — define a pure property rule and demand `assert!(property)(*)` on the relation being checked"
+fn diagnose_retired_assertion_annotation(source: &str) -> Option<DelightQLError> {
+    source.contains("(~~assert").then(|| DelightQLError::from(Parse::AssertionRetired {
+     message: "the `(~~assert … ~~)` annotation has been removed — define a pure property rule and demand `assert!(property)(*)` on the relation being checked"
                 .to_string(),
-        })
+ }))
 }
 
 /// The group openers a token stream nests through. A depth reader that misses
@@ -146,7 +155,7 @@ fn marker_at(tokens: &[Token], index: usize) -> Option<&Token> {
 /// STRUCTURAL HEAD GROUNDING IS RESERVED: `foo(T(*), {.name})(*) :- …`. The
 /// brace group in a head position has no derivation, and the refusal it
 /// deserves is the reservation rather than an unexpected token.
-fn diagnose_structural_head(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_structural_head(tokens: &[Token]) -> Option<DelightQLError> {
     let before = depths(tokens);
     let neck = tokens
         .iter()
@@ -159,11 +168,12 @@ fn diagnose_structural_head(tokens: &[Token]) -> Option<ParseDiagnosis> {
     let dotted = tokens
         .get(brace.0 + 1)
         .is_some_and(|token| token.text == ".");
-    dotted.then(|| ParseDiagnosis {
-        subcategory: crate::uri_registry::subcat::PARSE_STRUCTURAL_HEAD,
-        message: "structural head grounding is reserved — a head parameter names a \
+    dotted.then(|| {
+        DelightQLError::from(Parse::StructuralHead {
+            message: "structural head grounding is reserved — a head parameter names a \
                   relation or a scalar, not a shape to destructure"
-            .to_string(),
+                .to_string(),
+        })
     })
 }
 
@@ -171,7 +181,7 @@ fn diagnose_structural_head(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// group-modulo sigil wherever a relational reading is possible, so the guard
 /// has no derivation; the fix is the same parenthesization every composition
 /// needs.
-fn diagnose_bare_operator_guard(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_bare_operator_guard(tokens: &[Token]) -> Option<DelightQLError> {
     let before = depths(tokens);
     for (index, token) in tokens.iter().enumerate() {
         if token.text != "|" || before[index] == 0 {
@@ -186,12 +196,11 @@ fn diagnose_bare_operator_guard(tokens: &[Token]) -> Option<ParseDiagnosis> {
             .filter(|token| INFIX_OPS.contains(&token.text.as_str()) || token.text == "=")
             .count();
         if operators >= 2 {
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_GUARD_GROUPING,
+            return Some(DelightQLError::from(Parse::GuardGrouping {
                 message: "a guard composes operators and DelightQL has no precedence — \
                           parenthesize the arithmetic, e.g. `f:(n | (n % 2) = 0)`"
                     .to_string(),
-            });
+            }));
         }
     }
     None
@@ -201,7 +210,7 @@ fn diagnose_bare_operator_guard(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// binds an effectful body under a pure label, which has no derivation: the
 /// label asserts what its body is, and a pure label over an effect body is the
 /// assertion being wrong rather than a shape the grammar forgot.
-fn diagnose_unmarked_effect_label(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_unmarked_effect_label(tokens: &[Token]) -> Option<DelightQLError> {
     let before = depths(tokens);
     for (index, token) in tokens.iter().enumerate() {
         if token.text != ":" || before[index] != 0 {
@@ -234,14 +243,13 @@ fn diagnose_unmarked_effect_label(tokens: &[Token]) -> Option<ParseDiagnosis> {
             .filter(|at| before[*at] == 0)
             .find_map(|at| marker_at(tokens, at));
         if let Some(demanded) = demanded {
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_EFFECT_LABEL,
+            return Some(DelightQLError::from(Parse::EffectLabel {
                 message: format!(
                     "the binding '{}' demands the directive '{}!', so its label must be \
                      '!'-marked: write '{}!'",
                     name.text, demanded.text, name.text
                 ),
-            });
+            }));
         }
     }
     None
@@ -255,7 +263,7 @@ fn diagnose_unmarked_effect_label(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// Keyed on what the author TYPED: a neck at group depth zero, a head left of
 /// it that carries no `!` on its own subject, and a directive call to the
 /// right of it.
-fn diagnose_pure_head_effect_body(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_pure_head_effect_body(tokens: &[Token]) -> Option<DelightQLError> {
     let mut depth = 0i32;
     let mut neck: Option<usize> = None;
     for (index, token) in tokens.iter().enumerate() {
@@ -297,15 +305,14 @@ fn diagnose_pure_head_effect_body(tokens: &[Token]) -> Option<ParseDiagnosis> {
         .get(head_open.wrapping_sub(1))
         .map(|token| token.text.clone())
         .unwrap_or_else(|| "this rule".to_string());
-    Some(ParseDiagnosis {
-        subcategory: crate::uri_registry::subcat::PARSE_EFFECT_PURITY,
+    Some(DelightQLError::from(Parse::EffectPurity {
         message: format!(
             "definition '{subject}': its head lacks '!' but its body demands the \
              directive '{demanded}!' — a rule without the effect marker must not \
              contain a directive. Declare the effect in the head: \
              '{subject}!(*) :- …'."
         ),
-    })
+    }))
 }
 
 /// A session directive standing INSIDE a group. R9: a session directive is
@@ -316,7 +323,7 @@ fn diagnose_pure_head_effect_body(tokens: &[Token]) -> Option<ParseDiagnosis> {
 ///
 /// Keyed on GROUP DEPTH, which the tokens carry, and on the callee's declared
 /// category — never on the shape recovery happened to leave behind.
-fn diagnose_nested_session_directive(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_nested_session_directive(tokens: &[Token]) -> Option<DelightQLError> {
     let mut depth = 0i32;
     for (index, token) in tokens.iter().enumerate() {
         match token.text.as_str() {
@@ -336,14 +343,13 @@ fn diagnose_nested_session_directive(tokens: &[Token]) -> Option<ParseDiagnosis>
                 {
                     continue;
                 }
-                return Some(ParseDiagnosis {
-                    subcategory: crate::uri_registry::subcat::PARSE_SESSION_POSITION,
+                return Some(DelightQLError::from(Parse::SessionPosition {
                     message: format!(
                         "{}!: session directives are legal only at the REPL/CLI top level \
                          or the liminal space — not nested in a query",
                         name.text
                     ),
-                });
+                }));
             }
             _ => {}
         }
@@ -359,7 +365,7 @@ fn diagnose_nested_session_directive(tokens: &[Token]) -> Option<ParseDiagnosis>
 /// Read from the author's QUERY tokens: a failed parse re-lexes an
 /// annotation's own bytes, and its parens would move a depth reader that is
 /// counting the author's groups.
-fn diagnose_nested_directive_position(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_nested_directive_position(tokens: &[Token]) -> Option<DelightQLError> {
     let before = depths(tokens);
     for index in 0..tokens.len() {
         if before[index] == 0 {
@@ -373,14 +379,13 @@ fn diagnose_nested_directive_position(tokens: &[Token]) -> Option<ParseDiagnosis
         {
             continue;
         }
-        return Some(ParseDiagnosis {
-            subcategory: crate::uri_registry::subcat::PARSE_DIRECTIVE_POSITION,
+        return Some(DelightQLError::from(Parse::DirectivePosition {
             message: format!(
                 "{}!: predicate-position lowering is not yet supported in v0.1 — lift it \
                  out of the predicate and demand it as its own step",
                 name.text
             ),
-        });
+        }));
     }
     None
 }
@@ -391,7 +396,7 @@ fn diagnose_nested_directive_position(tokens: &[Token]) -> Option<ParseDiagnosis
 /// computes is not a head. The grammar cannot derive the shape, so the rule
 /// the author broke is only reachable from the tokens they typed: a plain
 /// head group before a top-level neck, with an application opener inside it.
-fn diagnose_head_computes(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_head_computes(tokens: &[Token]) -> Option<DelightQLError> {
     // The head is the form's first tokens: a subject name and a PLAIN group.
     // A `:(`-opened head is a CFE, whose parameters lawfully declare
     // callables (`f:()`), so only the plain opener is this shape.
@@ -428,8 +433,7 @@ fn diagnose_head_computes(tokens: &[Token]) -> Option<ParseDiagnosis> {
         return None;
     }
     let callee = computes?;
-    Some(ParseDiagnosis {
-        subcategory: crate::uri_registry::subcat::PARSE_HEAD_COMPUTES,
+    Some(DelightQLError::from(Parse::HeadComputes {
         message: format!(
             "a head lists names, and `{callee}:(…)` computes — a computation is not a \
              name, so a head that computes is not a head. Compute in the body and \
@@ -438,7 +442,7 @@ fn diagnose_head_computes(tokens: &[Token]) -> Option<ParseDiagnosis> {
             subject = subject.text,
             neck = neck.text,
         ),
-    })
+    }))
 }
 
 /// A comma compound written as a VALUE: `+((age > 30, city = "B") as t)`.
@@ -446,7 +450,7 @@ fn diagnose_head_computes(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// Comma and semicolon construct relational compounds; a value position
 /// composes truths with `and`/`or`. Keyed on a parenthesized group holding a
 /// comparison beside a top-level comma, closed and then named.
-fn diagnose_comma_compound_value(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_comma_compound_value(tokens: &[Token]) -> Option<DelightQLError> {
     let comparisons = ["=", "!=", "<>", ">", "<", ">=", "<="];
     for (index, token) in tokens.iter().enumerate() {
         if token.text != "as" || index == 0 {
@@ -491,13 +495,12 @@ fn diagnose_comma_compound_value(tokens: &[Token]) -> Option<ParseDiagnosis> {
             }
         }
         if comma && compared {
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_SIGIL,
+            return Some(DelightQLError::from(Parse::Sigil {
                 message: "comma and semicolon construct relational compounds, so \
                           `(a > x, b = y)` is not a value — in a value position, \
                           compose truths with `and` / `or`: `(a > x and b = y) as t`"
                     .to_string(),
-            });
+            }));
         }
     }
     None
@@ -509,7 +512,7 @@ fn diagnose_comma_compound_value(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// (`f(users(*) & 1, 2)(*)`); a one-group call's parentheses are the access
 /// group, and a lifted tail has no meaning there. The projection the tail
 /// reaches for belongs to the ACCESS group.
-fn diagnose_lift_tail(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_lift_tail(tokens: &[Token]) -> Option<DelightQLError> {
     let before = depths(tokens);
     for (index, token) in tokens.iter().enumerate() {
         if token.text != "&" || before[index] == 0 {
@@ -552,8 +555,7 @@ fn diagnose_lift_tail(tokens: &[Token]) -> Option<ParseDiagnosis> {
                 continue;
             }
         }
-        return Some(ParseDiagnosis {
-            subcategory: crate::uri_registry::subcat::PARSE_LIFT_TAIL,
+        return Some(DelightQLError::from(Parse::LiftTail {
             message: format!(
                 "`&` bounds arguments only in a two-group call, where lifted rows \
                  follow it; `{callee}(…)` has one group, and that group holds the \
@@ -561,7 +563,7 @@ fn diagnose_lift_tail(tokens: &[Token]) -> Option<ParseDiagnosis> {
                  `{callee}(doc, path)(value, type)`",
                 callee = callee.text,
             ),
-        });
+        }));
     }
     None
 }
@@ -572,7 +574,7 @@ fn diagnose_lift_tail(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// A definition's body is ONE domain expression, and `as` names publication
 /// positions — a parenthesized list of named values is a row, which a value
 /// definition does not produce.
-fn diagnose_body_naming(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_body_naming(tokens: &[Token]) -> Option<DelightQLError> {
     let before = depths(tokens);
     // A top-level neck followed directly by a parenthesized group.
     let neck = tokens.iter().enumerate().find_map(|(index, token)| {
@@ -599,13 +601,14 @@ fn diagnose_body_naming(tokens: &[Token]) -> Option<ParseDiagnosis> {
             _ => {}
         }
     }
-    (named && comma).then(|| ParseDiagnosis {
-        subcategory: crate::uri_registry::subcat::PARSE_VALUE_NAMING,
-        message: "a definition's body is one domain expression — `as` names a \
+    (named && comma).then(|| {
+        DelightQLError::from(Parse::ValueNaming {
+            message: "a definition's body is one domain expression — `as` names a \
                   publication position, and a parenthesized list of named values \
                   is a row, which a value definition does not produce. Publish the \
                   columns from the caller's projection instead"
-            .to_string(),
+                .to_string(),
+        })
     })
 }
 
@@ -622,7 +625,7 @@ fn diagnose_body_naming(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// `"k": ~> v` — a bare iteration binder. Iteration derives a record or a
 /// tuple to destructure into; a bare name has no derivation, and the binder
 /// for an array of plain values is written inside brackets: `"k": ~> [v]`.
-fn diagnose_bare_iteration_binder(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_bare_iteration_binder(tokens: &[Token]) -> Option<DelightQLError> {
     for index in 0..tokens.len().saturating_sub(3) {
         let keyed = tokens[index].text.starts_with('"') && tokens[index + 1].text == ":";
         if !(keyed && tokens[index + 2].text == "~>") {
@@ -640,14 +643,13 @@ fn diagnose_bare_iteration_binder(tokens: &[Token]) -> Option<ParseDiagnosis> {
             .is_some_and(|token| matches!(token.text.as_str(), "}" | "," | ";"))
         {
             let key = &tokens[index].text;
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_ITERATION_BINDER,
+            return Some(DelightQLError::from(Parse::IterationBinder {
                 message: format!(
                     "a bare iteration binder has no derivation: `{key}: ~> {binder}` \
                      names nothing to destructure into. To bind each plain value of \
                      the array, write the binder inside brackets: `{key}: ~> [{binder}]`"
                 ),
-            });
+            }));
         }
     }
     None
@@ -657,7 +659,7 @@ fn diagnose_bare_iteration_binder(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// pattern extracts values; a qualified name would assert an equality with an
 /// existing column instead, and that is not what patterns do. The reach into
 /// a document is the path binding, spelled with a leading dot.
-fn diagnose_qualified_pattern_member(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_qualified_pattern_member(tokens: &[Token]) -> Option<DelightQLError> {
     let destructure = tokens.iter().position(|token| token.text == "~=")?;
     for index in destructure..tokens.len().saturating_sub(4) {
         let opens = matches!(tokens[index].text.as_str(), "{" | ",");
@@ -681,21 +683,20 @@ fn diagnose_qualified_pattern_member(tokens: &[Token]) -> Option<ParseDiagnosis>
         {
             let qualifier = &tokens[index + 1].text;
             let name = &tokens[index + 3].text;
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_PATTERN_QUALIFIED,
+            return Some(DelightQLError::from(Parse::PatternQualified {
                 message: format!(
                     "a pattern member cannot be qualified: a pattern extracts values, \
                      and `{qualifier}.{name}` would assert an equality with an existing \
                      column instead. Reach into the document with a path binding: \
                      `.{qualifier}.{name}` publishes `{qualifier}_{name}`, and `as` renames"
                 ),
-            });
+            }));
         }
     }
     None
 }
 
-fn diagnose_metadata_induction(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_metadata_induction(tokens: &[Token]) -> Option<DelightQLError> {
     // `"k" : ~> <key column> : ~>`. The metadata sigil admits interior
     // whitespace, so it reaches the recovery lexer as its two halves and is
     // matched here as the pair it is spelled with. The key column is a
@@ -734,15 +735,14 @@ fn diagnose_metadata_induction(tokens: &[Token]) -> Option<ParseDiagnosis> {
             .iter()
             .map(|token| token.text.as_str())
             .collect();
-        return Some(ParseDiagnosis {
-            subcategory: crate::uri_registry::subcat::PARSE_METADATA_INDUCTION,
+        return Some(DelightQLError::from(Parse::MetadataInduction {
             message: format!(
                 "a metadata group is one object per group, and `{key}: ~>` induces a \
                  table — a metadata group stands under a fixed key by its own \
                  spelling: `{key}: ~> {column}:~> {{…}}` in a PATTERN, and \
                  `{key}: {column}:~> {{…}}` in a CONSTRUCTION"
             ),
-        });
+        }));
     }
     None
 }
@@ -765,7 +765,7 @@ fn is_name_start(c: char) -> bool {
 /// Keyed on ADJACENCY, which is what makes `:{` an accessor rather than a key's
 /// colon before a record: `x:{p}` runs unbroken from the name through the
 /// close, while `"k": {p}` is a string, a colon, and a separate record.
-fn diagnose_path_variable(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_path_variable(tokens: &[Token]) -> Option<DelightQLError> {
     for index in 1..tokens.len().saturating_sub(2) {
         // The accessor's open reaches recovery whole where the lexer had it and
         // as two characters where the span was re-lexed; both are one opening.
@@ -799,14 +799,13 @@ fn diagnose_path_variable(tokens: &[Token]) -> Option<ParseDiagnosis> {
         // so there is no zero-step path to write.
         if !bracket && written.text == "." && tokens[close].text == "}" {
             let subject = &subject.text;
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_PATH_VARIABLE,
+            return Some(DelightQLError::from(Parse::PathVariable {
                 message: format!(
                     "`{subject}:{{.}}` reaches for the whole document, and the whole \
                      document is the column itself — write `{subject}`; a path reaches \
                      inside: `{subject}:{{.key}}`"
                 ),
-            });
+            }));
         }
         // A leading dot inside braces is a path being SPELLED, however badly.
         // This teaching is about the accessor's DOOR and what may stand behind
@@ -830,14 +829,13 @@ fn diagnose_path_variable(tokens: &[Token]) -> Option<ParseDiagnosis> {
                 written.text
             )
         };
-        return Some(ParseDiagnosis {
-            subcategory: crate::uri_registry::subcat::PARSE_PATH_VARIABLE,
+        return Some(DelightQLError::from(Parse::PathVariable {
             message: format!(
                 "the json accessor takes exactly one LITERAL path, and `{}` is not \
                  one — {advice}",
                 written.text
             ),
-        });
+        }));
     }
     None
 }
@@ -850,7 +848,7 @@ fn diagnose_path_variable(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// joins both have no derivation, so the refusal they deserve has no other
 /// road to the author. Counted over the author's own tokens: `!!` is one
 /// token and nothing else spells it.
-fn diagnose_dml_marker(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_dml_marker(tokens: &[Token]) -> Option<DelightQLError> {
     // The marker is GLUED to the name it marks — that is what makes it a
     // marker rather than two characters — so a `!!` standing on its own,
     // inside a blob's payload or wherever else recovery re-lexed, marks
@@ -873,13 +871,12 @@ fn diagnose_dml_marker(tokens: &[Token]) -> Option<ParseDiagnosis> {
         .map(|(index, _)| index)
         .collect();
     if marks.len() > 1 {
-        return Some(ParseDiagnosis {
-            subcategory: "dml/marker/multiple",
-            message: format!(
+        return Some(DelightQLError::from(DmlMarker::Multiple {
+    message: format!(
                 "{} relations carry the mutation marker; a statement writes to ONE —                  mark the relation being written and join the rest unmarked",
                 marks.len()
             ),
-        });
+}));
     }
     // ONE mark, and something joined before it: the marked relation is not
     // the one the chain is built from.
@@ -899,11 +896,12 @@ fn diagnose_dml_marker(tokens: &[Token]) -> Option<ParseDiagnosis> {
             }
             _ => false,
         });
-    joined_before.then(|| ParseDiagnosis {
-        subcategory: "dml/marker/mismatch",
-        message: "the mutation marker is on a relation the chain JOINS, not the one it \
+    joined_before.then(|| {
+        DelightQLError::from(DmlMarker::Mismatch {
+            message: "the mutation marker is on a relation the chain JOINS, not the one it \
                   is built from — mark the source the statement writes to and put it first"
-            .to_string(),
+                .to_string(),
+        })
     })
 }
 
@@ -912,21 +910,22 @@ fn diagnose_dml_marker(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// A target NAMES where the effect lands, and an anonymous table has no name
 /// to be — so `delete!(_(*))(*)` designates nothing. The grammar has no
 /// derivation for it; the refusal it deserves is the designator's own.
-fn diagnose_anonymous_target(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_anonymous_target(tokens: &[Token]) -> Option<DelightQLError> {
     const TERMINALS: &[&str] = &["insert", "update", "delete"];
     tokens.windows(4).find_map(|window| {
         let terminal = TERMINALS.contains(&window[0].text.as_str())
             && window[1].text == "!"
             && window[2].text == "("
             && window[3].text.starts_with("_(");
-        terminal.then(|| ParseDiagnosis {
-            subcategory: "semantic/effect/dml/target_designator",
-            message: format!(
-                "{}!'s target is a whole-table DESIGNATOR — `name(*)`, optionally \
+        terminal.then(|| {
+            DelightQLError::from(Effect::DmlTargetDesignator {
+                message: format!(
+                    "{}!'s target is a whole-table DESIGNATOR — `name(*)`, optionally \
                  namespace-qualified — naming where to write; an anonymous table names \
                  nothing and cannot be one",
-                window[0].text
-            ),
+                    window[0].text
+                ),
+            })
         })
     })
 }
@@ -935,20 +934,19 @@ fn diagnose_anonymous_target(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// two `-` operators and breaks the parse. Keyed on an ADJACENT minus
 /// pair (`a - -b` has a gap and stays silent); a pair behind an odd
 /// number of `"` is inside a string literal and stays silent too.
-fn diagnose_dash_comment(tokens: &[Token], source: &str) -> Option<ParseDiagnosis> {
+fn diagnose_dash_comment(tokens: &[Token], source: &str) -> Option<DelightQLError> {
     for pair in tokens.windows(2) {
         if pair[0].text == "-" && pair[1].text == "-" && pair[1].start == pair[0].end {
             let quotes_before = source[..pair[0].start].matches('"').count();
             if quotes_before % 2 == 1 {
                 continue; // inside a string literal — ordinary text
             }
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_COMMENT,
+            return Some(DelightQLError::from(Parse::Comment {
                 message: "`--` is not a comment in DelightQL — it lexes as two `-` \
                           operators. Line comments are `//`. (If subtraction of a \
                           negative was meant, group it: `a - (-b)`.)"
                     .to_string(),
-            });
+            }));
         }
     }
     None
@@ -958,17 +956,16 @@ fn diagnose_dash_comment(tokens: &[Token], source: &str) -> Option<ParseDiagnosi
 /// have; the spelling is `#(col desc)`. Keyed on `-` directly after the
 /// sort sigil's `(`; a minus deeper in the window (`#(0 - col)`) is
 /// arithmetic and stays silent.
-fn diagnose_sort_minus(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_sort_minus(tokens: &[Token]) -> Option<DelightQLError> {
     // `#(` is ONE token — the ordering sigil's own opener.
     for w in tokens.windows(2) {
         if w[0].text == "#(" && w[1].text == "-" {
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_SORT_MINUS,
+            return Some(DelightQLError::from(Parse::SortMinus {
                 message: "`#(-col)` is not descending sort — the spelling is \
                           `#(col desc)`, per key: `#(a desc, b)`. (Unary minus \
                           as arithmetic needs grouping: `#((0 - col))`.)"
                     .to_string(),
-            });
+            }));
         }
     }
     None
@@ -980,7 +977,7 @@ fn diagnose_sort_minus(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// DelightQL's null-safe operator, or the explicit prelude predicate — and
 /// derives nothing: no grammar production, normalization arm or lowering
 /// admits either glyph.
-fn diagnose_retired_equality(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_retired_equality(tokens: &[Token]) -> Option<DelightQLError> {
     for pair in tokens.windows(2) {
         let glued = pair[1].start == pair[0].end && pair[1].text == "=";
         if !glued {
@@ -992,21 +989,20 @@ fn diagnose_retired_equality(tokens: &[Token]) -> Option<ParseDiagnosis> {
             _ => continue,
         };
         let sigma = if glyph == "==" { "sql_eq" } else { "sql_ne" };
-        return Some(ParseDiagnosis {
-            subcategory: crate::uri_registry::subcat::PARSE_RETIRED_OPERATOR,
+        return Some(DelightQLError::from(Parse::RetiredOperator {
             message: format!(
                 "`{glyph}` is no longer DelightQL syntax; use `{delightql}` for \
                  DelightQL {predicate} or `+{sigma}(l, r)` for the target SQL \
                  operation"
             ),
-        });
+        }));
     }
     None
 }
 
 /// `col is null` / `col is not null` — SQL spelling with no DelightQL
 /// counterpart; `=` is the null-safe equality.
-fn diagnose_is_null(tokens: &[Token], source: &str) -> Option<ParseDiagnosis> {
+fn diagnose_is_null(tokens: &[Token], source: &str) -> Option<DelightQLError> {
     for (i, tok) in tokens.iter().enumerate() {
         if !tok.text.eq_ignore_ascii_case("is") {
             continue;
@@ -1023,14 +1019,13 @@ fn diagnose_is_null(tokens: &[Token], source: &str) -> Option<ParseDiagnosis> {
             if null_tok.text.eq_ignore_ascii_case("null") {
                 let written = &source[tok.start..null_tok.end];
                 let remedy = if negated { "col != null" } else { "col = null" };
-                return Some(ParseDiagnosis {
-                    subcategory: crate::uri_registry::subcat::PARSE_IS_NULL,
+                return Some(DelightQLError::from(Parse::IsNull {
                     message: format!(
                         "'{written}' is SQL, not DelightQL — there is no `is null`. \
                          `=` is the null-safe equality (IS NOT DISTINCT FROM): write \
                          `{remedy}`."
                     ),
-                });
+                }));
             }
         }
     }
@@ -1038,15 +1033,14 @@ fn diagnose_is_null(tokens: &[Token], source: &str) -> Option<ParseDiagnosis> {
 }
 
 /// `_ (…)` — the anonymous table constructor is one token.
-fn diagnose_anon_space(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_anon_space(tokens: &[Token]) -> Option<DelightQLError> {
     for pair in tokens.windows(2) {
         if pair[0].text == "_" && pair[1].text == "(" && pair[1].start > pair[0].end {
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_ANON_SPACE,
+            return Some(DelightQLError::from(Parse::AnonSpace {
                 message: "the anonymous table constructor is ONE token — no space \
                           between `_` and `(`: write `_(id @ 1)`, not `_ (id @ 1)`."
                     .to_string(),
-            });
+            }));
         }
     }
     None
@@ -1055,17 +1049,16 @@ fn diagnose_anon_space(tokens: &[Token]) -> Option<ParseDiagnosis> {
 /// `_()` — there is no empty anonymous table. The grammar wants a row
 /// inside the parens and reports a MISSING identifier, which explains
 /// nothing; the ruled reading is that the form names no relation at all.
-fn diagnose_empty_anon(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_empty_anon(tokens: &[Token]) -> Option<DelightQLError> {
     // `_(` lexes as one token — the constructor's own opener.
     for pair in tokens.windows(2) {
         if pair[0].text == "_(" && pair[1].text == ")" && pair[1].start == pair[0].end {
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_ANON_EMPTY,
+            return Some(DelightQLError::from(ParseAnon::Empty {
                 message: "there is no empty anonymous table: `_()` names no relation. \
                           The union identity is the empty relation of the matching schema; \
                           its typed spelling (`_(cols @)`) is reserved and not yet available"
                     .to_string(),
-            });
+            }));
         }
     }
     None
@@ -1097,7 +1090,7 @@ fn next_significant_index(tokens: &[Token], from: usize) -> Option<usize> {
 /// so `f(*) (*)` and `f(*)\n(*)` are the same query as `f(*)(*)` and must
 /// reach the same teaching — a byte-adjacency test would give one of them a
 /// worse error for a blank.
-fn diagnose_glob_argument(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_glob_argument(tokens: &[Token]) -> Option<DelightQLError> {
     for (index, window) in tokens.windows(3).enumerate() {
         let [open, glob, close] = window else {
             continue;
@@ -1106,15 +1099,14 @@ fn diagnose_glob_argument(tokens: &[Token]) -> Option<ParseDiagnosis> {
             continue;
         }
         if next_significant(tokens, index + 3).is_some_and(|next| next.text == "(") {
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_GLOB_ARGUMENT,
+            return Some(DelightQLError::from(Parse::GlobArgument {
                 message: "a bare `*` is not a higher-order argument: with a second \
                           group the left one supplies parameters, and `*` names no \
                           relation for one to bind. Supply the relation itself — \
                           `f(users(*))(*)` — or land it with `@`. With ONE group, \
                           `f(*)` is ordinary access."
                     .to_string(),
-            });
+            }));
         }
     }
     None
@@ -1137,7 +1129,7 @@ const RELATION_CONNECTIVES: &[&str] = &["|;|", "||", "|>"];
 /// which no interior can open with, or a second group follows it.
 /// Recovery may leave the second group outside the form it attributes the
 /// failure to, so the first proof does not depend on the tail being read.
-fn diagnose_compound_relation_actual(tokens: &[Token]) -> Option<ParseDiagnosis> {
+fn diagnose_compound_relation_actual(tokens: &[Token]) -> Option<DelightQLError> {
     let before = depths(tokens);
     for (open, window) in tokens.windows(2).enumerate() {
         let [name, paren] = window else {
@@ -1166,8 +1158,7 @@ fn diagnose_compound_relation_actual(tokens: &[Token]) -> Option<ParseDiagnosis>
         let second_group = close < tokens.len()
             && next_significant(tokens, close + 1).is_some_and(|next| next.text == "(");
         if opens_with_a_relation || second_group {
-            return Some(ParseDiagnosis {
-                subcategory: crate::uri_registry::subcat::PARSE_HO_RELATION_ACTUAL,
+            return Some(DelightQLError::from(Parse::HoRelationActual {
                 message: format!(
                     "a higher-order argument is one closed relation value: a set \
                      expression, pipeline, or join has no derivation inside `{}(…)`. \
@@ -1175,7 +1166,7 @@ fn diagnose_compound_relation_actual(tokens: &[Token]) -> Option<ParseDiagnosis>
                      access, `{}(name(*))(*)`.",
                     name.text, name.text
                 ),
-            });
+            }));
         }
     }
     None
@@ -1191,44 +1182,99 @@ fn is_name(token: &Token) -> bool {
         && token.text != "_"
 }
 
-/// Two infix operators in one ungrouped expression window — the PONY
-/// rule: DelightQL has no operator precedence, so `a * b + c` has no
-/// reading; every composition is parenthesized explicitly.
-fn diagnose_pony(tokens: &[Token]) -> Option<ParseDiagnosis> {
-    let is_op = |t: &Token| INFIX_OPS.contains(&t.text.as_str());
-    let breaks = |t: &Token| WINDOW_BREAKERS.contains(&t.text.as_str());
-    let operandish = |t: &Token| !is_op(t) && !breaks(t);
+/// The PONY rule at the value tier: DelightQL has no operator precedence,
+/// so `a * b + c` has no reading; every composition is parenthesized
+/// explicitly. The connective tier has no token reader: a run mixing `and`
+/// with `or` is recognized by the grammar as its refusal witness wherever a
+/// truth stands, and normalization refuses it with this same identity.
+fn diagnose_pony(tokens: &[Token]) -> Option<DelightQLError> {
+    diagnose_mixed_operators(tokens)
+}
 
-    for i in 1..tokens.len() {
-        if !is_op(&tokens[i]) || !operandish(&tokens[i - 1]) {
+/// Two infix operators in one ungrouped expression window.
+///
+/// The window is read by depth exactly as the connective tier's is: a group
+/// opened inside it — an argument row, an anonymous table, a parenthesized
+/// operand — is ONE operand of the window, and its own tokens are a window of
+/// their own. So `1 + min:(iter / 7, 4)` composes nothing, while
+/// `(a + b) * c + d` does.
+fn diagnose_mixed_operators(tokens: &[Token]) -> Option<DelightQLError> {
+    #[derive(Clone, Copy, Default)]
+    struct Window {
+        /// The first binary operator of the window, once an operand precedes
+        /// one.
+        first: Option<usize>,
+        /// Whether an operand has followed `first`.
+        operand_after_first: bool,
+        /// Whether the last item at this depth was an operand.
+        prev_operand: bool,
+    }
+    let is_op = |t: &Token| INFIX_OPS.contains(&t.text.as_str());
+    let breaks = |t: &Token| WINDOW_BREAKERS.contains(&t.text.as_str()) || is_connective(t);
+    let opens = |t: &Token| OPENERS.contains(&t.text.as_str());
+    // What may stand after a binary operator: an operand token or a group.
+    let operand_follows = |index: usize| {
+        tokens
+            .get(index)
+            .is_some_and(|t| opens(t) || (!is_op(t) && !breaks(t)))
+    };
+    let mark_operand = |window: &mut Window| {
+        window.prev_operand = true;
+        if window.first.is_some() {
+            window.operand_after_first = true;
+        }
+    };
+
+    let before = depths(tokens);
+    let mut windows: Vec<Window> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let Ok(depth) = usize::try_from(before[index]) else {
+            windows.clear();
+            continue;
+        };
+        if token.text == ")" {
+            // The group closes: its interior window ends, and the group is
+            // one operand of the window it stood in.
+            windows.truncate(depth);
+            if let Some(outer) = depth.checked_sub(1).and_then(|d| windows.get_mut(d)) {
+                mark_operand(outer);
+            }
             continue;
         }
-        // Walk forward inside the window looking for a second operator.
-        let mut j = i + 1;
-        let mut saw_operand = false;
-        while j < tokens.len() {
-            let t = &tokens[j];
-            if breaks(t) {
-                break; // window ends — grouped or a different clause
-            }
-            if is_op(t) {
-                if saw_operand && tokens.get(j + 1).is_some_and(operandish) {
-                    let (a, b) = (&tokens[i].text, &t.text);
-                    return Some(ParseDiagnosis {
-                        subcategory: crate::uri_registry::subcat::PARSE_PONY,
+        if windows.len() <= depth {
+            windows.resize(depth + 1, Window::default());
+        }
+        if opens(token) {
+            windows.truncate(depth + 1);
+            continue;
+        }
+        if breaks(token) {
+            windows[depth] = Window::default();
+            continue;
+        }
+        let window = &mut windows[depth];
+        if is_op(token) {
+            if let Some(first) = window.first {
+                if window.operand_after_first && operand_follows(index + 1) {
+                    let (a, b) = (&tokens[first].text, &token.text);
+                    return Some(DelightQLError::from(Parse::Pony {
                         message: format!(
                             "mixed operators `{a}` and `{b}` without grouping: \
                              DelightQL has NO operator precedence (no PEMDAS), so \
                              the expression has no reading. Parenthesize every \
                              composition: `((a {a} b) {b} c)` or `(a {a} (b {b} c))`."
                         ),
-                    });
+                    }));
                 }
-                break; // consecutive ops or op-then-breaker: not the pattern
             }
-            saw_operand = true;
-            j += 1;
+            // A binary operator follows an operand; a leading or repeated
+            // operator is a sign, not a composition.
+            window.first = window.prev_operand.then_some(index);
+            window.operand_after_first = false;
+            window.prev_operand = false;
+            continue;
         }
+        mark_operand(window);
     }
     None
 }
@@ -1237,20 +1283,69 @@ fn diagnose_pony(tokens: &[Token]) -> Option<ParseDiagnosis> {
 mod tests {
     use super::*;
 
-    fn subcategory(source: &str) -> Option<&'static str> {
+    /// The diagnosed identity's hierarchy under `parse/` (or whole, for a
+    /// teaching that names another family's identity).
+    fn subcategory(source: &str) -> Option<String> {
         let mut parser = crate::pipeline::syntax::Parser::new();
         let tree = parser.parse_prompt(source);
-        diagnose(&tree.tokens(), tree.source()).map(|d| d.subcategory)
+        diagnose(&tree.tokens(), tree.source()).map(|d| {
+            let hierarchy = d.id().hierarchy();
+            hierarchy
+                .strip_prefix("parse/")
+                .unwrap_or(&hierarchy)
+                .to_string()
+        })
     }
 
     #[test]
     fn pony_fires_on_mixed_operators() {
-        assert_eq!(subcategory("_(x @ 1), x * 2 + 1 = 3"), Some("pony"));
+        assert_eq!(
+            subcategory("_(x @ 1), x * 2 + 1 = 3").as_deref(),
+            Some("pony")
+        );
     }
 
     #[test]
     fn pony_silent_on_grouped_and_on_glob() {
-        assert_ne!(subcategory("users(*), x is null"), Some("pony"));
+        assert_ne!(subcategory("users(*), x is null").as_deref(), Some("pony"));
+    }
+
+    /// A GROUP IS ONE OPERAND OF ITS WINDOW. An argument row opened inside an
+    /// expression is its own window, so `1 + min:(iter / 7, 4)` composes
+    /// nothing; and a parenthesized operand counts as the operand before the
+    /// next operator, so `(a + b) * c + d` is the mixture it looks like.
+    #[test]
+    fn pony_reads_operator_windows_by_depth() {
+        assert_ne!(
+            subcategory("_(x @ 1), y = 1 + min:(x / 7, 4)").as_deref(),
+            Some("pony")
+        );
+        assert_ne!(
+            subcategory("_(x @ 1), y = (x + 1) * 2").as_deref(),
+            Some("pony")
+        );
+        assert_eq!(
+            subcategory("_(x @ 1), y = (x + 1) * 2 + 3").as_deref(),
+            Some("pony")
+        );
+        assert_eq!(
+            subcategory("_(x @ 1), y = 1 + min:(x / 7 * 2, 4)").as_deref(),
+            Some("pony")
+        );
+    }
+
+    /// A connective ends the VALUE tier's window: a comparison on each side
+    /// of `and` is not two operators composed.
+    #[test]
+    fn pony_silent_on_one_comparison_per_conjunct() {
+        assert_ne!(
+            subcategory("users(*), a > 1 and b < 2").as_deref(),
+            Some("pony")
+        );
+        assert_eq!(
+            subcategory("users(*), a + 1 > 2 and b < 2").as_deref(),
+            Some("pony")
+        );
     }
 
     /// The retired glyphs are diagnosed from token ADJACENCY, so a spaced
@@ -1258,28 +1353,37 @@ mod tests {
     /// mistaken for them.
     #[test]
     fn retired_equality_glyphs_teach_both_roads() {
-        assert_eq!(subcategory("users(*), a == 1"), Some("retired_operator"));
-        assert_eq!(subcategory("users(*), a !== 1"), Some("retired_operator"));
-        assert_eq!(subcategory("users(*), a = 1"), None);
-        assert_eq!(subcategory("users(*), a != 1"), None);
-        assert_eq!(subcategory("users(*), +sql_eq(a, 1)"), None);
+        assert_eq!(
+            subcategory("users(*), a == 1").as_deref(),
+            Some("retired_operator")
+        );
+        assert_eq!(
+            subcategory("users(*), a !== 1").as_deref(),
+            Some("retired_operator")
+        );
+        assert_eq!(subcategory("users(*), a = 1").as_deref(), None);
+        assert_eq!(subcategory("users(*), a != 1").as_deref(), None);
+        assert_eq!(subcategory("users(*), +sql_eq(a, 1)").as_deref(), None);
         let mut parser = crate::pipeline::syntax::Parser::new();
         let tree = parser.parse_prompt("users(*), a == 1");
         let found = diagnose(&tree.tokens(), tree.source()).expect("diagnosed");
-        assert!(found.message.contains("`=` for DelightQL equality"));
-        assert!(found.message.contains("`+sql_eq(l, r)`"));
+        assert!(found.to_string().contains("`=` for DelightQL equality"));
+        assert!(found.to_string().contains("`+sql_eq(l, r)`"));
         let tree = parser.parse_prompt("users(*), a !== 1");
         let found = diagnose(&tree.tokens(), tree.source()).expect("diagnosed");
-        assert!(found.message.contains("`!=` for DelightQL inequality"));
-        assert!(found.message.contains("`+sql_ne(l, r)`"));
+        assert!(found.to_string().contains("`!=` for DelightQL inequality"));
+        assert!(found.to_string().contains("`+sql_ne(l, r)`"));
     }
 
     /// The three bare-glob spellings, told apart by how many groups follow
     /// the name rather than by what stands inside one.
     #[test]
     fn glob_argument_fires_only_with_a_second_group() {
-        assert_eq!(subcategory("users(*)(*)"), Some("glob_argument"));
-        assert_eq!(subcategory("users(*)(id)"), Some("glob_argument"));
+        assert_eq!(subcategory("users(*)(*)").as_deref(), Some("glob_argument"));
+        assert_eq!(
+            subcategory("users(*)(id)").as_deref(),
+            Some("glob_argument")
+        );
     }
 
     /// A compound relation expression in a higher-order argument list: read
@@ -1290,24 +1394,33 @@ mod tests {
     fn a_compound_relation_actual_teaches_binding_first() {
         assert_eq!(
             subcategory("f(_(x, y @ 1, 10) |;| _(x, y @ 2, 20))(*)"),
-            Some("ho/relation_actual")
+            Some("ho/relation_actual".to_string())
         );
         assert_eq!(
             subcategory("f(a(*) || b(*))(*)"),
-            Some("ho/relation_actual")
+            Some("ho/relation_actual".to_string())
         );
-        assert_eq!(subcategory("f(a(*) |> (x))(*)"), Some("ho/relation_actual"));
+        assert_eq!(
+            subcategory("f(a(*) |> (x))(*)"),
+            Some("ho/relation_actual".to_string())
+        );
         // An interior's own continuation is not an argument list.
         assert_ne!(
             subcategory("f(, x > 1 |;| g(*))"),
-            Some("ho/relation_actual")
+            Some("ho/relation_actual".to_string())
         );
         // Two arguments are two closed values.
-        assert_ne!(subcategory("f(a(*), b(*))(*)"), Some("ho/relation_actual"));
+        assert_ne!(
+            subcategory("f(a(*), b(*))(*)"),
+            Some("ho/relation_actual".to_string())
+        );
         // ONE group is access, and access admits the glob.
-        assert_eq!(subcategory("users(*)"), None);
+        assert_eq!(subcategory("users(*)").as_deref(), None);
         // A relation supplied AS a relation is not this shape.
-        assert_ne!(subcategory("f(users(*))(*)"), Some("glob_argument"));
+        assert_ne!(
+            subcategory("f(users(*))(*)"),
+            Some("glob_argument".to_string())
+        );
     }
 
     /// One authored spelling per kind the grammar declares EXTRA. The kinds
@@ -1341,7 +1454,7 @@ mod tests {
         for between in [" ", "  \t ", "\n", "\n\n  "] {
             assert_eq!(
                 subcategory(&format!("users(*){between}(*)")),
-                Some("glob_argument"),
+                Some("glob_argument".to_string()),
                 "whitespace changed the teaching: {between:?}"
             );
         }
@@ -1349,7 +1462,7 @@ mod tests {
             for between in *spellings {
                 assert_eq!(
                     subcategory(&format!("users(*){between}(*)")),
-                    Some("glob_argument"),
+                    Some("glob_argument".to_string()),
                     "the {kind} extra changed the teaching: {between:?}"
                 );
             }
@@ -1363,17 +1476,23 @@ mod tests {
     fn only_extras_are_stepped_over() {
         // A separator is not an extra: it makes these different queries, and
         // neither is the two-group shape.
-        assert_ne!(subcategory("users(*), (id)"), Some("glob_argument"));
-        assert_ne!(subcategory("users(*) |> (id)"), Some("glob_argument"));
+        assert_ne!(
+            subcategory("users(*), (id)").as_deref(),
+            Some("glob_argument")
+        );
+        assert_ne!(
+            subcategory("users(*) |> (id)").as_deref(),
+            Some("glob_argument")
+        );
         // An unterminated delimited extra runs to the end of the text, so no
         // second group stands after it to find.
         assert_ne!(
             subcategory("users(*) (/* unclosed (*)"),
-            Some("glob_argument")
+            Some("glob_argument".to_string())
         );
         assert_ne!(
             subcategory("users(*) (/! unclosed (*)"),
-            Some("glob_argument")
+            Some("glob_argument".to_string())
         );
     }
 
@@ -1383,15 +1502,18 @@ mod tests {
     fn head_computes_fires_on_a_call_in_a_head() {
         assert_eq!(
             subcategory("h(count:(a)) : _(a @ 1)"),
-            Some("head_computes")
+            Some("head_computes".to_string())
         );
         // A CFE head opens with `:(` and lawfully declares callables.
         assert_ne!(
             subcategory("transform_both:(f:(), col1, col2) : (col1 /-> f:() as x, col2)"),
-            Some("head_computes")
+            Some("head_computes".to_string())
         );
         // A plain listed head is not this shape, whatever else failed.
-        assert_ne!(subcategory("h(a, b) : _(a @ 1"), Some("head_computes"));
+        assert_ne!(
+            subcategory("h(a, b) : _(a @ 1"),
+            Some("head_computes".to_string())
+        );
     }
 
     /// Comma constructs relational compounds; a value position composes with
@@ -1400,10 +1522,13 @@ mod tests {
     fn comma_compound_value_fires_when_the_compound_is_named() {
         assert_eq!(
             subcategory(r#"people(*) |> +((age > 30, city = "Boston") as t)"#),
-            Some("sigil")
+            Some("sigil".to_string())
         );
         // A single comparison named is not the compound.
-        assert_ne!(subcategory("people(*) |> +((age > 30) as t"), Some("sigil"));
+        assert_ne!(
+            subcategory("people(*) |> +((age > 30) as t"),
+            Some("sigil".to_string())
+        );
     }
 
     /// The one-group lift tail refuses toward the access group; a two-group
@@ -1411,13 +1536,13 @@ mod tests {
     #[test]
     fn lift_tail_fires_only_with_one_group() {
         assert_eq!(
-            subcategory(r#"json_each("[7,8]", "$" & value, type)"#),
+            subcategory(r#"json_each("[7,8]", "$" & value, type)"#).as_deref(),
             Some("lift_tail")
         );
         // A second group makes the left one an ho_part, where `&` is lawful;
         // whatever else fails, it is not this teaching.
         assert_ne!(
-            subcategory(r#"args(1, 100; 2, 200 & 1, "x"; 2, "y")(*)"#),
+            subcategory(r#"args(1, 100; 2, 200 & 1, "x"; 2, "y")(*)"#).as_deref(),
             Some("lift_tail")
         );
     }
@@ -1427,7 +1552,7 @@ mod tests {
     fn body_naming_fires_on_a_named_row_body() {
         assert_eq!(
             subcategory("t:(f:(), a, b) : (a /-> f:() as x, b /-> f:() as y)"),
-            Some("value_naming")
+            Some("value_naming".to_string())
         );
     }
 
@@ -1436,44 +1561,56 @@ mod tests {
     #[test]
     fn whole_document_path_teaches_the_bare_column() {
         assert_eq!(
-            subcategory(r#"_(a @ 1) |> ({"a": a:{.}})"#),
+            subcategory(r#"_(a @ 1) |> ({"a": a:{.}})"#).as_deref(),
             Some("path_variable")
         );
     }
 
     #[test]
     fn is_null_fires_and_teaches_negation() {
-        assert_eq!(subcategory("_(x @ 1), x is null"), Some("is_null"));
-        assert_eq!(subcategory("_(x @ 1), x is not null"), Some("is_null"));
+        assert_eq!(
+            subcategory("_(x @ 1), x is null").as_deref(),
+            Some("is_null")
+        );
+        assert_eq!(
+            subcategory("_(x @ 1), x is not null").as_deref(),
+            Some("is_null")
+        );
     }
 
     #[test]
     fn anon_space_fires() {
-        assert_eq!(subcategory("_ (x @ 1)"), Some("anon_space"));
+        assert_eq!(subcategory("_ (x @ 1)").as_deref(), Some("anon_space"));
     }
 
     #[test]
     fn empty_anon_fires_and_leaves_inhabited_ones_alone() {
-        assert_eq!(subcategory("_(1) |;| _()"), Some("anon/empty"));
-        assert_eq!(subcategory("_()"), Some("anon/empty"));
+        assert_eq!(subcategory("_(1) |;| _()").as_deref(), Some("anon/empty"));
+        assert_eq!(subcategory("_()").as_deref(), Some("anon/empty"));
         // A row makes it a relation; whatever else fails here, it is not this.
-        assert_ne!(subcategory("_(x @ 1) |;| _(x @"), Some("anon/empty"));
+        assert_ne!(
+            subcategory("_(x @ 1) |;| _(x @"),
+            Some("anon/empty".to_string())
+        );
     }
 
     #[test]
     fn dash_comment_fires_trailing_and_leading() {
         assert_eq!(
-            subcategory("_(x @ 1), # < 1 -- trailing note"),
+            subcategory("_(x @ 1), # < 1 -- trailing note").as_deref(),
             Some("comment")
         );
-        assert_eq!(subcategory("-- a comment\n_(x @ 1"), Some("comment"));
+        assert_eq!(
+            subcategory("-- a comment\n_(x @ 1"),
+            Some("comment".to_string())
+        );
     }
 
     #[test]
     fn retired_assertion_annotation_teaches_the_effect_form() {
         assert_eq!(
             subcategory("_(x @ 1) (~~assert |> exists(*) ~~)"),
-            Some("assertion/retired")
+            Some("assertion/retired".to_string())
         );
     }
 
@@ -1482,29 +1619,41 @@ mod tests {
         // The comment's prose contains an is_null shape and a PONY shape;
         // the comment diagnosis must win — the prose is not the query.
         assert_eq!(
-            subcategory("_(x @ 1), # < 1 -- check x is null"),
+            subcategory("_(x @ 1), # < 1 -- check x is null").as_deref(),
             Some("comment")
         );
         assert_eq!(
-            subcategory("_(x @ 1), # < 1 -- was x * 2 + 1"),
+            subcategory("_(x @ 1), # < 1 -- was x * 2 + 1").as_deref(),
             Some("comment")
         );
     }
 
     #[test]
     fn sort_minus_fires_and_arithmetic_stays_silent() {
-        assert_eq!(subcategory("_(x @ 1) |> #(-x)"), Some("sort_minus"));
+        assert_eq!(
+            subcategory("_(x @ 1) |> #(-x)").as_deref(),
+            Some("sort_minus")
+        );
         // minus deeper in the window is arithmetic, not descending intent
-        assert_ne!(subcategory("_(x @ 1) |> #(0 - x) is"), Some("sort_minus"));
+        assert_ne!(
+            subcategory("_(x @ 1) |> #(0 - x) is").as_deref(),
+            Some("sort_minus")
+        );
     }
 
     #[test]
     fn dash_comment_silent_on_gap_and_inside_string() {
         // `- -` with a gap is subtraction of a negative, not a comment.
-        assert_ne!(subcategory("_(x @ 1), x - - 1 = 3"), Some("comment"));
+        assert_ne!(
+            subcategory("_(x @ 1), x - - 1 = 3").as_deref(),
+            Some("comment")
+        );
         // `--` inside a string literal is ordinary text; the real mistake
         // here is `is null` and that diagnosis must still win.
-        assert_eq!(subcategory("_(s @ \"a--b\"), s is null"), Some("is_null"));
+        assert_eq!(
+            subcategory("_(s @ \"a--b\"), s is null").as_deref(),
+            Some("is_null")
+        );
     }
 
     #[test]
@@ -1524,9 +1673,12 @@ mod tests {
         // positions: the `--` pair is still adjacent, the `#(-` window
         // still matches.
         assert_eq!(
-            subcategory("_(x @ \"café\"), # < 1 -- note"),
+            subcategory("_(x @ \"café\"), # < 1 -- note").as_deref(),
             Some("comment")
         );
-        assert_eq!(subcategory("_(x @ \"café\") |> #(-x)"), Some("sort_minus"));
+        assert_eq!(
+            subcategory("_(x @ \"café\") |> #(-x)").as_deref(),
+            Some("sort_minus")
+        );
     }
 }

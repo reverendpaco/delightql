@@ -64,7 +64,7 @@ pub use patterns::{
 };
 pub use pipes::{DestructureMapping, DestructureMode};
 pub use references::{NamedReference, Reference};
-pub use relational::{GroundMention, InnerRelationPattern, Relation};
+pub use relational::{DeferredItem, GroundMention, InnerRelationPattern, Relation};
 pub use spreads::{Glob, RegexSelector, RenameSource, SelectorItem, Spread};
 pub use truth::{
     ArgumentValue, Comparison, Existence, Membership, MembershipSource, Polarity, Probe,

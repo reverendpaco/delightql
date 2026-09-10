@@ -30,12 +30,12 @@
 //! definition file and an argumentative query in a query sequence — identical
 //! bytes — so nothing here guesses.
 
+use crate::diagnostic::{ErrorSelector, Internal, Parse};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::{DangerSpec, InlineDdlSpec, OptionSpec, Query, Unresolved};
 use crate::pipeline::asts::ddl::ClauseDecl;
 use crate::pipeline::query_features::{FeatureCollector, HoParamBindings};
 use crate::pipeline::syntax::{cst, SyntaxTree, TypedNode};
-use crate::pipeline::verdict::ExpectedError;
 use std::rc::Rc;
 
 mod definitions;
@@ -88,7 +88,7 @@ pub struct Sidecars {
     pub ddl_blocks: Vec<InlineDdlSpec>,
     /// The error this form declares it expects. One per form: two would be
     /// two claims about one outcome.
-    pub expected_error: Option<ExpectedError>,
+    pub expected_error: Option<ErrorSelector>,
 }
 
 impl Sidecars {
@@ -249,9 +249,10 @@ pub fn submission(tree: &SyntaxTree, registry: Rc<crate::names::Registry>) -> Re
         crate::pipeline::syntax::Root::QuerySequence => query_sequence(tree, registry),
         crate::pipeline::syntax::Root::DefinitionFile => definition_file(tree, registry),
         // A companion cell is a column's, never a submission's.
-        crate::pipeline::syntax::Root::CompanionCell => Err(
-            crate::error::DelightQLError::parse_error("a companion cell is not a submission"),
-        ),
+        crate::pipeline::syntax::Root::CompanionCell => Err(Internal::invariant(
+            "normalize",
+            "a companion cell is not a submission",
+        )),
     }
 }
 
@@ -306,7 +307,7 @@ pub(crate) struct Normalizer<'t> {
     /// The error hook the form under construction has declared, waiting for
     /// that form to finish. A hook decorates a POSITION, and the form it
     /// stands in is what claims it.
-    pending_error: Option<ExpectedError>,
+    pending_error: Option<ErrorSelector>,
     /// The authored spelling of the relational term the chain currently ends
     /// in. An edge SELECTS by exactly those bytes — IDENTITY IS THE CANONICAL
     /// SPELLING — and the built relation cannot hand them back: an interior
@@ -482,10 +483,13 @@ impl<'t> Normalizer<'t> {
             // branch means the selector and the parse disagree, which is a
             // façade defect rather than an authoring mistake.
             (_, branch) => {
-                return Err(DelightQLError::parse_error(format!(
-                    "the {entrance:?} entrance parsed a {} root",
-                    branch_name(branch)
-                )))
+                return Err(Internal::invariant(
+                    "normalize",
+                    format!(
+                        "the {entrance:?} entrance parsed a {} root",
+                        branch_name(branch)
+                    ),
+                ))
             }
         }
         Ok(())
@@ -628,7 +632,10 @@ impl<'t> Normalizer<'t> {
     /// a parse this normalizer should never have been handed.
     pub(crate) fn require<T>(&self, slot: Option<T>, what: &str) -> Result<T> {
         slot.ok_or_else(|| {
-            DelightQLError::parse_error(format!("the grammar requires {what}, and it is absent"))
+            Internal::invariant(
+                "normalize",
+                format!("the grammar requires {what}, and it is absent"),
+            )
         })
     }
 }
@@ -650,13 +657,15 @@ impl<'t> Normalizer<'t> {
 pub(crate) fn declared_error_within(
     tree: &SyntaxTree,
     span: &std::ops::Range<usize>,
-) -> Option<ExpectedError> {
+) -> Result<Option<ErrorSelector>> {
     let mut found = None;
     for any in crate::pipeline::syntax::walk(tree) {
         if any.typed_kind() != Some(cst::Kind::ErrorAnnotation) {
             continue;
         }
-        let hook = cst::ErrorAnnotation::cast(any.node())?;
+        let Some(hook) = cst::ErrorAnnotation::cast(any.node()) else {
+            return Ok(None);
+        };
         // A hook recovery had to REPAIR is not the hook the author wrote.
         // `(~~error nonsense ~~)` recovers as an `error_annotation` whose URI
         // is absent — which is the BARE hook's shape, and the bare hook
@@ -675,23 +684,39 @@ pub(crate) fn declared_error_within(
         // normalizer's; here a second one only means this reader cannot say
         // which was meant, so it says nothing.
         if found.is_some() {
-            return None;
+            return Ok(None);
         }
-        found = Some(ExpectedError {
-            uri_segments: match hook.uri() {
-                None => Vec::new(),
-                Some(uri) => uri
-                    .children()
-                    .map(|segment| tree.text(segment).to_string())
-                    .collect(),
-            },
-        });
+        let segments: Vec<String> = match hook.uri() {
+            None => Vec::new(),
+            Some(uri) => uri
+                .children()
+                .map(|segment| tree.text(segment).to_string())
+                .collect(),
+        };
+        found = Some(selector_of(&segments)?);
     }
     // A hook standing INSIDE the span recovery could not read has no typed
     // node left to cast — and that is exactly the query whose refusal
     // arrived before the hook was reached. What the author typed is still
     // there in the bytes, read within the same extent.
-    found.or_else(|| declared_error_after_recovery(tree, span))
+    match found {
+        Some(selector) => Ok(Some(selector)),
+        None => declared_error_after_recovery(tree, span),
+    }
+}
+
+/// The selector an authored hook denotes, validated against the declared
+/// hierarchy. An unknown DelightQL-owned path is a typo and refuses: a hook
+/// that could never match would otherwise sit silently beside the query it
+/// was meant to judge.
+pub(crate) fn selector_of(segments: &[String]) -> Result<ErrorSelector> {
+    let borrowed: Vec<&str> = segments.iter().map(String::as_str).collect();
+    crate::diagnostic::selector(&borrowed).map_err(|refusal| {
+        Parse::ErrorHookUnknown {
+            message: format!("the expected-error hook names no known error: {refusal}"),
+        }
+        .into()
+    })
 }
 
 /// The declaration, read off the author's own bytes, inside ONE query's
@@ -712,11 +737,11 @@ pub(crate) fn declared_error_within(
 fn declared_error_after_recovery(
     tree: &SyntaxTree,
     span: &std::ops::Range<usize>,
-) -> Option<ExpectedError> {
+) -> Result<Option<ErrorSelector>> {
     const OPEN: &str = "(~~error";
     const CLOSE: &str = "~~)";
     let source = tree.source();
-    let mut found: Option<ExpectedError> = None;
+    let mut found: Option<ErrorSelector> = None;
     for token in tree.tokens() {
         if token.start < span.start || !source[token.start..].starts_with(OPEN) {
             continue;
@@ -741,11 +766,11 @@ fn declared_error_after_recovery(
         // ONE GOAL DECLARES ONE EXPECTED ERROR; a second means this reader
         // cannot say which was meant.
         if found.is_some() {
-            return None;
+            return Ok(None);
         }
-        found = Some(ExpectedError { uri_segments });
+        found = Some(selector_of(&uri_segments)?);
     }
-    found
+    Ok(found)
 }
 
 /// What an error hook's body says, held to what the grammar admits there.
@@ -830,11 +855,10 @@ impl Deferred {
 /// whole-surface measurement groups by it, and nothing can mint a deferral
 /// the inventory has not already named.
 pub(crate) fn gap(family: Deferred, detail: impl std::fmt::Display) -> DelightQLError {
-    DelightQLError::parse_error_categorized(
-        "normalize/gap",
-        format!(
+    DelightQLError::from(Parse::NormalizeGap {
+        message: format!(
             "{}: {detail} is admitted by the grammar and has no carrier yet",
             family.family()
         ),
-    )
+    })
 }

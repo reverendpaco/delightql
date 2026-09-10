@@ -36,11 +36,11 @@ fn arm_of(
         .collect();
     registry
         .authority()
-        .derive(RelForm::Anonymous(AnonymousSpec {
-            shape: AnonymousShape::Tabular,
-            slots: &slots,
-            answers_to: None,
-        }))
+        .derive(RelForm::Anonymous(AnonymousSpec::plain(
+            AnonymousShape::Tabular,
+            &slots,
+            None,
+        )))
         .expect("an anonymous relation is built")
 }
 
@@ -75,7 +75,6 @@ fn embed_of(
             input,
             why: crate::relation::form::ProjectWhy::Stage,
             slots: &slots,
-            dependencies: &[],
         }))
         .expect("an embed over a built relation")
 }
@@ -570,7 +569,797 @@ fn exact_continuation_distinguishes_a_same_heading_sibling() {
     );
 }
 
-/// A MINUS BINDS THROUGH THE SAME AUTHORITY.
+/// TWO READS OF ONE SOURCE NEVER ANSWER FOR EACH OTHER AT A SQL SITE.
+///
+/// A fresh read of a definition is its own occurrence: its site answers
+/// its own positions and the positions construction carried into them,
+/// and nothing else. A sibling read of the same source, and a rebuild that
+/// replaced the source, are not realized at that site, whatever they share
+/// with it. The lawful directed roads stay: a rebuild's site answers the
+/// position it replaced, and a read's site answers the source position it
+/// carries.
+#[test]
+fn a_fresh_read_never_answers_for_a_sibling_read_or_a_rebuild_of_its_source() {
+    let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let source = arm(&registry, &["v"]);
+    let rebuilt = export_of(&registry, source);
+    registry
+        .authority()
+        .report_replacement_for_test(source, rebuilt)
+        .expect("an export carries every position of its operand");
+    let instance = |registry: &crate::relation::Planning| {
+        registry
+            .authority()
+            .derive(RelForm::Instantiate(crate::relation::form::InstanceSpec {
+                kind: crate::relation::form::DefinitionKind::Cte,
+                template: source,
+                answers_to: None,
+            }))
+            .expect("a fresh read of the source")
+    };
+    let outer = instance(&registry);
+    let inner = instance(&registry);
+    let port_of = |relation: &SemanticRelation| {
+        crate::relation::published_ports(&registry, relation).expect("one position")[0]
+    };
+    let (source_port, rebuilt_port, outer_port, inner_port) = (
+        port_of(&source),
+        port_of(&rebuilt),
+        port_of(&outer),
+        port_of(&inner),
+    );
+    assert_ne!(outer_port, inner_port, "two reads publish two occurrences");
+
+    let names = registry.names();
+    let sealed = registry.seal();
+    let bindings = names.bindings();
+    let inner_site = bindings
+        .bind_interface(&sealed, &inner)
+        .expect("the inner read emits its own interface");
+    let rebuilt_site = bindings
+        .bind_interface(&sealed, &rebuilt)
+        .expect("the rebuild emits its own interface");
+
+    assert_eq!(
+        bindings
+            .at(inner_site, inner_port)
+            .expect("a site answers its own position"),
+        inner_port.column()
+    );
+    assert!(
+        bindings.at(inner_site, outer_port).is_err(),
+        "the inner read's site must not answer the outer read's occurrence"
+    );
+    assert!(
+        bindings.at(inner_site, rebuilt_port).is_err(),
+        "the inner read's site must not answer a rebuild of its source"
+    );
+    assert_eq!(
+        bindings
+            .at(rebuilt_site, source_port)
+            .expect("a rebuild answers what it replaced"),
+        rebuilt_port.column(),
+        "the directed replacement translation stands"
+    );
+    assert!(
+        bindings.at(rebuilt_site, outer_port).is_err()
+            && bindings.at(rebuilt_site, inner_port).is_err(),
+        "a rebuild of the source answers for neither read of it"
+    );
+}
+
+/// A fresh read of one source, through the one instantiating act.
+fn read_of(registry: &crate::relation::Planning, source: SemanticRelation) -> SemanticRelation {
+    registry
+        .authority()
+        .derive(RelForm::Instantiate(crate::relation::form::InstanceSpec {
+            kind: crate::relation::form::DefinitionKind::Cte,
+            template: source,
+            answers_to: None,
+        }))
+        .expect("a fresh read of the source")
+}
+
+/// The one position a single-column relation publishes.
+fn only_port(
+    registry: &crate::relation::Planning,
+    relation: &SemanticRelation,
+) -> crate::relation::PortId {
+    crate::relation::published_ports(registry, relation).expect("one position")[0]
+}
+
+/// A chain publishing a relation, the way a rebuild receives its operands.
+fn chain_over(
+    registry: &crate::relation::Planning,
+    relation: SemanticRelation,
+) -> crate::pipeline::asts::core::Chain<crate::pipeline::asts::core::Refined> {
+    registry
+        .authority()
+        .ground_read::<crate::pipeline::asts::core::Refined>(
+            crate::pipeline::asts::core::Access::All,
+            false,
+            relation,
+        )
+        .expect("a chain reading the relation")
+}
+
+/// A correspondence merging one position of each side.
+fn merging(
+    left: crate::relation::PortId,
+    right: crate::relation::PortId,
+) -> crate::pipeline::asts::core::MemberCorrelation<crate::pipeline::asts::core::Refined> {
+    crate::pipeline::asts::core::MemberCorrelation::Correspond(
+        crate::pipeline::asts::core::Correspondence::new(vec![crate::relation::form::MergedKey {
+            left,
+            right,
+        }]),
+    )
+}
+
+/// A REBUILD CERTIFIES ONLY WHAT IT DERIVED OVER WHAT ITS OPERAND STANDS ON.
+///
+/// Two joins of three reads of one source, `A+B` and `A+C`, genuinely share
+/// the occurrence `A`. A rebuild opened over `A+B`'s own occurrences cannot
+/// be driven to join `C`, cannot be closed on a product it did not derive,
+/// and records nothing; so `B`'s position stays absent at `A+C`'s SQL site.
+/// The same operation, driven over `B`, certifies the genuine rebuild and
+/// its site answers both the old merged position and `B`.
+#[test]
+fn a_rebuild_over_a_shared_operand_does_not_certify_a_join_of_another_operand() {
+    use crate::relation::form::{JoinKind, JoinSpec, MergedKey};
+    let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let source = arm(&registry, &["v"]);
+    let (a, b, c) = (
+        read_of(&registry, source),
+        read_of(&registry, source),
+        read_of(&registry, source),
+    );
+    let (a_port, b_port, c_port) = (
+        only_port(&registry, &a),
+        only_port(&registry, &b),
+        only_port(&registry, &c),
+    );
+    let join = |right: SemanticRelation, right_port| {
+        registry
+            .authority()
+            .derive(RelForm::Join(JoinSpec {
+                left: a,
+                right,
+                kind: JoinKind::FullOuter,
+                merged: &[MergedKey {
+                    left: a_port,
+                    right: right_port,
+                }],
+            }))
+            .expect("a join of two reads")
+    };
+    // The resolver's join of A and B, merged on v, and a product assembled
+    // elsewhere over A and C.
+    let old = join(b, b_port);
+    let old_merged = only_port(&registry, &old);
+    let elsewhere = join(c, c_port);
+    let full = Some(crate::pipeline::asts::core::JoinType::FullOuter);
+
+    // Driving the rebuild toward C refuses; closing it on the foreign
+    // product refuses.
+    let mut rebuild = registry
+        .authority()
+        .rebuilding(old, &[a, b])
+        .expect("A+B stands over A and B");
+    rebuild
+        .begins_with(&chain_over(&registry, a))
+        .expect("the rebuild begins with A");
+    assert!(
+        rebuild
+            .join(
+                chain_over(&registry, a),
+                chain_over(&registry, c),
+                merging(a_port, c_port),
+                full.clone(),
+            )
+            .is_err(),
+        "a rebuild over A and B does not join C"
+    );
+    assert!(
+        rebuild.finish(chain_over(&registry, elsewhere)).is_err(),
+        "a rebuild certifies only the product it derived"
+    );
+    // Opening over occurrences the operand does not stand over derives a
+    // product and certifies nothing.
+    let mut wrong = registry
+        .authority()
+        .rebuilding(old, &[a, c])
+        .expect("opening judges; it does not refuse the operand");
+    wrong
+        .begins_with(&chain_over(&registry, a))
+        .expect("the rebuild begins with A");
+    let product = wrong
+        .join(
+            chain_over(&registry, a),
+            chain_over(&registry, c),
+            merging(a_port, c_port),
+            full.clone(),
+        )
+        .expect("A+C is derived over A and C");
+    let derived_elsewhere = product.semantic_relation();
+    wrong
+        .finish(product)
+        .expect("the product is returned uncertified");
+    let names = registry.names();
+    for candidate in [&elsewhere, &derived_elsewhere] {
+        assert!(
+            crate::relation::replacement(&names, old.relation(), candidate)
+                .expect("an epoch-checked read")
+                .is_none(),
+            "A+B is not recorded as replaced by a join of A and C"
+        );
+    }
+
+    // The genuine rebuild, over B, is certified.
+    let mut rebuild = registry
+        .authority()
+        .rebuilding(old, &[a, b])
+        .expect("A+B stands over A and B");
+    rebuild
+        .begins_with(&chain_over(&registry, a))
+        .expect("the rebuild begins with A");
+    let product = rebuild
+        .join(
+            chain_over(&registry, a),
+            chain_over(&registry, b),
+            merging(a_port, b_port),
+            full.clone(),
+        )
+        .expect("A+B is derived again over A and B");
+    let new = product.semantic_relation();
+    let new_merged = only_port(&registry, &new);
+    rebuild
+        .finish(product)
+        .expect("the rebuild closes on its product");
+    assert!(
+        crate::relation::replacement(&names, old.relation(), &new)
+            .expect("an epoch-checked read")
+            .is_some(),
+        "the rebuild it derived is recorded"
+    );
+
+    let sealed = registry.seal();
+    let bindings = names.bindings();
+    let foreign_site = bindings
+        .bind_interface(&sealed, &derived_elsewhere)
+        .expect("A+C emits its own interface");
+    let answer = bindings.at(foreign_site, b_port);
+    assert!(
+        answer.is_err(),
+        "absent B {b_port:?} answered at A+C as {answer:?}"
+    );
+    assert!(bindings.at(foreign_site, old_merged).is_err());
+    let site = bindings
+        .bind_interface(&sealed, &new)
+        .expect("the rebuilt A+B emits its own interface");
+    assert_eq!(
+        bindings
+            .at(site, old_merged)
+            .expect("the rebuild answers the merged position it replaced"),
+        new_merged.column()
+    );
+    assert_eq!(
+        bindings
+            .at(site, b_port)
+            .expect("the rebuild answers B, which it stands over"),
+        new_merged.column()
+    );
+}
+
+/// CARRYING ONE ARM'S POSITIONS DOES NOT MAKE A SET THAT ARM'S REPUBLICATION.
+///
+/// A positional union of two reads carries its opening arm's positions, and
+/// the other arm lives in its contribution table. A rebuild opened over an
+/// export of `A` alone admits neither the union as `A`'s realization nor,
+/// opened the other way, the union as an operand standing over `A` alone.
+/// The whole union, republished, is certified as itself.
+#[test]
+fn a_set_is_not_admitted_as_a_republication_of_one_of_its_arms() {
+    let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let source = arm(&registry, &["v"]);
+    let a = read_of(&registry, source);
+    let b = read_of(&registry, source);
+    let old = export_of(&registry, a);
+    let old_port = only_port(&registry, &old);
+    let union = step(&registry, POSITIONAL, &[a, b]);
+    let union_port = only_port(&registry, &union);
+    let names = registry.names();
+
+    // Forward: the union is not A standing again.
+    let mut rebuild = registry
+        .authority()
+        .rebuilding(old, &[a])
+        .expect("an export of A stands over A");
+    assert!(
+        rebuild.begins_with(&chain_over(&registry, union)).is_err(),
+        "a union carrying A's positions beside B is not a republication of A"
+    );
+    // Inverse: the union does not stand over A alone.
+    let mut inverse = registry
+        .authority()
+        .rebuilding(union, &[a])
+        .expect("opening judges; it does not refuse the operand");
+    inverse
+        .begins_with(&chain_over(&registry, old))
+        .expect("an export of A stands in A's place");
+    inverse
+        .finish(chain_over(&registry, old))
+        .expect("the product is returned uncertified");
+    assert!(
+        crate::relation::replacement(&names, old.relation(), &union)
+            .expect("an epoch-checked read")
+            .is_none()
+            && crate::relation::replacement(&names, union.relation(), &old)
+                .expect("an epoch-checked read")
+                .is_none(),
+        "neither direction records a replacement"
+    );
+
+    // Control: the whole union, republished, is certified as itself.
+    let whole = export_of(&registry, union);
+    let whole_port = only_port(&registry, &whole);
+    let again = export_of(&registry, union);
+    let again_port = only_port(&registry, &again);
+    let mut rebuild = registry
+        .authority()
+        .rebuilding(whole, &[union])
+        .expect("an export of the union stands over the union");
+    rebuild
+        .begins_with(&chain_over(&registry, again))
+        .expect("another export of the union stands in its place");
+    rebuild
+        .finish(chain_over(&registry, again))
+        .expect("the rebuild closes on its product");
+    assert!(
+        crate::relation::replacement(&names, whole.relation(), &again)
+            .expect("an epoch-checked read")
+            .is_some(),
+        "republishing the whole union is certified"
+    );
+
+    let sealed = registry.seal();
+    let bindings = names.bindings();
+    let union_site = bindings
+        .bind_interface(&sealed, &union)
+        .expect("the union emits its own interface");
+    assert_eq!(
+        bindings
+            .at(union_site, union_port)
+            .expect("a site answers its own position"),
+        union_port.column()
+    );
+    let answer = bindings.at(union_site, old_port);
+    assert!(
+        answer.is_err(),
+        "A-only's publication {old_port:?} answered at the union as {answer:?}"
+    );
+    let again_site = bindings
+        .bind_interface(&sealed, &again)
+        .expect("the republished union emits its own interface");
+    assert_eq!(
+        bindings
+            .at(again_site, whole_port)
+            .expect("the certified republication answers the position it replaced"),
+        again_port.column()
+    );
+}
+
+/// AN OPERAND DOES NOT STOP PARTICIPATING WHEN ITS COLUMN DISAPPEARS.
+///
+/// A corresponding union and a full outer join of `A(v)` and `B(w)` both
+/// depend on `B` for their rows — padding and unmatched rows publish NULL
+/// into `v` — and projecting `w` out changes none of that. A rebuild opened
+/// over `A` alone judges the old operation by its recorded operands, finds
+/// `B`, and certifies nothing; opened over both, the genuine rebuild of the
+/// join is certified and answers the projected position.
+#[test]
+fn projecting_an_operand_away_does_not_erase_its_participation() {
+    use crate::relation::form::{JoinKind, JoinSpec, ProjectOutSpec};
+    for is_set in [true, false] {
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+        let a = read_of(&registry, arm(&registry, &["v"]));
+        let b = read_of(&registry, arm(&registry, &["w"]));
+        let combined = if is_set {
+            step(&registry, CORRESPONDING, &[a, b])
+        } else {
+            registry
+                .authority()
+                .derive(RelForm::Join(JoinSpec {
+                    left: a,
+                    right: b,
+                    kind: JoinKind::FullOuter,
+                    merged: &[],
+                }))
+                .expect("a full outer join of two reads")
+        };
+        let ports = crate::relation::published_ports(&registry, &combined).expect("ports");
+        let old = registry
+            .authority()
+            .derive(RelForm::ProjectOut(ProjectOutSpec {
+                input: combined,
+                removed: &ports[1..],
+            }))
+            .expect("the compound with w projected out");
+        let old_port = only_port(&registry, &old);
+        let a_only = export_of(&registry, a);
+        let mut rebuild = registry
+            .authority()
+            .rebuilding(old, &[a])
+            .expect("opening judges; it does not refuse the operand");
+        rebuild
+            .begins_with(&chain_over(&registry, a_only))
+            .expect("an export of A stands in A's place");
+        rebuild
+            .finish(chain_over(&registry, a_only))
+            .expect("the product is returned uncertified");
+        let names = registry.names();
+        assert!(
+            crate::relation::replacement(&names, old.relation(), &a_only)
+                .expect("an epoch-checked read")
+                .is_none(),
+            "is_set={is_set}: a compound over A and B is not replaced by A alone"
+        );
+        // The genuine rebuild over both operands is certified (join case).
+        let certified = if is_set {
+            None
+        } else {
+            let mut rebuild = registry
+                .authority()
+                .rebuilding(old, &[a, b])
+                .expect("the projected join stands over A and B");
+            rebuild
+                .begins_with(&chain_over(&registry, a))
+                .expect("the rebuild begins with A");
+            let product = rebuild
+                .join(
+                    chain_over(&registry, a),
+                    chain_over(&registry, b),
+                    crate::pipeline::asts::core::MemberCorrelation::Cartesian(()),
+                    Some(crate::pipeline::asts::core::JoinType::FullOuter),
+                )
+                .expect("A+B is derived over A and B");
+            let new = product.semantic_relation();
+            rebuild
+                .finish(product)
+                .expect("the rebuild closes on its product");
+            assert!(
+                crate::relation::replacement(&names, old.relation(), &new)
+                    .expect("an epoch-checked read")
+                    .is_some(),
+                "the rebuild over both operands is certified"
+            );
+            Some(new)
+        };
+        let sealed = registry.seal();
+        let bindings = names.bindings();
+        let site = bindings
+            .bind_interface(&sealed, &a_only)
+            .expect("A alone emits its own interface");
+        let answer = bindings.at(site, old_port);
+        assert!(
+            answer.is_err(),
+            "is_set={is_set}: the compound's position {old_port:?} answered at A alone as {answer:?}"
+        );
+        if let Some(new) = certified {
+            let site = bindings
+                .bind_interface(&sealed, &new)
+                .expect("the rebuilt join emits its own interface");
+            assert!(
+                bindings.at(site, old_port).is_ok(),
+                "the certified rebuild answers the projected position"
+            );
+        }
+    }
+}
+
+/// A WITNESS IS NOT A REPUBLICATION OF ITS OPERAND.
+///
+/// A signed witness totalizes an empty operand into one proxy row, and an
+/// existence witness collapses its operand to one verdict row; neither
+/// keeps the operand's rows. Hiding the verdict column does not undo that,
+/// so a witness over `A` never stands in `A`'s place.
+#[test]
+fn a_witness_is_not_admitted_as_a_republication_of_its_operand() {
+    use crate::relation::form::{ProjectOutSpec, SignedWitnessSpec};
+    let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let a = read_of(&registry, arm(&registry, &["v"]));
+    let old = export_of(&registry, a);
+    let old_port = only_port(&registry, &old);
+    let witness = registry
+        .authority()
+        .derive(RelForm::SignedWitness(SignedWitnessSpec { input: a }))
+        .expect("a signed witness over A");
+    let ports = crate::relation::published_ports(&registry, &witness).expect("ports");
+    let totalized = registry
+        .authority()
+        .derive(RelForm::ProjectOut(ProjectOutSpec {
+            input: witness,
+            removed: &ports[1..],
+        }))
+        .expect("the witness with its verdict projected out");
+    let mut rebuild = registry
+        .authority()
+        .rebuilding(old, &[a])
+        .expect("an export of A stands over A");
+    assert!(
+        rebuild
+            .begins_with(&chain_over(&registry, totalized))
+            .is_err(),
+        "a totalized witness over A does not stand in A's place"
+    );
+    let names = registry.names();
+    assert!(
+        crate::relation::replacement(&names, old.relation(), &totalized)
+            .expect("an epoch-checked read")
+            .is_none()
+    );
+    let sealed = registry.seal();
+    let bindings = names.bindings();
+    let site = bindings
+        .bind_interface(&sealed, &totalized)
+        .expect("the witness emits its own interface");
+    assert!(bindings.at(site, old_port).is_err());
+}
+
+/// AN EMPTY MAP DOES NOT MAKE A GROUPING A NARROWING.
+///
+/// A grouping of a grid to no columns and an empty-column access over the
+/// same grid both publish nothing and both stand on the grid, yet one row of
+/// the grouping stands for many rows of the grid. Only two recorded
+/// narrowings of one grid replace each other; a grouping is refused, and a
+/// rebuild over a join with the grouping cannot consume the narrowing in its
+/// place.
+#[test]
+fn an_empty_map_does_not_make_a_grouping_a_narrowing() {
+    use crate::relation::form::{
+        AccessShape, AccessSpec, GroupKind, GroupSpec, JoinKind, JoinSpec,
+    };
+    for group in [false, true] {
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+        let a = read_of(&registry, arm(&registry, &["v"]));
+        let grid = arm(&registry, &["w"]);
+        let empty_access = |registry: &crate::relation::Planning| {
+            registry
+                .authority()
+                .derive(RelForm::Access(AccessSpec {
+                    input: grid,
+                    shape: AccessShape::Empty,
+                    slots: &[],
+                    dependencies: &[],
+                }))
+                .expect("an empty-column access over the grid")
+        };
+        let consumed = if group {
+            registry
+                .authority()
+                .derive(RelForm::Group(GroupSpec {
+                    input: grid,
+                    kind: GroupKind::Distinct,
+                    keys: &[],
+                    reductions: &[],
+                }))
+                .expect("a grouping of the grid to no columns")
+        } else {
+            empty_access(&registry)
+        };
+        let narrowed = empty_access(&registry);
+        let old = registry
+            .authority()
+            .derive(RelForm::Join(JoinSpec {
+                left: a,
+                right: consumed,
+                kind: JoinKind::Inner,
+                merged: &[],
+            }))
+            .expect("a join of A with the zero-width operand");
+        let old_port = only_port(&registry, &old);
+        let paired = registry
+            .authority()
+            .narrowed_again(consumed, &narrowed)
+            .is_ok();
+        assert_eq!(
+            paired, !group,
+            "only two recorded narrowings of one grid replace each other"
+        );
+        let mut rebuild = registry
+            .authority()
+            .rebuilding(old, &[a, consumed])
+            .expect("the join stands over A and its zero-width operand");
+        rebuild
+            .begins_with(&chain_over(&registry, a))
+            .expect("the rebuild begins with A");
+        let product = rebuild.join(
+            chain_over(&registry, a),
+            chain_over(&registry, narrowed),
+            crate::pipeline::asts::core::MemberCorrelation::Cartesian(()),
+            Some(crate::pipeline::asts::core::JoinType::Inner),
+        );
+        let names = registry.names();
+        match product {
+            Ok(product) if !group => {
+                let new = product.semantic_relation();
+                rebuild
+                    .finish(product)
+                    .expect("the rebuild closes on its product");
+                assert!(
+                    crate::relation::replacement(&names, old.relation(), &new)
+                        .expect("an epoch-checked read")
+                        .is_some(),
+                    "a genuine re-narrowing lets the rebuild be certified"
+                );
+                let sealed = registry.seal();
+                let bindings = names.bindings();
+                let site = bindings
+                    .bind_interface(&sealed, &new)
+                    .expect("the rebuilt join emits its own interface");
+                assert!(bindings.at(site, old_port).is_ok());
+            }
+            Ok(_) => panic!("a narrowing stood in for a grouping"),
+            Err(_) => assert!(
+                group,
+                "a genuine re-narrowing is consumed in the narrowing's place"
+            ),
+        }
+    }
+}
+
+/// A GROUP STEP DOES NOT BECOME A STAGE REPUBLICATION WHEN RE-APPENDED.
+///
+/// Re-appending a step over the relation that replaced its operand derives a
+/// fresh stage export only for a step whose result the record shows as a
+/// republication of the replaced relation. A grouping stands on one input
+/// too, but a distinct bag re-derived as a stage would be an A-only
+/// publication a later rebuild could certify as A itself.
+#[test]
+fn a_group_step_does_not_become_a_stage_republication() {
+    use crate::pipeline::asts::core::{Access, Resolved};
+    use crate::relation::pending::{GroupShape, Pending, Position};
+    let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let a = read_of(&registry, arm(&registry, &["v"]));
+    let a_port = only_port(&registry, &a);
+    let (step, _) = registry
+        .authority()
+        .bind(Pending::Group {
+            input: a,
+            keys: vec![Position::restating_expanded(a_port)],
+            shape: GroupShape::Distinct,
+        })
+        .expect("a distinct grouping over A");
+    let grouped = *step.result();
+    let moved = export_of(&registry, a);
+    let old_chain = registry
+        .authority()
+        .ground_read::<Resolved>(Access::All, false, a)
+        .expect("a chain reading A");
+    let new_chain = registry
+        .authority()
+        .ground_read::<Resolved>(Access::All, false, moved)
+        .expect("a chain reading the export of A");
+    registry
+        .authority()
+        .refine_relation(old_chain, |_| Ok(new_chain.clone()))
+        .expect("an export of A replaces A");
+    assert!(
+        registry
+            .authority()
+            .continue_over(new_chain, step, a)
+            .is_err(),
+        "a grouping step is not re-derived as a stage republication"
+    );
+    assert!(
+        crate::relation::replacement(&registry.names(), grouped.relation(), &moved)
+            .expect("an epoch-checked read")
+            .is_none(),
+        "no record relates the grouping to a publication over A"
+    );
+}
+
+/// TWO FRESH READS OF ONE SOURCE CANNOT BE PAIRED BY ANY STATED OCCURRENCES.
+///
+/// A rebuild opened over the definition, over either read, or over both
+/// never certifies one read as the other's replacement: the read it is
+/// asked to begin with is not the occurrence it was opened over, or the
+/// operand stands over something unstated. The inner read's SQL site never
+/// answers the outer read's occurrence.
+#[test]
+fn a_rebuild_cannot_certify_one_fresh_read_as_another_read_s_replacement() {
+    let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let source = arm(&registry, &["v"]);
+    let outer = read_of(&registry, source);
+    let inner = read_of(&registry, source);
+    let (outer_port, inner_port) = (only_port(&registry, &outer), only_port(&registry, &inner));
+    for over in [vec![source], vec![outer], vec![inner], vec![outer, inner]] {
+        let mut rebuild = registry
+            .authority()
+            .rebuilding(outer, &over)
+            .expect("opening judges; it does not refuse the operand");
+        match rebuild.begins_with(&chain_over(&registry, inner)) {
+            // The inner read is not the first stated occurrence.
+            Err(_) => continue,
+            // Opened over the inner read itself it may begin, but the outer
+            // read does not stand over that, so closing certifies nothing.
+            Ok(()) => {
+                assert!(
+                    over[0] == inner,
+                    "only the inner read itself begins a rebuild with it"
+                );
+                rebuild
+                    .finish(chain_over(&registry, inner))
+                    .expect("the product is returned uncertified");
+            }
+        }
+    }
+    let names = registry.names();
+    assert!(
+        crate::relation::replacement(&names, outer.relation(), &inner)
+            .expect("an epoch-checked read")
+            .is_none(),
+        "no stated occurrences record one read as the other's replacement"
+    );
+    let sealed = registry.seal();
+    let bindings = names.bindings();
+    let site = bindings
+        .bind_interface(&sealed, &inner)
+        .expect("the inner read emits its own interface");
+    assert_eq!(
+        bindings
+            .at(site, inner_port)
+            .expect("a site answers its own position"),
+        inner_port.column()
+    );
+    let answer = bindings.at(site, outer_port);
+    assert!(
+        answer.is_err(),
+        "outer {outer_port:?} answered at the inner read's site as {answer:?}"
+    );
+}
+
+/// A REBUILD OVER THE READ IT REPLACES IS CERTIFIED BY THE SAME OPERATION.
+///
+/// The single-table road: a relation built over a read occurrence begins
+/// the rebuild in the read's place, the rebuild closes on it, and the
+/// rebuild's SQL site answers the position it replaced.
+#[test]
+fn a_rebuild_over_the_read_it_replaces_is_certified_and_answers_for_it() {
+    let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+    let source = arm(&registry, &["v"]);
+    let read = read_of(&registry, source);
+    let rebuilt = export_of(&registry, read);
+    let (read_port, rebuilt_port) = (only_port(&registry, &read), only_port(&registry, &rebuilt));
+    let mut rebuild = registry
+        .authority()
+        .rebuilding(read, &[read])
+        .expect("a read stands over itself");
+    rebuild
+        .begins_with(&chain_over(&registry, rebuilt))
+        .expect("a republication over the read stands in its place");
+    rebuild
+        .finish(chain_over(&registry, rebuilt))
+        .expect("the rebuild closes on its product");
+    let names = registry.names();
+    assert!(
+        crate::relation::replacement(&names, read.relation(), &rebuilt)
+            .expect("an epoch-checked read")
+            .is_some()
+    );
+    let sealed = registry.seal();
+    let bindings = names.bindings();
+    let site = bindings
+        .bind_interface(&sealed, &rebuilt)
+        .expect("the rebuild emits its own interface");
+    assert_eq!(
+        bindings
+            .at(site, read_port)
+            .expect("the rebuild answers the read it stands over"),
+        rebuilt_port.column()
+    );
+}
+
 ///
 /// Its evidence is the exact-heading map rather than a contribution table,
 /// and it has one emitting branch — but the road, the refusals and the
@@ -922,7 +1711,7 @@ fn every_scratch_and_note_road_states_its_heading_at_derivation() {
         ("relation/mod.rs", "ScratchSpec::stating"),
         // Focused witnesses construct their scratch with the same closed form.
         (
-            "pipeline/effect_transformer/tests.rs",
+            "defuse/environment/scoped/effect/tests.rs",
             "ScratchSpec::stating",
         ),
         (
@@ -1010,11 +1799,11 @@ fn a_scratch_holding_a_select_list_republishes_its_positions() {
     }];
     let base = planning
         .authority()
-        .derive(RelForm::Anonymous(AnonymousSpec {
-            shape: AnonymousShape::Tabular,
-            slots: &slots,
-            answers_to: None,
-        }))
+        .derive(RelForm::Anonymous(AnonymousSpec::plain(
+            AnonymousShape::Tabular,
+            &slots,
+            None,
+        )))
         .expect("an anonymous relation derives");
     let stage = |input| {
         planning

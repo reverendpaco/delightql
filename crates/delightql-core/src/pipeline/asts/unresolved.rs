@@ -113,8 +113,6 @@ pub type WindowFrame = crate::pipeline::asts::core::WindowFrame;
 pub type FrameBound = crate::pipeline::asts::core::FrameBound;
 pub type HoArgument =
     crate::pipeline::asts::core::operators::HoArgument<crate::pipeline::asts::core::Unresolved>;
-pub type ScalarArgument =
-    crate::pipeline::asts::core::operators::ScalarArgument<crate::pipeline::asts::core::Unresolved>;
 pub type CallArguments =
     crate::pipeline::asts::core::operators::CallArguments<crate::pipeline::asts::core::Unresolved>;
 

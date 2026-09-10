@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 
+use crate::diagnostic::{Resolution, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
@@ -12,7 +13,6 @@ pub(in crate::pipeline::resolver) fn resolve_simple_expr(
     expr: ast_unresolved::DomainExpression,
     position: &crate::pipeline::resolver::Position<'_>,
     in_correlation: bool,
-    witness: &mut crate::pipeline::resolver::Witness,
     registry: &crate::relation::Planning,
 ) -> Result<ast_resolved::DomainExpression> {
     use crate::pipeline::resolver::unification::{ColumnReference, UnificationResult};
@@ -31,7 +31,6 @@ pub(in crate::pipeline::resolver) fn resolve_simple_expr(
             let result = position.address(
                 ColumnReference::Named { name, qualifier },
                 in_correlation,
-                witness,
                 registry,
             )?;
             settle(result, position, registry)
@@ -44,7 +43,6 @@ pub(in crate::pipeline::resolver) fn resolve_simple_expr(
                     qualifier: ordinal.qualifier,
                 },
                 in_correlation,
-                witness,
                 registry,
             )?;
             match result {
@@ -66,11 +64,9 @@ pub(in crate::pipeline::resolver) fn resolve_simple_expr(
         // position and refuses BEFORE any closed resolved tree is minted.
         ast_unresolved::DomainExpression::Application(
             ast_unresolved::FunctionApplication::Open(_),
-        ) => Err(crate::error::DelightQLError::validation_error_categorized(
-            "value/open/unapplied",
-            "a composition input stands outside any callable applying it",
-            "the position that applies an open body spends its slot",
-        )),
+        ) => Err(DelightQLError::from(Semantic::ValueOpenUnapplied {
+            message: "a composition input stands outside any callable applying it".to_string(),
+        })),
         _ => unreachable!("resolve_simple_expr called with non-simple expression"),
     }
 }
@@ -93,23 +89,21 @@ fn settle(
             if position.any_opaque(registry)? {
                 return Err(opaque_heading_refusal());
             }
-            Err(DelightQLError::column_not_found_error(
-                column,
-                "in domain expression",
-            ))
+            Err(DelightQLError::from(Resolution::Column {
+                column: column.to_string(),
+                context: "in domain expression".to_string(),
+            }))
         }
         UnificationResult::Opaque => Err(crate::pipeline::resolver::opaque_reference_refusal()),
-        UnificationResult::Refused(refusal) => Err(refusal.into_error()),
+        UnificationResult::Refused(refusal) => Err(refusal),
         UnificationResult::Ambiguous { column, tables } => {
-            Err(DelightQLError::validation_error_categorized(
-                "resolution/ambiguous",
-                format!(
+            Err(DelightQLError::from(Resolution::Ambiguous {
+                message: format!(
                     "Ambiguous column '{}' exists in scopes: {}",
                     column,
                     tables.join(", "),
                 ),
-                "in domain expression",
-            ))
+            }))
         }
     }
 }
@@ -117,11 +111,9 @@ fn settle(
 /// A name was used against a relation whose dimensions the target does not
 /// publish. Nothing was enumerated, so nothing can be reported absent.
 pub(crate) fn opaque_heading_refusal() -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        crate::uri_registry::subcat::RESOLUTION_SCHEMA,
-        "this relation's heading is not published by the target, so its dimensions \
-         cannot be named here",
-        "declare the dimensions at the mention — `f(...)(a, b)` names one slot per \
-         dimension of the full width",
-    )
+    DelightQLError::from(Resolution::Schema {
+        message: "this relation's heading is not published by the target, so its dimensions \
+         cannot be named here"
+            .to_string(),
+    })
 }

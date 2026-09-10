@@ -2,7 +2,7 @@
 (star_sigil) @variable.parameter
 (comma_sigil)@punctuation.delimiter
 (ho_rule "("@keyword")"@keyword )
-(ho_cte "("@keyword")"@keyword )
+;(ho_cte "("@keyword")"@keyword )
 (definition_neck) @punctuation.delimiter
 (metadata_sigil)@punctuation.special
 (effect_marker)@punctuation.special

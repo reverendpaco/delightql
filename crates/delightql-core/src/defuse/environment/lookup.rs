@@ -6,6 +6,7 @@
 //! admissibility maps the answer to its artifact; it never performs another
 //! name search.
 
+use crate::diagnostic::{Grounding, Internal};
 use crate::error::{DelightQLError, Result};
 use crate::resolution::{
     EntityDefinition, EntityInfo, RegistrySource, ResolvedEntityKind, ResolverCore, SchemaSource,
@@ -348,12 +349,12 @@ impl Environment {
                 translated =
                     crate::pipeline::ast_resolved::NamespacePath::from_fq_string(&aliased.fq)
                         .map_err(|e| {
-                            DelightQLError::database_error(
+                            Internal::invariant(
+                                "defuse::environment::lookup",
                                 format!(
-                                    "corrupt catalog: alias targets namespace '{}'",
+                                    "corrupt catalog: alias targets namespace '{}': {e}",
                                     aliased.fq
                                 ),
-                                format!("{e:?}"),
                             )
                         })?;
                 &translated
@@ -439,13 +440,13 @@ fn realize_relation<'s>(
                     served.namespace(),
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Internal::invariant(
+                        "defuse::environment::lookup",
                         format!(
-                            "corrupt catalog: served entity '{}' names namespace '{}'",
+                            "corrupt catalog: served entity '{}' names namespace '{}': {e}",
                             served.name(),
                             served.namespace()
                         ),
-                        format!("{e:?}"),
                     )
                 })?;
                 match core
@@ -509,17 +510,14 @@ fn catalog_entity(
 
 /// The refusal an unbound data hole produces where a relation was asked for.
 pub(crate) fn unbound_data_hole(name: &SqlIdentifier, world: &str) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        crate::uri_registry::subcat::GROUNDING_DATA_HOLE_UNBOUND,
-        format!(
+    DelightQLError::from(Grounding::DataHoleUnbound {
+        message: format!(
             "'{name}' is a free data name of '{world}', and no ground! has bound that \
              world's data holes to a data world. A consulted body reads its own \
              definitions and the data world an explicit grounding published — never \
              the caller's tables, CTEs, or session database ambiently"
         ),
-        "ground!(\"<data namespace>\", \"<rules namespace>\", \"<grounded name>\") binds the \
-         holes, or enlist!(\"<data namespace>\") inside the consulted file links them",
-    )
+    })
 }
 
 /// The SIGMA-POSITION judgment over ONE exhaustive enumeration: the same

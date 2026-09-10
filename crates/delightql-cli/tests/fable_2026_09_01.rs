@@ -74,12 +74,12 @@ fn embedded_repl_namespace_installs_and_answers() {
 
     use delightql_cli::client::context::Mode;
     use delightql_cli::client::database::ClientDatabase;
-    use delightql_cli::client::mount::{install_repl_namespace, open_client_handle};
+    use delightql_cli::connection::{open_handle, SessionProfile};
     use delightql_cli::exec_ng::run_dql_query;
 
     let db = Arc::new(ClientDatabase::open_on(Mode::Other).expect("open the client database"));
-    let mut handle = open_client_handle(&db).expect("open the client handle");
-    install_repl_namespace(&mut *handle).expect("install repl::*");
+    let mut handle =
+        open_handle(SessionProfile::Client(Some(db.clone()))).expect("open the client handle");
     let mut session = handle.session().expect("session");
     // `option` is a reserved word: bare, the admission law refuses it in
     // every position, which is the very defect this test pins.

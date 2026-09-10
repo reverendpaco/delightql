@@ -18,6 +18,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::EffectRun;
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::*;
@@ -66,13 +67,12 @@ impl EffectExecutable for RunPredicate {
         // An execution directive starts a run; it cannot be a sub-expression
         // of another statement (EFFECT-ALGEBRA §9/R9). Whole-statement run!
         // never reaches here — the relay entry point owns it.
-        Err(DelightQLError::validation_error_categorized(
-            "effect/run/position",
-            "run! starts a run (consult the file, then demand its main! — \
+        Err(DelightQLError::from(EffectRun::Position {
+            message: "run! starts a run (consult the file, then demand its main! — \
              EFFECT-ALGEBRA F2) and must be the entire statement at the \
-             REPL/CLI top level",
-            "run! must be the whole statement",
-        ))
+             REPL/CLI top level"
+                .to_string(),
+        }))
     }
 }
 
@@ -121,12 +121,11 @@ impl EffectExecutable for RunNamespacePredicate {
         _alias: Option<String>,
         _system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
-        Err(DelightQLError::validation_error_categorized(
-            "effect/run/position",
-            "run_namespace! demands a consulted namespace's main! \
+        Err(DelightQLError::from(EffectRun::Position {
+            message: "run_namespace! demands a consulted namespace's main! \
              (EFFECT-ALGEBRA F3) and must be the entire statement at the \
-             REPL/CLI top level, or a demand inside an effect-rule body",
-            "run_namespace! must be the whole statement",
-        ))
+             REPL/CLI top level, or a demand inside an effect-rule body"
+                .to_string(),
+        }))
     }
 }

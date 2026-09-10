@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::diagnostic::Semantic;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::Comparison;
 use crate::pipeline::asts::core::Existence;
@@ -173,14 +174,14 @@ pub(super) fn inject_exists_into_subquery(
                 return Ok(source.transparently(resolved::Transparent::Bound { bound }));
             }
             resolved::Continuation::Destructure { .. } => {
-                return Err(DelightQLError::validation_error_categorized(
-                    "refiner/exists/injection_condition",
-                    format!(
-                        "A dependent EXISTS cannot be placed through this parent condition: \
+                return Err(DelightQLError::from(
+                    Semantic::RefinerExistsInjectionCondition {
+                        message: format!(
+                            "A dependent EXISTS cannot be placed through this parent condition: \
                          {:?}",
-                        peeled.last().form()
-                    ),
-                    "dependent EXISTS placement",
+                            peeled.last().form()
+                        ),
+                    },
                 ))
             }
             _ => peeled.rejoin(),

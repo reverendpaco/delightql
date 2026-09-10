@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::diagnostic::{Constraint, Resolution};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_unresolved;
 use crate::pipeline::ast_visit::{walk_visit_relational, AstVisit, Descent};
@@ -43,14 +44,12 @@ fn check_forward_references_grouped(
                 let current_position = cte_order.iter().position(|name| name == cte_name).unwrap();
 
                 if ref_position > current_position {
-                    return Err(DelightQLError::ParseError {
-                        message: format!(
+                    return Err(DelightQLError::from(Resolution::General {
+    message: format!(
                             "CTE '{}' references '{}' which is defined later. CTEs must reference previously defined CTEs.",
                             cte_name, table_ref
                         ),
-                        source: None,
-                        subcategory: None,
-                    });
+}));
                 }
             }
             // If not found in cte_order, it's either a database table or doesn't exist
@@ -97,11 +96,9 @@ fn check_for_cycles_grouped(
         if !visited.contains(cte_name)
             && has_cycle_dfs(&graph, cte_name, &mut visited, &mut recursion_stack)?
         {
-            return Err(DelightQLError::ParseError {
+            return Err(DelightQLError::from(Constraint::General {
                 message: format!("Circular CTE dependency detected involving '{}'", cte_name),
-                source: None,
-                subcategory: None,
-            });
+            }));
         }
     }
 

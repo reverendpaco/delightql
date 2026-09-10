@@ -14,7 +14,8 @@
 
 use super::Normalizer;
 use crate::ddl_pipeline::asts::{DdlConstraint, DdlDefault};
-use crate::error::{DelightQLError, Result};
+use crate::diagnostic::Internal;
+use crate::error::Result;
 use crate::pipeline::asts::core::ArgumentValue;
 use crate::pipeline::asts::core::SigmaApplication;
 use crate::pipeline::asts::core::{
@@ -65,7 +66,8 @@ pub fn constraint_cell(
                 Ok(foreign_key(&expr).unwrap_or(DdlConstraint::Check { expr }))
             }
         },
-        cst::CompanionCell::DefaultCell(_) => Err(DelightQLError::parse_error(
+        cst::CompanionCell::DefaultCell(_) => Err(Internal::invariant(
+            "normalize::companion",
             "the constraint-cell root parsed a default cell",
         )),
     }
@@ -96,7 +98,8 @@ pub fn default_cell(tree: &SyntaxTree, registry: Rc<crate::names::Registry>) -> 
                 expr => DdlDefault::Value { expr },
             })
         }
-        cst::CompanionCell::ConstraintCell(_) => Err(DelightQLError::parse_error(
+        cst::CompanionCell::ConstraintCell(_) => Err(Internal::invariant(
+            "normalize::companion",
             "the default-cell root parsed a constraint cell",
         )),
     }
@@ -107,16 +110,19 @@ fn companion_cell<'t>(
     column: CompanionColumn,
 ) -> Result<cst::CompanionCell<'t>> {
     let Some(cst::SourceFileChild::CompanionCellRoot(root)) = tree.root_branch() else {
-        return Err(DelightQLError::parse_error(format!(
-            "the {column:?} cell root carries no cell"
-        )));
+        return Err(Internal::invariant(
+            "normalize::companion",
+            format!("the {column:?} cell root carries no cell"),
+        ));
     };
     root.children()
         .find_map(|child| match child {
             cst::CompanionCellRootChild::CompanionCell(cell) => Some(cell),
             cst::CompanionCellRootChild::CompanionRootMarker(_) => None,
         })
-        .ok_or_else(|| DelightQLError::parse_error("a companion root carries a cell"))
+        .ok_or_else(|| {
+            Internal::invariant("normalize::companion", "a companion root carries a cell")
+        })
 }
 
 fn key_columns<'t>(

@@ -16,10 +16,9 @@ pub(crate) fn execute_sql_with_pipe(
     mgr: &Arc<PipeConnectionManager>,
 ) -> std::result::Result<QueryResults, delightql_core::error::DelightQLError> {
     let (columns, rows) = mgr.execute_query_raw(sql).map_err(|e| {
-        delightql_core::error::DelightQLError::database_error(
-            format!("Pipe query failed: {}", e),
-            e.to_string(),
-        )
+        delightql_core::error::DelightQLError::from(delightql_types::diagnostic::Siso::Query {
+            message: format!("Pipe query failed: {}", e),
+        })
     })?;
 
     let row_count = rows.len();
@@ -33,18 +32,10 @@ pub(crate) fn execute_sql_with_pipe(
 /// Create an introspector for a Pipe connection.
 pub(crate) fn create_pipe_introspector(
     mgr: &Arc<PipeConnectionManager>,
-) -> Result<
-    Box<dyn delightql_types::introspect::DatabaseIntrospector>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    let introspector =
-        mgr.introspector()
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to create pipe introspector: {}", e),
-                ))
-            })?;
+) -> delightql_types::Result<Box<dyn delightql_types::introspect::DatabaseIntrospector>> {
+    let introspector = mgr
+        .introspector()
+        .map_err(|e| delightql_cli_siso::error::diagnostic("pipe introspector", e))?;
     Ok(Box::new(introspector))
 }
 
@@ -55,12 +46,13 @@ pub(crate) fn create_pipe_introspector(
 /// Actual query execution goes through the pipe via `execute_sql_with_pipe`.
 pub(crate) fn create_pipe_system_components(
     mgr: &Arc<PipeConnectionManager>,
-) -> anyhow::Result<delightql_types::ConnectionComponents> {
-    let schema = mgr.schema().map_err(|e| anyhow::anyhow!("{}", e))?;
+) -> delightql_types::Result<delightql_types::ConnectionComponents> {
+    let schema = mgr
+        .schema()
+        .map_err(|e| delightql_cli_siso::error::diagnostic("pipe schema", e))?;
 
     // Session connection: a local in-memory SQLite DB for bootstrap session tables.
-    let session_conn = delightql_backends::SqliteConnectionManager::new_memory()
-        .map_err(|e| anyhow::anyhow!("Failed to create session database for pipe: {}", e))?;
+    let session_conn = delightql_backends::SqliteConnectionManager::new_memory()?;
     let raw_conn_arc = session_conn.get_connection_arc();
     let adapter = delightql_backends::sqlite::SqliteConnection::new(raw_conn_arc.clone());
     let conn_arc: std::sync::Arc<std::sync::Mutex<dyn delightql_types::DatabaseConnection>> =
@@ -68,7 +60,7 @@ pub(crate) fn create_pipe_system_components(
 
     let introspector = mgr
         .introspector()
-        .map_err(|e| anyhow::anyhow!("Failed to create pipe introspector: {}", e))?;
+        .map_err(|e| delightql_cli_siso::error::diagnostic("pipe introspector", e))?;
 
     Ok(delightql_types::ConnectionComponents {
         schema: Box::new(schema),

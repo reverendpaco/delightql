@@ -13,7 +13,7 @@ use crate::pipeline::asts::core::{StructuralForm, StructuralStep, TupleOrdinalOp
 use crate::pipeline::asts::unresolved as ast_unresolved;
 use crate::pipeline::sql_ast::{QueryExpression, SelectStatement, SqlStatement, TableExpression};
 use crate::pipeline::Pipeline;
-use crate::system::DelightQLSystem;
+use crate::system::ReadySystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 use std::sync::{Arc, Mutex};
@@ -33,8 +33,8 @@ impl DatabaseIntrospector for NoTables {
     }
 }
 
-fn world() -> DelightQLSystem {
-    DelightQLSystem::new(
+fn world() -> ReadySystem {
+    ReadySystem::new(
         Arc::new(Mutex::new(MockDatabaseConnection::new())),
         Box::new(NoTables),
         "sqlite",

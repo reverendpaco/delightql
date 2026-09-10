@@ -86,7 +86,7 @@ impl ReplState {
         // `None` when the in-memory engine refused, which degrades
         // `repl::*` loudly and never blocks access to the user's database.
         let (mut handle, repl_namespace_available) =
-            crate::connection::open_handle_over(repl_db.clone())?;
+            crate::connection::SessionProfile::Client(repl_db.clone()).open()?;
 
         // mount! the user database as "main" if specified
         if let Some(ref path) = db_path {
@@ -151,8 +151,9 @@ impl ReplState {
             ) {
                 crate::client::incident::warning(
                     "ledger",
-                    crate::client::incident::hierarchy::LEDGER_WRITE_LOST,
-                    format!("repl::config.option '{name}' seed failed ({reason})"),
+                    delightql_types::diagnostic::Client::LedgerWriteLost {
+                        message: format!("repl::config.option '{name}' seed failed ({reason})"),
+                    },
                 );
             }
         }
@@ -177,11 +178,12 @@ impl ReplState {
         {
             crate::client::incident::warning(
                 "ledger",
-                crate::client::incident::hierarchy::LEDGER_WRITE_LOST,
-                format!(
-                    "repl::config.option '{name}' projection failed ({reason}); \
+                delightql_types::diagnostic::Client::LedgerWriteLost {
+                    message: format!(
+                        "repl::config.option '{name}' projection failed ({reason}); \
                      the typed value stands"
-                ),
+                    ),
+                },
             );
         }
     }
@@ -383,11 +385,12 @@ pub fn prompt_recovery_boundary(repl_state: &mut ReplState) -> CommandResult {
                 if lost > 0 {
                     crate::client::incident::warning(
                         "ledger",
-                        crate::client::incident::hierarchy::LEDGER_WRITE_LOST,
-                        format!(
-                            "{lost} pending repl-database writes were lost ({})",
-                            reason.unwrap_or_default()
-                        ),
+                        delightql_types::diagnostic::Client::LedgerWriteLost {
+                            message: format!(
+                                "{lost} pending repl-database writes were lost ({})",
+                                reason.unwrap_or_default()
+                            ),
+                        },
                     );
                 }
             }
@@ -634,8 +637,9 @@ fn note_lost_ledger_write(outcome: &crate::client::database::WriteOutcome) {
     if let crate::client::database::WriteOutcome::Lost(reason) = outcome {
         crate::client::incident::warning(
             "ledger",
-            crate::client::incident::hierarchy::LEDGER_WRITE_LOST,
-            format!("a repl::history.input write was lost ({reason})"),
+            delightql_types::diagnostic::Client::LedgerWriteLost {
+                message: format!("a repl::history.input write was lost ({reason})"),
+            },
         );
     }
 }
@@ -980,7 +984,6 @@ fn handle_repl_command(parts: &[&str], repl_state: &mut ReplState) {
     }
 }
 
-
 /// `.bug [description…]`: the session files now, the client database
 /// serialized, and every database and DDL file the session mounted, as
 /// one tarball beside the session files. The words become an info row
@@ -989,8 +992,10 @@ fn handle_bug_command(repl_state: &mut ReplState, description: &str) -> Result<(
     let Some(db) = repl_state.repl_db.clone() else {
         crate::client::incident::error(
             "dot_command",
-            crate::client::incident::hierarchy::DATABASE_UNAVAILABLE,
-            "no client database this session; there is nothing to report from".to_string(),
+            delightql_types::diagnostic::Client::DatabaseUnavailable {
+                message: "no client database this session; there is nothing to report from"
+                    .to_string(),
+            },
         );
         return Ok(());
     };
@@ -1015,12 +1020,16 @@ fn handle_bug_command(repl_state: &mut ReplState, description: &str) -> Result<(
                 report.databases.len(),
                 report.ddl_files.len()
             );
-            println!("  replay with: dql query --replay-repl {}", report.archive.display());
+            println!(
+                "  replay with: dql query --replay-repl {}",
+                report.archive.display()
+            );
         }
         Err(e) => crate::client::incident::error(
             "dot_command",
-            crate::client::incident::hierarchy::CONFIG,
-            format!("the bug report could not be written: {e}"),
+            delightql_types::diagnostic::Client::Config {
+                message: format!("the bug report could not be written: {e}"),
+            },
         ),
     }
     Ok(())
@@ -1216,12 +1225,11 @@ pub fn process_query_in_mode(
             };
             eprintln!("error: {said}");
             if let Some(db) = &repl_state.repl_db {
-                use crate::client::incident::{hierarchy, Incident, IncidentKind};
-                let mut incident = Incident::plain(
+                use crate::client::incident::{Incident, IncidentKind};
+                let mut incident = Incident::of(
                     IncidentKind::Error,
                     "preflight",
-                    hierarchy::PREFLIGHT_REFUSED,
-                    said,
+                    &delightql_types::diagnostic::Client::PreflightRefused { message: said }.into(),
                 );
                 incident.input = Some(query.to_string());
                 db.record_incident(incident);
@@ -1273,59 +1281,65 @@ pub fn process_query_in_mode(
     // Named, so a panic's incident row names its road; caught, so the
     // ledger closes with the panic's own words rather than "disconnected".
     let (tx, rx) = mpsc::channel();
-    let query_thread = thread::Builder::new().name("query".to_string()).spawn(move || {
-        let run_all = || -> Result<Option<crate::exec_ng::ResultMetadata>> {
-        // Now we can use the cloned connection in the thread
-        let result = if sql_mode {
-            // For SQL mode, we'll execute directly without thread interruption for now
-            // This means Ctrl-C won't work for SQL queries yet
-            execute_sql_directly(
-                &query_str,
-                &db_connection,
-                zebra_mode,
-                target_stage.as_ref().or(Some(&Stage::Sql)),
-            )
-            .map(|_| None)
-        // SQL doesn't return metadata
-        } else {
-            crate::exec_ng::ZEBRA_MODE.with(|z| *z.borrow_mut() = zebra_mode);
-
-            let run = || -> Result<Option<crate::exec_ng::ResultMetadata>> {
-                let mut handle = dql_handle.lock().unwrap_or_else(|e| e.into_inner());
-                let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
-                crate::exec_ng::execute_query(
-                    &query_str,
-                    &mut *session,
-                    target_stage,
-                    output_format,
-                    no_headers,
-                    false,
-                    false,
-                )
-            };
-            run()
-        };
-        result
-        };
-        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_all)) {
-            Ok(result) => result,
-            Err(payload) => {
-                let message = if let Some(s) = payload.downcast_ref::<&str>() {
-                    (*s).to_string()
-                } else if let Some(s) = payload.downcast_ref::<String>() {
-                    s.clone()
+    let query_thread = thread::Builder::new()
+        .name("query".to_string())
+        .spawn(move || {
+            let run_all = || -> Result<Option<crate::exec_ng::ResultMetadata>> {
+                // Now we can use the cloned connection in the thread
+                let result = if sql_mode {
+                    // For SQL mode, we'll execute directly without thread interruption for now
+                    // This means Ctrl-C won't work for SQL queries yet
+                    execute_sql_directly(
+                        &query_str,
+                        &db_connection,
+                        zebra_mode,
+                        target_stage.as_ref().or(Some(&Stage::Sql)),
+                    )
+                    .map(|_| None)
+                // SQL doesn't return metadata
                 } else {
-                    "panic with non-string payload".to_string()
+                    crate::exec_ng::ZEBRA_MODE.with(|z| *z.borrow_mut() = zebra_mode);
+
+                    let run = || -> Result<Option<crate::exec_ng::ResultMetadata>> {
+                        let mut handle = dql_handle.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
+                        crate::exec_ng::execute_query(
+                            &query_str,
+                            &mut *session,
+                            target_stage,
+                            output_format,
+                            no_headers,
+                            false,
+                            false,
+                        )
+                    };
+                    run()
                 };
-                Err(anyhow::anyhow!(
-                    "[{}] the query thread panicked: {message}",
-                    crate::client::incident::PANIC_URI
-                ))
-            }
-        };
-        let _ = tx.send(result);
-    })
-    .expect("the query thread spawns");
+                result
+            };
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_all)) {
+                Ok(result) => result,
+                Err(payload) => {
+                    let message = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "panic with non-string payload".to_string()
+                    };
+                    Err(anyhow::Error::new(
+                        delightql_core::error::DelightQLError::from(
+                            delightql_types::diagnostic::Internal::Panic {
+                                message: format!("the query thread panicked: {message}"),
+                                location: None,
+                            },
+                        ),
+                    ))
+                }
+            };
+            let _ = tx.send(result);
+        })
+        .expect("the query thread spawns");
 
     // Wait for query completion or interruption
     loop {
@@ -1435,7 +1449,6 @@ pub fn process_query_in_mode(
 }
 
 // Helper function to execute query and return metadata
-
 
 /// Get ANSI color code based on zebra mode and column index
 fn get_zebra_color(zebra_mode: Option<usize>, col_index: usize) -> &'static str {
@@ -1692,18 +1705,21 @@ mod recovery_boundary_tests {
     }
 
     impl DqlSession for ScriptedSession {
-        fn query(&mut self, text: &str) -> Result<QueryResult, String> {
+        fn query(&mut self, text: &str) -> Result<QueryResult, delightql_core::api::ApiError> {
             self.queries.lock().unwrap().push(text.to_string());
-            Err("scripted session: no results".to_string())
+            Err("scripted session: no results".into())
         }
         fn fetch(
             &mut self,
             _handle: &delightql_core::api::QueryHandle,
             _count: u64,
-        ) -> Result<FetchResult, String> {
-            Err("scripted".to_string())
+        ) -> Result<FetchResult, delightql_core::api::ApiError> {
+            Err("scripted".into())
         }
-        fn close(&mut self, _handle: delightql_core::api::QueryHandle) -> Result<(), String> {
+        fn close(
+            &mut self,
+            _handle: delightql_core::api::QueryHandle,
+        ) -> Result<(), delightql_core::api::ApiError> {
             Ok(())
         }
     }

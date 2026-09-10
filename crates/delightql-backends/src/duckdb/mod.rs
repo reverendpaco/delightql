@@ -8,7 +8,6 @@
 /// - DelightQL-to-SQL transpilation and execution
 /// - Schema introspection
 /// - Thread-safe operations
-
 pub mod connection;
 pub mod db_adapter;
 pub mod executor;
@@ -25,9 +24,9 @@ pub use schema_provider::DuckDBSchemaProvider;
 pub use value::SqlValue;
 
 // DynamicDuckDBSchema implementation for DatabaseSchema trait
-use delightql_types::{DelightQLError, Result};
+use delightql_types::diagnostic::{DuckDb, Runtime};
 use delightql_types::schema::{ColumnInfo as ResolverColumnInfo, DatabaseSchema};
-use delightql_types::namespace::NamespacePath;
+use delightql_types::{DelightQLError, Result};
 use duckdb::Connection;
 use std::sync::{Arc, Mutex};
 
@@ -44,9 +43,13 @@ impl DynamicDuckDBSchema {
 }
 
 impl DatabaseSchema for DynamicDuckDBSchema {
-    fn get_table_columns(&self, schema: Option<&str>, table_name: &str) -> Result<Option<Vec<ResolverColumnInfo>>> {
+    fn get_table_columns(
+        &self,
+        schema: Option<&str>,
+        table_name: &str,
+    ) -> Result<Option<Vec<ResolverColumnInfo>>> {
         let conn = self.connection.lock().map_err(|error| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire DuckDB schema connection",
                 error.to_string(),
             )
@@ -72,7 +75,9 @@ impl DatabaseSchema for DynamicDuckDBSchema {
         };
 
         let mut stmt = conn.prepare(&query).map_err(|error| {
-            DelightQLError::database_error("Failed to prepare DuckDB schema query", error.to_string())
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("Failed to prepare DuckDB schema query: {error}"),
+            })
         })?;
         let columns = stmt
             .query_map([], |row| {
@@ -86,14 +91,19 @@ impl DatabaseSchema for DynamicDuckDBSchema {
                     nullable: is_nullable == "YES",
                     position: position as usize,
                     declared_type: data_type.filter(|t| !t.is_empty()),
+                    interior: false,
                 })
             })
             .map_err(|error| {
-                DelightQLError::database_error("Failed to query DuckDB schema", error.to_string())
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to query DuckDB schema: {error}"),
+                })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| {
-                DelightQLError::database_error("Failed to read DuckDB schema", error.to_string())
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to read DuckDB schema: {error}"),
+                })
             })?;
 
         if columns.is_empty() {
@@ -105,7 +115,7 @@ impl DatabaseSchema for DynamicDuckDBSchema {
 
     fn table_exists(&self, schema: Option<&str>, table_name: &str) -> Result<bool> {
         let conn = self.connection.lock().map_err(|error| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire DuckDB schema connection",
                 error.to_string(),
             )
@@ -128,18 +138,21 @@ impl DatabaseSchema for DynamicDuckDBSchema {
         };
 
         let mut stmt = conn.prepare(&query).map_err(|error| {
-            DelightQLError::database_error("Failed to prepare DuckDB schema query", error.to_string())
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("Failed to prepare DuckDB schema query: {error}"),
+            })
         })?;
         let mut rows = stmt.query_map([], |_| Ok(())).map_err(|error| {
-            DelightQLError::database_error("Failed to query DuckDB schema", error.to_string())
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("Failed to query DuckDB schema: {error}"),
+            })
         })?;
         match rows.next() {
             None => Ok(false),
             Some(Ok(())) => Ok(true),
-            Some(Err(error)) => Err(DelightQLError::database_error(
-                "Failed to read DuckDB schema",
-                error.to_string(),
-            )),
+            Some(Err(error)) => Err(DelightQLError::from(DuckDb::Engine {
+                message: format!("Failed to read DuckDB schema: {error}"),
+            })),
         }
     }
 }

@@ -9,7 +9,6 @@
 #![allow(unreachable_patterns)]
 
 use delightql_core::api::internals::parse;
-use delightql_core::error::{DelightQLError, KnownLimitationType};
 use rand::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -724,39 +723,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    // Check if this is a known limitation
-                    let is_known_limitation = matches!(
-                        &e,
-                        DelightQLError::KnownLimitation {
-                            limitation_type: KnownLimitationType::QualifiedNameAmbiguity,
-                            ..
-                        }
-                    );
-
-                    if is_known_limitation {
-                        // This is a known tree-sitter limitation, not a real bug
-                        if !args.failures_only {
-                            if args.verbose {
-                                eprintln!("Query {}: [WARN] Known limitation: {}", i + 1, e);
-                                eprintln!("  Query: {}", query);
-                            } else {
-                                eprintln!("Query {}: [WARN]", i + 1); // Known tree-sitter issue
-                            }
-                        }
+                    // Real parse error - this might be a bug
+                    if args.failures_only {
+                        // In failures-only mode, output tab-delimited: seed<tab>n<tab>query
+                        let seed_str = args.seed.map_or("RANDOM".to_string(), |s| s.to_string());
+                        println!("{}\t{}\t{}", seed_str, i + 1, query);
+                        eprintln!("# Parse error: {}", e);
                     } else {
-                        // Real parse error - this might be a bug
-                        if args.failures_only {
-                            // In failures-only mode, output tab-delimited: seed<tab>n<tab>query
-                            let seed_str =
-                                args.seed.map_or("RANDOM".to_string(), |s| s.to_string());
-                            println!("{}\t{}\t{}", seed_str, i + 1, query);
-                            eprintln!("# Parse error: {}", e);
-                        } else {
-                            eprintln!("Query {}: [FAIL] Parse error: {}", i + 1, e);
-                            eprintln!("  Query: {}", query);
-                            if args.seed.is_some() {
-                                eprintln!("  (seed: {})", args.seed.unwrap());
-                            }
+                        eprintln!("Query {}: [FAIL] Parse error: {}", i + 1, e);
+                        eprintln!("  Query: {}", query);
+                        if args.seed.is_some() {
+                            eprintln!("  (seed: {})", args.seed.unwrap());
                         }
                     }
                 }

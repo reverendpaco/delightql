@@ -51,7 +51,7 @@ pub fn handle_jstruct_command(
     let db_path_str = temp_path.to_string_lossy().to_string();
     let output_format = format.unwrap_or(OutputFormat::Table);
 
-    let mut handle = connection::open_handle()?;
+    let mut handle = connection::open_handle(connection::SessionProfile::client())?;
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
 
     // A higher-order directive writes both groups: `(arguments)(receipt

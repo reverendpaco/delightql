@@ -44,18 +44,12 @@ impl<S> PipeIntrospector<S> {
     where
         S: PipeMetadataSource,
     {
-        let raw = self.source.query_metadata(sql).map_err(|e| {
-            delightql_types::error::DelightQLError::database_error(
-                "Pipe introspection query failed",
-                e.to_string(),
-            )
-        })?;
-        decode_single_query(&raw).map_err(|e| {
-            delightql_types::error::DelightQLError::database_error(
-                "Pipe introspection metadata is malformed",
-                e.to_string(),
-            )
-        })
+        let raw = self
+            .source
+            .query_metadata(sql)
+            .map_err(|e| crate::error::diagnostic(&"Pipe introspection query failed", e))?;
+        decode_single_query(&raw)
+            .map_err(|e| crate::error::diagnostic(&"Pipe introspection metadata is malformed", e))
     }
 
     /// TwoPhase mode: discovery query lists table names, then PRAGMA table_info per table.
@@ -68,30 +62,24 @@ impl<S> PipeIntrospector<S> {
         S: PipeMetadataSource,
     {
         let raw = self.source.query_metadata(discovery_sql).map_err(|e| {
-            delightql_types::error::DelightQLError::database_error(
-                "Pipe introspection discovery query failed",
-                e.to_string(),
-            )
+            crate::error::diagnostic(&"Pipe introspection discovery query failed", e)
         })?;
         let tables = decode_discovery(&raw, has_type_column).map_err(|e| {
-            delightql_types::error::DelightQLError::database_error(
-                "Pipe introspection discovery metadata is malformed",
-                e.to_string(),
-            )
+            crate::error::diagnostic(&"Pipe introspection discovery metadata is malformed", e)
         })?;
         let mut entities = Vec::with_capacity(tables.len());
         for (table_name, entity_type_id) in tables {
             let pragma_sql = format!("PRAGMA table_info({})", table_name);
             let columns = self.source.query_metadata(&pragma_sql).map_err(|e| {
-                delightql_types::error::DelightQLError::database_error(
-                    format!("Pipe introspection table metadata query failed for '{table_name}'"),
-                    e.to_string(),
+                crate::error::diagnostic(
+                    &format!("Pipe introspection table metadata query failed for '{table_name}'"),
+                    e,
                 )
             })?;
             let attributes = decode_relation_columns(&columns, &table_name).map_err(|e| {
-                delightql_types::error::DelightQLError::database_error(
-                    format!("Pipe introspection table metadata is malformed for '{table_name}'"),
-                    e.to_string(),
+                crate::error::diagnostic(
+                    &format!("Pipe introspection table metadata is malformed for '{table_name}'"),
+                    e,
                 )
             })?;
             entities.push(DiscoveredEntity {

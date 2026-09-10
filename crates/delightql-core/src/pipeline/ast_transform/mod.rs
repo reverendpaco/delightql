@@ -16,19 +16,18 @@ use crate::pipeline::asts::core::expressions::functions::{
     CaseExpression, FunctorCall, PureCall, SealedCall, ValueTemplate, ValueTemplatePart,
 };
 use crate::pipeline::asts::core::expressions::metadata_types::CteRequirements;
-use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
+use crate::pipeline::asts::core::expressions::relational::{InnerRelationPattern, Realized};
 use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
 use crate::pipeline::asts::core::operators::{FrameBound, WindowFrame};
 use crate::pipeline::asts::core::ArgumentValue;
 use crate::pipeline::asts::core::{
-    Access, AnonRelation, AnonTable, BagCorrelation, Chain, Continuation, CorrPred, CteBinding,
-    Datum, DelegateSpec, DomainExpression, Enclyph, ErJoinStep, FunctionApplication, Glob, Grelex,
-    GroundForm, GroupSpec, HeaderItem, MemberCorrelation, MetadataGroup, MetadataTarget,
-    NamedOutItem, NamedReference, OrderingSpec, OutItem, PatternTarget, Phase, PipeOp, Query,
-    Record, RecordMember, RecordPattern, RecordPatternMember, ReductionItem, ReductionPlan,
-    Reference, RegexSelector, Relation, RenameSource, RenameSpec, RepositionSpec, SelectorItem,
-    Slot, Spread, TabularBody, TabularRow, TreeGroupPlan, TreePattern, TruthExpression, Tuple,
-    TupleElement, WholeHeading,
+    Access, AnonTable, BagCorrelation, Chain, Continuation, CorrPred, Datum, DelegateSpec,
+    DomainExpression, Enclyph, ErJoinStep, FunctionApplication, Glob, GroupSpec, HeaderItem,
+    MemberCorrelation, MetadataGroup, MetadataTarget, NamedOutItem, NamedReference, OrderingSpec,
+    OutItem, PatternTarget, Phase, PipeOp, Query, Record, RecordMember, RecordPattern,
+    RecordPatternMember, ReductionItem, ReductionPlan, Reference, RegexSelector, Relation,
+    RenameSource, RenameSpec, RepositionSpec, SelectorItem, Slot, Spread, TabularBody, TabularRow,
+    TreeGroupPlan, TreePattern, TruthExpression, Tuple, TupleElement, WholeHeading,
 };
 use crate::pipeline::asts::core::{
     Comparison, Existence, Membership, Probe, RelationalMembership, SigmaApplication, ValueRow,
@@ -60,27 +59,17 @@ impl<T> FoldAction<T> {
 // Payload folds for a same-phase rewrite
 // =============================================================================
 
-/// The seven payload folds for a rewrite that stays in one phase.
+/// The payload folds for a rewrite that stays in one phase.
 ///
-/// `P::Scope` and `Q::Scope` are the SAME type here, so carrying a payload
+/// Each `P::…` and `Q::…` is the SAME type here, so carrying a payload
 /// across is not a decision anyone could get wrong and not a retag of
 /// anything: the value is already in the phase it is going to. A rewrite
 /// that crosses phases cannot use this — the types differ, and the compiler
-/// says so.
+/// says so. What a node PUBLISHES is not among these: a relation identity
+/// crosses by the phases' own door (`phases::carry_scope`), and no walk is
+/// asked for one.
 macro_rules! same_phase_payload_folds {
     ($phase:ty) => {
-        fn fold_scope(
-            &mut self,
-            scope: <$phase as crate::pipeline::asts::core::Phase>::Scope,
-        ) -> crate::error::Result<<$phase as crate::pipeline::asts::core::Phase>::Scope> {
-            Ok(scope)
-        }
-        fn fold_correlation_arm(
-            &mut self,
-            arm: <$phase as crate::pipeline::asts::core::Phase>::CorrelationArm,
-        ) -> crate::error::Result<<$phase as crate::pipeline::asts::core::Phase>::CorrelationArm> {
-            Ok(arm)
-        }
         fn fold_output(
             &mut self,
             output: <$phase as crate::pipeline::asts::core::Phase>::Output,
@@ -182,50 +171,14 @@ macro_rules! minted_where_it_is_decided {
     ($($method:ident -> $target:ty : $what:literal),+ $(,)?) => {
         $(
             fn $method(&mut self, _: ()) -> crate::error::Result<$target> {
-                Err(crate::error::DelightQLError::transformation_error(
-                    concat!(
+                Err(Internal::invariant("phase_payload", concat!(
                         $what,
                         " is minted where it is decided, and this fold is not that place",
-                    ),
-                    "phase_payload",
-                ))
+                    )))
             }
         )+
     };
 }
-
-/// The answer for the two slots RESOLUTION mints: a relation's scope, and the
-/// boundary a consulted view publishes.
-///
-/// Both are minted by the pass that determines what the relation IS. There is
-/// no default here: a scope stood in for by a fold would be a relation nobody
-/// looked at, recorded in the registry as though somebody had. A consulted
-/// view is the resolver's own product and never arrives from the authored
-/// tree, so a fold that walks past one is walking past something nobody
-/// resolved.
-macro_rules! scope_is_minted_where_it_is_resolved {
-    () => {
-        fn fold_correlation_arm(
-            &mut self,
-            _: delightql_types::SqlIdentifier,
-        ) -> crate::error::Result<crate::relation::SemanticRelation> {
-            Err(crate::error::DelightQLError::transformation_error(
-                "a whole-heading correlation's arm is answered where the correlation is \
-                 resolved, and this fold walked past one nobody resolved",
-                "correlation_arm",
-            ))
-        }
-        fn fold_scope(&mut self, _: ()) -> crate::error::Result<crate::relation::SemanticRelation> {
-            Err(crate::error::DelightQLError::transformation_error(
-                "a relation's scope is minted where the relation is resolved, and this \
-                 fold walked past a relation nobody resolved",
-                "result",
-            ))
-        }
-    };
-}
-
-pub(crate) use scope_is_minted_where_it_is_resolved;
 
 /// The answer for a column reference at the edge out of the authored phase.
 ///
@@ -242,12 +195,12 @@ macro_rules! column_is_bound_where_it_is_resolved {
             column: crate::pipeline::asts::core::AuthoredColumn,
         ) -> crate::error::Result<crate::pipeline::asts::core::ColumnOccurrence> {
             let crate::pipeline::asts::core::AuthoredColumn { name, .. } = column;
-            Err(crate::error::DelightQLError::transformation_error(
+            Err(Internal::invariant(
+                "lvar",
                 format!(
                     "the column reference '{name}' is bound where it is resolved, \
                      and this fold walked past a name nobody looked up"
                 ),
-                "lvar",
             ))
         }
     };
@@ -267,13 +220,13 @@ macro_rules! binder_is_bound_where_the_pattern_is_resolved {
             &mut self,
             binder: crate::pipeline::asts::core::WrittenBinder,
         ) -> crate::error::Result<crate::relation::PortId> {
-            Err(crate::error::DelightQLError::transformation_error(
+            Err(Internal::invariant(
+                "slot_bind",
                 format!(
                     "the slot binding '{}' is bound where the caller pattern is \
                      resolved, and this fold walked past a pattern nobody bound",
                     binder.name
                 ),
-                "slot_bind",
             ))
         }
     };
@@ -294,11 +247,12 @@ macro_rules! a_landing_is_consumed_where_the_pipe_is_applied {
             &mut self,
             _: crate::pipeline::asts::core::AtSign,
         ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-            Err(crate::error::DelightQLError::validation_error_categorized(
-                "resolution/ho/pipe_landing",
-                "`@` names the parameter a piped relation lands at, and this one \
-                 stands in no invocation under a pipe",
-                "a landing is written where a pipe is applied",
+            Err($crate::diagnostic::DelightQLError::from(
+                $crate::diagnostic::Ho::PipeLanding {
+                    message: "`@` names the parameter a piped relation lands at, and this one \
+                 stands in no invocation under a pipe"
+                        .to_string(),
+                },
             ))
         }
     };
@@ -318,12 +272,13 @@ macro_rules! a_context_marker_is_consumed_where_the_call_instantiates {
             &mut self,
             _: crate::pipeline::asts::core::ContextMarker,
         ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-            Err(crate::error::DelightQLError::validation_error_categorized(
-                "resolution/context/marker_position",
-                "`..` selects the context calling mode of a context-aware definition, \
-                 and this call instantiates none",
-                "write the arguments the callee declares; `..` belongs only in a \
-                 context-aware definition's call",
+            Err($crate::diagnostic::DelightQLError::from(
+                $crate::diagnostic::Resolution::ContextMarkerPosition {
+                    message:
+                        "`..` selects the context calling mode of a context-aware definition, \
+                 and this call instantiates none"
+                            .to_string(),
+                },
             ))
         }
     };
@@ -343,13 +298,13 @@ macro_rules! position_is_resolved_against_a_heading {
             &mut self,
             ordinal: crate::pipeline::asts::core::ColumnOrdinal,
         ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-            Err(crate::error::DelightQLError::transformation_error(
+            Err(Internal::invariant(
+                "column_ordinal",
                 format!(
                     "the column position '{}' is resolved against a heading, and \
                      this fold walked past one with no heading to answer it",
                     crate::lispy::ToLispy::to_lispy(&ordinal)
                 ),
-                "column_ordinal",
             ))
         }
 
@@ -357,13 +312,13 @@ macro_rules! position_is_resolved_against_a_heading {
             &mut self,
             range: crate::pipeline::asts::core::ColumnRange,
         ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-            Err(crate::error::DelightQLError::transformation_error(
+            Err(Internal::invariant(
+                "column_range",
                 format!(
                     "the column range '{}' is resolved against a heading, and this \
                      fold walked past one with no heading to answer it",
                     crate::lispy::ToLispy::to_lispy(&range)
                 ),
-                "column_range",
             ))
         }
     };
@@ -418,25 +373,23 @@ pub(crate) use minted_where_it_is_decided;
 ///
 /// The PAYLOAD methods below have no defaults, and that is the point. A
 /// phase selects what a field holds, so there is no mechanical way to carry
-/// one across an edge: `P::Scope` and `Q::Scope` are different types and
-/// only the implementor knows what the Q-phase value is. A fold that has
+/// one across an edge: `P::Col` and `Q::Col` are different types and only
+/// the implementor knows what the Q-phase value is. A fold that has
 /// nothing to say about a payload cannot silently retag it — it does not
 /// compile until it answers. Each answer may fail, so a transition that
 /// cannot be made is an error rather than a fabricated value.
+///
+/// WHAT A NODE PUBLISHES IS NOT A PAYLOAD, and there is deliberately no
+/// method here that answers with a relation identity — not for a head or a
+/// step's result, not for the arm a whole-heading correlation names. An
+/// identity is the relation authority's answer at the node's derivation;
+/// it crosses a phase, or survives a same-phase rewrite, through the
+/// phases' own doors (`phases::carry_scope`, `phases::carry_correlation_arm`),
+/// which take no answer from the walk. A walk rewrites what a node HOLDS;
+/// what it IS was decided where it was built.
 #[allow(unused_variables)]
 pub trait AstTransform<P: Phase, Q: Phase> {
     // -- Payload folds: required, one per phase-selected field ----------------
-
-    /// The relation a node publishes.
-    fn fold_scope(&mut self, scope: P::Scope) -> Result<Q::Scope>;
-
-    /// Which ARM a whole-heading correlation names.
-    ///
-    /// A separate answer from `fold_scope`: this one names an operand by the
-    /// spelling the author wrote beside a glob, and the scope it resolves to
-    /// is found by asking which arm answers to that name — not by the scope
-    /// the enclosing node publishes.
-    fn fold_correlation_arm(&mut self, arm: P::CorrelationArm) -> Result<Q::CorrelationArm>;
 
     /// A binding's decided-once recursion fact.
 
@@ -502,10 +455,6 @@ pub trait AstTransform<P: Phase, Q: Phase> {
         walk_transform_relational(self, e)
     }
 
-    fn transform_relation(&mut self, r: Relation<P>) -> Result<Relation<Q>> {
-        walk_transform_relation(self, r)
-    }
-
     fn transform_boolean(&mut self, e: TruthExpression<P>) -> Result<TruthExpression<Q>> {
         walk_transform_boolean(self, e)
     }
@@ -528,58 +477,51 @@ pub trait AstTransform<P: Phase, Q: Phase> {
         walk_transform_callable(self, c)
     }
 
-    fn transform_operator(&mut self, o: PipeOp<P>) -> Result<PipeOp<Q>> {
-        walk_transform_operator(self, o)
+    /// What a ground read NAMES, as the authored phase holds it. A leaf: a
+    /// spelling before resolution, nothing after, so a bound phase's walk
+    /// has nothing here to answer with — which relation a resolved read is
+    /// stands in the head's own result. The default is the phases' door.
+    fn transform_mention(&mut self, mention: P::Mention) -> Result<Q::Mention> {
+        crate::pipeline::asts::core::phases::carry_mention::<P, Q>(mention)
     }
 
-    fn transform_step(
-        &mut self,
-        step: crate::pipeline::asts::core::Step<P>,
-    ) -> Result<crate::pipeline::asts::core::Step<Q>> {
-        walk_transform_step(self, step)
+    // THERE IS DELIBERATELY NO HOOK THAT ANSWERS WITH A NODE'S STRUCTURE — not
+    // a head, not a step, not a continuation, an operator, an access, a
+    // projection item, a grouping, an ordering, a pattern, a header. A
+    // relation's interface and support law were derived from that structure,
+    // so a hook that answered with one could stand a witness's syntax under
+    // an ordering's record. The structure crosses by the walk functions' own
+    // reconstruction (`walk_transform_*`), which rebuild the variant they were
+    // handed around what it holds; the hooks below answer for LEAVES — a
+    // value, a truth, a reference, a callable, an authored mention — and for
+    // whole relational SUBTREES, whose published identity the holding node
+    // checks.
+
+    /// REALIZE AN INTERIOR, once it has crossed: the one hook that answers
+    /// with an interior, and the one place a walk may stand a different body
+    /// under a head's kept identity.
+    ///
+    /// The answer is a [`Realized`] — the classification, over the body the
+    /// interior stood over or over a `Replacement` the relation authority
+    /// judged for that body — and the chain carrier judges it against the
+    /// body the head actually holds before building the head. A walk with no
+    /// realization to perform keeps the interior, which is the default.
+    fn realize_interior(&mut self, pattern: InnerRelationPattern<Q>) -> Result<Realized<Q>> {
+        Ok(Realized::kept(pattern))
     }
 
-    fn transform_continuation(&mut self, c: Continuation<P>) -> Result<Continuation<Q>> {
-        walk_transform_continuation(self, c)
-    }
-
-    fn transform_grelex(&mut self, g: Grelex<P>) -> Result<Grelex<Q>> {
-        walk_transform_grelex(self, g)
-    }
-
-    fn transform_anon_table(&mut self, a: AnonTable<P>) -> Result<AnonTable<Q>> {
-        walk_transform_anon_table(self, a)
-    }
-
-    fn transform_inner_relation(
-        &mut self,
-        i: InnerRelationPattern<P>,
-    ) -> Result<InnerRelationPattern<Q>> {
-        walk_transform_inner_relation(self, i)
-    }
-
-    // -- Action hooks (FoldAction wrappers) -----------------------------------
-    // These wrap the non-action hooks in FoldAction::Continue by default.
+    // -- The subtree hook ------------------------------------------------------
     // Override to return FoldAction::Replaced when a pass fully handles a
-    // subtree (e.g., the refiner's FAR cycle).
+    // relational subtree (the refiner's FAR cycle). What the subtree
+    // publishes is checked by the node that holds it: an operand nested in a
+    // step or a head comes back publishing what it published, or the fold
+    // refuses there.
 
     fn transform_relational_action(&mut self, e: Chain<P>) -> Result<FoldAction<Chain<Q>>> {
         self.transform_relational(e).map(FoldAction::Continue)
     }
 
-    fn transform_relation_action(&mut self, r: Relation<P>) -> Result<FoldAction<Relation<Q>>> {
-        self.transform_relation(r).map(FoldAction::Continue)
-    }
-
-    // -- Supporting transform methods -----------------------------------------
-
-    fn transform_access(&mut self, d: Access<P>) -> Result<Access<Q>> {
-        walk_transform_access(self, d)
-    }
-
-    fn transform_cte_binding(&mut self, c: CteBinding<P>) -> Result<CteBinding<Q>> {
-        walk_transform_cte_binding(self, c)
-    }
+    // -- Leaf hooks -------------------------------------------------------------
 
     fn transform_enclyph(&mut self, e: Enclyph<P>) -> Result<Enclyph<Q>> {
         walk_transform_enclyph(self, e)
@@ -587,18 +529,6 @@ pub trait AstTransform<P: Phase, Q: Phase> {
 
     fn transform_record_member(&mut self, m: RecordMember<P>) -> Result<RecordMember<Q>> {
         walk_transform_record_member(self, m)
-    }
-
-    fn transform_metadata_group(&mut self, g: MetadataGroup<P>) -> Result<MetadataGroup<Q>> {
-        walk_transform_metadata_group(self, g)
-    }
-
-    fn transform_reduction_item(&mut self, i: ReductionItem<P>) -> Result<ReductionItem<Q>> {
-        walk_transform_reduction_item(self, i)
-    }
-
-    fn transform_tree_pattern(&mut self, p: TreePattern<P>) -> Result<TreePattern<Q>> {
-        walk_transform_tree_pattern(self, p)
     }
 
     fn transform_case(&mut self, c: CaseExpression<P>) -> Result<CaseExpression<Q>> {
@@ -616,44 +546,8 @@ pub trait AstTransform<P: Phase, Q: Phase> {
         walk_transform_reference(self, r)
     }
 
-    fn transform_spread(&mut self, s: Spread<P>) -> Result<Spread<Q>> {
-        walk_transform_spread(self, s)
-    }
-
-    fn transform_selector_item(&mut self, i: SelectorItem<P>) -> Result<SelectorItem<Q>> {
-        walk_transform_selector_item(self, i)
-    }
-
-    fn transform_ordering_spec(&mut self, o: OrderingSpec<P>) -> Result<OrderingSpec<Q>> {
-        walk_transform_ordering_spec(self, o)
-    }
-
     fn transform_window_frame(&mut self, f: WindowFrame<P>) -> Result<WindowFrame<Q>> {
         walk_transform_window_frame(self, f)
-    }
-
-    fn transform_group_spec(&mut self, m: GroupSpec<P>) -> Result<GroupSpec<Q>> {
-        walk_transform_group_spec(self, m)
-    }
-
-    fn transform_out_item(&mut self, i: OutItem<P>) -> Result<OutItem<Q>> {
-        walk_transform_out_item(self, i)
-    }
-
-    fn transform_named_out_item(&mut self, i: NamedOutItem<P>) -> Result<NamedOutItem<Q>> {
-        walk_transform_named_out_item(self, i)
-    }
-
-    fn transform_rename_spec(&mut self, r: RenameSpec<P>) -> Result<RenameSpec<Q>> {
-        walk_transform_rename_spec(self, r)
-    }
-
-    fn transform_reposition_spec(&mut self, r: RepositionSpec<P>) -> Result<RepositionSpec<Q>> {
-        walk_transform_reposition_spec(self, r)
-    }
-
-    fn transform_tabular_row(&mut self, r: TabularRow<Datum<P>>) -> Result<TabularRow<Datum<Q>>> {
-        walk_transform_tabular_row(self, r)
     }
 
     fn transform_frame_bound(&mut self, b: FrameBound<P>) -> Result<FrameBound<Q>> {
@@ -719,7 +613,7 @@ pub fn walk_transform_out_item<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Size
             let expr = t.transform_domain(one.expr.clone())?;
             Ok(OutItem::One(one.folded(t, expr)?))
         }
-        OutItem::Many(spread) => Ok(OutItem::Many(t.transform_spread(spread)?)),
+        OutItem::Many(spread) => Ok(OutItem::Many(walk_transform_spread(t, spread)?)),
         OutItem::Whole => Ok(OutItem::Whole),
     }
 }
@@ -738,7 +632,7 @@ pub fn walk_transform_group_spec<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Si
 ) -> Result<GroupSpec<Q>> {
     match spec {
         GroupSpec::Distinct { keys } => Ok(GroupSpec::Distinct {
-            keys: keys.try_map(|item| t.transform_out_item(item))?,
+            keys: keys.try_map(|item| walk_transform_out_item(t, item))?,
         }),
         GroupSpec::Reduce {
             keys,
@@ -747,9 +641,9 @@ pub fn walk_transform_group_spec<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Si
         } => Ok(GroupSpec::Reduce {
             keys: keys
                 .into_iter()
-                .map(|item| t.transform_out_item(item))
+                .map(|item| walk_transform_out_item(t, item))
                 .collect::<Result<Vec<_>>>()?,
-            reductions: reductions.try_map(|item| t.transform_reduction_item(item))?,
+            reductions: reductions.try_map(|item| walk_transform_reduction_item(t, item))?,
             plan: transform_reduction_plan(t, plan)?,
         }),
     }
@@ -861,7 +755,7 @@ pub fn walk_transform_enclyph<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized
                 Ok::<_, crate::error::DelightQLError>(match e {
                     TupleElement::Value(value) => TupleElement::Value(t.transform_domain(value)?),
                     TupleElement::Spread(spread) => {
-                        TupleElement::Spread(t.transform_spread(spread)?)
+                        TupleElement::Spread(walk_transform_spread(t, spread)?)
                     }
                 })
             })?,
@@ -882,10 +776,10 @@ pub fn walk_transform_record_member<P: Phase, Q: Phase, F: AstTransform<P, Q> + 
             key,
             value: Box::new(t.transform_enclyph(*value)?),
         }),
-        RecordMember::Spread(spread) => Ok(RecordMember::Spread(t.transform_spread(spread)?)),
+        RecordMember::Spread(spread) => Ok(RecordMember::Spread(walk_transform_spread(t, spread)?)),
         RecordMember::Metadata { key, group } => Ok(RecordMember::Metadata {
             key,
-            group: Box::new(t.transform_metadata_group(*group)?),
+            group: Box::new(walk_transform_metadata_group(t, *group)?),
         }),
         RecordMember::SelfKeyed(NamedReference(column)) => {
             Ok(RecordMember::SelfKeyed(NamedReference(t.fold_col(column)?)))
@@ -900,9 +794,9 @@ pub fn walk_transform_reduction_item<P: Phase, Q: Phase, F: AstTransform<P, Q> +
     item: ReductionItem<P>,
 ) -> Result<ReductionItem<Q>> {
     match item {
-        ReductionItem::Out(item) => Ok(ReductionItem::Out(t.transform_out_item(item)?)),
+        ReductionItem::Out(item) => Ok(ReductionItem::Out(walk_transform_out_item(t, item)?)),
         ReductionItem::Metadata(metadata) => {
-            let group = t.transform_metadata_group(metadata.group.clone())?;
+            let group = walk_transform_metadata_group(t, metadata.group.clone())?;
             Ok(ReductionItem::Metadata(metadata.folded(t, group)?))
         }
         ReductionItem::Pivot(pivot) => Ok(ReductionItem::Pivot(
@@ -916,12 +810,12 @@ pub fn walk_transform_reduction_item<P: Phase, Q: Phase, F: AstTransform<P, Q> +
             payload: delegate
                 .payload
                 .into_iter()
-                .map(|item| t.transform_out_item(item))
+                .map(|item| walk_transform_out_item(t, item))
                 .collect::<Result<Vec<_>>>()?,
             order: delegate
                 .order
                 .into_iter()
-                .map(|o| t.transform_ordering_spec(o))
+                .map(|o| walk_transform_ordering_spec(t, o))
                 .collect::<Result<Vec<_>>>()?,
         })),
     }
@@ -938,14 +832,13 @@ pub fn walk_transform_metadata_group<P: Phase, Q: Phase, F: AstTransform<P, Q> +
                 MetadataTarget::Enclyph(t.transform_enclyph(enclyph)?)
             }
             MetadataTarget::Group(nested) => {
-                MetadataTarget::Group(Box::new(t.transform_metadata_group(*nested)?))
+                MetadataTarget::Group(Box::new(walk_transform_metadata_group(t, *nested)?))
             }
         },
         cte_requirements: group
             .cte_requirements
             .map(|r| transform_cte_requirements(t, r))
             .transpose()?,
-        summary: group.summary,
     })
 }
 
@@ -973,7 +866,7 @@ pub fn walk_transform_tree_pattern<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
                     } => Ok(RecordPatternMember::Nested {
                         key,
                         iteration,
-                        pattern: Box::new(t.transform_tree_pattern(*pattern)?),
+                        pattern: Box::new(walk_transform_tree_pattern(t, *pattern)?),
                     }),
                     RecordPatternMember::Path(binding) => Ok(RecordPatternMember::Path(binding)),
                     RecordPatternMember::Metadata { key, target } => {
@@ -981,7 +874,7 @@ pub fn walk_transform_tree_pattern<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
                             key: t.fold_binder(key)?,
                             target: match target {
                                 PatternTarget::Pattern(inner) => PatternTarget::Pattern(Box::new(
-                                    t.transform_tree_pattern(*inner)?,
+                                    walk_transform_tree_pattern(t, *inner)?,
                                 )),
                                 PatternTarget::Disregarded => PatternTarget::Disregarded,
                             },
@@ -1075,19 +968,21 @@ pub fn walk_transform_domain<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>
 /// Carry a whole-heading correlation across a phase change. The MODE
 /// travels: which columns the two arms pair is found by name in one form and
 /// by position in the other, and a pass that dropped the distinction could
-/// not tell the two spellings apart again.
-pub fn transform_whole_heading<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
-    t: &mut F,
+/// not tell the two spellings apart again. The ARMS are relation identities
+/// and cross by the phases' door: the walk is handed nothing here and
+/// answers nothing.
+pub fn transform_whole_heading<P: Phase, Q: Phase>(
     whole: WholeHeading<P>,
 ) -> Result<WholeHeading<Q>> {
+    use crate::pipeline::asts::core::phases::carry_correlation_arm;
     Ok(match whole {
         WholeHeading::ByName { left, right } => WholeHeading::ByName {
-            left: t.fold_correlation_arm(left)?,
-            right: t.fold_correlation_arm(right)?,
+            left: carry_correlation_arm::<P, Q>(left)?,
+            right: carry_correlation_arm::<P, Q>(right)?,
         },
         WholeHeading::ByPosition { left, right } => WholeHeading::ByPosition {
-            left: t.fold_correlation_arm(left)?,
-            right: t.fold_correlation_arm(right)?,
+            left: carry_correlation_arm::<P, Q>(left)?,
+            right: carry_correlation_arm::<P, Q>(right)?,
         },
     })
 }
@@ -1099,7 +994,7 @@ pub fn transform_corr_pred<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
 ) -> Result<CorrPred<Q>> {
     Ok(match predicate {
         CorrPred::Expression(expression) => CorrPred::Expression(t.transform_boolean(expression)?),
-        CorrPred::Whole(whole) => CorrPred::Whole(transform_whole_heading(t, whole)?),
+        CorrPred::Whole(whole) => CorrPred::Whole(transform_whole_heading::<P, Q>(whole)?),
     })
 }
 
@@ -1423,7 +1318,7 @@ fn transform_functor_call_inner<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Siz
                         t.transform_callable(callable).map(ScalarArgument::Callable)
                     }
                     ScalarArgument::Spread(spread) => {
-                        t.transform_spread(spread).map(ScalarArgument::Spread)
+                        walk_transform_spread(t, spread).map(ScalarArgument::Spread)
                     }
                     ScalarArgument::Star => Ok(ScalarArgument::Star),
                     ScalarArgument::Context(marker) => {
@@ -1485,7 +1380,7 @@ pub fn transform_standard_application<P: Phase, Q: Phase, F: AstTransform<P, Q> 
                 ordering: window
                     .ordering
                     .into_iter()
-                    .map(|ordering| t.transform_ordering_spec(ordering))
+                    .map(|ordering| walk_transform_ordering_spec(t, ordering))
                     .collect::<Result<Vec<_>>>()?,
                 frame: window
                     .frame
@@ -1536,12 +1431,12 @@ pub fn walk_transform_operator<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Size
 ) -> Result<PipeOp<Q>> {
     match op {
         PipeOp::Project(items) => Ok(PipeOp::Project(
-            items.try_map(|item| t.transform_out_item(item))?,
+            items.try_map(|item| walk_transform_out_item(t, item))?,
         )),
         PipeOp::Embed(items) => Ok(PipeOp::Embed(
-            items.try_map(|item| t.transform_out_item(item))?,
+            items.try_map(|item| walk_transform_out_item(t, item))?,
         )),
-        PipeOp::Group(spec) => Ok(PipeOp::Group(t.transform_group_spec(spec)?)),
+        PipeOp::Group(spec) => Ok(PipeOp::Group(walk_transform_group_spec(t, spec)?)),
         PipeOp::MapCover(MapCover {
             callable,
             selector,
@@ -1551,7 +1446,7 @@ pub fn walk_transform_operator<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Size
             callable: t.fold_cover_callable(callable)?,
             selector: selector
                 .into_iter()
-                .map(|item| t.transform_selector_item(item))
+                .map(|item| walk_transform_selector_item(t, item))
                 .collect::<Result<Vec<_>>>()?,
             guard: guard
                 .map(|c| t.transform_boolean(*c).map(|b| Box::new(b)))
@@ -1569,14 +1464,14 @@ pub fn walk_transform_operator<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Size
         PipeOp::ProjectOut(selector) => Ok(PipeOp::ProjectOut(
             selector
                 .into_iter()
-                .map(|item| t.transform_selector_item(item))
+                .map(|item| walk_transform_selector_item(t, item))
                 .collect::<Result<Vec<_>>>()?,
         )),
         PipeOp::Rename(specs) => Ok(PipeOp::Rename(
-            specs.try_map(|s| t.transform_rename_spec(s))?,
+            specs.try_map(|s| walk_transform_rename_spec(t, s))?,
         )),
         PipeOp::Transform { items, guard } => Ok(PipeOp::Transform {
-            items: items.try_map(|item| t.transform_named_out_item(item))?,
+            items: items.try_map(|item| walk_transform_named_out_item(t, item))?,
             guard: guard
                 .map(|c| t.transform_boolean(*c).map(|b| Box::new(b)))
                 .transpose()?,
@@ -1591,7 +1486,7 @@ pub fn walk_transform_operator<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Size
             naming,
             selector: selector
                 .into_iter()
-                .map(|item| t.transform_selector_item(item))
+                .map(|item| walk_transform_selector_item(t, item))
                 .collect::<Result<Vec<_>>>()?,
             cells: cells
                 .into_iter()
@@ -1625,36 +1520,12 @@ pub fn walk_transform_anon_table<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Si
                 })
                 .transpose()?
                 .map(|row| TabularRow(Box::new(row))),
-            rows: anon.body.rows.try_map(|row| t.transform_tabular_row(row))?,
+            rows: anon
+                .body
+                .rows
+                .try_map(|row| walk_transform_tabular_row(t, row))?,
         },
     })
-}
-
-pub fn walk_transform_grelex<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
-    t: &mut F,
-    head: Grelex<P>,
-) -> Result<Grelex<Q>> {
-    let form = match head.form().clone() {
-        GroundForm::Reference(rel) => {
-            GroundForm::Reference(t.transform_relation_action(rel)?.into_inner())
-        }
-        GroundForm::Literal(anon) => GroundForm::Literal(AnonRelation {
-            table: t.transform_anon_table(anon.table)?,
-            alias: anon.alias,
-            outer: anon.outer,
-        }),
-    };
-    head.folded(t, form)
-}
-
-/// One step crossing phases: the form's payloads rephase and what the step
-/// publishes goes through the scope fold.
-pub fn walk_transform_step<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
-    t: &mut F,
-    step: crate::pipeline::asts::core::Step<P>,
-) -> Result<crate::pipeline::asts::core::Step<Q>> {
-    let form = t.transform_continuation(step.form().clone())?;
-    step.folded(t, form)
 }
 
 pub fn walk_transform_continuation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
@@ -1663,16 +1534,25 @@ pub fn walk_transform_continuation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
 ) -> Result<Continuation<Q>> {
     match continuation {
         Continuation::Access { access, named } => Ok(Continuation::Access {
-            access: t.transform_access(access)?,
+            access: walk_transform_access(t, access)?,
             named: crate::pipeline::asts::core::phases::carry_stage_name::<P, Q>(named)?,
         }),
         Continuation::Correlate { whole } => Ok(Continuation::Correlate {
-            whole: transform_whole_heading(t, whole)?,
+            whole: transform_whole_heading::<P, Q>(whole)?,
         }),
         Continuation::Restrict { condition, origin } => Ok(Continuation::Restrict {
             condition: t.transform_boolean(condition)?,
             origin,
         }),
+        // The condition is rewritten INSIDE the value the correlation act
+        // minted, and whether the destination phase holds one is the
+        // phases' answer through the one door.
+        Continuation::Correlated(correlated) => Ok(Continuation::Correlated(
+            crate::pipeline::asts::core::phases::carry_correlated::<P, Q>(
+                correlated,
+                |condition| t.transform_boolean(condition),
+            )?,
+        )),
         Continuation::Bound { bound } => Ok(Continuation::Bound { bound }),
         Continuation::Destructure {
             source,
@@ -1681,7 +1561,7 @@ pub fn walk_transform_continuation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
             schema,
         } => Ok(Continuation::Destructure {
             source: Box::new(t.transform_domain(*source)?),
-            pattern: t.transform_tree_pattern(pattern)?,
+            pattern: walk_transform_tree_pattern(t, pattern)?,
             mode,
             schema: t.fold_destructure(schema)?,
         }),
@@ -1696,7 +1576,10 @@ pub fn walk_transform_continuation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
                     .map(|c| transform_member_correlation(t, c))
                     .transpose()?,
             )?,
-            join_type,
+            // A comma with no decided orientation is an inner join, and the
+            // refined phase works with a decided one: the narrowing is the
+            // phases' answer, made here for every member that crosses.
+            join_type: Q::join_orientation(join_type),
         }),
         Continuation::BagOp {
             operator,
@@ -1718,7 +1601,7 @@ pub fn walk_transform_continuation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
             )?,
         }),
         Continuation::Pipe { operator, named } => Ok(Continuation::Pipe {
-            operator: t.transform_operator(operator)?,
+            operator: walk_transform_operator(t, operator)?,
             // The one door: a fold between two phases that both hold
             // authored characters carries the name, and a fold INTO a phase
             // that has spent it refuses rather than dropping it silently.
@@ -1742,10 +1625,10 @@ pub fn walk_transform_continuation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
     }
 }
 
-/// A structural run step crossing phases: the form's payloads rephase, the
-/// stage name carries through the one door every stage name uses, and the
-/// scope folds. Exhaustive over [`StructuralForm`], so a new structural kind
-/// cannot cross a phase without deciding its walk here.
+/// A structural run step crossing phases: the form's payloads rephase and
+/// the stage name carries through the one door every stage name uses.
+/// Exhaustive over [`StructuralForm`], so a new structural kind cannot cross
+/// a phase without deciding its walk here.
 pub fn walk_transform_structural_step<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
     t: &mut F,
     step: crate::pipeline::asts::core::StructuralStep<P>,
@@ -1756,14 +1639,14 @@ pub fn walk_transform_structural_step<P: Phase, Q: Phase, F: AstTransform<P, Q> 
         StructuralForm::Ordering { specs, bound } => StructuralForm::Ordering {
             specs: specs
                 .into_iter()
-                .map(|s| t.transform_ordering_spec(s))
+                .map(|s| walk_transform_ordering_spec(t, s))
                 .collect::<Result<Vec<_>>>()?,
             bound,
         },
         StructuralForm::Reposition { moves } => StructuralForm::Reposition {
             moves: moves
                 .into_iter()
-                .map(|m| t.transform_reposition_spec(m))
+                .map(|m| walk_transform_reposition_spec(t, m))
                 .collect::<Result<Vec<_>>>()?,
         },
         StructuralForm::Meta => StructuralForm::Meta,
@@ -1778,7 +1661,7 @@ pub fn walk_transform_structural_step<P: Phase, Q: Phase, F: AstTransform<P, Q> 
             schema,
         } => StructuralForm::Narrow {
             nest: t.transform_reference(nest)?,
-            pattern: match t.transform_tree_pattern(TreePattern::Record(pattern))? {
+            pattern: match walk_transform_tree_pattern(t, TreePattern::Record(pattern))? {
                 TreePattern::Record(pattern) => pattern,
                 TreePattern::Array(_) => unreachable!("a record pattern crosses as one"),
             },
@@ -1789,6 +1672,19 @@ pub fn walk_transform_structural_step<P: Phase, Q: Phase, F: AstTransform<P, Q> 
         form,
         named: crate::pipeline::asts::core::phases::carry_stage_name::<P, Q>(named)?,
     })
+}
+
+
+/// The deferred items of a pattern cross as VALUES: each keeps the position
+/// it was minted for and its value takes the leaf hook.
+fn transform_deferred<P: Phase, Q: Phase, T: AstTransform<P, Q> + ?Sized>(
+    t: &mut T,
+    deferred: Vec<crate::pipeline::asts::core::expressions::DeferredItem<P>>,
+) -> Result<Vec<crate::pipeline::asts::core::expressions::DeferredItem<Q>>> {
+    deferred
+        .into_iter()
+        .map(|item| item.crossing(|value| t.transform_domain(value)))
+        .collect()
 }
 
 pub fn walk_transform_inner_relation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
@@ -1815,6 +1711,7 @@ pub fn walk_transform_inner_relation<P: Phase, Q: Phase, F: AstTransform<P, Q> +
         InnerRelationPattern::CorrelatedScalarJoin {
             identifier,
             correlation_filters,
+            deferred,
             subquery,
         } => Ok(InnerRelationPattern::CorrelatedScalarJoin {
             identifier,
@@ -1822,12 +1719,14 @@ pub fn walk_transform_inner_relation<P: Phase, Q: Phase, F: AstTransform<P, Q> +
                 .into_iter()
                 .map(|f| t.transform_boolean(f))
                 .collect::<Result<Vec<_>>>()?,
+            deferred: transform_deferred(t, deferred)?,
             subquery: Box::new(t.transform_relational_action(*subquery)?.into_inner()),
         }),
         InnerRelationPattern::CorrelatedGroupJoin {
             identifier,
             correlation_filters,
             aggregations,
+            deferred,
             subquery,
         } => Ok(InnerRelationPattern::CorrelatedGroupJoin {
             identifier,
@@ -1839,6 +1738,7 @@ pub fn walk_transform_inner_relation<P: Phase, Q: Phase, F: AstTransform<P, Q> +
                 .into_iter()
                 .map(|e| t.transform_domain(e))
                 .collect::<Result<Vec<_>>>()?,
+            deferred: transform_deferred(t, deferred)?,
             subquery: Box::new(t.transform_relational_action(*subquery)?.into_inner()),
         }),
     }
@@ -1858,7 +1758,7 @@ pub fn walk_transform_relation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Size
             alias: crate::pipeline::asts::core::phases::carry_stage_name::<P, Q>(alias)?,
         }),
         Relation::Ground { mention, outer } => Ok(Relation::Ground {
-            mention: crate::pipeline::asts::core::phases::carry_mention::<P, Q>(mention)?,
+            mention: t.transform_mention(mention)?,
             outer,
         }),
         Relation::InnerRelation {
@@ -1866,7 +1766,7 @@ pub fn walk_transform_relation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Size
             alias,
             outer,
         } => Ok(Relation::InnerRelation {
-            pattern: t.transform_inner_relation(pattern)?,
+            pattern: walk_transform_inner_relation(t, pattern)?,
             alias,
             outer,
         }),
@@ -1888,16 +1788,6 @@ pub fn walk_transform_relational<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Si
 // =============================================================================
 // Walk functions — top-level
 // =============================================================================
-
-pub fn walk_transform_cte_binding<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
-    t: &mut F,
-    cte: CteBinding<P>,
-) -> Result<CteBinding<Q>> {
-    // THE BINDING CROSSES WHOLE. Its own carrier folds the chains it holds
-    // and keeps subject and variant; this walker has no hook for deciding,
-    // or re-deciding, what a binding is or what it stands on.
-    cte.folded(t)
-}
 
 pub fn walk_transform_query<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
     t: &mut F,
@@ -1989,7 +1879,7 @@ pub fn walk_transform_selector_item<P: Phase, Q: Phase, F: AstTransform<P, Q> + 
         SelectorItem::Reference(reference) => {
             Ok(SelectorItem::Reference(t.transform_reference(reference)?))
         }
-        SelectorItem::Spread(spread) => Ok(SelectorItem::Spread(t.transform_spread(spread)?)),
+        SelectorItem::Spread(spread) => Ok(SelectorItem::Spread(walk_transform_spread(t, spread)?)),
     }
 }
 

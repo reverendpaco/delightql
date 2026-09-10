@@ -27,6 +27,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::{DirectiveBinding, Internal};
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
@@ -96,23 +97,23 @@ impl EffectExecutable for ExplainRunPredicate {
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
         if arguments.len() != 1 {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(DirectiveBinding::Arity {
+                message: format!(
                     "sys::execution.explain_run() expects 1 argument (file_path), got {}",
                     arguments.len()
                 ),
-                "Invalid argument count",
-            ));
+            }));
         }
         let path = match &arguments[0] {
             DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
                 s.clone()
             }
             other => {
-                return Err(DelightQLError::database_error(
-                    format!("explain_run() file_path must be a string literal, got {other:?}"),
-                    "Invalid argument type",
-                ))
+                return Err(DelightQLError::from(DirectiveBinding::Value {
+                    message: format!(
+                        "explain_run() file_path must be a string literal, got {other:?}"
+                    ),
+                }))
             }
         };
 
@@ -128,9 +129,9 @@ impl EffectExecutable for ExplainRunPredicate {
 
         let plan = crate::pipeline::effect_transformer::compile_namespace_main(system, &namespace)?;
         let typed = plan.typed.as_ref().ok_or_else(|| {
-            DelightQLError::database_error(
+            Internal::invariant(
+                "bin_cartridge::prelude::explain_run",
                 "explain_run: the compiled plan carries no typed layer",
-                "internal invariant",
             )
         })?;
 

@@ -15,6 +15,7 @@
 //! spelled here rather than remembered downstream.
 
 use super::{gap, Deferred, Normalizer};
+use crate::diagnostic::{Expansion, Internal, Narrowing};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::operators::{ColumnAlias, ColumnNameTemplate};
 use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
@@ -387,7 +388,6 @@ impl<'t> Normalizer<'t> {
                 key,
                 target,
                 cte_requirements: None,
-                summary: false,
             },
             naming,
         ))
@@ -616,19 +616,18 @@ impl<'t> Normalizer<'t> {
                         // they do not shape it. Shaping is the chain's, and
                         // the chain is where the expanded rows land.
                         _ => {
-                            return Err(DelightQLError::validation_error_categorized(
-                                "expansion/shaping_interior",
-                                format!(
+                            return Err(DelightQLError::from(Expansion::ShapingInterior {
+                                message: format!(
                                     "`.{column}( … )` names the interior columns to expand; \
                                      this one shapes them"
                                 ),
-                                "shape after the expansion: `.col(*) |> ( … )`",
-                            ))
+                            }))
                         }
                     }
                 }
                 if seen == 0 {
-                    return Err(DelightQLError::parse_error(
+                    return Err(Internal::invariant(
+                        "normalize::spec",
                         "an expansion interior names something",
                     ));
                 }
@@ -694,16 +693,13 @@ impl<'t> Normalizer<'t> {
                 member,
                 cst::PatternMember::Binder(_) | cst::PatternMember::PathBinding(_)
             ) {
-                return Err(DelightQLError::validation_error_categorized(
-                    "narrowing/member",
-                    format!(
+                return Err(DelightQLError::from(Narrowing::Member {
+                    message: format!(
                         "a narrowing names the fields its payload publishes; \
                          {} names none",
                         pattern_member_name(member)
                     ),
-                    "write the fields: `|> .col{a, b}` or `|> .col{.a.b}`; \
-                     destructure with `col ~= ~> { … }` for the pattern language",
-                ));
+                }));
             }
         }
         match self.tree_pattern(cst::TreePattern::RecordPattern(node))? {
@@ -751,7 +747,10 @@ impl<'t> Normalizer<'t> {
             cst::RepositionPairSource::Number(number) => {
                 let text = self.text(number);
                 let value: i64 = text.parse().map_err(|_| {
-                    DelightQLError::parse_error(format!("'{text}' is not a column position"))
+                    Internal::invariant(
+                        "normalize::spec",
+                        format!("'{text}' is not a column position"),
+                    )
                 })?;
                 Reference::Ordinal(crate::pipeline::asts::core::ColumnOrdinal {
                     position: value.unsigned_abs() as u16,
@@ -767,7 +766,10 @@ impl<'t> Normalizer<'t> {
         Ok(RepositionSpec {
             column,
             position: text.parse().map_err(|_| {
-                DelightQLError::parse_error(format!("'{text}' is not a target position"))
+                Internal::invariant(
+                    "normalize::spec",
+                    format!("'{text}' is not a target position"),
+                )
             })?,
         })
     }
@@ -789,9 +791,10 @@ impl<'t> Normalizer<'t> {
             "#<" => TupleOrdinalOperator::LessThan,
             "#>" => TupleOrdinalOperator::GreaterThan,
             other => {
-                return Err(DelightQLError::parse_error(format!(
-                    "'{other}' is not a bound operator"
-                )))
+                return Err(Internal::invariant(
+                    "normalize::spec",
+                    format!("'{other}' is not a bound operator"),
+                ))
             }
         };
         let value = self.require(value, "a bound has a count")?;
@@ -852,14 +855,12 @@ fn pattern_member_name(member: cst::PatternMember<'_>) -> &'static str {
 /// row-dependent term computes, and a truth term tests — neither is a heading,
 /// and the interior is a heading.
 fn interior_slot_refusal(column: &str) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "expansion/interior_slot",
-        format!(
+    DelightQLError::from(Expansion::InteriorSlot {
+        message: format!(
             "`.{column}( … )` names interior columns or fixes them to constants; \
              this slot does neither"
         ),
-        "constrain after the expansion: `.col(a, b), a > 1`",
-    )
+    })
 }
 
 /// The constant a ground interior slot fixes its position to. Parens are

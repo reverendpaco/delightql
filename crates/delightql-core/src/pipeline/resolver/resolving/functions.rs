@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 
+use crate::diagnostic::{Internal, Resolution};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::core::ColumnOccurrence;
@@ -99,17 +100,17 @@ fn resolve_record_members_via_fold(
                 )?;
                 for expression in expanded {
                     let ast_resolved::DomainExpression::Reference(reference) = expression else {
-                        return Err(DelightQLError::transformation_error(
-                            "a record spread addresses columns, and this one expanded to a value",
+                        return Err(Internal::invariant(
                             "record_member",
+                            "a record spread addresses columns, and this one expanded to a value",
                         ));
                     };
                     let Some(column) =
                         super::domain_expressions::projection::reference_column(&reference)
                     else {
-                        return Err(DelightQLError::transformation_error(
-                            "a record spread expanded to an address with no occurrence",
+                        return Err(Internal::invariant(
                             "record_member",
+                            "a record spread expanded to an address with no occurrence",
                         ));
                     };
                     push_unique(
@@ -136,10 +137,9 @@ fn resolve_record_members_via_fold(
                     name: authored.name.clone(),
                     qualifier: authored.qualifier.clone(),
                 };
-                let mut witness = crate::pipeline::resolver::Witness::default();
-                let result =
-                    fold.lexical
-                        .address(reference, false, &mut witness, &fold.core.identities)?;
+                let result = fold
+                    .lexical
+                    .address(reference, false, &fold.core.identities)?;
                 match result {
                     UnificationResult::Resolved(occurrence) => {
                         let column = occurrence.column;
@@ -151,24 +151,22 @@ fn resolve_record_members_via_fold(
                         )
                     }
                     UnificationResult::Unresolved(column) => {
-                        return Err(DelightQLError::column_not_found_error(
-                            column,
-                            "in tree group key",
-                        ))
+                        return Err(DelightQLError::from(Resolution::Column {
+                            column: column.to_string(),
+                            context: "in tree group key".to_string(),
+                        }))
                     }
                     UnificationResult::Opaque => {
                         return Err(crate::pipeline::resolver::opaque_reference_refusal())
                     }
-                    UnificationResult::Refused(refusal) => return Err(refusal.into_error()),
+                    UnificationResult::Refused(refusal) => return Err(refusal),
                     UnificationResult::Ambiguous { column, tables } => {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "resolution/ambiguous",
-                            format!(
+                        return Err(DelightQLError::from(Resolution::Ambiguous {
+                            message: format!(
                                 "Ambiguous column '{column}' in tree group key: {}",
                                 tables.join(", ")
                             ),
-                            "qualify the tree-group key",
-                        ))
+                        }))
                     }
                 }
             }

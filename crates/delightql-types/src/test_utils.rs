@@ -100,7 +100,8 @@
 //! ```
 
 use crate::db_traits::{DatabaseConnection, DbValue, Row};
-use crate::error::{DelightQLError, Result};
+use crate::diagnostic::Runtime;
+use crate::error::Result;
 use crate::schema::{ColumnInfo as SchemaColumnInfo, DatabaseSchema};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -140,10 +141,14 @@ impl MockRow {
 impl Row for MockRow {
     fn get_value(&self, idx: usize) -> Result<DbValue> {
         self.values.get(idx).cloned().ok_or_else(|| {
-            DelightQLError::validation_error(
-                "Column index out of bounds",
-                format!("Index {} exceeds column count {}", idx, self.values.len()),
-            )
+            Runtime::Value {
+                message: format!(
+                    "Column index out of bounds: index {} exceeds column count {}",
+                    idx,
+                    self.values.len()
+                ),
+            }
+            .into()
         })
     }
 
@@ -153,10 +158,10 @@ impl Row for MockRow {
             .position(|col| col == name)
             .and_then(|idx| self.values.get(idx).cloned())
             .ok_or_else(|| {
-                DelightQLError::validation_error(
-                    "Column not found",
-                    format!("Column '{}' not found in row", name),
-                )
+                Runtime::Value {
+                    message: format!("Column '{}' not found in row", name),
+                }
+                .into()
             })
     }
 
@@ -166,10 +171,14 @@ impl Row for MockRow {
 
     fn column_name(&self, idx: usize) -> Result<&str> {
         self.columns.get(idx).map(|s| s.as_str()).ok_or_else(|| {
-            DelightQLError::validation_error(
-                "Column index out of bounds",
-                format!("Index {} exceeds column count {}", idx, self.columns.len()),
-            )
+            Runtime::Value {
+                message: format!(
+                    "Column index out of bounds: index {} exceeds column count {}",
+                    idx,
+                    self.columns.len()
+                ),
+            }
+            .into()
         })
     }
 }
@@ -302,10 +311,10 @@ impl DatabaseConnection for MockDatabaseConnection {
 
         // Check for configured error
         if let Some(err_msg) = self.find_query_error(sql) {
-            return Err(DelightQLError::database_error(
-                "Mock database error",
-                err_msg,
-            ));
+            return Err(Runtime::Execution {
+                message: format!("Mock database error: {err_msg}"),
+            }
+            .into());
         }
 
         // Simulate affected rows (just return 1 for success)
@@ -328,10 +337,10 @@ impl DatabaseConnection for MockDatabaseConnection {
 
         // Check for configured error
         if let Some(err_msg) = self.find_query_error(sql) {
-            return Err(DelightQLError::database_error(
-                "Mock database error",
-                err_msg,
-            ));
+            return Err(Runtime::Execution {
+                message: format!("Mock database error: {err_msg}"),
+            }
+            .into());
         }
 
         // Return configured result
@@ -407,12 +416,7 @@ impl MockSchemaProvider {
 
     /// Get all table names (for inspection)
     pub fn list_tables(&self) -> Vec<(Option<String>, String)> {
-        self.tables
-            .lock()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect()
+        self.tables.lock().unwrap().keys().cloned().collect()
     }
 }
 
@@ -505,12 +509,14 @@ mod tests {
                     nullable: false,
                     position: 0,
                     declared_type: None,
+                    interior: false,
                 },
                 SchemaColumnInfo {
                     name: "name".into(),
                     nullable: true,
                     position: 1,
                     declared_type: None,
+                    interior: false,
                 },
             ],
         );
@@ -525,5 +531,4 @@ mod tests {
         assert_eq!(columns[0].name, "id");
         assert_eq!(columns[1].name, "name");
     }
-
 }

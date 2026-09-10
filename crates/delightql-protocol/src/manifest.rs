@@ -125,7 +125,12 @@ mod tests {
 
     #[test]
     fn round_trip_client_version() {
-        let term = ClientTerm::Version { max_message_size: 1_000_000, protocol_version: b("relay0"), lease_ms: 300_000, orientations: vec![Orientation::Rows, Orientation::Columns] };
+        let term = ClientTerm::Version {
+            max_message_size: 1_000_000,
+            protocol_version: b("relay0"),
+            lease_ms: 300_000,
+            orientations: vec![Orientation::Rows, Orientation::Columns],
+        };
         let framed = frame_client(&term).unwrap();
         let (payload, rest) = read_frame(&framed).unwrap().unwrap();
         assert!(rest.is_empty());
@@ -134,7 +139,9 @@ mod tests {
 
     #[test]
     fn round_trip_client_query() {
-        let term = ClientTerm::Query { text: b("SELECT * FROM users") };
+        let term = ClientTerm::Query {
+            text: b("SELECT * FROM users"),
+        };
         let framed = frame_client(&term).unwrap();
         let (payload, _) = read_frame(&framed).unwrap().unwrap();
         assert_eq!(decode_client(payload).unwrap(), term);
@@ -157,7 +164,10 @@ mod tests {
     fn round_trip_client_fetch_columns() {
         let term = ClientTerm::Fetch {
             handle: b("h1"),
-            projection: Projection::Select(vec![ColumnRef::ByName(b("name")), ColumnRef::ByIndex(2)]),
+            projection: Projection::Select(vec![
+                ColumnRef::ByName(b("name")),
+                ColumnRef::ByIndex(2),
+            ]),
             count: 50,
             orientation: Orientation::Columns,
         };
@@ -212,7 +222,12 @@ mod tests {
 
     #[test]
     fn round_trip_server_version() {
-        let term = ServerTerm::Version { max_message_size: 1_000_000, protocol_version: b("relay0"), lease_ms: 300_000, orientations: vec![Orientation::Rows] };
+        let term = ServerTerm::Version {
+            max_message_size: 1_000_000,
+            protocol_version: b("relay0"),
+            lease_ms: 300_000,
+            orientations: vec![Orientation::Rows],
+        };
         let framed = frame_server(&term).unwrap();
         let (payload, _) = read_frame(&framed).unwrap().unwrap();
         assert_eq!(decode_server(payload).unwrap(), term);
@@ -232,10 +247,7 @@ mod tests {
     #[test]
     fn round_trip_server_data() {
         let term = ServerTerm::Data {
-            cells: vec![
-                vec![cell("Alice"), cell("30")],
-                vec![cell("Bob"), None],
-            ],
+            cells: vec![vec![cell("Alice"), cell("30")], vec![cell("Bob"), None]],
         };
         let framed = frame_server(&term).unwrap();
         let (payload, _) = read_frame(&framed).unwrap().unwrap();
@@ -281,11 +293,12 @@ mod tests {
 
     #[test]
     fn round_trip_server_error() {
-        let term = ServerTerm::Error {
-            kind: ErrorKind::Syntax,
-            identity: vec![],
-            message: b("unexpected token near FROM"),
-        };
+        let term = ServerTerm::Error(WireError::of(
+            &delightql_types::diagnostic::Parse::General {
+                message: "unexpected token near FROM".to_string(),
+            }
+            .into(),
+        ));
         let framed = frame_server(&term).unwrap();
         let (payload, _) = read_frame(&framed).unwrap().unwrap();
         assert_eq!(decode_server(payload).unwrap(), term);

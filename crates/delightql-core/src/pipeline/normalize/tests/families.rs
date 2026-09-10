@@ -734,7 +734,7 @@ fn an_effect_marked_binding_over_an_effectful_body_stands() {
 /// so the same edge written either way is one subject.
 #[test]
 fn an_edge_declares_a_pair() {
-    let clause = definition("b(*) &(::normal) a(*) :- a(*), b(*)");
+    let clause = definition("b(*) &(::normal) a(*) :- a(*), b(*), a.k = b.k");
     let DefSubject::Edge {
         left,
         right,
@@ -892,8 +892,8 @@ fn an_annotation_decorates_and_collects() {
             .declared
             .expected_error
             .as_ref()
-            .map(|hook| hook.uri_segments.clone()),
-        Some(vec!["semantic".to_string(), "arity".to_string()])
+            .map(|hook| hook.display()),
+        Some("error://semantic/arity".to_string())
     );
     assert_eq!(
         lispy(&hooked.queries().nth(0).expect("a goal").query),
@@ -1316,53 +1316,51 @@ mod bindings {
             .expect("the read carries its access")
     }
 
-    /// A formal bound to a compiler-owned CARRIER is read by IDENTITY: no
-    /// character-bearing lookup key participates. This is the road an
-    /// interior CTE the invocation materialized reaches the body by, and the
-    /// carrier's declared columns become the caller pattern.
+    /// A formal bound to a compiler-owned CARRIER is read by IDENTITY, under
+    /// the access the body wrote: a whole read stays whole, because the
+    /// carrier already publishes the receiving interface; a body-authored
+    /// pattern passes through as written. No name map participates.
     #[test]
-    fn a_table_scope_parameter_becomes_a_plan_read() {
+    fn a_relation_formal_is_read_by_identity_under_the_access_written() {
         let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
-        let scope = registry.authority().reserve_proffer();
-        let mut bindings = HoParamBindings::default();
-        bindings.table_scope_params.insert("V".to_string(), scope);
-        bindings
-            .argumentative_patterns
-            .insert("V".to_string(), vec!["id".to_string(), "total".to_string()]);
-        let query = bound("V(*)", bindings);
+        let bindings = proffered("V(*)", &registry);
+        let scope = bindings.formals.landed_source().or_else(|| {
+            bindings
+                .formals
+                .get(&delightql_types::SqlIdentifier::new("V"))
+                .and_then(|bound| bound.landing())
+        });
+        let query = bound("V(*)", bindings.clone());
         let GroundForm::Reference(Relation::Ground { mention, .. }) = head(&query).form() else {
             panic!("expected a ground read");
         };
-        let access = read_access(&query);
         assert!(
-            matches!(mention, GroundMention::Structural { pending: bound, .. } if *bound == scope),
+            matches!(mention, GroundMention::Structural { pending, .. } if Some(*pending) == scope),
             "the carrier is addressed by identity"
         );
-        // A glob access over a declared carrier substitutes the DECLARATION's
-        // names: argumentative binding is positional, and the supplied
-        // relation's own spellings never reach the body.
-        let Access::Slots(slots) = access else {
-            panic!("expected the declared caller pattern, got {access:?}");
+        assert!(matches!(read_access(&query), Access::All));
+
+        let patterned = bound("V(id, total)", bindings);
+        let Access::Slots(slots) = read_access(&patterned) else {
+            panic!("the body's own pattern passes through");
         };
         assert_eq!(slots.len(), 2);
     }
 
-    /// A formal bound to a relation EXPRESSION arrives whole.
+    /// The bindings a definition head proffers at consult time, through the
+    /// one authority that binds relation formals.
+    fn proffered(head: &str, registry: &crate::relation::Planning) -> HoParamBindings {
+        let clause = definition(&format!("f({head})(*) :- V(*)"));
+        crate::pipeline::resolver::grounding::create_proffer_bindings(&clause.front.head, registry)
+            .expect("the head proffers")
+    }
+
+    /// A formal bound to an INLINE relation — a lift under declared names —
+    /// arrives whole.
     #[test]
-    fn a_table_expression_parameter_arrives_whole() {
-        let mut bindings = HoParamBindings::default();
-        bindings.table_expr_params.insert(
-            "V".to_string(),
-            Chain::authored(GroundForm::Literal(AnonRelation::plain(
-                AnonTable::from_values(
-                    None,
-                    vec![vec![DomainExpression::Application(
-                        FunctionApplication::Ground(LiteralValue::Number("1".into())),
-                    )]],
-                )
-                .unwrap(),
-            ))),
-        );
+    fn an_inline_relation_formal_arrives_whole() {
+        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+        let bindings = proffered("V(a)", &registry);
         let query = bound("V(*)", bindings);
         assert!(matches!(head(&query).form(), GroundForm::Literal(_)));
     }
@@ -1421,35 +1419,13 @@ mod bindings {
         assert!(shows(&bound("users(*), # < n", bindings), "(value 3)"));
     }
 
-    /// An argumentative param bound BY NAME names its relation through the
-    /// arity-checked entry, and a qualifier of that formal substitutes
-    /// from it.
-    #[test]
-    fn an_argumentative_by_name_qualifier_becomes_the_supplied_name() {
-        let mut bindings = HoParamBindings::default();
-        bindings.argumentative_table_refs.push((
-            "W".to_string(),
-            delightql_types::SqlIdentifier::new("refs"),
-            1,
-            vec!["key".to_string()],
-        ));
-        let query = bound("users(*) |> (W.key)", bindings);
-        assert!(
-            shows(&query, "(qualifier \"refs\")"),
-            "the arity-checked binding did not substitute\n  got: {}",
-            lispy(&query)
-        );
-    }
-
     /// A compiler-owned carrier is addressed by IDENTITY and its plan read
     /// carries the AUTHORED formal: no table spelling exists for a
     /// qualifier to convert to.
     #[test]
     fn a_carrier_qualifier_keeps_the_authored_formal() {
         let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
-        let scope = registry.authority().reserve_proffer();
-        let mut bindings = HoParamBindings::default();
-        bindings.table_scope_params.insert("V".to_string(), scope);
+        let bindings = proffered("V(*)", &registry);
         let query = bound("V(*) |> (V.key)", bindings);
         assert!(
             shows(&query, "(qualifier \"V\")"),

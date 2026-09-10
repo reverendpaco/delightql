@@ -15,7 +15,9 @@ use self::join_builder::rebuild_join_segment;
 use super::analyzer::AnalyzedSegment;
 use super::flattener::FlatTable;
 use super::types::*;
-use crate::error::{DelightQLError, Result};
+use crate::diagnostic::Internal;
+use crate::error::Result;
+use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::core::{Comparison, Existence, GroundForm, RelationalMembership};
 use crate::pipeline::asts::refined::{LiteralValue, Refined};
 use crate::pipeline::asts::resolved::{InnerRelationPattern, Resolved};
@@ -40,10 +42,13 @@ pub(super) fn rebuild_internal(
     // Check for forbidden predicates first
     for pred in &analyzed.predicates {
         if let PredicateClass::Forbidden { reason } = &pred.class {
-            return Err(DelightQLError::parse_error(format!(
-                "Forbidden predicate: {:?} (reason: {:?})",
-                pred.expr, reason
-            )));
+            return Err(Internal::invariant(
+                "refiner::rebuilder",
+                format!(
+                    "Forbidden predicate: {:?} (reason: {:?})",
+                    pred.expr, reason
+                ),
+            ));
         }
     }
 
@@ -264,21 +269,24 @@ fn build_base_relation(
     }
 
     // A DERIVED TABLE CROSSES AS A NODE, with the pattern read out of the
-    // head it stands under rather than stored beside it.
+    // head it stands under rather than stored beside it, and its body is
+    // rebuilt from the segment the flattener stored beside the head. There
+    // is no road that copies the body across instead: a subquery crossing
+    // unrebuilt keeps every member condition a filter over the join.
     if let Some((head, inner_pattern)) = table.inner_head() {
-        // PHASE 5: Use flattened subquery if available (recursive flattening)
-        if let Some(ref subquery_segment) = table.subquery_segment {
-            return build_inner_relation_from_flattened(
-                inner_pattern,
-                head,
-                subquery_segment,
-                danger_gates,
-                identities,
-            );
-        } else {
-            // Fallback: Old behavior (re-process AST)
-            return build_inner_relation(inner_pattern, head);
-        }
+        let subquery_segment = table.subquery_segment.as_deref().ok_or_else(|| {
+            Internal::invariant(
+                "refiner::rebuilder",
+                "a derived table is flattened together with its subquery segment",
+            )
+        })?;
+        return build_inner_relation_from_flattened(
+            inner_pattern,
+            head,
+            subquery_segment,
+            danger_gates,
+            identities,
+        );
     }
 
     build_ground_relation(table, schema_box, identities)
@@ -290,15 +298,19 @@ fn build_tvf_relation(
     schema_box: crate::relation::SemanticRelation,
     identities: &crate::relation::Planning,
 ) -> Result<refined::Chain> {
+    let mut fold = super::RefinerFold::inner(
+        crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+        identities,
+    );
     let ho_arguments = tvf_data
         .arguments
         .iter()
         .map(|argument| {
             Ok(match argument {
                 Some(argument) => crate::pipeline::asts::core::operators::HoArgument::Value(
-                    crate::pipeline::asts::core::ArgumentValue::plain(super::carry::domain(
-                        argument.clone(),
-                    )?),
+                    crate::pipeline::asts::core::ArgumentValue::plain(
+                        fold.transform_domain(argument.clone())?,
+                    ),
                 ),
                 // A valueless position rides back as the skip it is.
                 None => crate::pipeline::asts::core::operators::HoArgument::Skip,
@@ -326,7 +338,7 @@ fn build_tvf_relation(
     })?;
     authority.read_asking(
         refined::Chain::ground(head),
-        super::carry::access(tvf_data.access.clone())?,
+        crate::pipeline::ast_transform::walk_transform_access(&mut fold, tvf_data.access.clone())?,
     )
 }
 
@@ -337,9 +349,15 @@ fn build_anonymous_relation(
     schema_box: crate::relation::SemanticRelation,
     identities: &crate::relation::Planning,
 ) -> Result<refined::Chain> {
-    let table = super::carry::anon_table(resolved::AnonTable {
-        body: anon_data.body.clone(),
-    })?;
+    let table = crate::pipeline::ast_transform::walk_transform_anon_table(
+        &mut super::RefinerFold::inner(
+            crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+            identities,
+        ),
+        resolved::AnonTable {
+            body: anon_data.body.clone(),
+        },
+    )?;
     let chain = refined::Chain::ground(identities.authority().reading(
         crate::relation::builder::ReadHead::Anonymous {
             relation: refined::AnonRelation {
@@ -357,90 +375,27 @@ fn build_anonymous_relation(
     // read them.
     if matches!(flat.access, resolved::Access::Unasked) {
         let ports = crate::relation::published_ports(identities, &schema_box)?;
-        return identities.authority().extend(
+        let narrowed = identities.authority().extend(
             chain,
             crate::relation::builder::StepOp::Access {
                 shape: crate::relation::form::AccessShape::Empty,
                 slots: &[],
                 dependencies: &ports,
             },
-        );
+        )?;
+        // THE REBUILT NARROWING STANDS WHERE THE RESOLVER'S STOOD. The
+        // segment's join stood over the resolver's zero-width narrowing of
+        // this grid; the one derived here narrows the same grid to nothing,
+        // and the authority records it as the replacement so the rebuild
+        // may consume it in that occurrence's place.
+        if let Some(was) = flat.narrowed {
+            identities
+                .authority()
+                .narrowed_again(was, &narrowed.semantic_relation())?;
+        }
+        return Ok(narrowed);
     }
     Ok(chain)
-}
-
-/// Build an INNER-RELATION
-fn build_inner_relation(
-    pattern: &InnerRelationPattern<Resolved>,
-    head: &resolved::Grelex,
-) -> Result<refined::Chain> {
-    // For CDT-SJ and CDT-GJ: Remove correlation filters from subquery since they've been hoisted to JOIN ON
-    let cleaned_pattern = match pattern {
-        InnerRelationPattern::CorrelatedScalarJoin {
-            identifier,
-            correlation_filters,
-            subquery,
-        } => {
-            // Remove the correlation filters from inside the subquery
-            let cleaned_subquery =
-                remove_correlation_filters_from_expr(subquery, correlation_filters);
-
-            // Hygienic injections were already done by pattern_classifier
-            // Just preserve them through the phase conversion
-            InnerRelationPattern::CorrelatedScalarJoin {
-                identifier: identifier.clone(),
-                correlation_filters: correlation_filters.clone(),
-                subquery: Box::new(cleaned_subquery),
-            }
-        }
-        InnerRelationPattern::CorrelatedGroupJoin {
-            identifier,
-            correlation_filters,
-            aggregations,
-            subquery,
-        } => {
-            // For CDT-GJ: Remove correlation filters from subquery, just like CDT-SJ!
-            //
-            // Discovery: User must explicitly include correlation column in modulo operator:
-            //   orders(, orders.user_id = users.id |> %(user_id ~> count:(*)))
-            //                                         ^^^^^^^^ explicit GROUP BY
-            //
-            // The correlation filter gets hoisted to JOIN ON (just like CDT-SJ)
-            // The GROUP BY is already explicit in the modulo operator
-            // No need to keep correlation filters inside the subquery!
-            let cleaned_subquery =
-                remove_correlation_filters_from_expr(subquery, correlation_filters);
-
-            // Hygienic injections were already done by pattern_classifier
-            InnerRelationPattern::CorrelatedGroupJoin {
-                identifier: identifier.clone(),
-                correlation_filters: correlation_filters.clone(),
-                aggregations: aggregations.clone(),
-                subquery: Box::new(cleaned_subquery),
-            }
-        }
-        other => panic!(
-            "catch-all hit in rebuilder.rs build_inner_relation (pattern clean): {:?}",
-            other
-        ),
-    };
-
-    let refined_pattern: InnerRelationPattern<Refined> =
-        super::carry::inner_relation(cleaned_pattern)?;
-
-    // THE HEAD CROSSES. Its own classification is rebuilt into the refined
-    // phase and what it publishes travels with it, because a crossing has
-    // no argument for a relation.
-    Ok(refined::Chain::ground(head.clone().crossing(|form| {
-        let GroundForm::Reference(resolved::Relation::InnerRelation { outer, .. }) = form else {
-            unreachable!("the head was just matched as a derived table");
-        };
-        Ok(GroundForm::Reference(refined::Relation::InnerRelation {
-            pattern: refined_pattern,
-            alias: None,
-            outer,
-        }))
-    })?))
 }
 
 /// Build INNER-RELATION from flattened subquery segment (PHASE 5: Recursive FAR)
@@ -489,35 +444,43 @@ fn build_inner_relation_from_flattened(
         crate::relation::Refinement::Rebuilt { chain, map } => (chain, Some(map)),
     };
 
-    // Convert pattern from Resolved to Refined, replacing the subquery with the rebuilt one
+    // Convert pattern from Resolved to Refined, replacing the subquery with
+    // the rebuilt one. The hoisted conditions, aggregations and deferred
+    // values cross through the refiner's own fold, so a relation nested in
+    // any of them is refined where it stands.
+    let mut fold = super::RefinerFold::inner(danger_gates.clone(), identities);
     let refined_pattern: InnerRelationPattern<Refined> = match pattern {
         InnerRelationPattern::CorrelatedScalarJoin {
             identifier,
             correlation_filters,
+            deferred,
             ..
         } => InnerRelationPattern::CorrelatedScalarJoin {
             identifier: identifier.clone(),
             correlation_filters: correlation_filters
                 .iter()
-                .map(|f| super::carry::boolean(f.clone()))
+                .map(|f| fold.transform_boolean(f.clone()))
                 .collect::<Result<Vec<_>>>()?,
+            deferred: carry_deferred(deferred, &mut fold)?,
             subquery: Box::new(rebuilt_subquery),
         },
         InnerRelationPattern::CorrelatedGroupJoin {
             identifier,
             correlation_filters,
             aggregations,
+            deferred,
             ..
         } => InnerRelationPattern::CorrelatedGroupJoin {
             identifier: identifier.clone(),
             correlation_filters: correlation_filters
                 .iter()
-                .map(|f| super::carry::boolean(f.clone()))
+                .map(|f| fold.transform_boolean(f.clone()))
                 .collect::<Result<Vec<_>>>()?,
             aggregations: aggregations
                 .iter()
-                .map(|a| super::carry::domain(a.clone()))
+                .map(|a| fold.transform_domain(a.clone()))
                 .collect::<Result<Vec<_>>>()?,
+            deferred: carry_deferred(deferred, &mut fold)?,
             subquery: Box::new(rebuilt_subquery),
         },
         InnerRelationPattern::UncorrelatedDerivedTable {
@@ -555,34 +518,6 @@ fn build_inner_relation_from_flattened(
 }
 /// Remove correlation filters from a relational expression
 /// Public wrapper for use by flattener when recursively flattening INNER-RELATIONs
-pub fn remove_correlation_filters_from_expr(
-    expr: &resolved::Chain,
-    filters_to_remove: &[resolved::TruthExpression],
-) -> resolved::Chain {
-    // The head and every surviving step travel WHOLE: this pass only takes
-    // filters away and rebuilds operands nested inside a node, so nothing it
-    // hands back publishes a different relation.
-    expr.clone()
-        .rebuilding(
-            |nested| {
-                Ok(remove_correlation_filters_from_expr(
-                    &nested,
-                    filters_to_remove,
-                ))
-            },
-            |_, form| match form {
-                // Hoisted to the join's ON clause; it does not stand twice.
-                resolved::Continuation::Restrict { condition, .. }
-                    if filters_to_remove.contains(condition) =>
-                {
-                    Ok(crate::pipeline::asts::core::Standing::Drop)
-                }
-                _ => Ok(crate::pipeline::asts::core::Standing::Keep),
-            },
-        )
-        .expect("only restrictions are dropped here")
-}
-
 fn build_ground_relation(
     table: &FlatTable,
     schema_box: crate::relation::SemanticRelation,
@@ -599,9 +534,16 @@ fn build_ground_relation(
         resolved::Access::Unasked => resolved::Access::Unasked,
     };
 
+    let access = crate::pipeline::ast_transform::walk_transform_access(
+        &mut super::RefinerFold::inner(
+            crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+            identities,
+        ),
+        access,
+    )?;
     identities
         .authority()
-        .ground_read(super::carry::access(access)?, table.outer, schema_box)
+        .ground_read(access, table.outer, schema_box)
 }
 
 fn combine_predicates_with_and(
@@ -662,7 +604,13 @@ pub(super) fn refine_predicate_boolean(
             )?;
             Ok(refined::TruthExpression::RelationalMembership(
                 RelationalMembership {
-                    probe: super::carry::probe(probe)?,
+                    probe: crate::pipeline::ast_transform::transform_probe(
+                        &mut super::RefinerFold::inner(
+                            crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+                            identities,
+                        ),
+                        probe,
+                    )?,
                     relation: Box::new(refined_subquery),
                     negated,
                     addressing: (),
@@ -678,7 +626,27 @@ pub(super) fn refine_predicate_boolean(
         resolved::TruthExpression::Not { expr: inner } => Ok(refined::TruthExpression::Not {
             expr: Box::new(refine_predicate_boolean(*inner, identities)?),
         }),
-        // Everything else: nothing to refine, so it is carried.
-        other => super::carry::boolean(other),
+        // A leaf crosses through the refiner's own fold: its walk copies a
+        // chainless leaf and routes a relation nested in one — a scalar
+        // subquery in a comparison — through the hub.
+        other => super::RefinerFold::inner(
+            crate::pipeline::danger_gates::DangerGateMap::with_defaults(),
+            identities,
+        )
+        .transform_boolean(other),
     }
+}
+
+/// The deferred items cross the phase as values: the position each was
+/// minted for is the interior's, kept through the rebuild by the boundary
+/// that carried it, and the value crosses through the refiner's fold like
+/// any other.
+fn carry_deferred(
+    deferred: &[crate::pipeline::asts::core::expressions::DeferredItem<Resolved>],
+    fold: &mut super::RefinerFold<'_>,
+) -> Result<Vec<crate::pipeline::asts::core::expressions::DeferredItem<Refined>>> {
+    deferred
+        .iter()
+        .map(|item| item.clone().crossing(|value| fold.transform_domain(value)))
+        .collect()
 }

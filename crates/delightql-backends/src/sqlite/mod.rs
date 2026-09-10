@@ -12,10 +12,13 @@ pub mod value;
 pub use db_adapter::SqliteConnection;
 pub use introspect::introspect_sqlite_database;
 pub use introspection::SqliteIntrospector;
+pub mod error;
+pub use error::engine_error;
 
 // Re-export the schema from the parent module (it was already here as the original mod.rs)
+use delightql_types::diagnostic::Runtime;
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
-use delightql_types::{DelightQLError, Result};
+use delightql_types::Result;
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
@@ -28,19 +31,18 @@ pub struct DynamicSqliteSchema {
 impl DynamicSqliteSchema {
     /// Create from an existing user database connection
     pub fn new(connection: Arc<Mutex<Connection>>) -> Self {
-        Self {
-            connection,
-        }
+        Self { connection }
     }
 }
 
 impl DatabaseSchema for DynamicSqliteSchema {
-    fn get_table_columns(&self, schema: Option<&str>, table_name: &str) -> Result<Option<Vec<ColumnInfo>>> {
+    fn get_table_columns(
+        &self,
+        schema: Option<&str>,
+        table_name: &str,
+    ) -> Result<Option<Vec<ColumnInfo>>> {
         let conn = self.connection.lock().map_err(|error| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire SQLite schema connection",
-                error.to_string(),
-            )
+            Runtime::poisoned("Failed to acquire SQLite schema connection", error)
         })?;
 
         // For SQLite, schema refers to attached databases (main, temp, or attached name)
@@ -51,30 +53,27 @@ impl DatabaseSchema for DynamicSqliteSchema {
             format!("PRAGMA table_xinfo('{}')", table_name)
         };
 
-        let mut stmt = conn.prepare(&query).map_err(|error| {
-            DelightQLError::database_error("Failed to prepare SQLite schema query", error.to_string())
-        })?;
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|error| engine_error("Failed to prepare SQLite schema query", error))?;
         let columns = stmt
             .query_map([], |row| {
-                let name: String = row.get(1)?;  // Column name is at index 1
-                let decltype: String = row.get(2)?;  // Declared type at index 2 ('' if none)
-                let notnull: i32 = row.get(3)?;  // NOT NULL flag is at index 3
-                let cid: i32 = row.get(0)?;      // Column ID is at index 0
+                let name: String = row.get(1)?; // Column name is at index 1
+                let decltype: String = row.get(2)?; // Declared type at index 2 ('' if none)
+                let notnull: i32 = row.get(3)?; // NOT NULL flag is at index 3
+                let cid: i32 = row.get(0)?; // Column ID is at index 0
 
                 Ok(ColumnInfo {
                     name: name.into(),
-                    nullable: notnull == 0,  // notnull=0 means nullable
-                    position: (cid + 1) as usize,  // Convert 0-based to 1-based
+                    nullable: notnull == 0,       // notnull=0 means nullable
+                    position: (cid + 1) as usize, // Convert 0-based to 1-based
                     declared_type: (!decltype.is_empty()).then_some(decltype),
+                    interior: false,
                 })
             })
-            .map_err(|error| {
-                DelightQLError::database_error("Failed to query SQLite schema", error.to_string())
-            })?
+            .map_err(|error| engine_error("Failed to query SQLite schema", error))?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| {
-                DelightQLError::database_error("Failed to read SQLite schema", error.to_string())
-            })?;
+            .map_err(|error| engine_error("Failed to read SQLite schema", error))?;
 
         if columns.is_empty() {
             Ok(None)
@@ -85,10 +84,7 @@ impl DatabaseSchema for DynamicSqliteSchema {
 
     fn table_exists(&self, schema: Option<&str>, table_name: &str) -> Result<bool> {
         let conn = self.connection.lock().map_err(|error| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire SQLite schema connection",
-                error.to_string(),
-            )
+            Runtime::poisoned("Failed to acquire SQLite schema connection", error)
         })?;
 
         // For SQLite, check if we can get table_xinfo successfully
@@ -98,19 +94,16 @@ impl DatabaseSchema for DynamicSqliteSchema {
             format!("PRAGMA table_xinfo('{}')", table_name)
         };
 
-        let mut stmt = conn.prepare(&query).map_err(|error| {
-            DelightQLError::database_error("Failed to prepare SQLite schema query", error.to_string())
-        })?;
-        let mut rows = stmt.query_map([], |_| Ok(())).map_err(|error| {
-            DelightQLError::database_error("Failed to query SQLite schema", error.to_string())
-        })?;
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|error| engine_error("Failed to prepare SQLite schema query", error))?;
+        let mut rows = stmt
+            .query_map([], |_| Ok(()))
+            .map_err(|error| engine_error("Failed to query SQLite schema", error))?;
         match rows.next() {
             None => Ok(false),
             Some(Ok(())) => Ok(true),
-            Some(Err(error)) => Err(DelightQLError::database_error(
-                "Failed to read SQLite schema",
-                error.to_string(),
-            )),
+            Some(Err(error)) => Err(engine_error("Failed to read SQLite schema", error)),
         }
     }
 }

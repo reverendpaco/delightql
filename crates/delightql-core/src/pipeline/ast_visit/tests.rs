@@ -227,7 +227,6 @@ fn inner_exists(tag: &str) -> TruthExpression<Unresolved> {
         relation: Box::new(sentinel(tag)),
         addressing: ProbeAddressing {
             identifier: qn(tag),
-            using_columns: vec![],
         },
     })
 }
@@ -282,7 +281,6 @@ fn r_i4_recursion_closure_matrix() {
             relation: Box::new(sentinel("filter_condition")),
             addressing: ProbeAddressing {
                 identifier: qn("f"),
-                using_columns: vec![],
             },
             negated: false,
         }),
@@ -1035,7 +1033,9 @@ impl AstVisit<Unresolved> for FailAt {
             };
             let name = reference.name_text();
             if name == self.boom {
-                return Err(DelightQLError::parse_error("boom"));
+                return Err(DelightQLError::from(crate::diagnostic::Parse::General {
+                    message: "boom".to_string(),
+                }));
             }
             self.seen.push(name.to_string());
         }

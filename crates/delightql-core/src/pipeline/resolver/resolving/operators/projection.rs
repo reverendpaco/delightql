@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 
+use crate::diagnostic::Constraint;
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::core::AuthoredColumn;
 use crate::pipeline::asts::core::{Glob, Spread};
 use crate::pipeline::asts::core::{NamedReference, Reference};
@@ -141,15 +141,13 @@ fn resolve_projection_via_fold(
                 .iter()
                 .any(|column| fold.core.identities.published_sym(column.column()) == Some(name))
             {
-                return Err(DelightQLError::validation_error_categorized(
-                    "constraint",
-                    format!(
+                return Err(DelightQLError::from(Constraint::General {
+    message: format!(
                         "Duplicate column '{}' in embed projection: column already exists in source schema. \
                          Use $$(expr as {}) to replace the existing column instead",
                         naming, naming,
                     ),
-                    "in embed projection",
-                ));
+}));
             }
         }
     }
@@ -162,32 +160,15 @@ fn resolve_projection_via_fold(
     for item in items {
         let label = authored_label(&item).cloned();
         let ordinal = ordinal_label(&item);
-        // A scalar subquery resolves as one value; the spread road would
-        // mistake its interior for something to enumerate.
-        let resolved = match &item {
-            ast_unresolved::OutItem::One(one)
-                if matches!(
-                    one.expr,
-                    ast_unresolved::DomainExpression::Application(
-                        ast_unresolved::FunctionApplication::Scalarized(_)
-                    )
-                ) =>
-            {
-                let ast_unresolved::OutItem::One(one) = item else {
-                    unreachable!("the guard just matched a one-value item")
-                };
-                vec![crate::relation::pending::Position::Authored {
-                    expr: fold.transform_domain(one.expr)?,
-                    naming: one.naming,
-                }]
-            }
-            _ => super::super::domain_expressions::projection::resolve_out_items_via_fold(
-                fold,
-                vec![item],
-                available,
-                false,
-            )?,
-        };
+        // Every item is the fold's publication act (a scalar subquery
+        // resolves as one value there; the spread road would mistake its
+        // interior for something to enumerate).
+        let resolved = super::super::domain_expressions::projection::resolve_out_items_via_fold(
+            fold,
+            vec![item],
+            available,
+            false,
+        )?;
         for position in resolved {
             if position.value().is_some() {
                 output_metadata.push((
@@ -269,9 +250,8 @@ fn resolve_projection_via_fold(
             .or_else(|| ordinal_label.clone())
             .unwrap_or_default();
         if seen_user.contains(&canonical) {
-            return Err(DelightQLError::validation_error_categorized(
-                "constraint",
-                if authored {
+            return Err(DelightQLError::from(Constraint::General {
+                message: if authored {
                     format!(
                         "Duplicate column '{}' in projection: programmer-authored names must be \
                          unique. Rename one with 'as' to disambiguate",
@@ -288,19 +268,16 @@ fn resolve_projection_via_fold(
                         authored_label,
                     )
                 },
-                "in projection",
-            ));
+            }));
         }
         if engine_names.contains(&canonical) {
-            return Err(DelightQLError::validation_error_categorized(
-                "constraint",
-                format!(
+            return Err(DelightQLError::from(Constraint::General {
+    message: format!(
                     "Duplicate column '{}' in projection: explicit column collides with wildcard expansion. \
                      Rename with 'as' or remove the explicit reference",
                     authored_label,
                 ),
-                "in projection",
-            ));
+}));
         }
         seen_user.push(canonical);
     }

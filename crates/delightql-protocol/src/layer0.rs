@@ -9,6 +9,7 @@
 // Session<T> before any protocol operation. Handles are opaque types
 // consumed by close(). Orientations require proof of agreement.
 
+use delightql_types::diagnostic::{DelightQLError, DiagnosticClass, Runtime};
 use serde::{Deserialize, Serialize};
 
 // --- Atomic types ---
@@ -50,6 +51,126 @@ pub enum ErrorKind {
     Timeout,
 }
 
+/// THE ONE protocol-boundary conversion: a typed diagnostic's neutral class
+/// becomes the wire kind. Exhaustive, so a class added to the taxonomy
+/// cannot cross the wire unclassified.
+impl From<DiagnosticClass> for ErrorKind {
+    fn from(class: DiagnosticClass) -> ErrorKind {
+        match class {
+            DiagnosticClass::Syntax => ErrorKind::Syntax,
+            DiagnosticClass::Constraint => ErrorKind::Constraint,
+            DiagnosticClass::Connection => ErrorKind::Connection,
+            DiagnosticClass::Permission => ErrorKind::Permission,
+            DiagnosticClass::Timeout => ErrorKind::Timeout,
+        }
+    }
+}
+
+/// An error as it crosses the wire: kind, identity bytes, message bytes.
+///
+/// The fields are private and there is no constructor from loose parts:
+/// production builds one only from a typed diagnostic ([`WireError::of`]),
+/// which derives all three, and deserialization builds one from received
+/// bytes. A party therefore cannot pair an identity with a kind the
+/// diagnostic did not determine. The serialized shape is unchanged:
+/// `[kind, identity, message]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireError {
+    kind: ErrorKind,
+    identity: ByteSeq,
+    message: ByteSeq,
+}
+
+impl WireError {
+    /// The projection of one typed occurrence.
+    pub fn of(diagnostic: &DelightQLError) -> WireError {
+        WireError {
+            kind: diagnostic.class().into(),
+            identity: diagnostic.error_uri().into_bytes(),
+            message: diagnostic.to_string().into_bytes(),
+        }
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    pub fn identity(&self) -> &[u8] {
+        &self.identity
+    }
+
+    pub fn message(&self) -> &[u8] {
+        &self.message
+    }
+
+    /// The identity, lossily decoded.
+    pub fn identity_str(&self) -> String {
+        String::from_utf8_lossy(&self.identity).into_owned()
+    }
+
+    /// The message, lossily decoded.
+    pub fn message_str(&self) -> String {
+        String::from_utf8_lossy(&self.message).into_owned()
+    }
+}
+
+/// An error a PEER answered with, as received: its kind, identity bytes and
+/// message, exactly as sent. This is the transport's inbound statement and
+/// nothing else — it is not a [`WireError`], cannot become one, and cannot
+/// be placed in a [`ServerTerm`]. The only road from it to a diagnostic, a
+/// family match, a finding, or an outbound term is admission against the
+/// declared tree (`delightql_types::diagnostic::received`), which a relay
+/// performs once at the point of receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedError {
+    kind: ErrorKind,
+    identity: ByteSeq,
+    message: ByteSeq,
+}
+
+impl ReceivedError {
+    /// The one constructor: the deserialized statement, taken whole.
+    pub(crate) fn of_wire(wire: WireError) -> ReceivedError {
+        ReceivedError {
+            kind: wire.kind,
+            identity: wire.identity,
+            message: wire.message,
+        }
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    pub fn identity(&self) -> &[u8] {
+        &self.identity
+    }
+
+    pub fn message(&self) -> &[u8] {
+        &self.message
+    }
+
+    pub fn identity_str(&self) -> String {
+        String::from_utf8_lossy(&self.identity).into_owned()
+    }
+
+    pub fn message_str(&self) -> String {
+        String::from_utf8_lossy(&self.message).into_owned()
+    }
+}
+
+impl From<&DelightQLError> for WireError {
+    fn from(diagnostic: &DelightQLError) -> WireError {
+        WireError::of(diagnostic)
+    }
+}
+
+impl From<DelightQLError> for WireError {
+    fn from(diagnostic: DelightQLError) -> WireError {
+        WireError::of(&diagnostic)
+    }
+}
+
 /// Traversal orientation for fetch results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Orientation {
@@ -86,25 +207,62 @@ pub enum MetaItem {
 /// Terms the client sends. 7 variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientTerm {
-    Version { max_message_size: Nat, protocol_version: ByteSeq, lease_ms: Nat, orientations: Vec<Orientation> },
-    Query { text: ByteSeq },
-    Fetch { handle: Handle, projection: Projection, count: Nat, orientation: Orientation },
-    Stat { handle: Handle },
-    Close { handle: Handle },
-    Prepare { text: ByteSeq, dimensions: Vec<Dimension> },
-    Offer { handle: Handle, cells: Vec<Vec<Cell>>, orientation: Orientation },
+    Version {
+        max_message_size: Nat,
+        protocol_version: ByteSeq,
+        lease_ms: Nat,
+        orientations: Vec<Orientation>,
+    },
+    Query {
+        text: ByteSeq,
+    },
+    Fetch {
+        handle: Handle,
+        projection: Projection,
+        count: Nat,
+        orientation: Orientation,
+    },
+    Stat {
+        handle: Handle,
+    },
+    Close {
+        handle: Handle,
+    },
+    Prepare {
+        text: ByteSeq,
+        dimensions: Vec<Dimension>,
+    },
+    Offer {
+        handle: Handle,
+        cells: Vec<Vec<Cell>>,
+        orientation: Orientation,
+    },
 }
 
 /// Terms the server sends. 7 variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerTerm {
-    Version { max_message_size: Nat, protocol_version: ByteSeq, lease_ms: Nat, orientations: Vec<Orientation> },
-    Header { handle: Handle, dimensions: Vec<Dimension> },
-    Data { cells: Vec<Vec<Cell>> },
-    Metadata { items: Vec<MetaItem> },
+    Version {
+        max_message_size: Nat,
+        protocol_version: ByteSeq,
+        lease_ms: Nat,
+        orientations: Vec<Orientation>,
+    },
+    Header {
+        handle: Handle,
+        dimensions: Vec<Dimension>,
+    },
+    Data {
+        cells: Vec<Vec<Cell>>,
+    },
+    Metadata {
+        items: Vec<MetaItem>,
+    },
     End,
-    Ok { count_hint: Nat },
-    Error { kind: ErrorKind, identity: ByteSeq, message: ByteSeq },
+    Ok {
+        count_hint: Nat,
+    },
+    Error(WireError),
 }
 
 // --- Opaque handle types (typestate enforcement) ---
@@ -116,7 +274,9 @@ pub struct QueryHandle(Handle);
 
 impl QueryHandle {
     /// Access the raw handle bytes (for forwarding in relay adapters).
-    pub fn raw(&self) -> &Handle { &self.0 }
+    pub fn raw(&self) -> &Handle {
+        &self.0
+    }
 }
 
 /// Opaque handle to a load target. Created by `Session::prepare()`.
@@ -125,7 +285,9 @@ impl QueryHandle {
 pub struct LoadHandle(Handle);
 
 impl LoadHandle {
-    pub fn raw(&self) -> &Handle { &self.0 }
+    pub fn raw(&self) -> &Handle {
+        &self.0
+    }
 }
 
 /// An orientation agreed during version negotiation.
@@ -134,18 +296,24 @@ impl LoadHandle {
 pub struct AgreedOrientation(Orientation);
 
 impl AgreedOrientation {
-    pub fn orientation(&self) -> Orientation { self.0 }
+    pub fn orientation(&self) -> Orientation {
+        self.0
+    }
 }
 
 /// Wrapper for close operations — accepts either QueryHandle or LoadHandle.
 pub struct AnyHandle(Handle);
 
 impl From<QueryHandle> for AnyHandle {
-    fn from(h: QueryHandle) -> Self { AnyHandle(h.0) }
+    fn from(h: QueryHandle) -> Self {
+        AnyHandle(h.0)
+    }
 }
 
 impl From<LoadHandle> for AnyHandle {
-    fn from(h: LoadHandle) -> Self { AnyHandle(h.0) }
+    fn from(h: LoadHandle) -> Self {
+        AnyHandle(h.0)
+    }
 }
 
 // --- Narrowed response types (one per script branch) ---
@@ -153,8 +321,11 @@ impl From<LoadHandle> for AnyHandle {
 /// Response to Query: server opens a result or rejects.
 #[derive(Debug, PartialEq, Eq)]
 pub enum QueryResponse {
-    Header { handle: QueryHandle, dimensions: Vec<Dimension> },
-    Error { kind: ErrorKind, identity: ByteSeq, message: ByteSeq },
+    Header {
+        handle: QueryHandle,
+        dimensions: Vec<Dimension>,
+    },
+    Error(ReceivedError),
 }
 
 /// Response to Fetch: data, end, or error.
@@ -162,28 +333,31 @@ pub enum QueryResponse {
 pub enum FetchResponse {
     Data { cells: Vec<Vec<Cell>> },
     End,
-    Error { kind: ErrorKind, identity: ByteSeq, message: ByteSeq },
+    Error(ReceivedError),
 }
 
 /// Response to Stat: metadata or error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatResponse {
     Metadata { items: Vec<MetaItem> },
-    Error { kind: ErrorKind, identity: ByteSeq, message: ByteSeq },
+    Error(ReceivedError),
 }
 
 /// Response to Close: confirmed or error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseResponse {
     Ok,
-    Error { kind: ErrorKind, identity: ByteSeq, message: ByteSeq },
+    Error(ReceivedError),
 }
 
 /// Response to Prepare: server opens a load handle or rejects.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrepareResponse {
-    Header { handle: LoadHandle, dimensions: Vec<Dimension> },
-    Error { kind: ErrorKind, identity: ByteSeq, message: ByteSeq },
+    Header {
+        handle: LoadHandle,
+        dimensions: Vec<Dimension>,
+    },
+    Error(ReceivedError),
 }
 
 /// Response to Offer: accepted, done, or error.
@@ -191,7 +365,7 @@ pub enum PrepareResponse {
 pub enum OfferResponse {
     Ok { count_hint: Nat },
     End,
-    Error { kind: ErrorKind, identity: ByteSeq, message: ByteSeq },
+    Error(ReceivedError),
 }
 
 // --- Transport trait ---
@@ -223,17 +397,18 @@ pub enum VersionResult<T: Transport> {
     /// Version agreed. Contains a ready-to-use Session.
     Accepted(Session<T>),
     /// Version rejected by the server.
-    Rejected { kind: ErrorKind, message: ByteSeq },
+    /// The peer refused the handshake: its statement, as received, for the
+    /// consumer to admit or present — never reduced to loose fields.
+    Rejected(ReceivedError),
 }
 
 impl<T: Transport> std::fmt::Debug for VersionResult<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VersionResult::Accepted(_) => write!(f, "VersionResult::Accepted(Session)"),
-            VersionResult::Rejected { kind, message } => f
-                .debug_struct("VersionResult::Rejected")
-                .field("kind", kind)
-                .field("message", &String::from_utf8_lossy(message))
+            VersionResult::Rejected(error) => f
+                .debug_tuple("VersionResult::Rejected")
+                .field(error)
                 .finish(),
         }
     }
@@ -277,12 +452,16 @@ impl<T: Transport> Client<T> {
                 transport: self.transport,
                 agreed_orientations: agreed,
             }),
-            ServerTerm::Error { kind, message, .. } => VersionResult::Rejected { kind, message },
-            other => VersionResult::Rejected {
-                kind: ErrorKind::Connection,
-                message: format!("protocol violation: expected Version or Error, got {:?}", other)
-                    .into_bytes(),
-            },
+            ServerTerm::Error(error) => VersionResult::Rejected(ReceivedError::of_wire(error)),
+            other => VersionResult::Rejected(ReceivedError::of_wire(WireError::of(
+                &Runtime::Protocol {
+                    message: format!(
+                        "protocol violation: expected Version or Error, got {:?}",
+                        other
+                    ),
+                }
+                .into(),
+            ))),
         })
     }
 }
@@ -312,13 +491,16 @@ impl<T: Transport> Session<T> {
                 handle: QueryHandle(handle),
                 dimensions,
             },
-            ServerTerm::Error { kind, identity, message } => QueryResponse::Error { kind, identity, message },
-            other => QueryResponse::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: format!("protocol violation: expected Header or Error, got {:?}", other)
-                    .into_bytes(),
-            },
+            ServerTerm::Error(error) => QueryResponse::Error(ReceivedError::of_wire(error)),
+            other => QueryResponse::Error(ReceivedError::of_wire(WireError::of(
+                &Runtime::Protocol {
+                    message: format!(
+                        "protocol violation: expected Header or Error, got {:?}",
+                        other
+                    ),
+                }
+                .into(),
+            ))),
         })
     }
 
@@ -338,16 +520,16 @@ impl<T: Transport> Session<T> {
         Ok(match response {
             ServerTerm::Data { cells } => FetchResponse::Data { cells },
             ServerTerm::End => FetchResponse::End,
-            ServerTerm::Error { kind, identity, message } => FetchResponse::Error { kind, identity, message },
-            other => FetchResponse::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: format!(
-                    "protocol violation: expected Data, End, or Error, got {:?}",
-                    other
-                )
-                .into_bytes(),
-            },
+            ServerTerm::Error(error) => FetchResponse::Error(ReceivedError::of_wire(error)),
+            other => FetchResponse::Error(ReceivedError::of_wire(WireError::of(
+                &Runtime::Protocol {
+                    message: format!(
+                        "protocol violation: expected Data, End, or Error, got {:?}",
+                        other
+                    ),
+                }
+                .into(),
+            ))),
         })
     }
 
@@ -357,37 +539,31 @@ impl<T: Transport> Session<T> {
         })?;
         Ok(match response {
             ServerTerm::Metadata { items } => StatResponse::Metadata { items },
-            ServerTerm::Error { kind, identity, message } => StatResponse::Error { kind, identity, message },
-            other => StatResponse::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: format!(
-                    "protocol violation: expected Metadata or Error, got {:?}",
-                    other
-                )
-                .into_bytes(),
-            },
+            ServerTerm::Error(error) => StatResponse::Error(ReceivedError::of_wire(error)),
+            other => StatResponse::Error(ReceivedError::of_wire(WireError::of(
+                &Runtime::Protocol {
+                    message: format!(
+                        "protocol violation: expected Metadata or Error, got {:?}",
+                        other
+                    ),
+                }
+                .into(),
+            ))),
         })
     }
 
-    pub fn close(
-        &mut self,
-        handle: impl Into<AnyHandle>,
-    ) -> Result<CloseResponse, TransportError> {
+    pub fn close(&mut self, handle: impl Into<AnyHandle>) -> Result<CloseResponse, TransportError> {
         let raw = handle.into().0;
         let response = self.transport.exchange(ClientTerm::Close { handle: raw })?;
         Ok(match response {
             ServerTerm::Ok { .. } => CloseResponse::Ok,
-            ServerTerm::Error { kind, identity, message } => CloseResponse::Error { kind, identity, message },
-            other => CloseResponse::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: format!(
-                    "protocol violation: expected Ok or Error, got {:?}",
-                    other
-                )
-                .into_bytes(),
-            },
+            ServerTerm::Error(error) => CloseResponse::Error(ReceivedError::of_wire(error)),
+            other => CloseResponse::Error(ReceivedError::of_wire(WireError::of(
+                &Runtime::Protocol {
+                    message: format!("protocol violation: expected Ok or Error, got {:?}", other),
+                }
+                .into(),
+            ))),
         })
     }
 
@@ -404,16 +580,16 @@ impl<T: Transport> Session<T> {
                 handle: LoadHandle(handle),
                 dimensions,
             },
-            ServerTerm::Error { kind, identity, message } => PrepareResponse::Error { kind, identity, message },
-            other => PrepareResponse::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: format!(
-                    "protocol violation: expected Header or Error, got {:?}",
-                    other
-                )
-                .into_bytes(),
-            },
+            ServerTerm::Error(error) => PrepareResponse::Error(ReceivedError::of_wire(error)),
+            other => PrepareResponse::Error(ReceivedError::of_wire(WireError::of(
+                &Runtime::Protocol {
+                    message: format!(
+                        "protocol violation: expected Header or Error, got {:?}",
+                        other
+                    ),
+                }
+                .into(),
+            ))),
         })
     }
 
@@ -431,16 +607,16 @@ impl<T: Transport> Session<T> {
         Ok(match response {
             ServerTerm::Ok { count_hint } => OfferResponse::Ok { count_hint },
             ServerTerm::End => OfferResponse::End,
-            ServerTerm::Error { kind, identity, message } => OfferResponse::Error { kind, identity, message },
-            other => OfferResponse::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: format!(
-                    "protocol violation: expected Ok, End, or Error, got {:?}",
-                    other
-                )
-                .into_bytes(),
-            },
+            ServerTerm::Error(error) => OfferResponse::Error(ReceivedError::of_wire(error)),
+            other => OfferResponse::Error(ReceivedError::of_wire(WireError::of(
+                &Runtime::Protocol {
+                    message: format!(
+                        "protocol violation: expected Ok, End, or Error, got {:?}",
+                        other
+                    ),
+                }
+                .into(),
+            ))),
         })
     }
 }
@@ -508,11 +684,9 @@ impl<T: Transport> Handler for RemoteHandler<T> {
     fn handle(&mut self, term: ClientTerm) -> ServerTerm {
         match self.transport.exchange(term) {
             Ok(response) => response,
-            Err(e) => ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: b"delightql-error://runtime/relay/transport".to_vec(),
-                message: e.message.into_bytes(),
-            },
+            Err(e) => ServerTerm::Error(WireError::of(
+                &Runtime::Transport { message: e.message }.into(),
+            )),
         }
     }
 }
@@ -548,7 +722,70 @@ pub fn resolve_projection(projection: &Projection, columns: &[String]) -> Vec<us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use delightql_types::diagnostic::Parse;
     use std::collections::VecDeque;
+
+    /// A scripted wire error of the given kind: a typed diagnostic whose
+    /// class projects to that kind, as a backend would have produced it.
+    /// The same statement as a client receives it.
+    fn received(kind: ErrorKind, message: &str) -> ReceivedError {
+        ReceivedError::of_wire(wire(kind, message))
+    }
+
+    fn wire(kind: ErrorKind, message: &str) -> WireError {
+        let diagnostic: DelightQLError = match kind {
+            ErrorKind::Syntax => Parse::General {
+                message: message.to_string(),
+            }
+            .into(),
+            ErrorKind::Constraint => Runtime::Expectation {
+                declared: String::new(),
+                outcome: message.to_string(),
+            }
+            .into(),
+            ErrorKind::Connection => Runtime::Transport {
+                message: message.to_string(),
+            }
+            .into(),
+            ErrorKind::Permission => Runtime::Precondition {
+                message: message.to_string(),
+            }
+            .into(),
+            ErrorKind::Timeout => unreachable!("no scripted timeout"),
+        };
+        WireError::of(&diagnostic)
+    }
+
+    /// The serialized shape of an error term is unchanged by the sealed
+    /// carrier: `{"Error": [kind, identity, message]}`, byte for byte what
+    /// the loose triple produced.
+    #[test]
+    fn wire_error_bytes_are_the_old_triple() {
+        let term = ServerTerm::Error(WireError::of(
+            &Runtime::Precondition {
+                message: "msg".to_string(),
+            }
+            .into(),
+        ));
+        let raw = rmp_serde::to_vec(&term).unwrap();
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        // Captured from the loose-triple encoding of kind Permission,
+        // identity "delightql-error://x/y", message "msg", with the identity
+        // bytes replaced by this diagnostic's own (runtime/precondition).
+        let identity = b"delightql-error://runtime/precondition";
+        let mut expected = String::from("81a54572726f7293aa5065726d697373696f6e");
+        expected.push_str(&format!("dc{:04x}", identity.len()));
+        expected.push_str(
+            &identity
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        );
+        expected.push_str("936d7367");
+        assert_eq!(hex, expected);
+        let back: ServerTerm = rmp_serde::from_slice(&raw).unwrap();
+        assert_eq!(back, term);
+    }
 
     /// A mock transport that replays a scripted sequence of server responses.
     struct MockTransport {
@@ -617,11 +854,11 @@ mod tests {
             .unwrap()
         {
             VersionResult::Accepted(session) => session,
-            VersionResult::Rejected { kind, message } => {
+            VersionResult::Rejected(error) => {
                 panic!(
                     "version rejected: {:?}: {}",
-                    kind,
-                    String::from_utf8_lossy(&message)
+                    error.kind(),
+                    error.message_str()
                 );
             }
         }
@@ -635,10 +872,7 @@ mod tests {
             version_ok(),
             ServerTerm::Header {
                 handle: b("h1"),
-                dimensions: vec![
-                    dim(1, "name", "TEXT"),
-                    dim(2, "age", "INTEGER"),
-                ],
+                dimensions: vec![dim(1, "name", "TEXT"), dim(2, "age", "INTEGER")],
             },
             ServerTerm::Data {
                 cells: vec![
@@ -691,41 +925,40 @@ mod tests {
     fn query_returns_error() {
         let mock = MockTransport::new(vec![
             version_ok(),
-            ServerTerm::Error {
-                kind: ErrorKind::Syntax,
-                identity: vec![],
-                message: b("parse error near FROM"),
-            },
+            ServerTerm::Error(wire(ErrorKind::Syntax, "parse error near FROM")),
         ]);
 
         let mut session = accept_version(Client::new(mock));
 
         let resp = session.query(b("SELECTX * FROM users")).unwrap();
-        assert_eq!(resp, QueryResponse::Error {
-            kind: ErrorKind::Syntax,
-            identity: vec![],
-            message: b("parse error near FROM"),
-        });
+        assert_eq!(
+            resp,
+            QueryResponse::Error(received(ErrorKind::Syntax, "parse error near FROM"))
+        );
     }
 
     // --- Script: version rejected ---
 
     #[test]
     fn version_rejected() {
-        let mock = MockTransport::new(vec![
-            ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: b("unsupported version"),
-            },
-        ]);
+        let mock = MockTransport::new(vec![ServerTerm::Error(wire(
+            ErrorKind::Connection,
+            "unsupported version",
+        ))]);
 
         let client = Client::new(mock);
-        let result = client.version(1_000_000, b("future"), 300_000, vec![Orientation::Rows]).unwrap();
+        let result = client
+            .version(1_000_000, b("future"), 300_000, vec![Orientation::Rows])
+            .unwrap();
         match result {
-            VersionResult::Rejected { kind, message } => {
-                assert_eq!(kind, ErrorKind::Connection);
-                assert_eq!(message, b("unsupported version"));
+            VersionResult::Rejected(error) => {
+                assert_eq!(error.kind(), ErrorKind::Connection);
+                assert_eq!(error.message(), b("unsupported version"));
+                assert_eq!(
+                    error.identity(),
+                    b("delightql-error://runtime/relay/transport"),
+                    "the peer's identity survives the handshake"
+                );
             }
             VersionResult::Accepted(_) => panic!("expected Rejected"),
         }
@@ -735,20 +968,19 @@ mod tests {
 
     #[test]
     fn version_no_common_orientation() {
-        let mock = MockTransport::new(vec![
-            ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: b("no common orientation"),
-            },
-        ]);
+        let mock = MockTransport::new(vec![ServerTerm::Error(wire(
+            ErrorKind::Connection,
+            "no common orientation",
+        ))]);
 
         let client = Client::new(mock);
-        let result = client.version(1_000_000, b("relay0"), 300_000, vec![Orientation::Columns]).unwrap();
+        let result = client
+            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Columns])
+            .unwrap();
         match result {
-            VersionResult::Rejected { kind, message } => {
-                assert_eq!(kind, ErrorKind::Connection);
-                assert_eq!(message, b("no common orientation"));
+            VersionResult::Rejected(error) => {
+                assert_eq!(error.kind(), ErrorKind::Connection);
+                assert_eq!(error.message(), b("no common orientation"));
             }
             VersionResult::Accepted(_) => panic!("expected Rejected"),
         }
@@ -774,7 +1006,9 @@ mod tests {
         let mut session = accept_version(Client::new(mock));
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let resp = session.query(b("UPDATE employees SET salary = salary * 1.1")).unwrap();
+        let resp = session
+            .query(b("UPDATE employees SET salary = salary * 1.1"))
+            .unwrap();
         let handle = match resp {
             QueryResponse::Header { handle, dimensions } => {
                 assert_eq!(dimensions[0].name, b("affected_rows"));
@@ -887,7 +1121,9 @@ mod tests {
         let mock = MockTransport::new(vec![]); // empty — immediate exhaustion
         let client = Client::new(mock);
 
-        let err = client.version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows]).unwrap_err();
+        let err = client
+            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .unwrap_err();
         assert_eq!(err.message, "mock exhausted");
     }
 
@@ -918,7 +1154,7 @@ mod tests {
         // Close gets a Header back — protocol violation, surfaced as Error
         let resp = session.close(handle).unwrap();
         match resp {
-            CloseResponse::Error { kind, .. } => assert_eq!(kind, ErrorKind::Connection),
+            CloseResponse::Error(error) => assert_eq!(error.kind(), ErrorKind::Connection),
             _ => panic!("expected Error from protocol violation"),
         }
     }
@@ -940,9 +1176,13 @@ mod tests {
                 dimensions: vec![dim(1, "b", "TEXT")],
             },
             // Fetch from h1
-            ServerTerm::Data { cells: vec![vec![cell("1")]] },
+            ServerTerm::Data {
+                cells: vec![vec![cell("1")]],
+            },
             // Fetch from h2
-            ServerTerm::Data { cells: vec![vec![cell("hello")]] },
+            ServerTerm::Data {
+                cells: vec![vec![cell("hello")]],
+            },
             // End h1, End h2
             ServerTerm::End,
             ServerTerm::End,
@@ -973,8 +1213,14 @@ mod tests {
             _ => panic!("expected Data"),
         }
 
-        assert_eq!(session.fetch(&h1, Projection::All, 10, rows).unwrap(), FetchResponse::End);
-        assert_eq!(session.fetch(&h2, Projection::All, 10, rows).unwrap(), FetchResponse::End);
+        assert_eq!(
+            session.fetch(&h1, Projection::All, 10, rows).unwrap(),
+            FetchResponse::End
+        );
+        assert_eq!(
+            session.fetch(&h2, Projection::All, 10, rows).unwrap(),
+            FetchResponse::End
+        );
 
         assert_eq!(session.close(h1).unwrap(), CloseResponse::Ok);
         assert_eq!(session.close(h2).unwrap(), CloseResponse::Ok);
@@ -993,8 +1239,8 @@ mod tests {
             // Column-oriented: outer = columns, inner = values in that column
             ServerTerm::Data {
                 cells: vec![
-                    vec![cell("Alice"), cell("Bob")],   // name column
-                    vec![cell("30"), cell("25")],        // age column
+                    vec![cell("Alice"), cell("Bob")], // name column
+                    vec![cell("30"), cell("25")],     // age column
                 ],
             },
             ServerTerm::End,
@@ -1039,10 +1285,7 @@ mod tests {
             },
             // Only requested column "name"
             ServerTerm::Data {
-                cells: vec![
-                    vec![cell("Alice")],
-                    vec![cell("Bob")],
-                ],
+                cells: vec![vec![cell("Alice")], vec![cell("Bob")]],
             },
             ServerTerm::End,
             ServerTerm::Ok { count_hint: 0 },
@@ -1051,7 +1294,10 @@ mod tests {
         let mut session = accept_version(Client::new(mock));
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let handle = match session.query(b("SELECT id, name, email FROM users")).unwrap() {
+        let handle = match session
+            .query(b("SELECT id, name, email FROM users"))
+            .unwrap()
+        {
             QueryResponse::Header { handle, .. } => handle,
             _ => panic!("expected Header"),
         };
@@ -1085,8 +1331,10 @@ mod tests {
             let client_bytes = crate::manifest::frame_client(&term)?;
 
             // Server side: framed bytes → msgpack → term
-            let (payload, _) = crate::manifest::read_frame(&client_bytes)?
-                .ok_or(TransportError { message: "incomplete frame".into() })?;
+            let (payload, _) =
+                crate::manifest::read_frame(&client_bytes)?.ok_or(TransportError {
+                    message: "incomplete frame".into(),
+                })?;
             let received = crate::manifest::decode_client(payload)?;
 
             // Mock server logic
@@ -1096,13 +1344,17 @@ mod tests {
             let server_bytes = crate::manifest::frame_server(&response)?;
 
             // Client side: framed bytes → msgpack → term
-            let (payload, _) = crate::manifest::read_frame(&server_bytes)?
-                .ok_or(TransportError { message: "incomplete frame".into() })?;
+            let (payload, _) =
+                crate::manifest::read_frame(&server_bytes)?.ok_or(TransportError {
+                    message: "incomplete frame".into(),
+                })?;
             crate::manifest::decode_server(payload)
         }
     }
 
-    fn manifest_transport(responses: Vec<ServerTerm>) -> ManifestTransport<impl FnMut(ClientTerm) -> ServerTerm> {
+    fn manifest_transport(
+        responses: Vec<ServerTerm>,
+    ) -> ManifestTransport<impl FnMut(ClientTerm) -> ServerTerm> {
         let mut queue = VecDeque::from(responses);
         ManifestTransport {
             handler: move |_| queue.pop_front().expect("manifest mock exhausted"),
@@ -1149,7 +1401,10 @@ mod tests {
             _ => panic!("expected Data"),
         }
 
-        assert_eq!(session.fetch(&handle, Projection::All, 100, rows).unwrap(), FetchResponse::End);
+        assert_eq!(
+            session.fetch(&handle, Projection::All, 100, rows).unwrap(),
+            FetchResponse::End
+        );
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);
     }
 
@@ -1157,31 +1412,38 @@ mod tests {
     fn query_error_via_manifest() {
         let transport = manifest_transport(vec![
             version_ok(),
-            ServerTerm::Error { kind: ErrorKind::Syntax, identity: vec![], message: b("parse error near FROM") },
+            ServerTerm::Error(wire(ErrorKind::Syntax, "parse error near FROM")),
         ]);
 
         let mut session = accept_version(Client::new(transport));
 
         let resp = session.query(b("SELECTX * FROM users")).unwrap();
-        assert_eq!(resp, QueryResponse::Error {
-            kind: ErrorKind::Syntax,
-            identity: vec![],
-            message: b("parse error near FROM"),
-        });
+        assert_eq!(
+            resp,
+            QueryResponse::Error(received(ErrorKind::Syntax, "parse error near FROM"))
+        );
     }
 
     #[test]
     fn version_rejected_via_manifest() {
-        let transport = manifest_transport(vec![
-            ServerTerm::Error { kind: ErrorKind::Connection, identity: vec![], message: b("unsupported version") },
-        ]);
+        let transport = manifest_transport(vec![ServerTerm::Error(wire(
+            ErrorKind::Connection,
+            "unsupported version",
+        ))]);
 
         let client = Client::new(transport);
-        let result = client.version(1_000_000, b("future"), 300_000, vec![Orientation::Rows]).unwrap();
+        let result = client
+            .version(1_000_000, b("future"), 300_000, vec![Orientation::Rows])
+            .unwrap();
         match result {
-            VersionResult::Rejected { kind, message } => {
-                assert_eq!(kind, ErrorKind::Connection);
-                assert_eq!(message, b("unsupported version"));
+            VersionResult::Rejected(error) => {
+                assert_eq!(error.kind(), ErrorKind::Connection);
+                assert_eq!(error.message(), b("unsupported version"));
+                assert_eq!(
+                    error.identity(),
+                    b("delightql-error://runtime/relay/transport"),
+                    "the peer's identity survives the handshake"
+                );
             }
             VersionResult::Accepted(_) => panic!("expected Rejected"),
         }
@@ -1221,7 +1483,10 @@ mod tests {
             _ => panic!("expected Data"),
         }
 
-        assert_eq!(session.fetch(&handle, Projection::All, 100, rows).unwrap(), FetchResponse::End);
+        assert_eq!(
+            session.fetch(&handle, Projection::All, 100, rows).unwrap(),
+            FetchResponse::End
+        );
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);
     }
 
@@ -1231,13 +1496,14 @@ mod tests {
             version_ok(),
             ServerTerm::Header {
                 handle: b("h7"),
-                dimensions: vec![dim(1, "id", "INT"), dim(2, "name", "TEXT"), dim(3, "email", "TEXT")],
+                dimensions: vec![
+                    dim(1, "id", "INT"),
+                    dim(2, "name", "TEXT"),
+                    dim(3, "email", "TEXT"),
+                ],
             },
             ServerTerm::Data {
-                cells: vec![
-                    vec![cell("Alice")],
-                    vec![cell("Bob")],
-                ],
+                cells: vec![vec![cell("Alice")], vec![cell("Bob")]],
             },
             ServerTerm::End,
             ServerTerm::Ok { count_hint: 0 },
@@ -1246,7 +1512,10 @@ mod tests {
         let mut session = accept_version(Client::new(transport));
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let handle = match session.query(b("SELECT id, name, email FROM users")).unwrap() {
+        let handle = match session
+            .query(b("SELECT id, name, email FROM users"))
+            .unwrap()
+        {
             QueryResponse::Header { handle, .. } => handle,
             _ => panic!("expected Header"),
         };
@@ -1260,7 +1529,10 @@ mod tests {
             _ => panic!("expected Data"),
         }
 
-        assert_eq!(session.fetch(&handle, Projection::All, 100, rows).unwrap(), FetchResponse::End);
+        assert_eq!(
+            session.fetch(&handle, Projection::All, 100, rows).unwrap(),
+            FetchResponse::End
+        );
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);
     }
 
@@ -1274,8 +1546,8 @@ mod tests {
             },
             ServerTerm::Data {
                 cells: vec![
-                    vec![cell("Alice"), cell("Bob")],   // name column
-                    vec![cell("30"), cell("25")],        // age column
+                    vec![cell("Alice"), cell("Bob")], // name column
+                    vec![cell("30"), cell("25")],     // age column
                 ],
             },
             ServerTerm::End,
@@ -1298,7 +1570,10 @@ mod tests {
             _ => panic!("expected Data"),
         }
 
-        assert_eq!(session.fetch(&handle, Projection::All, 100, cols).unwrap(), FetchResponse::End);
+        assert_eq!(
+            session.fetch(&handle, Projection::All, 100, cols).unwrap(),
+            FetchResponse::End
+        );
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);
     }
 
@@ -1320,7 +1595,13 @@ mod tests {
         let mut session = accept_version(Client::new(mock));
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let handle = match session.prepare(b("INSERT INTO users (name, email)"), vec![dim(1, "name", "varchar"), dim(2, "email", "varchar")]).unwrap() {
+        let handle = match session
+            .prepare(
+                b("INSERT INTO users (name, email)"),
+                vec![dim(1, "name", "varchar"), dim(2, "email", "varchar")],
+            )
+            .unwrap()
+        {
             PrepareResponse::Header { handle, dimensions } => {
                 assert_eq!(dimensions.len(), 2);
                 assert_eq!(dimensions[0].name, b("name"));
@@ -1329,15 +1610,25 @@ mod tests {
             PrepareResponse::Error { .. } => panic!("expected Header"),
         };
 
-        let resp = session.offer(&handle, vec![
-            vec![cell("alice"), cell("alice@example.com")],
-            vec![cell("bob"), cell("bob@example.com")],
-        ], rows).unwrap();
+        let resp = session
+            .offer(
+                &handle,
+                vec![
+                    vec![cell("alice"), cell("alice@example.com")],
+                    vec![cell("bob"), cell("bob@example.com")],
+                ],
+                rows,
+            )
+            .unwrap();
         assert_eq!(resp, OfferResponse::Ok { count_hint: 1000 });
 
-        let resp = session.offer(&handle, vec![
-            vec![cell("carol"), cell("carol@example.com")],
-        ], rows).unwrap();
+        let resp = session
+            .offer(
+                &handle,
+                vec![vec![cell("carol"), cell("carol@example.com")]],
+                rows,
+            )
+            .unwrap();
         assert_eq!(resp, OfferResponse::Ok { count_hint: 1000 });
 
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);
@@ -1359,19 +1650,25 @@ mod tests {
         let mut session = accept_version(Client::new(mock));
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let handle = match session.prepare(b("COPY INTO staging"), vec![dim(1, "id", "integer"), dim(2, "value", "float")]).unwrap() {
+        let handle = match session
+            .prepare(
+                b("COPY INTO staging"),
+                vec![dim(1, "id", "integer"), dim(2, "value", "float")],
+            )
+            .unwrap()
+        {
             PrepareResponse::Header { handle, .. } => handle,
             _ => panic!("expected Header"),
         };
 
-        let resp = session.offer(&handle, vec![
-            vec![cell("1"), cell("3.14")],
-        ], rows).unwrap();
+        let resp = session
+            .offer(&handle, vec![vec![cell("1"), cell("3.14")]], rows)
+            .unwrap();
         assert_eq!(resp, OfferResponse::Ok { count_hint: 500 });
 
-        let resp = session.offer(&handle, vec![
-            vec![cell("2"), cell("2.72")],
-        ], rows).unwrap();
+        let resp = session
+            .offer(&handle, vec![vec![cell("2"), cell("2.72")]], rows)
+            .unwrap();
         assert_eq!(resp, OfferResponse::End);
 
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);
@@ -1381,21 +1678,27 @@ mod tests {
     fn prepare_error() {
         let mock = MockTransport::new(vec![
             version_ok(),
-            ServerTerm::Error {
-                kind: ErrorKind::Permission,
-                identity: vec![],
-                message: b("INSERT not allowed on read-only replica"),
-            },
+            ServerTerm::Error(wire(
+                ErrorKind::Permission,
+                "INSERT not allowed on read-only replica",
+            )),
         ]);
 
         let mut session = accept_version(Client::new(mock));
 
-        let resp = session.prepare(b("INSERT INTO users (name)"), vec![dim(1, "name", "varchar")]).unwrap();
-        assert_eq!(resp, PrepareResponse::Error {
-            kind: ErrorKind::Permission,
-            identity: vec![],
-            message: b("INSERT not allowed on read-only replica"),
-        });
+        let resp = session
+            .prepare(
+                b("INSERT INTO users (name)"),
+                vec![dim(1, "name", "varchar")],
+            )
+            .unwrap();
+        assert_eq!(
+            resp,
+            PrepareResponse::Error(received(
+                ErrorKind::Permission,
+                "INSERT not allowed on read-only replica"
+            ))
+        );
     }
 
     #[test]
@@ -1406,30 +1709,32 @@ mod tests {
                 handle: b("L3"),
                 dimensions: vec![dim(1, "id", "integer")],
             },
-            ServerTerm::Error {
-                kind: ErrorKind::Constraint,
-                identity: vec![],
-                message: b("UNIQUE constraint failed: users.id"),
-            },
+            ServerTerm::Error(wire(
+                ErrorKind::Constraint,
+                "UNIQUE constraint failed: users.id",
+            )),
             ServerTerm::Ok { count_hint: 0 },
         ]);
 
         let mut session = accept_version(Client::new(mock));
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let handle = match session.prepare(b("INSERT INTO users (id)"), vec![dim(1, "id", "integer")]).unwrap() {
+        let handle = match session
+            .prepare(b("INSERT INTO users (id)"), vec![dim(1, "id", "integer")])
+            .unwrap()
+        {
             PrepareResponse::Header { handle, .. } => handle,
             _ => panic!("expected Header"),
         };
 
-        let resp = session.offer(&handle, vec![
-            vec![cell("1")],
-        ], rows).unwrap();
-        assert_eq!(resp, OfferResponse::Error {
-            kind: ErrorKind::Constraint,
-            identity: vec![],
-            message: b("UNIQUE constraint failed: users.id"),
-        });
+        let resp = session.offer(&handle, vec![vec![cell("1")]], rows).unwrap();
+        assert_eq!(
+            resp,
+            OfferResponse::Error(received(
+                ErrorKind::Constraint,
+                "UNIQUE constraint failed: users.id"
+            ))
+        );
 
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);
     }
@@ -1449,16 +1754,28 @@ mod tests {
         let mut session = accept_version(Client::new(mock));
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let handle = match session.prepare(b("INSERT INTO users (name, email)"), vec![dim(1, "name", "TEXT"), dim(2, "email", "TEXT")]).unwrap() {
+        let handle = match session
+            .prepare(
+                b("INSERT INTO users (name, email)"),
+                vec![dim(1, "name", "TEXT"), dim(2, "email", "TEXT")],
+            )
+            .unwrap()
+        {
             PrepareResponse::Header { handle, .. } => handle,
             _ => panic!("expected Header"),
         };
 
         // Offer rows with null cells — nulls must survive the protocol
-        let resp = session.offer(&handle, vec![
-            vec![cell("alice"), null_cell()],
-            vec![cell("bob"), cell("bob@example.com")],
-        ], rows).unwrap();
+        let resp = session
+            .offer(
+                &handle,
+                vec![
+                    vec![cell("alice"), null_cell()],
+                    vec![cell("bob"), cell("bob@example.com")],
+                ],
+                rows,
+            )
+            .unwrap();
         assert_eq!(resp, OfferResponse::Ok { count_hint: 100 });
 
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);
@@ -1479,16 +1796,28 @@ mod tests {
         let mut session = accept_version(Client::new(mock));
         let cols = session.agreed_orientation(Orientation::Columns).unwrap();
 
-        let handle = match session.prepare(b("INSERT INTO users (name, age)"), vec![dim(1, "name", "TEXT"), dim(2, "age", "INT")]).unwrap() {
+        let handle = match session
+            .prepare(
+                b("INSERT INTO users (name, age)"),
+                vec![dim(1, "name", "TEXT"), dim(2, "age", "INT")],
+            )
+            .unwrap()
+        {
             PrepareResponse::Header { handle, .. } => handle,
             _ => panic!("expected Header"),
         };
 
         // Column-oriented: outer = columns, inner = values
-        let resp = session.offer(&handle, vec![
-            vec![cell("alice"), cell("bob")],   // name column
-            vec![cell("30"), cell("25")],        // age column
-        ], cols).unwrap();
+        let resp = session
+            .offer(
+                &handle,
+                vec![
+                    vec![cell("alice"), cell("bob")], // name column
+                    vec![cell("30"), cell("25")],     // age column
+                ],
+                cols,
+            )
+            .unwrap();
         assert_eq!(resp, OfferResponse::Ok { count_hint: 500 });
 
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);
@@ -1512,7 +1841,13 @@ mod tests {
         let mut session = accept_version(Client::new(transport));
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let handle = match session.prepare(b("INSERT INTO users (name, email)"), vec![dim(1, "name", "varchar"), dim(2, "email", "varchar")]).unwrap() {
+        let handle = match session
+            .prepare(
+                b("INSERT INTO users (name, email)"),
+                vec![dim(1, "name", "varchar"), dim(2, "email", "varchar")],
+            )
+            .unwrap()
+        {
             PrepareResponse::Header { handle, dimensions } => {
                 assert_eq!(dimensions.len(), 2);
                 handle
@@ -1520,15 +1855,25 @@ mod tests {
             PrepareResponse::Error { .. } => panic!("expected Header"),
         };
 
-        let resp = session.offer(&handle, vec![
-            vec![cell("alice"), cell("alice@example.com")],
-            vec![cell("bob"), cell("bob@example.com")],
-        ], rows).unwrap();
+        let resp = session
+            .offer(
+                &handle,
+                vec![
+                    vec![cell("alice"), cell("alice@example.com")],
+                    vec![cell("bob"), cell("bob@example.com")],
+                ],
+                rows,
+            )
+            .unwrap();
         assert_eq!(resp, OfferResponse::Ok { count_hint: 1000 });
 
-        let resp = session.offer(&handle, vec![
-            vec![cell("carol"), cell("carol@example.com")],
-        ], rows).unwrap();
+        let resp = session
+            .offer(
+                &handle,
+                vec![vec![cell("carol"), cell("carol@example.com")]],
+                rows,
+            )
+            .unwrap();
         assert_eq!(resp, OfferResponse::Ok { count_hint: 1000 });
 
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);
@@ -1550,17 +1895,27 @@ mod tests {
         let mut session = accept_version(Client::new(transport));
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let handle = match session.prepare(b("COPY INTO staging"), vec![dim(1, "id", "integer"), dim(2, "value", "float")]).unwrap() {
+        let handle = match session
+            .prepare(
+                b("COPY INTO staging"),
+                vec![dim(1, "id", "integer"), dim(2, "value", "float")],
+            )
+            .unwrap()
+        {
             PrepareResponse::Header { handle, .. } => handle,
             _ => panic!("expected Header"),
         };
 
         assert_eq!(
-            session.offer(&handle, vec![vec![cell("1"), cell("3.14")]], rows).unwrap(),
+            session
+                .offer(&handle, vec![vec![cell("1"), cell("3.14")]], rows)
+                .unwrap(),
             OfferResponse::Ok { count_hint: 500 }
         );
         assert_eq!(
-            session.offer(&handle, vec![vec![cell("2"), cell("2.72")]], rows).unwrap(),
+            session
+                .offer(&handle, vec![vec![cell("2"), cell("2.72")]], rows)
+                .unwrap(),
             OfferResponse::End
         );
 
@@ -1582,15 +1937,27 @@ mod tests {
         let mut session = accept_version(Client::new(transport));
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let handle = match session.prepare(b("INSERT INTO users (name, email)"), vec![dim(1, "name", "TEXT"), dim(2, "email", "TEXT")]).unwrap() {
+        let handle = match session
+            .prepare(
+                b("INSERT INTO users (name, email)"),
+                vec![dim(1, "name", "TEXT"), dim(2, "email", "TEXT")],
+            )
+            .unwrap()
+        {
             PrepareResponse::Header { handle, .. } => handle,
             _ => panic!("expected Header"),
         };
 
-        let resp = session.offer(&handle, vec![
-            vec![cell("alice"), null_cell()],
-            vec![cell("bob"), cell("bob@example.com")],
-        ], rows).unwrap();
+        let resp = session
+            .offer(
+                &handle,
+                vec![
+                    vec![cell("alice"), null_cell()],
+                    vec![cell("bob"), cell("bob@example.com")],
+                ],
+                rows,
+            )
+            .unwrap();
         assert_eq!(resp, OfferResponse::Ok { count_hint: 100 });
 
         assert_eq!(session.close(handle).unwrap(), CloseResponse::Ok);

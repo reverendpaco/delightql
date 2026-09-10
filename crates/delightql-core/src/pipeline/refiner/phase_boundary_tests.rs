@@ -9,7 +9,7 @@
 
 use crate::pipeline::asts::{refined as ast_refined, resolved as ast_resolved};
 use crate::pipeline::Pipeline;
-use crate::system::DelightQLSystem;
+use crate::system::ReadySystem;
 use delightql_types::introspect::{DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 use delightql_types::DatabaseIntrospector;
@@ -46,8 +46,8 @@ impl DatabaseIntrospector for OneGroundRelation {
     }
 }
 
-fn system() -> DelightQLSystem {
-    DelightQLSystem::new(
+fn system() -> ReadySystem {
+    ReadySystem::new(
         Arc::new(Mutex::new(MockDatabaseConnection::new())),
         Box::new(OneGroundRelation),
         "sqlite",
@@ -58,7 +58,7 @@ fn system() -> DelightQLSystem {
 /// The same system with `users` reachable unqualified: a mounted namespace
 /// enlisted into main. `DelightQLSystem::new` introspects nothing, so a bare
 /// system can only read callables.
-fn ground_world() -> DelightQLSystem {
+fn ground_world() -> ReadySystem {
     let mut system = system();
     static MOUNT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     let dir = MOUNT_DIR.get_or_init(|| {

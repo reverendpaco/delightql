@@ -52,6 +52,7 @@ pub mod predicates;
 pub mod prelude;
 pub mod registry;
 
+use crate::diagnostic::{DelightQLError, EffectPipe};
 use crate::enums::{EntityType, Language};
 use crate::error::Result;
 use crate::pipeline::asts::unresolved::{DomainExpression, GroundForm};
@@ -274,9 +275,8 @@ pub trait EffectExecutable: BinEntity {
         // setwise override (doc!, compile) gives them true semantics.
         match rows.len() {
             1 => self.execute(&rows[0], alias, system),
-            n => Err(crate::error::DelightQLError::validation_error_categorized(
-                "effect/pipe/lifted_not_yet",
-                format!(
+            n => Err(DelightQLError::from(EffectPipe::LiftedNotYet {
+                message: format!(
                     "{} received a {n}-row lifted argument: a piped relation \
                      is ONE set-at-a-time demand (the argumentative functor \
                      receives the whole relation, one receipt — even an empty \
@@ -284,8 +284,7 @@ pub trait EffectExecutable: BinEntity {
                      entity. Pipe a single row, or issue separate statements",
                     self.name()
                 ),
-                "lifted argument not yet",
-            )),
+            })),
         }
     }
 }

@@ -14,11 +14,12 @@
 //! registrations and the ordinary refine/address/transform/generate chain.
 
 use super::{resolve_query_with, ResolutionConfig};
+use crate::diagnostic::{Constraint, DelightQLError, Resolution, Semantic};
 use crate::pipeline::asts::core::AuthoredColumn;
 use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::{ast_unresolved, danger_gates, generator, refiner, transformer};
 use crate::resolution::ResolverCore;
-use crate::system::DelightQLSystem;
+use crate::system::{DelightQLSystem, ReadySystem};
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 use std::sync::{Arc, Mutex};
@@ -41,9 +42,9 @@ impl DatabaseIntrospector for EmptyIntrospector {
 /// A fully authoritative system (namespace_authoritative = true, real
 /// bootstrap catalog) whose user connection contains no tables at all.
 /// This is the faithful environment: the bootstrap EXISTENCE gate is armed.
-fn fresh_empty_system() -> DelightQLSystem {
+fn fresh_empty_system() -> ReadySystem {
     let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-    DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+    ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
         .expect("fresh in-memory system should build")
 }
 
@@ -76,6 +77,7 @@ fn created_object_note(
             position: position as u32,
             named: Some(identities.intern(column, false)),
             declared_type: None,
+            interior: false,
         })
         .collect();
     identities
@@ -135,10 +137,9 @@ fn compile_with_notes(
     generator::SqlGenerator::new(&names)
         .generate_statement(&sql_ast)
         .map_err(|e| {
-            crate::error::DelightQLError::validation_error(
-                format!("SQL generation failed: {e}"),
-                "plan-note probe",
-            )
+            DelightQLError::from(Constraint::General {
+                message: format!("SQL generation failed: {e}"),
+            })
         })
 }
 
@@ -155,7 +156,10 @@ fn bootstrap_existence_gate_refuses_unknown_table_without_note() {
     let err = compile_with_notes("plan_scratch(*), x > 0 |> (x)", &system, &[])
         .expect_err("a table in no catalog must be refused without a plan note");
     assert!(
-        matches!(err, crate::error::DelightQLError::TableNotFoundError { .. }),
+        matches!(
+            err,
+            DelightQLError::Semantic(Semantic::Resolution(Resolution::Table { .. }))
+        ),
         "expected TableNotFoundError, got: {err:?}"
     );
 }
@@ -400,7 +404,10 @@ fn qualified_reference_bypasses_plan_notes_and_is_refused() {
     )
     .expect_err("qualified references must not see query-local notes");
     assert!(
-        matches!(err, crate::error::DelightQLError::TableNotFoundError { .. }),
+        matches!(
+            err,
+            DelightQLError::Semantic(Semantic::Resolution(Resolution::Table { .. }))
+        ),
         "expected TableNotFoundError on the qualified path, got: {err:?}"
     );
 }

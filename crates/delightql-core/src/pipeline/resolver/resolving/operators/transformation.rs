@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 
+use crate::diagnostic::Resolution;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::core::ColumnOccurrence;
@@ -197,14 +198,14 @@ pub(super) fn resolve_transform_via_fold(
     let mut targets = Vec::new();
     for item in transformations.into_vec() {
         let (expr, naming, qualifier) = (item.expr, item.naming, item.qualifier);
-        let expression = Some(
+        // A TRANSFORM WRITES ITS OPERAND'S POSITION IN PLACE, so its value
+        // is evaluated where the operand stands: one reading past the
+        // interior boundary the enclosing join evaluates refuses.
+        let expression = fold.judged_here("a transform inside the interior", |fold| {
             super::super::domain_expressions::projection::resolve_out_value_via_fold(
                 fold, expr, available,
-            )?,
-        )
-        .into_iter()
-        .next()
-        .expect("one transform expression resolves to one expression");
+            )
+        })?;
         // AS WRITTEN, both halves: a strop is what makes an address
         // case-sensitive, and a folded target addresses a column nobody named.
         let alias_spelling = fold
@@ -219,14 +220,12 @@ pub(super) fn resolve_transform_via_fold(
                 .intern(qualifier.as_str(), qualifier.is_stropped());
             fold.core.identities.canonical(spelling)
         });
-        let mut witness = crate::pipeline::resolver::Witness::default();
         let matches = vec![fold.lexical.address(
             crate::pipeline::resolver::unification::ColumnReference::Named {
                 name: naming.clone(),
                 qualifier: qualifier.clone(),
             },
             false,
-            &mut witness,
             &fold.core.identities,
         )?];
         // Two different failures wore one message, and neither of them was a
@@ -244,29 +243,29 @@ pub(super) fn resolve_transform_via_fold(
                 occurrence.column
             }
             crate::pipeline::resolver::unification::UnificationResult::Unresolved(_) => {
-                return Err(DelightQLError::column_not_found_error(
-                    spelled,
-                    "as a transform target",
-                ));
+                return Err(DelightQLError::from(Resolution::Column {
+                    column: spelled.to_string(),
+                    context: "as a transform target".to_string(),
+                }));
             }
             crate::pipeline::resolver::unification::UnificationResult::Ambiguous { .. } => {
-                return Err(DelightQLError::validation_error_categorized(
-                    "resolution/ambiguous",
-                    format!("Ambiguous transform target '{spelled}'"),
-                    "as a transform target",
-                ));
+                return Err(DelightQLError::from(Resolution::Ambiguous {
+                    message: format!("Ambiguous transform target '{spelled}'"),
+                }));
             }
             crate::pipeline::resolver::unification::UnificationResult::Opaque => {
                 return Err(crate::pipeline::resolver::opaque_reference_refusal());
             }
             crate::pipeline::resolver::unification::UnificationResult::Refused(refusal) => {
-                return Err(refusal.into_error());
+                return Err(refusal);
             }
         };
         if targets.contains(&(alias_sym, qualifier_sym)) {
-            return Err(DelightQLError::parse_error(format!(
-                "Duplicate transform target '{naming}'"
-            )));
+            return Err(crate::diagnostic::DelightQLError::from(
+                crate::diagnostic::Constraint::General {
+                    message: format!("Duplicate transform target '{naming}'"),
+                },
+            ));
         }
         targets.push((alias_sym, qualifier_sym));
         // THE TARGET IS THE OUTPUT. Resolution found the one column this item

@@ -48,19 +48,15 @@ pub fn refuse_if_over(budget: NestingBudget, depth: usize) -> Option<crate::erro
 /// teaching about. A literal here would be a second authority the catalog
 /// could not correct.
 fn refusal(depth: usize, budget: usize) -> crate::error::DelightQLError {
-    crate::error::DelightQLError::validation_error_categorized(
-        NESTING.refusal(),
-        format!(
-            "this query nests {depth} levels deep and this session's budget is {budget}. \
+    (NESTING.refusal())(format!(
+        "this query nests {depth} levels deep and this session's budget is {budget}. \
              Depth is a resource policy, not a rule of the language: the compiler's \
              walks recurse, and a walk deeper than the stack it runs on would abort \
              the process rather than answer. Raise the budget ({knob}), or flatten \
              the query — a chain of pipe stages costs no depth where nested \
              parentheses do.",
-            knob = NESTING.knob(),
-        ),
-        "nesting budget",
-    )
+        knob = NESTING.knob(),
+    ))
 }
 
 #[cfg(test)]

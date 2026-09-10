@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-use crate::{QueryResult, SqliteConnectionManager, SqliteExecutor};
+use crate::{SqliteConnectionManager, SqliteExecutor};
+use delightql_types::diagnostic::Runtime;
 use delightql_types::{DelightQLError, Result};
 use std::path::Path;
 
@@ -22,80 +23,36 @@ impl QueryResults {
     }
 }
 
-impl From<QueryResult> for QueryResults {
-    fn from(result: QueryResult) -> Self {
-        QueryResults::new(result.columns, result.rows)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ExecutionError {
-    #[error("SQL execution failed on database '{database_path}' with query: {sql}")]
-    SqlExecutionError {
-        sql: String,
-        database_path: std::path::PathBuf,
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[error("SQL syntax error: {message}")]
-    SqlSyntaxError {
-        message: String,
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
-
-    #[error("Database connection failed: {path}")]
-    DatabaseConnectionError {
-        path: String,
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
-
-    #[error("Row count mismatch: expected {expected}, got {actual}")]
-    RowCountMismatch { expected: usize, actual: usize },
-
-    #[error("Column mismatch: expected {expected:?}, got {actual:?}")]
-    ColumnMismatch {
-        expected: Vec<String>,
-        actual: Vec<String>,
-    },
-
-    #[error("Data mismatch at row {row}: expected {expected:?}, got {actual:?}")]
-    DataMismatch {
-        row: usize,
-        expected: Vec<String>,
-        actual: Vec<String>,
-    },
-}
-
 fn validate_test_database_path(database_path: &Path) -> Result<()> {
     if !database_path.exists() {
-        return Err(DelightQLError::validation_error(
-            "Test database does not exist",
-            format!("Expected test database at: {}", database_path.display()),
-        ));
+        return Err(Runtime::Io {
+            message: format!(
+                "Test database does not exist: expected it at {}",
+                database_path.display()
+            ),
+        }
+        .into());
     }
 
     if let Some(file_name) = database_path.file_name() {
         let name = file_name.to_string_lossy();
         #[allow(unused_mut)] // mutated only under the duckdb feature
-        let mut is_valid = name.ends_with(".db")
-            || name.ends_with(".sqlite")
-            || name.ends_with(".sqlite3");
+        let mut is_valid =
+            name.ends_with(".db") || name.ends_with(".sqlite") || name.ends_with(".sqlite3");
         #[cfg(feature = "duckdb")]
         {
             is_valid = is_valid || name.ends_with(".duckdb") || name.ends_with(".ddb");
         }
 
         if !is_valid {
-            return Err(DelightQLError::validation_error(
-                "Invalid database file extension",
-                format!(
-                    "Database file should have a supported extension: {}",
+            return Err(Runtime::Unsupported {
+                message: format!(
+                    "Invalid database file extension: the database file should have a \
+                     supported extension: {}",
                     database_path.display()
                 ),
-            ));
+            }
+            .into());
         }
     }
 
@@ -126,42 +83,27 @@ pub fn execute_sql(sql: String, database_path: &Path) -> Result<QueryResults> {
     validate_test_database_path(database_path)?;
 
     let database_path_str = database_path.to_str().ok_or_else(|| {
-        DelightQLError::validation_error(
-            "Invalid database path encoding",
-            format!(
-                "Database path '{}' must be valid UTF-8",
+        DelightQLError::from(Runtime::Io {
+            message: format!(
+                "Invalid database path encoding: '{}' must be valid UTF-8",
                 database_path.display()
             ),
-        )
+        })
     })?;
 
     // Detect database type and execute accordingly
     match detect_database_type(database_path) {
         DatabaseType::SQLite => {
-            let connection_manager =
-                SqliteConnectionManager::new_file(database_path_str).map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to create database connection manager",
-                        format!("Database: {}, SQL: {}", database_path.display(), sql),
-                        Box::new(e),
-                    )
-                })?;
-            execute_sql_with_connection(sql, &connection_manager, database_path)
+            let connection_manager = SqliteConnectionManager::new_file(database_path_str)?;
+            execute_sql_with_connection(sql, &connection_manager)
         }
         #[cfg(feature = "duckdb")]
         DatabaseType::DuckDB => {
             use crate::DuckDBConnectionManager;
 
-            let connection_manager =
-                DuckDBConnectionManager::new_file(database_path_str).map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to create DuckDB connection manager",
-                        format!("Database: {}, SQL: {}", database_path.display(), sql),
-                        Box::new(e),
-                    )
-                })?;
+            let connection_manager = DuckDBConnectionManager::new_file(database_path_str)?;
 
-            execute_sql_with_duckdb_connection(sql, &connection_manager, database_path)
+            execute_sql_with_duckdb_connection(sql, &connection_manager)
         }
     }
 }
@@ -170,18 +112,10 @@ pub fn execute_sql(sql: String, database_path: &Path) -> Result<QueryResults> {
 pub fn execute_sql_with_connection(
     sql: String,
     connection_manager: &SqliteConnectionManager,
-    database_path: &Path,
 ) -> Result<QueryResults> {
-    let mut executor =
-        crate::SqliteExecutorImpl::new(connection_manager);
+    let mut executor = crate::SqliteExecutorImpl::new(connection_manager);
 
-    let result = executor.execute_query(&sql).map_err(|e| {
-        DelightQLError::database_error_with_source(
-            "SQL execution failed",
-            format!("Database: {}, SQL: {}", database_path.display(), sql),
-            Box::new(e),
-        )
-    })?;
+    let result = executor.execute_query(&sql)?;
 
     Ok(QueryResults::new(result.columns, result.rows))
 }
@@ -191,20 +125,12 @@ pub fn execute_sql_with_connection(
 pub fn execute_sql_with_duckdb_connection(
     sql: String,
     connection_manager: &crate::DuckDBConnectionManager,
-    database_path: &Path,
 ) -> Result<QueryResults> {
     use crate::DuckDBExecutor;
 
-    let mut executor =
-        crate::DuckDBExecutorImpl::new(connection_manager);
+    let mut executor = crate::DuckDBExecutorImpl::new(connection_manager);
 
-    let result = executor.execute_query(&sql).map_err(|e| {
-        DelightQLError::database_error_with_source(
-            "SQL execution failed",
-            format!("Database: {}, SQL: {}", database_path.display(), sql),
-            Box::new(e),
-        )
-    })?;
+    let result = executor.execute_query(&sql)?;
 
     // Convert DuckDB QueryResult to the common QueryResults type
     let row_count = result.rows.len();
@@ -213,57 +139,4 @@ pub fn execute_sql_with_duckdb_connection(
         rows: result.rows,
         row_count,
     })
-}
-
-pub fn validate_execution_results(
-    delightql_results: QueryResults,
-    sql_results: QueryResults,
-) -> std::result::Result<(), ExecutionError> {
-    if delightql_results.row_count != sql_results.row_count {
-        return Err(ExecutionError::RowCountMismatch {
-            expected: delightql_results.row_count,
-            actual: sql_results.row_count,
-        });
-    }
-
-    if delightql_results.columns != sql_results.columns {
-        return Err(ExecutionError::ColumnMismatch {
-            expected: delightql_results.columns,
-            actual: sql_results.columns,
-        });
-    }
-
-    for (i, (expected_row, actual_row)) in delightql_results
-        .rows
-        .iter()
-        .zip(sql_results.rows.iter())
-        .enumerate()
-    {
-        if expected_row != actual_row {
-            return Err(ExecutionError::DataMismatch {
-                row: i,
-                expected: expected_row.clone(),
-                actual: actual_row.clone(),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-pub fn execute_and_validate(
-    sql: String,
-    delightql_results: QueryResults,
-    database_path: &Path,
-) -> std::result::Result<(), ExecutionError> {
-    let sql_results =
-        execute_sql(sql.clone(), database_path).map_err(|e| ExecutionError::SqlExecutionError {
-            sql: sql.clone(),
-            database_path: database_path.to_path_buf(),
-            source: Box::new(e),
-        })?;
-
-    validate_execution_results(delightql_results, sql_results)?;
-
-    Ok(())
 }

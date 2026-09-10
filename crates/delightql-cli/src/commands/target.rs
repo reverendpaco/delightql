@@ -17,9 +17,9 @@ use crate::fatboy_exec::{
 pub fn handle_target_list() -> Result<()> {
     let pin = std::env::var(FATBOY_DIR_ENV).ok();
     match &pin {
-        Some(dir) => println!(
-            "{FATBOY_DIR_ENV}: {dir} (hard pin — only this directory is searched)"
-        ),
+        Some(dir) => {
+            println!("{FATBOY_DIR_ENV}: {dir} (hard pin — only this directory is searched)")
+        }
         None => {
             let store = fatboy_store_dir()
                 .map(|d| d.display().to_string())
@@ -108,12 +108,13 @@ pub fn handle_target_install(profile: &str, from: Option<&std::path::Path>) -> R
         None => {
             crate::client::incident::warning(
                 "argument",
-                crate::client::incident::hierarchy::ARGUMENT,
-                format!(
-                    "this dql is a {} build and carries no adapter digests — \
+                delightql_types::diagnostic::Client::Argument {
+                    message: format!(
+                        "this dql is a {} build and carries no adapter digests — \
                      installing UNVERIFIED",
-                    delightql_buildinfo::profile()
-                ),
+                        delightql_buildinfo::profile()
+                    ),
+                },
             );
             false
         }
@@ -141,7 +142,11 @@ pub fn handle_target_install(profile: &str, from: Option<&std::path::Path>) -> R
         "installed {} -> {} ({})",
         src.display(),
         dest.display(),
-        if verified { "digest verified" } else { "UNVERIFIED — dev build" }
+        if verified {
+            "digest verified"
+        } else {
+            "UNVERIFIED — dev build"
+        }
     );
 
     // No lies about what a connection will now use: sibling lookup
@@ -163,11 +168,7 @@ fn find_artifact(dir: &std::path::Path, profile: &str) -> Result<std::path::Path
     if bare.is_file() {
         return Ok(bare);
     }
-    let prefix = format!(
-        "dql-fatboy-{}-{}+",
-        profile,
-        delightql_buildinfo::VERSION
-    );
+    let prefix = format!("dql-fatboy-{}-{}+", profile, delightql_buildinfo::VERSION);
     let suffix = format!("-{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let mut hits: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", dir.display()))?
@@ -283,9 +284,7 @@ pub fn handle_target_verify() -> Result<()> {
     }
 
     if mismatches > 0 {
-        anyhow::bail!(
-            "{mismatches} adapter(s) do not match this dql's burned digests"
-        );
+        anyhow::bail!("{mismatches} adapter(s) do not match this dql's burned digests");
     }
     Ok(())
 }

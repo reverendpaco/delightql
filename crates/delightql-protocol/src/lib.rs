@@ -17,4 +17,4 @@ pub mod stdio;
 pub use layer0::*;
 
 // Re-export layer1 control types
-pub use layer1::{ClientMessage, ControlOp, ControlResult, ServerMessage};
+pub use layer1::{ClientMessage, ControlOp, ControlResponse, ControlResult, ServerMessage};

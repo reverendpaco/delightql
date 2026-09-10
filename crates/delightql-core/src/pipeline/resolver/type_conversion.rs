@@ -9,6 +9,7 @@
 //! implementor that uses the default walk functions for Unresolved → Resolved phase
 //! conversion, overriding only the variants that need special handling.
 
+use crate::diagnostic::{Constraint, Internal, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_resolved::Resolved;
@@ -37,7 +38,6 @@ impl AstTransform<Unresolved, Resolved> for PhaseConverter<'_> {
     crate::pipeline::ast_transform::binder_is_bound_where_the_pattern_is_resolved!();
     crate::pipeline::ast_transform::a_landing_is_consumed_where_the_pipe_is_applied!();
     crate::pipeline::ast_transform::a_context_marker_is_consumed_where_the_call_instantiates!();
-    crate::pipeline::ast_transform::scope_is_minted_where_it_is_resolved!();
     crate::pipeline::ast_transform::minted_where_it_is_decided!(
         fold_output -> crate::relation::PortId: "an expression's output port",
         fold_scalar_output -> crate::relation::PortId: "a scalarized relation's column",
@@ -47,39 +47,31 @@ impl AstTransform<Unresolved, Resolved> for PhaseConverter<'_> {
         &mut self,
         _: crate::pipeline::asts::core::DomainHole,
     ) -> crate::error::Result<crate::pipeline::asts::core::FormalHole> {
-        Err(crate::error::DelightQLError::validation_error_categorized(
-            "value/open/unapplied",
-            "a composition input stands outside any callable applying it",
-            "the position that applies an open body spends its slot",
-        ))
+        Err(DelightQLError::from(Semantic::ValueOpenUnapplied {
+            message: "a composition input stands outside any callable applying it".to_string(),
+        }))
     }
 
     fn fold_cover_callable(
         &mut self,
         _: crate::pipeline::asts::core::Callable<crate::pipeline::asts::core::Unresolved>,
     ) -> crate::error::Result<()> {
-        Err(crate::error::DelightQLError::transformation_error(
-            "a cover's callable is applied where its operator resolves, and this fold is not that place",
-            "phase_payload",
-        ))
+        Err(Internal::invariant("phase_payload", "a cover's callable is applied where its operator resolves, and this fold is not that place"))
     }
 
     fn fold_rename_target(
         &mut self,
         _: crate::pipeline::asts::core::NameTarget,
     ) -> crate::error::Result<crate::names::Spelling> {
-        Err(crate::error::DelightQLError::transformation_error(
-            "a rename target is expanded where the rename resolves, and this fold is not that place",
-            "phase_payload",
-        ))
+        Err(Internal::invariant("phase_payload", "a rename target is expanded where the rename resolves, and this fold is not that place"))
     }
     fn fold_drill(
         &mut self,
         _: crate::pipeline::asts::core::operators::AuthoredDrill,
     ) -> crate::error::Result<crate::pipeline::asts::core::operators::BoundDrill> {
-        Err(crate::error::DelightQLError::transformation_error(
-            "an interior drill binds where its operator resolves, and this fold is not that place",
+        Err(Internal::invariant(
             "phase_payload",
+            "an interior drill binds where its operator resolves, and this fold is not that place",
         ))
     }
 
@@ -105,13 +97,12 @@ impl AstTransform<Unresolved, Resolved> for PhaseConverter<'_> {
             TruthExpression::Existence(Existence { addressing, .. })
             | TruthExpression::RelationalMembership(RelationalMembership { addressing, .. }) => {
                 let identifier = &addressing.identifier;
-                Err(DelightQLError::validation_error(
-                    format!(
+                Err(DelightQLError::from(Constraint::General {
+                    message: format!(
                         "a relational membership test over '{}' cannot be resolved here",
                         identifier.name
                     ),
-                    "in a position that admits only scalar expressions",
-                ))
+                }))
             }
             other => walk_transform_boolean(self, other),
         }

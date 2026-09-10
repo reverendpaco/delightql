@@ -52,9 +52,9 @@ fn make_connection(
 ) -> Result<connection::ConnectionManager> {
     if let Some(ref path) = db_path {
         check_database_exists(path, make_new_db_if_missing)?;
-        connection::ConnectionManager::open(path, via)
+        Ok(connection::ConnectionManager::open(path, via)?)
     } else {
-        connection::ConnectionManager::new_memory()
+        Ok(connection::ConnectionManager::new_memory()?)
     }
 }
 
@@ -183,7 +183,12 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         .map(|p| p.to_string_lossy().to_string());
 
     if *no_sanitize {
-        crate::client::incident::warning("argument", crate::client::incident::hierarchy::SANITIZE_DISABLED, "output sanitization disabled, terminal injection possible".to_string());
+        crate::client::incident::warning(
+            "argument",
+            delightql_types::diagnostic::Client::SanitizeDisabled {
+                message: "output sanitization disabled, terminal injection possible".to_string(),
+            },
+        );
     }
 
     // Build the connection manager. For a fatboy target this classifies the
@@ -222,7 +227,7 @@ pub fn handle_query_subcommand(command: &Command, base_args: &CliArgs) -> Result
         }
     }
 
-    let mut handle = connection::open_handle()?;
+    let mut handle = connection::open_handle(connection::SessionProfile::client())?;
 
     // Apply --danger session-baseline overrides. Core parses and
     // validates the textual specs — unknown gates, bad states, and

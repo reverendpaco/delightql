@@ -15,14 +15,14 @@ between table names; the body is the join expression:
 users(*) & orders(*) :-
   users(*), orders(*), users.id = orders.user_id
 
-users(*) & items(*) :-
+orders(*) & items(*) :-
   orders(*), items(*), orders.id = items.order_id
 
 items(*) & products(*) :-
   items(*), products(*), items.product_id = products.id
 ```
 
-The `&` alone assign this join within a context called `::normal`.
+The `&` alone assigns this join to the default context `::normal`.
 
 ## Multiple Contexts {.dqlh}
 
@@ -49,7 +49,7 @@ users(*) &(::normal) orders(*) :-  // body
 
 ## Using Contexts {.dqlh}
 
-Calling the join mirrors the way in which the rules was defined:
+Calling the join mirrors the way in which the rule was defined:
 
 ```delightql
 users(*) & orders(*)
@@ -59,7 +59,8 @@ users(*) &(::audit) orders(*)
 
 ## Direct Join (`&`{.delightql .sigil}) {.dqlh}
 
-The `&`{.delightql .sigil} operator performs a direct lookup in the current context:
+The `&`{.delightql .sigil} operator performs a direct lookup in the written
+context, or `::normal` when omitted. It does not search every context:
 
 ```delightql
 users(*) & orders(*)

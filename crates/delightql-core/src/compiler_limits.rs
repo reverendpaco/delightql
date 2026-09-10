@@ -38,7 +38,7 @@ pub struct CompilerLimit {
     default_value: usize,
     ceiling: usize,
     unit: &'static str,
-    refusal: &'static str,
+    refusal: fn(String) -> crate::error::DelightQLError,
     knob: &'static str,
     /// Zero means "not yet read"; the environment is consulted once, lazily.
     /// It is also why zero can never be STORED: a stored zero would read back
@@ -78,7 +78,7 @@ pub static NESTING: CompilerLimit = CompilerLimit::new(
     500,
     1000,
     "authored tree levels",
-    crate::uri_registry::subcat::RESOURCE_NESTING,
+    |message| crate::diagnostic::Resource::Nesting { message }.into(),
     "DELIGHTQL_MAX_NESTING",
 );
 
@@ -112,7 +112,7 @@ pub static REFINEMENT_DEPTH: CompilerLimit = CompilerLimit::new(
     512,
     4096,
     "active refiner frames",
-    crate::uri_registry::subcat::RESOURCE_REFINEMENT_DEPTH,
+    |message| crate::diagnostic::Resource::RefinementDepth { message }.into(),
     "DELIGHTQL_MAX_REFINEMENT_DEPTH",
 );
 
@@ -154,7 +154,7 @@ impl CompilerLimit {
         default_value: usize,
         ceiling: usize,
         unit: &'static str,
-        refusal: &'static str,
+        refusal: fn(String) -> crate::error::DelightQLError,
         knob: &'static str,
     ) -> Self {
         CompilerLimit {
@@ -191,18 +191,14 @@ impl CompilerLimit {
     }
 
     /// The subcategory this limit's refusal is raised under.
-    pub fn refusal(&self) -> &'static str {
+    pub fn refusal(&self) -> fn(String) -> crate::error::DelightQLError {
         self.refusal
     }
 
     /// The identity the refusal wears, as an operator reads it off the badge
     /// and looks it up in the catalog.
     pub fn error_identity(&self) -> String {
-        format!(
-            "{}{}",
-            crate::uri_registry::UriKind::Error.scheme(),
-            self.refusal
-        )
+        (self.refusal)(String::new()).error_uri()
     }
 
     /// The environment knob that sets this limit when the host is a process.
@@ -565,9 +561,10 @@ mod tests {
                 "{}: the default must sit inside the ceiling it is bounded by",
                 limit.name()
             );
-            assert_eq!(
-                limit.error_identity(),
-                format!("delightql-error://{}", limit.refusal()),
+            assert!(
+                limit
+                    .error_identity()
+                    .starts_with("delightql-error://operational/resource/"),
                 "{}",
                 limit.name()
             );

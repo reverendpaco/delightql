@@ -67,6 +67,7 @@
 //! inherited behaviour, not a ruling, and it is stated here because the
 //! interner is where it becomes load-bearing.
 
+use crate::diagnostic::{DelightQLError, Resolution, Setop};
 pub mod baptism;
 pub mod birth;
 #[cfg(test)]
@@ -103,21 +104,15 @@ impl From<CorrespondenceError> for crate::error::DelightQLError {
     fn from(error: CorrespondenceError) -> Self {
         match error {
             CorrespondenceError::Ambiguous => {
-                crate::error::DelightQLError::validation_error_categorized(
-                    "setop/correspondence/ambiguous",
-                    "more than one column corresponds to one output slot",
-                    "a corresponding operation requires at most one candidate per output slot",
-                )
+                DelightQLError::from(Setop::CorrespondenceAmbiguous {
+                    message: "more than one column corresponds to one output slot".to_string(),
+                })
             }
-            CorrespondenceError::Opaque => {
-                crate::error::DelightQLError::validation_error_categorized(
-                    crate::uri_registry::subcat::RESOLUTION_SCHEMA,
-                    "an operand's heading is not published by the target, so there is \
-                     nothing to pair the other operand's columns with",
-                    "declare the dimensions at the mention — `f(...)(a, b)` names one \
-                     slot per dimension of the full width",
-                )
-            }
+            CorrespondenceError::Opaque => DelightQLError::from(Resolution::Schema {
+                message: "an operand's heading is not published by the target, so there is \
+                     nothing to pair the other operand's columns with"
+                    .to_string(),
+            }),
         }
     }
 }

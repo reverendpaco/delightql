@@ -12,6 +12,7 @@
 //! target callable by its name, an open body or query-scoped definition as
 //! a caller-resolved body with formal holes.
 
+use crate::diagnostic::{Cfe, Constraint, Recursion, Window};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::ast_unresolved;
@@ -142,11 +143,10 @@ fn substitute_holes(
             ) = &expr
             {
                 let Some(value) = self.args.get(hole.0 as usize) else {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "cfe/lambda_arity",
-                        "a closed callable's slot has no argument at its position",
-                        "supply one value per slot",
-                    ));
+                    return Err(DelightQLError::from(Cfe::LambdaArity {
+                        message: "a closed callable's slot has no argument at its position"
+                            .to_string(),
+                    }));
                 };
                 return Ok(value.clone());
             }
@@ -239,7 +239,7 @@ pub(crate) fn inline_cfe_call(
         return Ok(None);
     };
     let code_count = match &selection {
-        CallableSelection::Scoped(cfe) => cfe.callable_formals().len(),
+        CallableSelection::Scoped(scoped) => scoped.callable_formals().len(),
         CallableSelection::Family(family) => family
             .params()
             .iter()
@@ -265,22 +265,22 @@ pub(crate) fn inline_cfe_call(
     if members.iter().skip(1).any(|member| is_marker(member))
         || (!context_call && members.first().is_some_and(is_marker))
     {
-        return Err(DelightQLError::parse_error(format!(
-            "`..` stands first in a call or not at all; '{name}' received one elsewhere"
-        )));
+        return Err(DelightQLError::from(Constraint::General {
+            message: format!(
+                "`..` stands first in a call or not at all; '{name}' received one elsewhere"
+            ),
+        }));
     }
     if members.len() < code_count {
-        return Err(DelightQLError::validation_error_categorized(
-            "cfe/code_argument",
-            format!(
+        return Err(DelightQLError::from(Cfe::CodeArgument {
+            message: format!(
                 "'{name}' declares {code_count} code parameter{} and the call supplies \
                  only {} member{}",
                 if code_count == 1 { "" } else { "s" },
                 members.len(),
                 if members.len() == 1 { "" } else { "s" },
             ),
-            "supply one argument per declared parameter, code first",
-        ));
+        }));
     }
 
     // THE CALLER'S ACTUALS RESOLVE FIRST. Code members close into
@@ -324,11 +324,9 @@ pub(crate) fn inline_cfe_call(
                 )?
             }
             _ => {
-                return Err(DelightQLError::validation_error_categorized(
-                    "cfe/code_argument",
-                    format!("'{name}' takes code in its position {}", index + 1),
-                    "write a mention `fn:()`, a lambda `:(…)`, or a template `:\"…\"`",
-                ));
+                return Err(DelightQLError::from(Cfe::CodeArgument {
+                    message: format!("'{name}' takes code in its position {}", index + 1),
+                }));
             }
         };
         code_bindings.push(binding);
@@ -421,28 +419,22 @@ pub(crate) fn inline_cfe_call(
         fold.window_obligation = prior_obligation;
         if outcome.is_ok() {
             if !obligation.taken {
-                return Err(DelightQLError::validation_error_categorized(
-                    "window/not_a_window",
-                    format!(
+                return Err(DelightQLError::from(Window::NotAWindow {
+                    message: format!(
                         "the window rides the window function itself, and the body \
                          of '{name}' opens no function that can carry it — a \
                          consulted value definition computes per row unless its \
                          body reaches an aggregate or a target callable"
                     ),
-                    "spell the windowed call inside the argument, or window the \
-                     body's own aggregate",
-                ));
+                }));
             }
             if obligation.extra {
-                return Err(DelightQLError::validation_error_categorized(
-                    "window/not_a_window",
-                    format!(
+                return Err(DelightQLError::from(Window::NotAWindow {
+                    message: format!(
                         "the window rides ONE function, and the body of '{name}' \
                          opens more than one that could carry it"
                     ),
-                    "attach the window inside the definition, on the function it \
-                     rides",
-                ));
+                }));
             }
         }
     }
@@ -684,20 +676,18 @@ fn close_open_body(
 /// callee receives finished code, never a spelling to look up.
 fn close_scoped(
     fold: &mut ResolverFold<'_, '_>,
-    cfe: crate::pipeline::asts::core::CfeDefinition,
+    scoped: super::environment::ScopedCfe,
     application: &ast_unresolved::StandardApplication,
 ) -> Result<CallableBinding> {
     use crate::pipeline::asts::core::ContextMode;
-    let name = cfe.name.clone();
-    if cfe.context_mode != ContextMode::None || !cfe.callable_formals().is_empty() {
-        return Err(DelightQLError::validation_error_categorized(
-            "cfe/code_argument",
-            format!(
+    let name = scoped.name().clone();
+    if *scoped.context_mode() != ContextMode::None || !scoped.callable_formals().is_empty() {
+        return Err(DelightQLError::from(Cfe::CodeArgument {
+            message: format!(
                 "'{name}' is context-aware or curried and cannot cross as a code \
                  actual"
             ),
-            "pass a lambda `:(…)` closing over what it needs, or a consulted function",
-        ));
+        }));
     }
     let defaults: Vec<ast_resolved::DomainExpression> = application
         .call()
@@ -706,14 +696,12 @@ fn close_scoped(
         .cloned()
         .map(|value| fold.transform_domain(value))
         .collect::<Result<Vec<_>>>()?;
-    let (arity, scoped) = crate::defuse::admitted::scoped_curried(&cfe)?;
-    fold.env.push_horizon(cfe.horizon());
-    let resolved = scoped.resolve(fold);
-    fold.env.pop_horizon();
-    let resolved = resolved?;
+    // ONE OPERATION: the body resolves at the site its own declaration
+    // stands in, and it is never handed out to be resolved anywhere else.
+    let (arity, body) = scoped.close_curried(fold)?;
     Ok(CallableBinding::Closed(ClosedCallable {
         arity,
-        body: resolved,
+        body,
         defaults,
     }))
 }
@@ -735,14 +723,12 @@ fn instantiate_callable_site(
             defaults,
         } => {
             if application.guard.is_some() {
-                return Err(DelightQLError::validation_error_categorized(
-                    "cfe/code_argument",
-                    format!(
+                return Err(DelightQLError::from(Cfe::CodeArgument {
+                    message: format!(
                         "a guard on the invocation of code formal '{name}' has no \
                          reading"
                     ),
-                    "filter the rows before the call",
-                ));
+                }));
             }
             // The site's arguments resolve in THIS world; an argumentless
             // invocation applies the mention's own caller-resolved
@@ -769,14 +755,12 @@ fn instantiate_callable_site(
                 fold.env.reach(),
             )?
             else {
-                return Err(DelightQLError::validation_error_categorized(
-                    "cfe/code_argument",
-                    format!(
+                return Err(DelightQLError::from(Cfe::CodeArgument {
+                    message: format!(
                         "the code actual '{namespace}::{family_name}' no longer \
                          selects a callable"
                     ),
-                    "code actuals apply the definition they closed over",
-                ));
+                }));
             };
             let actuals = super::bound_use::ScalarActuals::of(false, Vec::new(), args);
             let use_value = match super::bound_use::bind_definition_use(
@@ -824,22 +808,18 @@ fn instantiate_callable_site(
                     .expect("the armed obligation outlives the body resolution");
                 fold.window_obligation = prior;
                 if outcome.is_ok() && !obligation.taken {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "window/not_a_window",
-                        format!(
+                    return Err(DelightQLError::from(Window::NotAWindow {
+                        message: format!(
                             "the window rides the window function itself, and the \
                              body of '{name}' opens no function that can carry it"
                         ),
-                        "window the body's own aggregate",
-                    ));
+                    }));
                 }
             }
             outcome?.ok_or_else(|| {
-                DelightQLError::validation_error_categorized(
-                    "cfe/code_argument",
-                    format!("the code actual behind '{name}' did not instantiate"),
-                    "code actuals apply the definition they closed over",
-                )
+                DelightQLError::from(Cfe::CodeArgument {
+                    message: format!("the code actual behind '{name}' did not instantiate"),
+                })
             })
         }
         CallableBinding::Target(target) => {
@@ -896,11 +876,9 @@ fn instantiate_callable_site(
         }
         CallableBinding::Closed(closed) => {
             if application.window.is_some() {
-                return Err(DelightQLError::validation_error_categorized(
-                    "window/not_a_window",
-                    format!("a window cannot ride the closed-body formal '{name}'"),
-                    "window the function inside the body instead",
-                ));
+                return Err(DelightQLError::from(Window::NotAWindow {
+                    message: format!("a window cannot ride the closed-body formal '{name}'"),
+                }));
             }
             let site_args: Vec<ast_resolved::DomainExpression> = application
                 .call()
@@ -915,17 +893,15 @@ fn instantiate_callable_site(
                 site_args
             };
             if args.len() != closed.arity {
-                return Err(DelightQLError::validation_error_categorized(
-                    "cfe/lambda_arity",
-                    format!(
+                return Err(DelightQLError::from(Cfe::LambdaArity {
+                    message: format!(
                         "'{name}' is bound to a closed body with {} slot{}; the \
                          invocation supplies {}",
                         closed.arity,
                         if closed.arity == 1 { "" } else { "s" },
                         args.len()
                     ),
-                    "supply one value per slot",
-                ));
+                }));
             }
             substitute_holes(closed.body, &args)
         }
@@ -1059,7 +1035,7 @@ pub(crate) fn instantiate_slot(
 /// shaped at registration — its admission is by binding name), or a
 /// catalog family (admitted and opened by identity).
 pub(in crate::defuse) enum CallableSelection<'s> {
-    Scoped(crate::pipeline::asts::unresolved::CfeDefinition),
+    Scoped(super::environment::ScopedCfe),
     Family(super::select::LinkedFamily<'s>),
 }
 
@@ -1141,26 +1117,22 @@ pub(in crate::defuse) fn select_callable_family<'s>(
 /// The immediate terminal for a SAME-KEY scalar self-reference: a value
 /// definition has no fixpoint to re-enter.
 fn scalar_recursion_refusal(name: &str) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "cfe/recursion",
-        format!(
+    DelightQLError::from(Cfe::Recursion {
+        message: format!(
             "the instantiation of '{name}' reaches itself with the same actuals: \
              a value definition cannot recurse"
         ),
-        "a scalar definition computes from its inputs; write recursion as a relational rule",
-    )
+    })
 }
 
 fn scalar_cycle_refusal(name: &str, chain: Vec<String>) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "cfe/recursion",
-        format!(
+    DelightQLError::from(Cfe::Recursion {
+        message: format!(
             "the value instantiation of '{name}' enters the cycle {}: a value definition \
              has no relational fixpoint to re-enter",
             chain.join(" -> ")
         ),
-        "break the value-definition cycle, or write recursion as a relational rule",
-    )
+    })
 }
 
 /// The ruled terminal for a CHANGED-KEY scalar self-reference, observed
@@ -1170,9 +1142,8 @@ fn scalar_widening_refusal(
     building: &[String],
     requested: &[String],
 ) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        crate::uri_registry::subcat::RECURSION_PARAMETER_WIDENING,
-        format!(
+    DelightQLError::from(Recursion::ParameterWidening {
+        message: format!(
             "'{name}' is recursive and its self-reference changes an actual \
              (building [{}], requested [{}]). A value definition's actuals select \
              ONE instantiation; state that changes between recursive steps belongs \
@@ -1180,6 +1151,5 @@ fn scalar_widening_refusal(
             building.join(", "),
             requested.join(", "),
         ),
-        "recursive parameters never widen",
-    )
+    })
 }

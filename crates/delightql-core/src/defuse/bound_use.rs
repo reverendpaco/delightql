@@ -19,6 +19,7 @@
 use super::environment::{Environment, RelationAnswer};
 use super::instance::InstanceTable;
 use super::select::LinkedFamily;
+use crate::diagnostic::{Cfe, Effect, Ho, Internal, Recursion, Resolution};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_transform::AstTransform;
 use crate::pipeline::asts::unresolved as ast_unresolved;
@@ -28,23 +29,18 @@ pub(in crate::defuse) use super::admitted::{
     use_scoped_ho, BoundAdmission, BoundUse, HoActuals, HoUse, NoActuals, ScalarActuals,
     ScopedBoundAdmission, ScopedBoundUse, ValueActuals,
 };
-pub(crate) use super::admitted::{
-    resolve_synthesized_body, use_effect_rule, EffectSelection, EffectUse, RelationUse,
-    ScopedEffectUse,
-};
+pub(crate) use super::admitted::{resolve_synthesized_body, RelationUse};
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
 use crate::resolution::ResolverCore;
 
 pub(super) fn mutual_recursion_refusal(chain: Vec<String>) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        crate::uri_registry::subcat::RECURSION_MUTUAL,
-        format!(
+    DelightQLError::from(Recursion::Mutual {
+        message: format!(
             "circular consulted-definition expansion: mutual recursion is not supported; \
              the definition-instance cycle is {}",
             chain.join(" -> ")
         ),
-        "break the cycle so each recursive definition reaches only its own established frontier",
-    )
+    })
 }
 
 pub(crate) fn judge_recursive_frontier(
@@ -58,15 +54,12 @@ pub(crate) fn judge_recursive_frontier(
 }
 
 fn mode_recursion_refusal(spelled: &str) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "cfe/recursion",
-        format!(
+    DelightQLError::from(Cfe::Recursion {
+        message: format!(
             "the declared mode of '{spelled}' reaches itself while its arms \
              resolve: a value definition cannot recurse"
         ),
-        "a declared mode computes from its inputs; write recursion as a \
-         relational rule",
-    )
+    })
 }
 
 /// One SELECTED relation definition: the classification door's token.
@@ -170,18 +163,18 @@ pub(crate) fn use_relation<'db>(
     // refuse with the teaching, never spin.
     let bound = require_fresh(
         bind_definition_use(&caller.config.instances, family, NoActuals)?,
-        || DelightQLError::ValidationError {
-            message: format!(
-                "circular consulted-definition expansion: '{}::{}' is already \
+        || {
+            DelightQLError::from(Recursion::ConsultedClauseOrder {
+                message: format!(
+                    "circular consulted-definition expansion: '{}::{}' is already \
                  being expanded. If this is a recursive rule, the \
                  base (non-recursive) clause must come FIRST in the consulted \
                  file — a self-reference is only recursive once a prior clause \
                  has established the name. If the cycle runs through another \
                  view, break the cycle. SEMANTICS/recursion-contract-law.md B5.",
-                display_namespace, name
-            ),
-            context: "resolver::consulted_view_expansion".to_string(),
-            subcategory: Some(crate::uri_registry::subcat::RECURSION_CONSULTED_CLAUSE_ORDER),
+                    display_namespace, name
+                ),
+            })
         },
     )?;
 
@@ -222,7 +215,7 @@ pub(crate) struct SquishedExpansion {
 /// an anonymous relation of any degree, or an explicit interior — and it
 /// refuses an argumentative access, whose names are logical binders and
 /// not a relation value. What it admits then resolves in a CLOSED world
-/// (`resolve_carriers`): the actual reads its own source, its literals and
+/// (`bind_relation_formals`): the actual reads its own source, its literals and
 /// the statement's definitions, never the caller's row, its sibling
 /// members, or its qualifiers — a name only the caller could answer
 /// refuses as capture. Interior names do not escape; only the callee's
@@ -258,16 +251,13 @@ impl ClosedRelationActual {
             }
         }
         let refuse = |shape: &str| {
-            DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::HO_RELATION_ACTUAL_FORM,
-                format!(
+            DelightQLError::from(Ho::RelationActualForm {
+                message: format!(
                     "parameter '{formal}' of '{callee}' is supplied at position {position} by \
                      {shape}: its names are logical binders, not a relation value, so it \
                      is not a closed relation this parameter can receive"
                 ),
-                "construct the relation with a closed interior — `t(, cond |> (cols))` — \
-                 or bind it first with `:` and pass the whole named relation, `f(name(*))`",
-            )
+            })
         };
         match chain.head_access() {
             // A whole read, or an inchoate one that reads whole.
@@ -340,24 +330,21 @@ pub(in crate::defuse) fn use_sigma(
     )? {
         BoundAdmission::Fresh(bound) => bound,
         BoundAdmission::Reenter => {
-            return Err(DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::RECURSION_CONSULTED_CLAUSE_ORDER,
-                format!(
+            return Err(DelightQLError::from(Recursion::ConsultedClauseOrder {
+                message: format!(
                     "the sigma rule '{functor}' cites itself while its body expands: \
                      an existence test has no fixpoint to re-enter. Break the cycle, \
                      or write the recursion as a relational rule and test THAT."
                 ),
-                "resolver::consulted_view_expansion",
-            ));
+            }));
         }
         BoundAdmission::Cycle { chain } => return Err(mutual_recursion_refusal(chain)),
         BoundAdmission::Widening {
             building,
             requested,
         } => {
-            return Err(DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::RECURSION_PARAMETER_WIDENING,
-                format!(
+            return Err(DelightQLError::from(Recursion::ParameterWidening {
+                message: format!(
                     "'{functor}' is recursive and its self-citation changes an \
                      argument (building [{}], requested [{}]). A sigma rule's \
                      arguments select ONE expansion; recursive state belongs in a \
@@ -365,8 +352,7 @@ pub(in crate::defuse) fn use_sigma(
                     building.join(", "),
                     requested.join(", "),
                 ),
-                "recursive parameters never widen",
-            ));
+            }));
         }
     };
     bound.resolve_sigma(fold, functor)
@@ -429,10 +415,10 @@ pub(crate) fn use_declared_mode<'db>(
     };
     let group = bound.reconstruct_group()?;
     let Some(authored) = group.declared_mode() else {
-        return Err(DelightQLError::database_error(
+        return Err(Internal::invariant(
+            "defuse::bound_use",
             "corrupt catalog: an entity declares a functional dependency and its stored \
              definition is not a fact function",
-            spelled.to_string(),
         ));
     };
     // THE TWO READINGS ARE ONE DECLARATION. The catalog chose the
@@ -444,10 +430,10 @@ pub(crate) fn use_declared_mode<'db>(
         &authored.inputs.iter().cloned().collect::<Vec<_>>(),
         &authored.outputs.iter().cloned().collect::<Vec<_>>(),
     ) {
-        return Err(DelightQLError::database_error(
+        return Err(Internal::invariant(
+            "defuse::bound_use",
             "corrupt catalog: the stored mode and the stored definition are not the same \
              declaration",
-            spelled.to_string(),
         ));
     }
     let authored = authored.clone();
@@ -500,15 +486,13 @@ pub(crate) fn use_runtime_served_view<'s, R>(
         BoundAdmission::Fresh(bound) => bound,
         BoundAdmission::Cycle { chain } => return Err(mutual_recursion_refusal(chain)),
         BoundAdmission::Reenter | BoundAdmission::Widening { .. } => {
-            return Err(DelightQLError::validation_error_categorized(
-                "effect/runtime_served/cycle",
-                format!(
+            return Err(DelightQLError::from(Effect::RuntimeServedCycle {
+                message: format!(
                     "expanding '{}' reaches itself: a runtime-served relation's \
                      definitions cannot be recursive",
                     spelled
                 ),
-                "name the relation's source directly",
-            ));
+            }));
         }
     };
     // A selected family's body that fails to open is CATALOG CORRUPTION,
@@ -588,21 +572,77 @@ pub(crate) enum ReductionStanding {
     /// A row-column occurrence stands outside every absorber and is not a
     /// group key: one answer per row in a slot with one answer per group.
     PerRow,
+    /// An ordinary aggregate stands where its input is already one row of
+    /// a reduction — inside another aggregate's argument, or inside the
+    /// row a collecting record or tuple gathers — with no relation
+    /// boundary between the two reductions. The teaching names both.
+    Nested { teaching: String },
 }
 
-/// The REDUCING grade's obligation, distributed over the value: an
-/// absorber licenses its own subtree; every column occurrence outside an
-/// absorber must be a bare group key. `sum:(x) + y` refuses unless `y` is
-/// a key — an absorber somewhere does not license per-row reads
-/// elsewhere, and there is no implicit aggregation, ever.
+/// The one classification of a resolved standard application the grade
+/// judgments dispatch on. Judged from the RESOLVED callee and the
+/// application's own window, never from the authored spelling.
+enum ApplicationRole {
+    /// A windowed application: one value per input row, the engine's own
+    /// judgment over its interior.
+    Windowed,
+    /// An engine aggregate: a reducing absorber.
+    Aggregate(String),
+    /// A callable the registry cannot classify: the author's assertion.
+    UnknownTarget,
+    /// A known scalar function: its arguments stand where it stands.
+    Scalar,
+}
+
+fn application_role(
+    core: &ResolverCore<'_>,
+    application: &crate::pipeline::asts::resolved::StandardApplication,
+) -> ApplicationRole {
+    if application.window.is_some() {
+        return ApplicationRole::Windowed;
+    }
+    let mut name = String::new();
+    let spelled = core
+        .identities
+        .write_function_name(
+            application.call().callee,
+            &mut crate::names::sink::Teaching(&mut name),
+        )
+        .is_ok();
+    if !spelled {
+        return ApplicationRole::Scalar;
+    }
+    let builtin = &core.built_in;
+    if builtin.is_aggregate(&name) {
+        ApplicationRole::Aggregate(name)
+    } else if builtin.is_known_function(&name) {
+        ApplicationRole::Scalar
+    } else {
+        ApplicationRole::UnknownTarget
+    }
+}
+
+/// The REDUCING grade's obligation, distributed over the value.
+///
+/// Two laws share one walk. THE ABSORBER LAW: an absorber licenses its own
+/// subtree; every column occurrence outside an absorber must be a bare
+/// group key. `sum:(x) + y` refuses unless `y` is a key — an absorber
+/// somewhere does not license per-row reads elsewhere, and there is no
+/// implicit aggregation, ever. THE NESTING LAW: a collecting record or
+/// tuple gathers the group's rows, and an aggregate's argument is one row
+/// of its input, so an ordinary aggregate standing inside either has no
+/// group of its own to reduce — `sum:(sum:(x))` and `{ k, "t": sum:(x) }`
+/// both refuse until a stage supplies the relation boundary. A window is
+/// one value per row and stands anywhere a value stands; a scalarized
+/// subquery is its own relation and its own boundary; a metadata group's
+/// target is a collector over each key's partition, judged like the record
+/// it stands in.
 pub(crate) fn judge_grade(
     core: &ResolverCore<'_>,
     grade: CallableGrade,
     group_keys: &std::collections::HashSet<crate::relation::PortId>,
     value: &crate::pipeline::asts::resolved::DomainExpression,
 ) -> ReductionStanding {
-    use crate::pipeline::ast_visit::{walk_visit_domain, AstVisit, Descent};
-    use crate::pipeline::asts::core::Resolved;
     use crate::pipeline::asts::resolved as ast_resolved;
 
     match grade {
@@ -612,78 +652,258 @@ pub(crate) fn judge_grade(
         CallableGrade::RowWise | CallableGrade::Windowed => return ReductionStanding::Lawful,
     }
 
-    struct Judge<'a, 'reg> {
-        core: &'a ResolverCore<'reg>,
-        group_keys: &'a std::collections::HashSet<crate::relation::PortId>,
-        unlicensed: bool,
-    }
-    impl AstVisit<Resolved> for Judge<'_, '_> {
-        fn enter_domain(&mut self, e: &ast_resolved::DomainExpression) -> Result<Descent> {
-            if let ast_resolved::DomainExpression::Reference(reference) = e {
-                let is_key = match reference {
-                    crate::pipeline::asts::core::Reference::Named(named) => {
-                        self.group_keys.contains(&named.column().column)
-                    }
-                    _ => false,
-                };
-                if !is_key {
-                    self.unlicensed = true;
-                    return Ok(Descent::Break);
-                }
-            }
-            Ok(Descent::Continue)
-        }
-
-        fn enter_function(&mut self, f: &ast_resolved::FunctionApplication) -> Result<Descent> {
-            match f {
-                ast_resolved::FunctionApplication::Standard(application) => {
-                    // A windowed application is the engine's own judgment
-                    // (window functions refuse in a grouped context there);
-                    // its interior is not this obligation's.
-                    if application.window.is_some() {
-                        return Ok(Descent::SkipSubtree);
-                    }
-                    let mut name = String::new();
-                    let spelled = self
-                        .core
-                        .identities
-                        .write_function_name(
-                            application.call().callee,
-                            &mut crate::names::sink::Teaching(&mut name),
-                        )
-                        .is_ok();
-                    if spelled {
-                        let builtin = &self.core.built_in;
-                        if builtin.is_aggregate(&name) || !builtin.is_known_function(&name) {
-                            // The absorber licenses ITS OWN subtree only.
-                            return Ok(Descent::SkipSubtree);
-                        }
-                    }
-                    Ok(Descent::Continue)
-                }
-                // A scalarized subquery owns its interior scope; a
-                // tree-group collects (the class's rows as an interior
-                // relation).
-                ast_resolved::FunctionApplication::Scalarized(_)
-                | ast_resolved::FunctionApplication::Enclyph(_) => Ok(Descent::SkipSubtree),
-                // A declared-mode call is one row PER INPUT ROW — its
-                // arguments walk like any other value.
-                ast_resolved::FunctionApplication::FieldSelect(_) => Ok(Descent::Continue),
-                _ => Ok(Descent::Continue),
-            }
-        }
-    }
-
     let mut judge = Judge {
         core,
         group_keys,
+        collector_depth: 0,
+        aggregate_depth: 0,
         unlicensed: false,
+        nested: None,
     };
-    let _ = walk_visit_domain(&mut judge, value);
-    if judge.unlicensed {
+    match value {
+        // THE COLLECTOR AT THE SLOT: its members are the collected row.
+        ast_resolved::DomainExpression::Application(
+            ast_resolved::FunctionApplication::Enclyph(enclyph),
+        ) => judge.collected(enclyph),
+        other => judge.leaf(other),
+    }
+    if let Some(teaching) = judge.nested {
+        ReductionStanding::Nested { teaching }
+    } else if judge.unlicensed {
         ReductionStanding::PerRow
     } else {
         ReductionStanding::Lawful
+    }
+}
+
+/// The same judgment for the collectors a GROUPING-KEY record holds: its
+/// induced members and its metadata members collect within the group the
+/// record keys, exactly as they do under `~>`. The record's plain members
+/// are keys, not collected rows, and are not this judgment's.
+pub(crate) fn judge_key_record_collectors(
+    core: &ResolverCore<'_>,
+    record: &crate::pipeline::asts::resolved::Record,
+) -> ReductionStanding {
+    use crate::pipeline::asts::core::RecordMember;
+    let mut judge = Judge {
+        core,
+        group_keys: &std::collections::HashSet::new(),
+        collector_depth: 0,
+        aggregate_depth: 0,
+        unlicensed: false,
+        nested: None,
+    };
+    for member in record.members.iter() {
+        if judge.nested.is_some() {
+            break;
+        }
+        match member {
+            RecordMember::Induced { value, .. } => judge.collected(value),
+            RecordMember::Metadata { group, .. } => judge.metadata_target(group),
+            RecordMember::Keyed { .. } | RecordMember::SelfKeyed(_) | RecordMember::Spread(_) => {}
+        }
+    }
+    match judge.nested {
+        Some(teaching) => ReductionStanding::Nested { teaching },
+        None => ReductionStanding::Lawful,
+    }
+}
+
+/// The same judgment for a metadata group standing at the reduction slot:
+/// its target collects each key's partition, so its members are judged as
+/// a collected row. A metadata group has no per-row reading to refuse, only
+/// the nesting law.
+pub(crate) fn judge_metadata_reduction(
+    core: &ResolverCore<'_>,
+    group: &crate::pipeline::asts::resolved::MetadataGroup,
+) -> ReductionStanding {
+    let mut judge = Judge {
+        core,
+        group_keys: &std::collections::HashSet::new(),
+        collector_depth: 0,
+        aggregate_depth: 0,
+        unlicensed: false,
+        nested: None,
+    };
+    judge.metadata_target(group);
+    match judge.nested {
+        Some(teaching) => ReductionStanding::Nested { teaching },
+        None => ReductionStanding::Lawful,
+    }
+}
+
+struct Judge<'a, 'reg> {
+    core: &'a ResolverCore<'reg>,
+    group_keys: &'a std::collections::HashSet<crate::relation::PortId>,
+    /// How many collecting constructors enclose the position being read:
+    /// inside one, a column is one row of the collected relation and
+    /// licensed; an aggregate is a reduction of a reduction.
+    collector_depth: usize,
+    /// How many engine aggregates enclose the position being read.
+    aggregate_depth: usize,
+    unlicensed: bool,
+    nested: Option<String>,
+}
+
+impl Judge<'_, '_> {
+    fn inside_reduction(&self) -> bool {
+        self.collector_depth > 0 || self.aggregate_depth > 0
+    }
+
+    /// The row a collecting record or tuple gathers, member by member. An
+    /// induced member is a collector of its own beneath this one, and so is
+    /// a metadata member's target, partitioned by its key.
+    fn collected(&mut self, enclyph: &crate::pipeline::asts::resolved::Enclyph) {
+        use crate::pipeline::asts::core::{Enclyph, RecordMember};
+        self.collector_depth += 1;
+        match enclyph {
+            Enclyph::Record(record) => {
+                for member in record.members.iter() {
+                    if self.nested.is_some() {
+                        break;
+                    }
+                    match member {
+                        RecordMember::SelfKeyed(_) => {}
+                        RecordMember::Keyed { value, .. } => self.leaf(value),
+                        RecordMember::Induced { value, .. } => self.collected(value),
+                        RecordMember::Metadata { group, .. } => self.metadata_target(group),
+                        RecordMember::Spread(spread) => self.leaf(spread.expanded()),
+                    }
+                }
+            }
+            Enclyph::EmptyRecord(_) => {}
+            Enclyph::Tuple(tuple) => {
+                for element in tuple.elements.iter() {
+                    if self.nested.is_some() {
+                        break;
+                    }
+                    self.leaf(element.value());
+                }
+            }
+        }
+        self.collector_depth -= 1;
+    }
+
+    /// A metadata group's target: the collector at the bottom of its key
+    /// chain, one partition per key value.
+    fn metadata_target(&mut self, group: &crate::pipeline::asts::resolved::MetadataGroup) {
+        use crate::pipeline::asts::core::MetadataTarget;
+        match &group.target {
+            MetadataTarget::Enclyph(enclyph) => self.collected(enclyph),
+            MetadataTarget::Group(nested) => self.metadata_target(nested),
+        }
+    }
+
+    /// One value, wherever it stands: at the slot, or as a collected cell.
+    fn leaf(&mut self, value: &crate::pipeline::asts::resolved::DomainExpression) {
+        let _ = crate::pipeline::ast_visit::walk_visit_domain(self, value);
+    }
+
+    fn refuse_nested(&mut self, aggregate: &str) {
+        let where_ = if self.aggregate_depth > 0 {
+            "inside another aggregate's argument, which is already one row of that \
+             reduction's input"
+                .to_string()
+        } else {
+            "inside a collecting record or tuple, whose members are the rows it \
+             gathers"
+                .to_string()
+        };
+        self.nested = Some(format!(
+            "`{aggregate}:` stands {where_}: a reduction of a reduction needs a \
+             relation boundary between the two — reduce in a stage of its own \
+             (`|> %(keys ~> {aggregate}:(…) as name)`) and read the result here"
+        ));
+    }
+}
+
+impl crate::pipeline::ast_visit::AstVisit<crate::pipeline::asts::core::Resolved> for Judge<'_, '_> {
+    fn enter_domain(
+        &mut self,
+        e: &crate::pipeline::asts::resolved::DomainExpression,
+    ) -> Result<crate::pipeline::ast_visit::Descent> {
+        use crate::pipeline::ast_visit::Descent;
+        if self.nested.is_some() {
+            return Ok(Descent::Break);
+        }
+        if let crate::pipeline::asts::resolved::DomainExpression::Reference(reference) = e {
+            let is_key = match reference {
+                crate::pipeline::asts::core::Reference::Named(named) => {
+                    self.group_keys.contains(&named.column().column)
+                }
+                _ => false,
+            };
+            if !is_key && !self.inside_reduction() {
+                self.unlicensed = true;
+            }
+        }
+        Ok(Descent::Continue)
+    }
+
+    fn enter_function(
+        &mut self,
+        f: &crate::pipeline::asts::resolved::FunctionApplication,
+    ) -> Result<crate::pipeline::ast_visit::Descent> {
+        use crate::pipeline::ast_visit::Descent;
+        use crate::pipeline::asts::resolved as ast_resolved;
+        match f {
+            ast_resolved::FunctionApplication::Standard(application) => {
+                match application_role(self.core, application) {
+                    // One value per input row; the engine judges the
+                    // interior of the window itself.
+                    ApplicationRole::Windowed => Ok(Descent::SkipSubtree),
+                    ApplicationRole::Aggregate(name) => {
+                        if self.inside_reduction() {
+                            self.refuse_nested(&name);
+                            return Ok(Descent::Break);
+                        }
+                        self.aggregate_depth += 1;
+                        Ok(Descent::Continue)
+                    }
+                    // Outside every reduction the position is reducing and
+                    // the unknown callable is the author's assertion of it;
+                    // inside one the position is row-wise and its arguments
+                    // stand where it stands.
+                    ApplicationRole::UnknownTarget => Ok(if self.inside_reduction() {
+                        Descent::Continue
+                    } else {
+                        Descent::SkipSubtree
+                    }),
+                    ApplicationRole::Scalar => Ok(Descent::Continue),
+                }
+            }
+            // A construction inside a value gathers its members as one row
+            // of the enclosing value: still the collected row, or still the
+            // aggregate's argument.
+            ast_resolved::FunctionApplication::Enclyph(_) => {
+                self.collector_depth += 1;
+                Ok(Descent::Continue)
+            }
+            // A scalarized subquery is its own relation: the boundary the
+            // nesting law asks for, and a scope of its own.
+            ast_resolved::FunctionApplication::Scalarized(_) => Ok(Descent::SkipSubtree),
+            _ => Ok(Descent::Continue),
+        }
+    }
+
+    fn exit_function(
+        &mut self,
+        f: &crate::pipeline::asts::resolved::FunctionApplication,
+    ) -> Result<crate::pipeline::ast_visit::Descent> {
+        use crate::pipeline::ast_visit::Descent;
+        use crate::pipeline::asts::resolved as ast_resolved;
+        match f {
+            ast_resolved::FunctionApplication::Standard(application) => {
+                if let ApplicationRole::Aggregate(_) = application_role(self.core, application) {
+                    self.aggregate_depth -= 1;
+                }
+            }
+            ast_resolved::FunctionApplication::Enclyph(_) => {
+                self.collector_depth -= 1;
+            }
+            _ => {}
+        }
+        Ok(Descent::Continue)
     }
 }
 
@@ -848,9 +1068,8 @@ pub(crate) fn use_sigma_enlisted(
     // erased wrong-kind ambiguity can never invent a collision.
     match fold.env.sigma_position(fold.core, &spelled)? {
         crate::defuse::environment::lookup::SigmaPosition::Collision { sigma } => {
-            Err(DelightQLError::validation_error_categorized(
-                "resolution/ambiguous",
-                format!(
+            Err(DelightQLError::from(Resolution::Ambiguous {
+                message: format!(
                     "Ambiguous entity '{}': a relation and the sigma rule in \
                      namespace {} both answer this existence test. While both \
                      definitions are live neither may answer — qualify the \
@@ -858,8 +1077,7 @@ pub(crate) fn use_sigma_enlisted(
                     functor,
                     family_display_namespace(&sigma),
                 ),
-                "Ambiguous existence test",
-            ))
+            }))
         }
         crate::defuse::environment::lookup::SigmaPosition::Sigma(sigma) => Ok(
             SigmaEnlisted::Expanded(use_sigma(fold, sigma, functor, arguments)?),

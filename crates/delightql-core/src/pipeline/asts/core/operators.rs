@@ -318,8 +318,11 @@ impl<P: Phase> CallArguments<P> {
                 }),
                 HoArgument::Landed(relation) => {
                     if found.is_some() {
-                        return Err(crate::error::DelightQLError::parse_error(
-                            "a call carries two landed relations; one pipe lands once",
+                        return Err(crate::diagnostic::DelightQLError::from(
+                            crate::diagnostic::Ho::PipeLanding {
+                                message: "a call carries two landed relations; one pipe lands once"
+                                    .to_string(),
+                            },
                         ));
                     }
                     found = Some(Landed { position, relation });
@@ -341,23 +344,49 @@ impl<P: Phase> CallArguments<P> {
         })
     }
 
-    /// REWRITE WHAT EACH RELATION POSITION CARRIES, kind intact. This is the
-    /// whole of the mutation an intervening phase is offered over the row:
-    /// it can replace a relation with another relation, and it cannot turn a
-    /// landed member into an authored one, an argument into a landing, or
-    /// change how many members there are.
-    pub fn rewrite_relations(
+    /// REWRITE WHAT THE LANDED POSITION CARRIES, kind intact. The landed
+    /// member is the one relation of the row on the EVALUATION SPINE — the
+    /// relation the pipe flowed into this call — and it is the only member
+    /// an executing phase may replace: it can put another relation there,
+    /// and it cannot turn the landed member into an authored one, touch an
+    /// authored argument, or change how many members there are. A row with
+    /// no landed member is left alone.
+    ///
+    /// The member is reached THROUGH the exhaustive judgment: a row carrying
+    /// two landed relations refuses here exactly as it refuses everywhere
+    /// else, so no executing road acts on a first match.
+    pub fn rewrite_landed(
         &mut self,
-        mut rewrite: impl FnMut(&super::Chain<P>) -> crate::error::Result<super::Chain<P>>,
+        rewrite: impl FnOnce(&super::Chain<P>) -> crate::error::Result<super::Chain<P>>,
     ) -> crate::error::Result<()> {
+        let Some(position) = self.judged()?.landed().map(|landed| landed.position) else {
+            return Ok(());
+        };
         if let Self::HigherOrder(part) = self {
-            for member in part.members.iter_mut() {
-                if let Some(relation) = member.relation_mut() {
-                    *relation = rewrite(relation)?;
+            match part.members.iter_mut().nth(position) {
+                Some(HoArgument::Landed(relation)) => *relation = rewrite(relation)?,
+                _ => {
+                    return Err(crate::diagnostic::Internal::invariant(
+                        "call arguments",
+                        "the judged landed position holds the landed member",
+                    ))
                 }
             }
         }
         Ok(())
+    }
+
+    /// THE AUTHORED RELATION-VALUED MEMBERS — relation actuals and rule
+    /// designators — in argument order. These are ENCLOSED positions: what
+    /// stands in them is admitted closed, never evaluated as the spine.
+    pub fn authored_relations(&self) -> impl Iterator<Item = &super::Chain<P>> {
+        self.ho_members().filter_map(|member| match member {
+            HoArgument::Relation(relation) | HoArgument::Rule(relation) => Some(relation),
+            HoArgument::Landed(_)
+            | HoArgument::Value(_)
+            | HoArgument::Landing(_)
+            | HoArgument::Skip => None,
+        })
     }
 
     /// Put `relation` at the row's FIRST relation position, whatever kind
@@ -675,19 +704,44 @@ mod landed_member {
         assert_eq!(after.judged().unwrap().landed().unwrap().position, 1);
     }
 
-    /// REWRITING WHAT A POSITION CARRIES CANNOT CHANGE WHAT IT IS. This is
-    /// the whole mutation an intervening phase is offered, so the landing
-    /// survives every rewrite rather than depending on each one to preserve
-    /// it.
+    /// REWRITING THE LANDED POSITION CANNOT CHANGE WHAT IT IS, and cannot
+    /// reach an authored member: the landing survives the rewrite, and the
+    /// authored relation beside it is untouched — an executing phase is
+    /// offered the spine and nothing else.
+    /// A ROW THAT LOST ITS UNIQUENESS CANNOT BE REWRITTEN: the rewrite reads
+    /// the exhaustive judgment first, so two landed members refuse instead
+    /// of the first being acted on.
     #[test]
-    fn a_rewrite_cannot_unland_a_member() {
+    fn a_rewrite_over_two_landed_members_refuses() {
+        let mut row: CallArguments<Unresolved> = CallArguments::higher_order(vec![
+            HoArgument::Landed(relation()),
+            HoArgument::Landed(relation()),
+        ]);
+        let mut rewrites = 0;
+        assert!(row
+            .rewrite_landed(|_| {
+                rewrites += 1;
+                Ok(relation())
+            })
+            .is_err());
+        assert_eq!(rewrites, 0, "nothing is rewritten on a malformed row");
+    }
+
+    #[test]
+    fn a_rewrite_reaches_only_the_landed_member_and_cannot_unland_it() {
         let mut row: CallArguments<Unresolved> = CallArguments::higher_order(vec![
             HoArgument::Relation(relation()),
             HoArgument::Landed(relation()),
         ]);
-        row.rewrite_relations(|_| Ok(relation()))
-            .expect("the rewrite replaces relations");
+        let mut rewrites = 0;
+        row.rewrite_landed(|_| {
+            rewrites += 1;
+            Ok(relation())
+        })
+        .expect("the rewrite replaces the landed relation");
+        assert_eq!(rewrites, 1, "exactly the landed member is rewritten");
         assert_eq!(row.judged().unwrap().landed().unwrap().position, 1);
+        assert_eq!(row.authored_relations().count(), 1);
         row.replace_first_relation(relation());
         assert_eq!(row.judged().unwrap().landed().unwrap().position, 1);
     }

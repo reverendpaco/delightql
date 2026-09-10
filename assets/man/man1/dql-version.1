@@ -7,11 +7,13 @@ dql-version \- print build identity
 .SH DESCRIPTION
 Prints the binary's build identity: version, burned identity (or
 .B dev
-for local builds), profile, and os/arch.
+for local builds), profile, and os/arch, then the SHA-256 of the
+running binary on its own line.
 .PP
 .EX
 $ dql version
 0.1.0 (dev, debug, linux/aarch64)
+binary sha256: 953b7b75c7e9eb7bc1e13f7d690d43824c733f86958ea3a5d77a9971faf5966c
 .EE
 .PP
 With
@@ -24,7 +26,8 @@ whose identity is
 .EX
 $ dql version --json
 {"version":"0.1.0","identity":"dev","profile":"debug",
- "os":"linux","arch":"aarch64","fatboy_digests":null}
+ "os":"linux","arch":"aarch64","fatboy_digests":null,
+ "binary_sha256":"953b7b75c7e9eb7..."}
 .EE
 .PP
 .I fatboy_digests

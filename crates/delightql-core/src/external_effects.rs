@@ -5,6 +5,7 @@
 //! seam exists so the lifecycle coordinator can be tested with a deterministic
 //! boundary without adding a fault switch to the public API.
 
+use crate::diagnostic::Runtime;
 use crate::error::{DelightQLError, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -34,8 +35,12 @@ pub(crate) trait LiminalCatalogBoundary: Send + Sync {
 /// savepoint; these effects do not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExternalEffect {
-    AttachedSqlite { schema_alias: String },
-    RegisteredExternalConnection { connection_id: i64 },
+    AttachedSqlite {
+        schema_alias: String,
+    },
+    RegisteredExternalConnection {
+        connection_id: i64,
+    },
     CreatedFile {
         path: PathBuf,
         prior_state: CreatedFilePriorState,
@@ -64,10 +69,12 @@ impl LiminalFileOps for RealLiminalFileOps {
         match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(DelightQLError::database_error(
-                format!("Failed to remove liminally-created file '{}'", path.display()),
-                error.to_string(),
-            )),
+            Err(error) => Err(DelightQLError::from(Runtime::Io {
+                message: format!(
+                    "Failed to remove liminally-created file '{}': {error}",
+                    path.display()
+                ),
+            })),
         }
     }
 
@@ -78,10 +85,12 @@ impl LiminalFileOps for RealLiminalFileOps {
             .open(path)
             .map(|_| ())
             .map_err(|error| {
-                DelightQLError::database_error(
-                    format!("Failed to restore liminal file '{}'", path.display()),
-                    error.to_string(),
-                )
+                DelightQLError::from(Runtime::Io {
+                    message: format!(
+                        "Failed to restore liminal file '{}': {error}",
+                        path.display()
+                    ),
+                })
             })
     }
 }
@@ -125,6 +134,9 @@ pub(crate) struct CreatedObjectRegistration {
     pub(crate) connection_id: i64,
     pub(crate) namespace_id: i64,
     pub(crate) attributes: Vec<(String, String)>,
+    /// Positions among `attributes` that carry nested relation payloads,
+    /// as the creating plan knew them.
+    pub(crate) interior_positions: Vec<usize>,
 }
 
 pub(crate) trait CreatedObjectCatalog: Send + Sync {
@@ -140,7 +152,7 @@ impl LiminalCatalogBoundary for RealLiminalCatalogBoundary {
         catalog
             .execute_batch("SAVEPOINT dql_liminal_program")
             .map_err(|error| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     "Failed to begin liminal program transaction",
                     error.to_string(),
                 )
@@ -156,7 +168,7 @@ impl LiminalCatalogBoundary for RealLiminalCatalogBoundary {
             }
         };
         catalog.execute_batch(sql).map_err(|error| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 "Failed to close liminal program transaction",
                 error.to_string(),
             )

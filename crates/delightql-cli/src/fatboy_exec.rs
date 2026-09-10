@@ -27,6 +27,7 @@ use delightql_protocol::{
     ServerTerm, Session, Transport, VersionResult,
 };
 use delightql_types::db_traits::{DatabaseConnection, DbValue};
+use delightql_types::diagnostic::{DelightQLError, DuckDb, Mount, Postgres, Runtime};
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
 
@@ -77,7 +78,7 @@ fn schema_enumeration_sql(profile: &str) -> &'static str {
 /// Enumerate the target's persistent schemas over the fatboy relay.
 fn enumerate_persistent_schemas(
     mgr: &std::sync::Arc<FatboyManager>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, DelightQLError> {
     let sql = schema_enumeration_sql(&mgr.profile);
     let (_cols, rows) = mgr.relay()?.query_nullable(sql)?;
     Ok(rows
@@ -195,7 +196,7 @@ pub struct FatboyRelay {
 impl FatboyRelay {
     /// Handshake over an already-built transport. Shared by both the
     /// socket (`connect`) and stdio (`from_child`) constructors.
-    fn from_transport(transport: Box<dyn Transport + Send>) -> Result<Self, String> {
+    fn from_transport(transport: Box<dyn Transport + Send>) -> Result<Self, DelightQLError> {
         let client = Client::new(transport);
         let session = match client
             .version(
@@ -204,19 +205,22 @@ impl FatboyRelay {
                 300_000,
                 vec![Orientation::Rows],
             )
-            .map_err(|e| format!("fatboy handshake: {}", e.message))?
-        {
+            .map_err(|e| {
+                DelightQLError::from(Runtime::Transport {
+                    message: format!("fatboy handshake: {}", e.message),
+                })
+            })? {
             VersionResult::Accepted(s) => s,
-            VersionResult::Rejected { message, .. } => {
-                return Err(format!(
-                    "fatboy rejected handshake: {}",
-                    String::from_utf8_lossy(&message)
-                ))
-            }
+            // The adapter's own refusal, admitted as the typed fact it is.
+            VersionResult::Rejected(error) => return Err(received(&error)),
         };
         let rows = session
             .agreed_orientation(Orientation::Rows)
-            .ok_or("fatboy does not support Rows orientation")?;
+            .ok_or_else(|| {
+                DelightQLError::from(Runtime::Protocol {
+                    message: "fatboy does not support Rows orientation".to_string(),
+                })
+            })?;
         Ok(Self {
             session: Mutex::new(session),
             rows,
@@ -226,8 +230,9 @@ impl FatboyRelay {
     /// Take a freshly spawned fatboy child and talk to it over its
     /// stdin/stdout (the default transport). The transport owns the
     /// child and reaps it on drop.
-    pub fn from_child(child: Child) -> Result<Self, String> {
-        let transport = StdioTransport::from_child(child).map_err(|e| e.message)?;
+    pub fn from_child(child: Child) -> Result<Self, DelightQLError> {
+        let transport = StdioTransport::from_child(child)
+            .map_err(|e| DelightQLError::from(Runtime::Transport { message: e.message }))?;
         Self::from_transport(Box::new(transport))
     }
 
@@ -235,20 +240,18 @@ impl FatboyRelay {
     pub fn query_nullable(
         &self,
         sql: &str,
-    ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), String> {
+    ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), DelightQLError> {
         let mut session = self
             .session
             .lock()
-            .map_err(|_| "fatboy session poisoned".to_string())?;
+            .map_err(|e| Runtime::poisoned("fatboy session", e))?;
 
         let (handle, dimensions) = match session
             .query(sql.as_bytes().to_vec())
-            .map_err(|e| format!("fatboy query: {}", e.message))?
+            .map_err(|e| transport("fatboy query", e))?
         {
             QueryResponse::Header { handle, dimensions } => (handle, dimensions),
-            QueryResponse::Error {
-                identity, message, ..
-            } => return Err(format_protocol_error(&identity, &message)),
+            QueryResponse::Error(error) => return Err(received(&error)),
         };
         let columns: Vec<String> = dimensions
             .iter()
@@ -259,7 +262,7 @@ impl FatboyRelay {
         loop {
             match session
                 .fetch(&handle, Projection::All, 10_000, self.rows)
-                .map_err(|e| format!("fatboy fetch: {}", e.message))?
+                .map_err(|e| transport("fatboy fetch", e))?
             {
                 FetchResponse::Data { cells } => {
                     for row in cells {
@@ -271,9 +274,7 @@ impl FatboyRelay {
                     }
                 }
                 FetchResponse::End => break,
-                FetchResponse::Error {
-                    identity, message, ..
-                } => return Err(format_protocol_error(&identity, &message)),
+                FetchResponse::Error(error) => return Err(received(&error)),
             }
         }
         let _ = session.close(handle);
@@ -281,28 +282,44 @@ impl FatboyRelay {
     }
 }
 
-/// Render a protocol Error for CLI-mode strings, keeping the identity
-/// URI visible: `[delightql-error://target/postgres/<class>/<sqlstate>] <message>`.
-/// (Server mode needs none of this — the relay session forwards backend
-/// Error terms verbatim, identity included.)
-fn format_protocol_error(identity: &[u8], message: &[u8]) -> String {
-    let msg = String::from_utf8_lossy(message);
-    if identity.is_empty() {
-        msg.into_owned()
-    } else {
-        format!("[{}] {}", String::from_utf8_lossy(identity), msg)
+/// The adapter's refusal, carried on as the typed fact it already is: the
+/// identity and class are decoded once against the declared tree, the
+/// message is the adapter's own. An identity this build does not declare
+/// is a protocol violation — never a re-badged replacement.
+fn received(error: &delightql_protocol::ReceivedError) -> DelightQLError {
+    received_bytes(error.identity(), error.message())
+}
+
+fn received_bytes(identity: &[u8], message: &[u8]) -> DelightQLError {
+    match delightql_types::diagnostic::received(identity, message) {
+        Some(occurrence) => occurrence.into(),
+        None => Runtime::Protocol {
+            message: format!(
+                "the adapter answered with an identity this build does not declare: \
+                 {} — {}",
+                String::from_utf8_lossy(identity),
+                String::from_utf8_lossy(message)
+            ),
+        }
+        .into(),
     }
 }
 
-/// DelightQLError for fatboy failures, with the static subcategory so
-/// the outer error URI is `delightql-error://target/postgres` (the precise
-/// per-error identity rides in the message via format_protocol_error).
-fn fatboy_db_error(context: &str, detail: String) -> delightql_types::DelightQLError {
-    delightql_types::DelightQLError::DatabaseOperationError {
-        message: context.to_string(),
-        details: detail,
-        source: None,
-        subcategory: Some("target/postgres"),
+/// A protocol transport failure between dql and its adapter process.
+fn transport(operation: &str, error: delightql_protocol::TransportError) -> DelightQLError {
+    Runtime::Transport {
+        message: format!("{operation}: {}", error.message),
+    }
+    .into()
+}
+
+/// The adapter process could not be reached: the profile's own connect
+/// identity.
+fn adapter_unreachable(profile: &str, message: String) -> DelightQLError {
+    match profile {
+        "postgres" => Postgres::Connect { message }.into(),
+        "duckdb" => DuckDb::Connect { message }.into(),
+        _ => Runtime::Transport { message }.into(),
     }
 }
 
@@ -348,13 +365,13 @@ impl FatboyManager {
     /// No socket file, no PDEATHSIG, no lease watchdog: the pipe is the
     /// lifecycle, and the transport reaps the child on drop, so it cannot
     /// outlive us. Portable across Linux/macOS/Windows with no per-OS code.
-    pub fn connect(profile: &str, db: &str) -> Result<Self, String> {
+    pub fn connect(profile: &str, db: &str) -> Result<Self, DelightQLError> {
         Self::connect_spec(profile, db.to_string(), SpawnSpec::Database(db.to_string()))
     }
 
     /// Connect to a worldly `postgres://` resource: the URL is handed to
     /// libpq verbatim as the conninfo (worldly syntax, worldly semantics).
-    pub fn connect_postgres_url(url: &str, display_db: &str) -> Result<Self, String> {
+    pub fn connect_postgres_url(url: &str, display_db: &str) -> Result<Self, DelightQLError> {
         Self::connect_spec(
             "postgres",
             display_db.to_string(),
@@ -362,7 +379,7 @@ impl FatboyManager {
         )
     }
 
-    fn connect_spec(profile: &str, db: String, spawn: SpawnSpec) -> Result<Self, String> {
+    fn connect_spec(profile: &str, db: String, spawn: SpawnSpec) -> Result<Self, DelightQLError> {
         // Lazy: record the route and how to spawn, but do NOT spawn the
         // child here. The first `relay()` call materializes it. (See the
         // `relay` field's note — this is the one-spawn collapse.)
@@ -379,14 +396,14 @@ impl FatboyManager {
     /// call (lazy — see the `relay` field). Later calls reuse it. Fallible:
     /// the spawn/handshake can fail, and that failure now surfaces here
     /// rather than at construction.
-    pub fn relay(&self) -> Result<&FatboyRelay, String> {
+    pub fn relay(&self) -> Result<&FatboyRelay, DelightQLError> {
         if let Some(r) = self.relay.get() {
             return Ok(r);
         }
         let _guard = self
             .init
             .lock()
-            .map_err(|_| "fatboy init lock poisoned".to_string())?;
+            .map_err(|e| Runtime::poisoned("fatboy init", e))?;
         // Re-check under the lock (another thread may have won the race).
         if let Some(r) = self.relay.get() {
             return Ok(r);
@@ -404,9 +421,11 @@ impl FatboyManager {
         match spawn_fatboy_stdio(&self.profile, &self.spawn) {
             Ok(child) => match StdioTransport::from_child(child) {
                 Ok(t) => Box::new(RemoteHandler::new(t)),
-                Err(e) => Box::new(DeadFatboyHandler { message: e.message }),
+                Err(e) => Box::new(DeadFatboyHandler {
+                    failure: Runtime::Transport { message: e.message }.into(),
+                }),
             },
-            Err(message) => Box::new(DeadFatboyHandler { message }),
+            Err(failure) => Box::new(DeadFatboyHandler { failure }),
         }
     }
 }
@@ -414,7 +433,7 @@ impl FatboyManager {
 /// Spawn a fatboy child: relay protocol over its stdin/stdout, diagnostics
 /// inherited onto our stderr. The returned `Child` is handed to a
 /// `StdioTransport`, which reaps it on drop.
-fn spawn_fatboy_stdio(profile: &str, spawn: &SpawnSpec) -> Result<Child, String> {
+fn spawn_fatboy_stdio(profile: &str, spawn: &SpawnSpec) -> Result<Child, DelightQLError> {
     let bin = fatboy_binary(profile);
     let (flag, value) = match spawn {
         SpawnSpec::Database(db) => ("--database", db.as_str()),
@@ -427,7 +446,7 @@ fn spawn_fatboy_stdio(profile: &str, spawn: &SpawnSpec) -> Result<Child, String>
         .stdout(Stdio::piped())
         // stderr inherits — fatboy errors surface on dql's stderr.
         .spawn()
-        .map_err(|e| fatboy_spawn_message(profile, &bin, &e))
+        .map_err(|e| adapter_unreachable(profile, fatboy_spawn_message(profile, &bin, &e)))
 }
 
 /// The refusal a user reads when the adapter isn't there. Speaks the
@@ -474,19 +493,16 @@ fn fatboy_spawn_message(profile: &str, bin: &std::path::Path, e: &std::io::Error
     )
 }
 
-/// Handler returned when the fatboy disappeared between sessions:
-/// answers every term with a Connection error (fail loud, not silent).
+/// Handler returned when the adapter could not be started or reached:
+/// answers every term with the typed failure that occurred (fail loud, not
+/// silent) — the occurrence itself, never a message re-badged here.
 struct DeadFatboyHandler {
-    message: String,
+    failure: DelightQLError,
 }
 
 impl Handler for DeadFatboyHandler {
     fn handle(&mut self, _term: delightql_protocol::ClientTerm) -> ServerTerm {
-        ServerTerm::Error {
-            kind: delightql_protocol::ErrorKind::Connection,
-            identity: b"delightql-error://target/postgres/connect".to_vec(),
-            message: self.message.clone().into_bytes(),
-        }
+        ServerTerm::Error(delightql_protocol::WireError::of(&self.failure))
     }
 }
 
@@ -504,10 +520,7 @@ impl FatboyConnection {
     }
 
     fn run(&self, sql: &str) -> delightql_types::Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
-        self.relay
-            .relay()
-            .and_then(|r| r.query_nullable(sql))
-            .map_err(|e| fatboy_db_error("Fatboy query failed", e))
+        self.relay.relay().and_then(|r| r.query_nullable(sql))
     }
 }
 
@@ -592,8 +605,7 @@ impl DatabaseIntrospector for FatboyIntrospector {
         let (_cols, rows) = self
             .relay
             .relay()
-            .and_then(|r| r.query_nullable(&introspect_sql(schema)))
-            .map_err(|e| fatboy_db_error("Fatboy introspection failed", e))?;
+            .and_then(|r| r.query_nullable(&introspect_sql(schema)))?;
 
         // Rows ordered by (table_name, ordinal): fold into entities.
         let mut entities: Vec<DiscoveredEntity> = Vec::new();
@@ -709,15 +721,8 @@ impl DatabaseSchema for FatboySchema {
              ORDER BY c.ordinal_position",
             schema_scope, escaped
         );
-        let relay = self.relay.relay().map_err(|error| {
-            delightql_types::DelightQLError::database_error(
-                "Fatboy schema relay unavailable",
-                error,
-            )
-        })?;
-        let (_cols, rows) = relay.query_nullable(&sql).map_err(|error| {
-            delightql_types::DelightQLError::database_error("Fatboy schema query failed", error)
-        })?;
+        let relay = self.relay.relay()?;
+        let (_cols, rows) = relay.query_nullable(&sql)?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -731,6 +736,7 @@ impl DatabaseSchema for FatboySchema {
                         nullable: get(1) == "0",
                         position: get(2).parse().unwrap_or(i),
                         declared_type: Some(get(3)).filter(|t| !t.is_empty()),
+                        interior: false,
                     }
                 })
                 .collect(),
@@ -756,23 +762,25 @@ impl DatabaseSchema for FatboySchema {
 pub fn create_fatboy_system_components(
     mgr: &std::sync::Arc<FatboyManager>,
     mounted_schema: Option<String>,
-) -> anyhow::Result<delightql_types::ConnectionComponents> {
+) -> Result<delightql_types::ConnectionComponents, DelightQLError> {
     // R-S4: refuse (loudly) when the resolved schema does not exist on the
     // target rather than bind an empty namespace. The resolved schema is the
     // spelled `#schema` (Phase B) or the engine default (public/main) for a
     // bare mount; both must be a persistent schema of the target. Checked
     // against the SAME enumeration Phase C mounts (build once, share).
     let resolved = effective_schema(&mounted_schema, &mgr.profile).to_string();
-    let schemas = enumerate_persistent_schemas(mgr)
-        .map_err(|e| anyhow::anyhow!("could not enumerate schemas on {}: {}", mgr.db, e))?;
+    let schemas = enumerate_persistent_schemas(mgr)?;
     if !schemas.iter().any(|s| s == &resolved) {
-        anyhow::bail!(
-            "schema '{}' does not exist on {} database '{}' (available: {})",
-            resolved,
-            mgr.profile,
-            mgr.db,
-            schemas.join(", ")
-        );
+        return Err(Mount::Locator {
+            message: format!(
+                "schema '{}' does not exist on {} database '{}' (available: {})",
+                resolved,
+                mgr.profile,
+                mgr.db,
+                schemas.join(", ")
+            ),
+        }
+        .into());
     }
     Ok(delightql_types::ConnectionComponents {
         schema: Box::new(FatboySchema::with_schema(
@@ -803,9 +811,8 @@ pub fn create_fatboy_system_components(
 /// cross-schema `run!` a single-connection, one-bracket plan.
 pub fn create_fatboy_tree_components(
     mgr: &std::sync::Arc<FatboyManager>,
-) -> anyhow::Result<Vec<(String, delightql_types::ConnectionComponents)>> {
-    let schemas = enumerate_persistent_schemas(mgr)
-        .map_err(|e| anyhow::anyhow!("could not enumerate schemas on {}: {}", mgr.db, e))?;
+) -> Result<Vec<(String, delightql_types::ConnectionComponents)>, DelightQLError> {
+    let schemas = enumerate_persistent_schemas(mgr)?;
     let identity = fatboy_resource_identity(mgr);
     let mut out = Vec::with_capacity(schemas.len());
     for schema in schemas {
@@ -858,15 +865,7 @@ pub(crate) fn execute_sql_with_fatboy(
     sql: &str,
     mgr: &std::sync::Arc<FatboyManager>,
 ) -> std::result::Result<delightql_backends::QueryResults, delightql_core::error::DelightQLError> {
-    let (columns, rows) = mgr
-        .relay()
-        .and_then(|r| r.query_nullable(sql))
-        .map_err(|e| {
-            delightql_core::error::DelightQLError::database_error(
-                format!("Fatboy query failed: {}", e),
-                e,
-            )
-        })?;
+    let (columns, rows) = mgr.relay().and_then(|r| r.query_nullable(sql))?;
     let string_rows: Vec<Vec<String>> = rows
         .into_iter()
         .map(|row| row.into_iter().map(|v| v.unwrap_or_default()).collect())
@@ -877,4 +876,131 @@ pub(crate) fn execute_sql_with_fatboy(
         rows: string_rows,
         row_count,
     })
+}
+
+#[cfg(test)]
+mod received_tests {
+    use super::*;
+    use delightql_protocol::WireError;
+    use delightql_types::diagnostic::{DiagnosticClass, PostgresNative};
+
+    /// The adapter's typed occurrence crosses the CLI road as the same
+    /// typed fact: identity, class and message survive the wire unchanged.
+    #[test]
+    fn a_received_provider_error_keeps_its_identity_and_class() {
+        let native = PostgresNative::new("23505", "duplicate key value").expect("a SQLSTATE");
+        let sent: DelightQLError = Postgres::Native(native).into();
+        let wire = WireError::of(&sent);
+        let carried = received_bytes(wire.identity(), wire.message());
+        assert_eq!(carried.error_uri(), sent.error_uri());
+        assert_eq!(carried.class(), DiagnosticClass::Constraint);
+        assert_eq!(carried.to_string(), "duplicate key value");
+        let fixed: DelightQLError = Postgres::Connect {
+            message: "gone".to_string(),
+        }
+        .into();
+        let wire = WireError::of(&fixed);
+        let carried = received_bytes(wire.identity(), wire.message());
+        assert_eq!(
+            carried.error_uri(),
+            "delightql-error://target/postgres/connect"
+        );
+        assert_eq!(carried.class(), fixed.class());
+    }
+
+    /// An identity this build does not declare is a protocol violation, not
+    /// a replacement identity chosen here.
+    #[test]
+    fn an_undeclared_received_identity_is_a_protocol_violation() {
+        let carried = received_bytes(b"delightql-error://target/postgres/nonsense", b"peer text");
+        assert_eq!(
+            carried.error_uri(),
+            "delightql-error://runtime/relay/protocol"
+        );
+        assert!(carried.to_string().contains("target/postgres/nonsense"));
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use delightql_protocol::{ClientTerm, ServerTerm, Transport, TransportError, WireError};
+    use delightql_types::diagnostic::DiagnosticClass;
+
+    /// A transport that answers the handshake with one prepared term.
+    struct Answering(Option<ServerTerm>);
+
+    impl Transport for Answering {
+        fn exchange(&mut self, _term: ClientTerm) -> Result<ServerTerm, TransportError> {
+            self.0.take().ok_or_else(|| TransportError {
+                message: "closed".to_string(),
+            })
+        }
+    }
+
+    /// The msgpack a foreign party would put on the wire for an Error term:
+    /// `{"Error": [kind, identity-bytes, message-bytes]}`.
+    fn foreign_error_term(identity: &str, message: &str) -> ServerTerm {
+        fn bytes(out: &mut Vec<u8>, data: &[u8]) {
+            if data.len() < 16 {
+                out.push(0x90 | data.len() as u8);
+            } else {
+                out.push(0xdc);
+                out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            }
+            for b in data {
+                if *b < 0x80 {
+                    out.push(*b);
+                } else {
+                    out.push(0xcc);
+                    out.push(*b);
+                }
+            }
+        }
+        let mut payload = vec![0x81, 0xa5];
+        payload.extend_from_slice(b"Error");
+        payload.push(0x93);
+        payload.push(0xa6);
+        payload.extend_from_slice(b"Syntax");
+        bytes(&mut payload, identity.as_bytes());
+        bytes(&mut payload, message.as_bytes());
+        delightql_protocol::manifest::decode_server(&payload)
+            .expect("a foreign party's term decodes")
+    }
+
+    #[test]
+    fn a_declared_version_rejection_survives_as_that_occurrence() {
+        let refusal: DelightQLError = Postgres::Connect {
+            message: "no adapter".to_string(),
+        }
+        .into();
+        let transport = Answering(Some(ServerTerm::Error(WireError::of(&refusal))));
+        let error = FatboyRelay::from_transport(Box::new(transport))
+            .err()
+            .expect("rejected");
+        assert_eq!(
+            error.error_uri(),
+            "delightql-error://target/postgres/connect"
+        );
+        assert_eq!(error.class(), DiagnosticClass::Connection);
+        assert_eq!(error.to_string(), "no adapter");
+    }
+
+    #[test]
+    fn a_foreign_version_rejection_is_the_local_protocol_refusal() {
+        let transport = Answering(Some(foreign_error_term(
+            "delightql-error://target/postgres/constraint/42P01",
+            "a code wearing the wrong class",
+        )));
+        let error = FatboyRelay::from_transport(Box::new(transport))
+            .err()
+            .expect("rejected");
+        assert_eq!(
+            error.error_uri(),
+            "delightql-error://runtime/relay/protocol"
+        );
+        assert!(error
+            .to_string()
+            .contains("target/postgres/constraint/42P01"));
+    }
 }

@@ -12,15 +12,16 @@
 //! an explicit grounding derives its lexical dependency closure.
 
 use super::ResolutionConfig;
+use crate::diagnostic::{DelightQLError, Resolution};
 use crate::resolution::ResolverCore;
-use crate::system::DelightQLSystem;
+use crate::system::{DelightQLSystem, ReadySystem};
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 use std::sync::{Arc, Mutex};
 
 /// A mount-capable world: `maindb` holds `customers`, and nothing is
 /// session-enlisted, so only a file's OWN declared edges can reach it.
-fn world() -> DelightQLSystem {
+fn world() -> ReadySystem {
     struct MountIntrospector;
     impl DatabaseIntrospector for MountIntrospector {
         fn introspect_entities(&self) -> delightql_types::Result<Vec<DiscoveredEntity>> {
@@ -43,7 +44,7 @@ fn world() -> DelightQLSystem {
         }
     }
     let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-    let mut system = DelightQLSystem::new(conn, Box::new(MountIntrospector), "sqlite")
+    let mut system = ReadySystem::new(conn, Box::new(MountIntrospector), "sqlite")
         .expect("fresh in-memory system should build");
     static MOUNT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     let dir = MOUNT_DIR.get_or_init(|| {
@@ -101,8 +102,7 @@ fn statement(
         crate::defuse::environment::UseEnvironment::session(&core.consult, "home")
             .expect("session world"),
     );
-    let mut fold =
-        super::resolver_fold::ResolverFold::new(&mut core, &mut env, config,);
+    let mut fold = super::resolver_fold::ResolverFold::new(&mut core, &mut env, config);
     let answer =
         crate::defuse::bound_use::classify_relation(fold.core, fold.env.reach(), name, false, ns)?
             .unwrap_or_else(|| panic!("{ns}.{name} is a consulted relation"));
@@ -128,18 +128,16 @@ fn bare_statement(
         crate::defuse::environment::UseEnvironment::session(&core.consult, "home")
             .expect("session world"),
     );
-    let mut fold =
-        super::resolver_fold::ResolverFold::new(&mut core, &mut env, config,);
+    let mut fold = super::resolver_fold::ResolverFold::new(&mut core, &mut env, config);
     let answer = fold
         .env
         .relation(fold.core, &delightql_types::SqlIdentifier::new(name), None)?;
     let selected = match answer {
         crate::defuse::environment::RelationAnswer::ConsultedView(selected) => selected,
         crate::defuse::environment::RelationAnswer::Ambiguous(message) => {
-            return Err(crate::error::DelightQLError::validation_error(
-                message,
-                "ambiguous bare name",
-            ))
+            return Err(DelightQLError::from(Resolution::Ambiguous {
+                message: message.to_string(),
+            }))
         }
         other => panic!("bare '{name}' must classify as a consulted view, not {other:?}"),
     };

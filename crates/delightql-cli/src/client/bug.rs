@@ -11,7 +11,7 @@ use delightql_core::api::DqlHandle;
 
 use super::database::ClientDatabase;
 use super::exit::{snapshot, SessionFiles};
-use super::incident::{hierarchy, Incident, IncidentKind};
+use super::incident::{Incident, IncidentKind};
 
 /// Where the report landed and what it carries.
 #[derive(Debug, Clone)]
@@ -34,11 +34,13 @@ pub fn write_bug_report(
     primary: Option<&Path>,
 ) -> anyhow::Result<BugReport> {
     if let Some(words) = description.map(str::trim).filter(|w| !w.is_empty()) {
-        db.record_incident(Incident::plain(
+        db.record_incident(Incident::of(
             IncidentKind::Info,
             "dot_command",
-            hierarchy::REPORT_DESCRIPTION,
-            words.to_string(),
+            &delightql_types::diagnostic::Client::ReportDescription {
+                message: words.to_string(),
+            }
+            .into(),
         ));
     }
 
@@ -105,7 +107,10 @@ fn archive_name(path: &Path, fallback_ext: &str) -> String {
 /// The files behind the session's cartridges: DDL sources and database
 /// files, by the same query the old report used. Resource kinds are the
 /// cartridge enum's: 1 = DDL file, 3 = database.
-fn mounted_resources(handle: &mut dyn DqlHandle, primary: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+fn mounted_resources(
+    handle: &mut dyn DqlHandle,
+    primary: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut ddl_files: Vec<PathBuf> = Vec::new();
     let mut db_files: Vec<PathBuf> = Vec::new();
     if let Some(p) = primary {
@@ -123,7 +128,11 @@ fn mounted_resources(handle: &mut dyn DqlHandle, primary: Option<&Path>) -> (Vec
     let Some(rows) = rows else {
         return (ddl_files, db_files);
     };
-    let uri_col = rows.columns.iter().position(|c| c == "source_uri").unwrap_or(0);
+    let uri_col = rows
+        .columns
+        .iter()
+        .position(|c| c == "source_uri")
+        .unwrap_or(0);
     let kind_col = rows
         .columns
         .iter()
@@ -172,7 +181,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("x.db");
         std::fs::write(&real, b"").unwrap();
-        assert_eq!(file_path_of(&format!("file://{}", real.display())), Some(real.clone()));
+        assert_eq!(
+            file_path_of(&format!("file://{}", real.display())),
+            Some(real.clone())
+        );
         assert_eq!(
             file_path_of(&format!("delightql-siso://prof/{}", real.display())),
             Some(real.clone())

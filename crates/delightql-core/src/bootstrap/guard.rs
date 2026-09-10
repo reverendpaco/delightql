@@ -27,6 +27,7 @@
 //! under ordinary policy; sealed `ALTER TABLE` alone is denied even for
 //! them, because SQLite's authorizer exposes no rename destination to judge.
 
+use crate::diagnostic::{Internal, Runtime};
 use rusqlite::config::DbConfig;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::Connection;
@@ -34,7 +35,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
-use delightql_types::error::DelightQLError;
 
 #[derive(Debug, Default)]
 struct GuardState {
@@ -130,13 +130,11 @@ impl BootstrapGuard {
         // a connection whose backstop cannot be armed is not sealed.
         let armed = conn
             .set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
-            .map_err(|e| {
-                DelightQLError::database_error("bootstrap guard defensive mode", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("bootstrap guard defensive mode", e.to_string()))?;
         if !armed {
-            return Err(DelightQLError::database_error(
+            return Err(Internal::invariant(
+                "bootstrap::guard",
                 "bootstrap guard defensive mode",
-                "the engine reported defensive mode disarmed after arming".to_string(),
             ));
         }
         Ok(guard)
@@ -175,21 +173,17 @@ impl BootstrapGuard {
         let mut protected = HashSet::new();
         let mut statement = conn
             .prepare("SELECT name FROM sqlite_master")
-            .map_err(|e| {
-                DelightQLError::database_error("bootstrap guard inventory", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("bootstrap guard inventory", e.to_string()))?;
         let names = statement
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| {
-                DelightQLError::database_error("bootstrap guard inventory", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("bootstrap guard inventory", e.to_string()))?;
         for name in names {
             protected.insert(canonical(&name.map_err(|e| {
-                DelightQLError::database_error("bootstrap guard inventory", e.to_string())
+                Runtime::catalog("bootstrap guard inventory", e.to_string())
             })?));
         }
         let mut state = self.state.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "bootstrap guard state",
                 format!("guard state was poisoned: {e}"),
             )

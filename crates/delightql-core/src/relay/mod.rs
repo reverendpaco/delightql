@@ -12,16 +12,80 @@
 use std::collections::HashMap;
 
 use delightql_protocol::{
-    ByteSeq, Cell, ClientTerm, CloseResponse, Dimension, ErrorKind, FetchResponse, Handle, Handler,
-    MetaItem, Orientation, Projection, QueryHandle, QueryResponse, ServerTerm, Session, Transport,
+    ByteSeq, Cell, ClientTerm, CloseResponse, Dimension, FetchResponse, Handle, Handler, MetaItem,
+    Orientation, Projection, QueryHandle, QueryResponse, ReceivedError, ServerTerm, Session,
+    Transport, WireError,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use rusqlite;
 
 use crate::{
+    diagnostic::{DelightQLError, ErrorSelector, Runtime, Sqlite, SqliteNative},
     pipeline::{self, resolver::ResolutionConfig, verdict, Pipeline},
-    system::DelightQLSystem,
+    system::ReadySystem,
 };
+
+/// What an execution can fail with: a diagnostic this process minted, or a
+/// backend party's occurrence ADMITTED at ingress ([`admitted`]) — never a
+/// party's bytes carried raw. Every failure projects to the wire through the
+/// one boundary conversion.
+pub(crate) type ExecutionFailure = DelightQLError;
+
+/// THE ingress judgment for an error a PARTY answered with. The party's
+/// identity bytes are decoded once against the declared tree: a declared
+/// occurrence is carried on as that typed fact (`DelightQLError::Received`),
+/// a party that refused and named nothing is judged under the one identity
+/// the hook road has always used for that case, and an identity this build
+/// does not declare is a protocol violation — never an occurrence, and never
+/// a family match by the shape of its text.
+pub(crate) fn admitted(received: ReceivedError) -> DelightQLError {
+    admitted_bytes(received.identity(), received.message())
+}
+
+fn admitted_bytes(identity: &[u8], message: &[u8]) -> DelightQLError {
+    if identity.is_empty() {
+        return Runtime::Bug {
+            message: String::from_utf8_lossy(message).into_owned(),
+        }
+        .into();
+    }
+    match crate::diagnostic::received(identity, message) {
+        Some(occurrence) => occurrence.into(),
+        None => Runtime::Protocol {
+            message: format!(
+                "the party answered with an identity this build does not declare: {} — {}",
+                String::from_utf8_lossy(identity),
+                String::from_utf8_lossy(message)
+            ),
+        }
+        .into(),
+    }
+}
+
+/// The one projection of a typed diagnostic onto the wire.
+pub(crate) fn error_term(diagnostic: &DelightQLError) -> ServerTerm {
+    ServerTerm::Error(WireError::of(diagnostic))
+}
+
+/// The bootstrap engine's refusal, as its own identity, with the DQL-side
+/// teaching appended where the message has one.
+#[cfg(not(target_arch = "wasm32"))]
+fn bootstrap_engine_error(operation: &str, error: rusqlite::Error) -> DelightQLError {
+    match error {
+        rusqlite::Error::SqliteFailure(code, message) => {
+            let text = teach_runtime_message(message.unwrap_or_else(|| code.to_string()));
+            let message = format!("{operation}: {text}");
+            match SqliteNative::new(code.extended_code, message.clone()) {
+                Some(native) => Sqlite::Native(native).into(),
+                None => Sqlite::Engine { message }.into(),
+            }
+        }
+        other => Sqlite::Engine {
+            message: format!("{operation}: {other}"),
+        }
+        .into(),
+    }
+}
 
 /// Buffered eager results for non-streaming connections (bootstrap, imported).
 struct EagerBuffer {
@@ -119,7 +183,9 @@ impl Default for RelayHooks {
 // --- RelayParty ---
 
 pub struct RelayParty<'a, T: Transport> {
-    system: &'a mut DelightQLSystem,
+    /// The reset-capable system: every compiler operation is reached through
+    /// its host, and `handle_reset` through it alone.
+    system: &'a mut ReadySystem,
     sql_session: Session<T>,
     handles: HashMap<Handle, QueryHandle>, // frontend handle → backend QueryHandle
     eager_buffers: HashMap<Handle, EagerBuffer>, // frontend handle → eager results
@@ -157,19 +223,36 @@ fn judge_declared(
     // that goal's extent is the only place a declaration about it can be —
     // and a text that shows no single goal shows no owner, which is the
     // closed answer.
-    let expected = crate::pipeline::normalize::declared_error_within(tree, owner?)?;
-    let actual = error.error_uri();
+    let expected = match crate::pipeline::normalize::declared_error_within(tree, owner?) {
+        Ok(Some(expected)) => expected,
+        Ok(None) => return None,
+        // The hook itself is the typo: that refusal is the answer.
+        Err(refusal) => return Some(GoalRefusal::Reported(error_term(&refusal))),
+    };
+    let actual = error.id();
     if expected.matches(&actual) {
         return Some(GoalRefusal::AsDeclared {
-            declared: expected.display_uri(),
+            declared: expected.display(),
             detail: format!("{actual}: {error}"),
         });
     }
-    Some(GoalRefusal::Reported(ServerTerm::Error {
-        kind: ErrorKind::Constraint,
-        identity: actual.into_bytes(),
-        message: format!("expected error {} but got: {error}", expected.display_uri()).into_bytes(),
-    }))
+    Some(GoalRefusal::Reported(error_term(&unmet_expectation(
+        &expected,
+        format!(
+            "expected error {} but got: {actual}: {error}",
+            expected.display()
+        ),
+    ))))
+}
+
+/// The declared expectation did not come: the one diagnostic a hook
+/// mismatch reports, whatever the statement did instead.
+fn unmet_expectation(expected: &ErrorSelector, outcome: String) -> DelightQLError {
+    Runtime::Expectation {
+        declared: expected.display(),
+        outcome,
+    }
+    .into()
 }
 
 /// What reading ONE goal can end in, short of the goal.
@@ -189,7 +272,7 @@ enum GoalRefusal {
 }
 
 impl<'a, T: Transport> RelayParty<'a, T> {
-    pub fn new(system: &'a mut DelightQLSystem, sql_session: Session<T>) -> Self {
+    pub fn new(system: &'a mut ReadySystem, sql_session: Session<T>) -> Self {
         RelayParty {
             system,
             sql_session,
@@ -249,25 +332,15 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         dql: &str,
         registry: &std::rc::Rc<crate::names::Registry>,
     ) -> std::result::Result<crate::pipeline::normalize::Goal, GoalRefusal> {
-        let syntax_error = |error: crate::error::DelightQLError| ServerTerm::Error {
-            kind: ErrorKind::Syntax,
-            identity: error.error_uri().into_bytes(),
-            message: error.to_string().into_bytes(),
-        };
+        let syntax_error = |error: crate::error::DelightQLError| error_term(&error);
         let tree = match pipeline::parse::submission_attributed(dql, registry.limits().nesting()) {
             Ok(tree) => tree,
             Err(refusal) => {
                 if let Some(count) = query_count_if_a_sequence(dql) {
                     if count > 1 {
-                        return Err(GoalRefusal::Reported(ServerTerm::Error {
-                            kind: ErrorKind::Syntax,
-                            identity: b"delightql-error://parse/multi_query".to_vec(),
-                            message: format!(
-                                "multi-query input rejected: found {count} queries in a single \
-                                 Query term (send each query as a separate Query message)"
-                            )
-                            .into_bytes(),
-                        }));
+                        return Err(GoalRefusal::Reported(error_term(
+                            &crate::diagnostic::Parse::MultiQuery { count }.into(),
+                        )));
                     }
                 }
                 // A defective parse still carries the declaration: an error
@@ -303,21 +376,18 @@ impl<'a, T: Transport> RelayParty<'a, T> {
 
     fn handle_query(&mut self, text: ByteSeq) -> ServerTerm {
         if let Err(error) = self.system.require_healthy() {
-            return ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: error.error_uri().into_bytes(),
-                message: error.to_string().into_bytes(),
-            };
+            return error_term(&error);
         }
 
         let dql = match String::from_utf8(text) {
             Ok(s) => s,
             Err(e) => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Syntax,
-                    identity: vec![],
-                    message: format!("invalid UTF-8 in query text: {}", e).into_bytes(),
-                }
+                return error_term(
+                    &Runtime::Protocol {
+                        message: format!("invalid UTF-8 in query text: {}", e),
+                    }
+                    .into(),
+                )
             }
         };
 
@@ -356,8 +426,11 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // plan compiler applies default gates only) — see relay/entry.rs.
         let allow_adhoc = self.danger_overrides.is_empty() && self.option_overrides.is_empty();
         let goal = match entry::classify_effect_entry(goal, allow_adhoc) {
-            Ok(effect_entry) => return self.handle_effect_entry(effect_entry),
-            Err(goal) => goal,
+            Ok(entry::Classified::Effect(effect_entry)) => {
+                return self.handle_effect_entry(effect_entry)
+            }
+            Ok(entry::Classified::Ordinary(goal)) => goal,
+            Err(error) => return error_term(&error),
         };
 
         // Normal single-query path: compile DQL → SQL via the pipeline
@@ -372,23 +445,13 @@ impl<'a, T: Transport> RelayParty<'a, T> {
 
         // Apply CLI-level overrides
         if let Err(e) = pipeline.set_cli_danger_overrides(self.danger_overrides.clone()) {
-            return ServerTerm::Error {
-                kind: ErrorKind::Syntax,
-                identity: e.error_uri().into_bytes(),
-                message: format!("{}", e).into_bytes(),
-            };
+            return error_term(&e);
         }
         pipeline.set_cli_option_overrides(self.option_overrides.clone());
 
         let compiled = match pipeline.compile() {
             Ok(c) => c,
-            Err(e) => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Syntax,
-                    identity: e.error_uri().into_bytes(),
-                    message: format!("{}", e).into_bytes(),
-                }
-            }
+            Err(e) => return error_term(&e),
         };
 
         let compiled = compiled;
@@ -452,20 +515,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         dimensions,
                     }
                 }
-                Ok(QueryResponse::Error {
-                    kind,
-                    identity,
-                    message,
-                }) => ServerTerm::Error {
-                    kind,
-                    identity,
-                    message,
-                },
-                Err(e) => ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: b"delightql-error://runtime/execution".to_vec(),
-                    message: teach_runtime_message(e.message).into_bytes(),
-                },
+                Ok(QueryResponse::Error(received)) => error_term(&admitted(received)),
+                Err(e) => error_term(&Runtime::Transport { message: e.message }.into()),
             }
         } else {
             // Eager path: execute on bootstrap or imported connection, buffer results
@@ -483,11 +534,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     );
                     ServerTerm::Header { handle, dimensions }
                 }
-                Err(msg) => ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: b"delightql-error://runtime/execution".to_vec(),
-                    message: teach_runtime_message(msg).into_bytes(),
-                },
+                Err(failure) => error_term(&failure),
             }
         };
         (term, staged)
@@ -500,12 +547,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         connection_id: Option<i64>,
     ) -> std::result::Result<(), ServerTerm> {
         for sql in prepare_sqls {
-            if let Err(msg) = self.execute_sql_routed(sql, connection_id) {
-                return Err(ServerTerm::Error {
-                    kind: ErrorKind::Permission,
-                    identity: b"delightql-error://runtime/execution".to_vec(),
-                    message: format!("staging the statement's source failed: {msg}").into_bytes(),
-                });
+            if let Err(failure) = self.execute_sql_routed(sql, connection_id) {
+                return Err(error_term(&failure));
             }
         }
         Ok(())
@@ -527,25 +570,10 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 Ok((_cols, rows)) => {
                     let held = cell_says_yes(rows.first());
                     if !held {
-                        return Some(ServerTerm::Error {
-                            kind: ErrorKind::Permission,
-                            identity: format!("delightql-error://{}", obligation.refusal.identity)
-                                .into_bytes(),
-                            message: obligation.refusal.message.clone().into_bytes(),
-                        });
+                        return Some(error_term(&obligation.refusal));
                     }
                 }
-                Err(msg) => {
-                    return Some(ServerTerm::Error {
-                        kind: ErrorKind::Permission,
-                        identity: b"delightql-error://runtime/execution".to_vec(),
-                        message: format!(
-                            "the check this statement may not run without could not be \
-                             evaluated: {msg}"
-                        )
-                        .into_bytes(),
-                    })
-                }
+                Err(failure) => return Some(error_term(&failure)),
             }
         }
         None
@@ -596,7 +624,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     fn judge_against_hook(
         &mut self,
         term: ServerTerm,
-        expected: &verdict::ExpectedError,
+        expected: &crate::diagnostic::ErrorSelector,
         identity: verdict::VerdictIdentity,
     ) -> std::result::Result<(), ServerTerm> {
         // A streaming result reports its engine failures while it is being
@@ -615,26 +643,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             other => other,
         };
         let (outcome, detail) = match &term {
-            ServerTerm::Error {
-                identity: uri,
-                message,
-                ..
-            } => {
-                // An engine that refused and named nothing is the one
-                // failure this system has no minted identity for; it is
-                // reported as a bug in the statement rather than as an
-                // anonymous error, which is the name the hook road has
-                // always judged it under.
-                let actual = if uri.is_empty() {
-                    "delightql-error://runtime/bug".to_string()
-                } else {
-                    String::from_utf8_lossy(uri).to_string()
-                };
-                (
-                    expected.matches(&actual),
-                    format!("{}: {}", actual, String::from_utf8_lossy(message)),
-                )
-            }
+            ServerTerm::Error(wire) => judge_wire(expected, wire),
             _ => (false, "statement succeeded; expected an error".to_string()),
         };
         // A result nobody will read still owes what it staged, and closing
@@ -658,21 +667,15 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         if outcome {
             return Ok(());
         }
-        Err(ServerTerm::Error {
-            kind: ErrorKind::Constraint,
-            identity: expected.display_uri().into_bytes(),
-            message: match &term {
-                ServerTerm::Error { .. } => {
-                    format!(
-                        "expected error {} but got: {}",
-                        expected.display_uri(),
-                        detail
-                    )
+        Err(error_term(&unmet_expectation(
+            expected,
+            match &term {
+                ServerTerm::Error(_) => {
+                    format!("expected error {} but got: {}", expected.display(), detail)
                 }
                 _ => "statement succeeded; expected an error".to_string(),
-            }
-            .into_bytes(),
-        })
+            },
+        )))
     }
 
     /// Read a result to its end, reporting the first failure it meets.
@@ -692,23 +695,11 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             {
                 Ok(FetchResponse::Data { .. }) => {}
                 Ok(FetchResponse::End) => return None,
-                Ok(FetchResponse::Error {
-                    kind,
-                    identity,
-                    message,
-                }) => {
-                    return Some(ServerTerm::Error {
-                        kind,
-                        identity,
-                        message,
-                    })
-                }
+                Ok(FetchResponse::Error(received)) => return Some(error_term(&admitted(received))),
                 Err(e) => {
-                    return Some(ServerTerm::Error {
-                        kind: ErrorKind::Connection,
-                        identity: b"delightql-error://runtime/execution".to_vec(),
-                        message: teach_runtime_message(e.message).into_bytes(),
-                    })
+                    return Some(error_term(
+                        &Runtime::Transport { message: e.message }.into(),
+                    ))
                 }
             }
         }
@@ -730,12 +721,12 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         &mut self,
         dql: &str,
         goal: crate::pipeline::normalize::Goal,
-        expected: verdict::ExpectedError,
+        expected: ErrorSelector,
         registry: crate::relation::Planning,
     ) -> ServerTerm {
         let identity = verdict::VerdictIdentity {
             name: None,
-            body_text: expected.display_uri(),
+            body_text: expected.display(),
         };
 
         // ANNOTATION TRANSPARENCY: an error hook must not change
@@ -746,44 +737,35 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // matched against the expected URI exactly like the pipeline path.
         let allow_adhoc = self.danger_overrides.is_empty() && self.option_overrides.is_empty();
         let goal = match entry::classify_effect_entry(goal, allow_adhoc) {
-            Err(goal) => goal,
-            Ok(effect_entry) => {
+            Ok(entry::Classified::Ordinary(goal)) => goal,
+            Err(error) => return error_term(&error),
+            Ok(entry::Classified::Effect(effect_entry)) => {
                 let term = self.handle_effect_entry(effect_entry);
                 return match term {
-                    ServerTerm::Error {
-                        identity: err_identity,
-                        message,
-                        ..
-                    } => {
-                        let actual_uri = String::from_utf8_lossy(&err_identity).to_string();
+                    ServerTerm::Error(wire) => {
+                        let (matched, detail) = judge_wire(&expected, &wire);
                         let v = verdict::Verdict {
-                            outcome: if expected.matches(&actual_uri) {
+                            outcome: if matched {
                                 verdict::VerdictOutcome::Pass
                             } else {
                                 verdict::VerdictOutcome::Fail
                             },
                             identity,
-                            detail: Some(format!(
-                                "{}: {}",
-                                actual_uri,
-                                String::from_utf8_lossy(&message)
-                            )),
+                            detail: Some(detail.clone()),
                         };
                         if let Some(ref mut hook) = self.hooks.on_error_hook {
                             hook(&v);
                         }
                         match v.outcome {
                             verdict::VerdictOutcome::Pass => self.empty_header_response(),
-                            _ => ServerTerm::Error {
-                                kind: ErrorKind::Constraint,
-                                identity: actual_uri.into_bytes(),
-                                message: format!(
+                            _ => error_term(&unmet_expectation(
+                                &expected,
+                                format!(
                                     "expected error {} but got: {}",
-                                    expected.display_uri(),
-                                    String::from_utf8_lossy(&message)
-                                )
-                                .into_bytes(),
-                            },
+                                    expected.display(),
+                                    detail
+                                ),
+                            )),
                         }
                     }
                     other => {
@@ -797,13 +779,10 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                             hook(&v);
                         }
                         let _ = other;
-                        ServerTerm::Error {
-                            kind: ErrorKind::Constraint,
-                            identity: expected.display_uri().into_bytes(),
-                            message: "statement succeeded; expected an error"
-                                .to_string()
-                                .into_bytes(),
-                        }
+                        error_term(&unmet_expectation(
+                            &expected,
+                            "statement succeeded; expected an error".to_string(),
+                        ))
                     }
                 };
             }
@@ -819,31 +798,28 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             registry,
         );
         if let Err(e) = pipeline.set_cli_danger_overrides(self.danger_overrides.clone()) {
-            return ServerTerm::Error {
-                kind: ErrorKind::Syntax,
-                identity: e.error_uri().into_bytes(),
-                message: format!("{}", e).into_bytes(),
-            };
+            return error_term(&e);
         }
         pipeline.set_cli_option_overrides(self.option_overrides.clone());
 
         let compiled = match pipeline.compile() {
             Err(e) => {
-                // Compile error — match against expected error URI
-                let actual_uri = e.error_uri();
+                // A compile refusal is judged typed: the selector against
+                // the identity this process minted.
+                let actual = e.id();
                 let v = verdict::Verdict {
-                    outcome: if expected.matches(&actual_uri) {
+                    outcome: if expected.matches(&actual) {
                         verdict::VerdictOutcome::Pass
                     } else {
                         verdict::VerdictOutcome::Fail
                     },
                     identity,
-                    detail: Some(format!("{}: {}", actual_uri, e)),
+                    detail: Some(format!("{}: {}", actual, e)),
                 };
                 if let Some(ref mut hook) = self.hooks.on_error_hook {
                     hook(&v);
                 }
-                return self.verdict_response(&v);
+                return self.verdict_response(&expected, &v);
             }
             Ok(c) => c,
         };
@@ -883,23 +859,18 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // Streaming path: forward to sql_session
         let backend_handle = match self.handles.get(&handle) {
             Some(bh) => bh,
-            None => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: vec![],
-                    message: b"unknown handle".to_vec(),
-                }
-            }
+            None => return error_term(&unknown_handle()),
         };
 
         let agreed = match self.sql_session.agreed_orientation(orientation) {
             Some(a) => a,
             None => {
-                return ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: vec![],
-                    message: b"orientation not agreed".to_vec(),
-                }
+                return error_term(
+                    &Runtime::Protocol {
+                        message: "orientation not agreed".to_string(),
+                    }
+                    .into(),
+                )
             }
         };
 
@@ -919,20 +890,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         match fetched {
             Ok(FetchResponse::Data { cells }) => ServerTerm::Data { cells },
             Ok(FetchResponse::End) => ServerTerm::End,
-            Ok(FetchResponse::Error {
-                kind,
-                identity,
-                message,
-            }) => ServerTerm::Error {
-                kind,
-                identity,
-                message,
-            },
-            Err(e) => ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: b"delightql-error://runtime/execution".to_vec(),
-                message: teach_runtime_message(e.message).into_bytes(),
-            },
+            Ok(FetchResponse::Error(received)) => error_term(&admitted(received)),
+            Err(e) => error_term(&Runtime::Transport { message: e.message }.into()),
         }
     }
 
@@ -946,11 +905,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             };
         }
         if !self.handles.contains_key(&handle) {
-            return ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: b"unknown handle".to_vec(),
-            };
+            return error_term(&unknown_handle());
         }
         ServerTerm::Metadata {
             items: vec![MetaItem::Backend(
@@ -970,26 +925,10 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         match self.handles.remove(&handle) {
             Some(backend_handle) => match self.sql_session.close(backend_handle) {
                 Ok(CloseResponse::Ok) => ServerTerm::Ok { count_hint: 0 },
-                Ok(CloseResponse::Error {
-                    kind,
-                    identity,
-                    message,
-                }) => ServerTerm::Error {
-                    kind,
-                    identity,
-                    message,
-                },
-                Err(e) => ServerTerm::Error {
-                    kind: ErrorKind::Connection,
-                    identity: b"delightql-error://runtime/execution".to_vec(),
-                    message: teach_runtime_message(e.message).into_bytes(),
-                },
+                Ok(CloseResponse::Error(received)) => error_term(&admitted(received)),
+                Err(e) => error_term(&Runtime::Transport { message: e.message }.into()),
             },
-            None => ServerTerm::Error {
-                kind: ErrorKind::Connection,
-                identity: vec![],
-                message: b"unknown handle".to_vec(),
-            },
+            None => error_term(&unknown_handle()),
         }
     }
 
@@ -1008,42 +947,35 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// `sys::diagnostics.finding` row: an error a hook consumed is data,
     /// not a finding; an error the client is about to receive is.
     fn record_reported_error(&self, term: &ServerTerm, input: Option<&str>) {
-        let ServerTerm::Error {
-            identity, message, ..
-        } = term
-        else {
+        let ServerTerm::Error(wire) = term else {
             return;
         };
-        let uri = String::from_utf8_lossy(identity);
-        let uri: &str = if uri.is_empty() {
-            crate::uri_registry::INTERNAL_UNBADGED
-        } else {
-            &uri
-        };
+        // The term about to leave is this process's own projection of a typed
+        // diagnostic; the finding is that occurrence, read back through the
+        // one admission judgment rather than as bytes.
+        let occurrence = admitted_bytes(wire.identity(), wire.message());
         self.system.record_finding(
             crate::diagnostics::Severity::Error,
-            uri,
-            &String::from_utf8_lossy(message),
+            &occurrence.error_uri(),
+            &occurrence.to_string(),
             input,
             "session",
         );
     }
 
     /// Return the appropriate protocol response for an error hook verdict.
-    /// Pass → empty header (the hook matched). Fail → protocol error.
-    fn verdict_response(&mut self, v: &verdict::Verdict) -> ServerTerm {
+    /// Pass → empty header (the hook matched). Fail → the unmet expectation.
+    fn verdict_response(&mut self, expected: &ErrorSelector, v: &verdict::Verdict) -> ServerTerm {
         match v.outcome {
             verdict::VerdictOutcome::Pass => self.empty_header_response(),
-            verdict::VerdictOutcome::Fail => ServerTerm::Error {
-                kind: ErrorKind::Constraint,
-                identity: vec![],
-                message: v
-                    .detail
-                    .as_deref()
-                    .unwrap_or("Error hook verdict: FAIL")
-                    .as_bytes()
-                    .to_vec(),
-            },
+            verdict::VerdictOutcome::Fail => error_term(&unmet_expectation(
+                expected,
+                format!(
+                    "expected error {} but got: {}",
+                    expected.display(),
+                    v.detail.as_deref().unwrap_or("Error hook verdict: FAIL")
+                ),
+            )),
         }
     }
 
@@ -1070,12 +1002,14 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     fn execute_eager_on_bootstrap(
         &self,
         sql: &str,
-    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
+    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), ExecutionFailure> {
         let conn = self.system.get_bootstrap_connection();
-        let conn_guard = conn.lock().map_err(|e| format!("Bootstrap lock: {}", e))?;
+        let conn_guard = conn
+            .lock()
+            .map_err(|e| Runtime::poisoned("Bootstrap lock", e))?;
         let mut stmt = conn_guard
             .prepare(sql)
-            .map_err(|e| format!("Bootstrap prepare: {}", e))?;
+            .map_err(|e| bootstrap_engine_error("Bootstrap prepare", e))?;
         let col_count = stmt.column_count();
         let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let rows_result = stmt
@@ -1086,10 +1020,10 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 }
                 Ok(values)
             })
-            .map_err(|e| format!("Bootstrap query: {}", e))?;
+            .map_err(|e| bootstrap_engine_error("Bootstrap query", e))?;
         let mut result_rows = Vec::new();
         for r in rows_result {
-            result_rows.push(r.map_err(|e| format!("Bootstrap fetch: {}", e))?);
+            result_rows.push(r.map_err(|e| bootstrap_engine_error("Bootstrap fetch", e))?);
         }
         Ok((column_names, result_rows))
     }
@@ -1099,17 +1033,12 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         &self,
         sql: &str,
         connection_id: i64,
-    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
-        let conn_arc = self
-            .system
-            .get_connection(connection_id)
-            .map_err(|e| format!("{}", e))?;
+    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), ExecutionFailure> {
+        let conn_arc = self.system.get_connection(connection_id)?;
         let conn_guard = conn_arc
             .lock()
-            .map_err(|e| format!("Connection {} lock: {}", connection_id, e))?;
-        let (columns, rows) = conn_guard
-            .query_all_rows(sql, &[])
-            .map_err(|e| format!("{}", e))?;
+            .map_err(|e| Runtime::poisoned(format!("Connection {} lock", connection_id), e))?;
+        let (columns, rows) = conn_guard.query_all_rows(sql, &[])?;
         Ok((
             columns,
             rows.into_iter()
@@ -1123,11 +1052,11 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// - `None` or `2`: route through the streaming backend protocol (sql_session)
     /// - `1`: execute eagerly on the bootstrap connection
     /// - `>= 3`: execute eagerly on an imported connection
-    fn execute_sql_routed(
+    pub(crate) fn execute_sql_routed(
         &mut self,
         sql: &str,
         connection_id: Option<i64>,
-    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
+    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), ExecutionFailure> {
         match connection_id.unwrap_or(2) {
             2 => self.execute_eager_through_protocol(sql),
             1 => {
@@ -1138,7 +1067,10 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 #[cfg(target_arch = "wasm32")]
                 {
                     let _ = sql;
-                    Err("bootstrap queries not supported on wasm32".to_string())
+                    Err(Runtime::Unsupported {
+                        message: "bootstrap queries not supported on wasm32".to_string(),
+                    }
+                    .into())
                 }
             }
             id => self.execute_eager_on_imported(sql, id),
@@ -1165,22 +1097,24 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     fn execute_eager_through_protocol(
         &mut self,
         sql: &str,
-    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
+    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), ExecutionFailure> {
         let rows_orient = self
             .sql_session
             .agreed_orientation(Orientation::Rows)
-            .ok_or_else(|| "Rows orientation not agreed".to_string())?;
+            .ok_or_else(|| {
+                DelightQLError::from(Runtime::Protocol {
+                    message: "Rows orientation not agreed".to_string(),
+                })
+            })?;
 
         let resp = self
             .sql_session
             .query(sql.as_bytes().to_vec())
-            .map_err(|e| e.message)?;
+            .map_err(|e| DelightQLError::from(Runtime::Transport { message: e.message }))?;
 
         let (handle, dimensions) = match resp {
             QueryResponse::Header { handle, dimensions } => (handle, dimensions),
-            QueryResponse::Error { message, .. } => {
-                return Err(String::from_utf8_lossy(&message).to_string());
-            }
+            QueryResponse::Error(received) => return Err(admitted(received)),
         };
 
         let columns: Vec<String> = dimensions
@@ -1198,16 +1132,16 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     Ok(resp) => resp,
                     Err(e) => {
                         let _ = self.sql_session.close(handle);
-                        return Err(e.message);
+                        return Err(Runtime::Transport { message: e.message }.into());
                     }
                 };
 
             match fetch_resp {
                 FetchResponse::Data { cells } => all_rows.extend(cells),
                 FetchResponse::End => break,
-                FetchResponse::Error { message, .. } => {
+                FetchResponse::Error(received) => {
                     let _ = self.sql_session.close(handle);
-                    return Err(String::from_utf8_lossy(&message).to_string());
+                    return Err(admitted(received));
                 }
             }
         }
@@ -1218,8 +1152,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
 }
 
 impl<'a, T: Transport> crate::api::ServerRelay for RelayParty<'a, T> {
-    fn handle_reset(&mut self) -> Result<(), String> {
-        RelayParty::handle_reset(self).map_err(|e| e.to_string())
+    fn handle_reset(&mut self) -> Result<(), crate::error::DelightQLError> {
+        RelayParty::handle_reset(self)
     }
 }
 
@@ -1239,11 +1173,12 @@ impl<'a, T: Transport> Handler for RelayParty<'a, T> {
                     .filter(|o| supported.contains(o))
                     .collect();
                 if agreed.is_empty() {
-                    ServerTerm::Error {
-                        kind: ErrorKind::Connection,
-                        identity: vec![],
-                        message: b"no common orientation".to_vec(),
-                    }
+                    error_term(
+                        &Runtime::Protocol {
+                            message: "no common orientation".to_string(),
+                        }
+                        .into(),
+                    )
                 } else {
                     ServerTerm::Version {
                         max_message_size,
@@ -1283,22 +1218,49 @@ impl<'a, T: Transport> Handler for RelayParty<'a, T> {
                 term
             }
 
-            ClientTerm::Prepare { .. } => ServerTerm::Error {
-                kind: ErrorKind::Permission,
-                identity: vec![],
-                message: b"Prepare not implemented".to_vec(),
-            },
+            ClientTerm::Prepare { .. } => error_term(
+                &Runtime::Unsupported {
+                    message: "Prepare not implemented".to_string(),
+                }
+                .into(),
+            ),
 
-            ClientTerm::Offer { .. } => ServerTerm::Error {
-                kind: ErrorKind::Permission,
-                identity: vec![],
-                message: b"Offer not implemented".to_vec(),
-            },
+            ClientTerm::Offer { .. } => error_term(
+                &Runtime::Unsupported {
+                    message: "Offer not implemented".to_string(),
+                }
+                .into(),
+            ),
         }
     }
 }
 
 pub(crate) use delightql_types::teach_runtime_message;
+
+/// The relay's own "no such handle": the client named a result this session
+/// does not hold, which is a protocol fault of the conversation.
+fn unknown_handle() -> DelightQLError {
+    Runtime::Protocol {
+        message: "unknown handle".to_string(),
+    }
+    .into()
+}
+
+/// Judge a selector against an error term: the term's bytes pass the same
+/// ingress judgment as any received error ([`admitted`]) and only the typed
+/// occurrence that judgment yields is matched — so an undeclared identity
+/// can satisfy no family, whatever prefix its text wears.
+fn judge_wire(expected: &ErrorSelector, wire: &WireError) -> (bool, String) {
+    judge_bytes(expected, wire.identity(), wire.message())
+}
+
+fn judge_bytes(expected: &ErrorSelector, identity: &[u8], message: &[u8]) -> (bool, String) {
+    let occurrence = admitted_bytes(identity, message);
+    (
+        expected.matches(&occurrence.id()),
+        format!("{}: {}", occurrence.id(), occurrence),
+    )
+}
 
 /// How many statements the text holds when read as a SEQUENCE — `None` when
 /// it is not a well-formed one. A diagnostic only: it runs on the failure

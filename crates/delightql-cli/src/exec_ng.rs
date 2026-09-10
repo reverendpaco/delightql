@@ -64,21 +64,22 @@ impl TypedRows {
 /// Fetch ALL rows of a DQL query with their nullability and descriptors
 /// intact.
 pub fn fetch_all_typed(session: &mut dyn DqlSession, dql: &str) -> Result<TypedRows> {
-    let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let qr = session.query(dql)?;
     let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
     let descriptors: Vec<String> = qr.columns.iter().map(|c| c.descriptor.clone()).collect();
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
     loop {
-        let fr = session
-            .fetch(&qr.handle, u64::MAX)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let fr = session.fetch(&qr.handle, u64::MAX)?;
         if fr.finished {
             break;
         }
         for row in &fr.rows {
             rows.push(
                 row.iter()
-                    .map(|cell| cell.as_ref().map(|b| String::from_utf8_lossy(b).to_string()))
+                    .map(|cell| {
+                        cell.as_ref()
+                            .map(|b| String::from_utf8_lossy(b).to_string())
+                    })
                     .collect(),
             );
         }
@@ -93,16 +94,14 @@ pub fn fetch_all_typed(session: &mut dyn DqlSession, dql: &str) -> Result<TypedR
 
 /// Fetch ALL rows from a DQL session into QueryResults.
 pub(crate) fn fetch_all(session: &mut dyn DqlSession, dql: &str) -> Result<QueryResults> {
-    let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let qr = session.query(dql)?;
 
     let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
 
     let mut all_rows: Vec<Vec<String>> = Vec::new();
 
     loop {
-        let fr = session
-            .fetch(&qr.handle, u64::MAX)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let fr = session.fetch(&qr.handle, u64::MAX)?;
 
         if fr.finished {
             break;
@@ -113,9 +112,7 @@ pub(crate) fn fetch_all(session: &mut dyn DqlSession, dql: &str) -> Result<Query
         }
     }
 
-    let _ = session
-        .close(qr.handle)
-        .map_err(|e| anyhow::anyhow!("{}", e));
+    let _ = session.close(qr.handle).map_err(anyhow::Error::new);
 
     let row_count = all_rows.len();
     Ok(QueryResults {
@@ -134,16 +131,14 @@ pub(crate) fn fetch_all_raw(
     session: &mut dyn DqlSession,
     dql: &str,
 ) -> Result<(Vec<String>, Vec<Vec<Option<Vec<u8>>>>)> {
-    let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let qr = session.query(dql)?;
 
     let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
 
     let mut all_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
 
     loop {
-        let fr = session
-            .fetch(&qr.handle, u64::MAX)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let fr = session.fetch(&qr.handle, u64::MAX)?;
 
         if fr.finished {
             break;
@@ -154,9 +149,7 @@ pub(crate) fn fetch_all_raw(
         }
     }
 
-    let _ = session
-        .close(qr.handle)
-        .map_err(|e| anyhow::anyhow!("{}", e));
+    let _ = session.close(qr.handle).map_err(anyhow::Error::new);
 
     Ok((columns, all_rows))
 }
@@ -172,16 +165,14 @@ fn display_results(
 ) -> Result<ResultMetadata> {
     use crate::output_format::format_output_with_zebra;
 
-    let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let qr = session.query(dql)?;
 
     let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
 
     let mut total_rows = 0usize;
 
     loop {
-        let fr = session
-            .fetch(&qr.handle, 100)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let fr = session.fetch(&qr.handle, 100)?;
 
         if fr.finished {
             break;
@@ -224,9 +215,7 @@ fn display_results(
         print!("{}", output);
     }
 
-    let _ = session
-        .close(qr.handle)
-        .map_err(|e| anyhow::anyhow!("{}", e));
+    let _ = session.close(qr.handle).map_err(anyhow::Error::new);
 
     Ok(ResultMetadata {
         columns,
@@ -251,7 +240,7 @@ fn display_results_json(
     use crate::output_format::json_object_row;
     use std::io::Write;
 
-    let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let qr = session.query(dql)?;
     let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
     let descriptors: Vec<String> = qr.columns.iter().map(|c| c.descriptor.clone()).collect();
 
@@ -263,9 +252,7 @@ fn display_results_json(
         out.write_all(b"[")?;
     }
     loop {
-        let fr = session
-            .fetch(&qr.handle, 100)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let fr = session.fetch(&qr.handle, 100)?;
         if fr.finished {
             break;
         }
@@ -299,9 +286,7 @@ fn display_results_json(
     }
     out.flush()?;
 
-    let _ = session
-        .close(qr.handle)
-        .map_err(|e| anyhow::anyhow!("{}", e));
+    let _ = session.close(qr.handle).map_err(anyhow::Error::new);
 
     Ok(ResultMetadata {
         columns,
@@ -317,7 +302,7 @@ fn display_results_json(
 fn display_results_raw(session: &mut dyn DqlSession, dql: &str) -> Result<ResultMetadata> {
     use std::io::{IsTerminal, Write};
 
-    let qr = session.query(dql).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let qr = session.query(dql)?;
     let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
     if columns.len() != 1 {
         anyhow::bail!(
@@ -333,19 +318,18 @@ fn display_results_raw(session: &mut dyn DqlSession, dql: &str) -> Result<Result
         // silent when piped (the intended use).
         crate::client::incident::warning(
             "argument",
-            crate::client::incident::hierarchy::SANITIZE_DISABLED,
-            "-f raw writes verbatim bytes (terminal control sequences \
+            delightql_types::diagnostic::Client::SanitizeDisabled {
+                message: "-f raw writes verbatim bytes (terminal control sequences \
              included); intended for pipes and files"
-                .to_string(),
+                    .to_string(),
+            },
         );
     }
     let mut stdout = std::io::stdout().lock();
     let mut total_rows = 0usize;
 
     loop {
-        let fr = session
-            .fetch(&qr.handle, 100)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let fr = session.fetch(&qr.handle, 100)?;
 
         if fr.finished {
             break;
@@ -364,9 +348,7 @@ fn display_results_raw(session: &mut dyn DqlSession, dql: &str) -> Result<Result
 
     stdout.flush()?;
 
-    let _ = session
-        .close(qr.handle)
-        .map_err(|e| anyhow::anyhow!("{}", e));
+    let _ = session.close(qr.handle).map_err(anyhow::Error::new);
 
     Ok(ResultMetadata {
         columns,

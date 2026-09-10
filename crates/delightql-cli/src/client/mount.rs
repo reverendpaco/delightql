@@ -51,19 +51,28 @@ const WRAPPER_DEFINITIONS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The interactive client's types-level mount factory.
+/// The client profile's types-level mount factory. Only a handle opened
+/// under `SessionProfile::Client` over a client database receives one; a
+/// server handle's factory knows no session locator.
 pub struct ReplMountFactory {
     connection: Arc<Mutex<rusqlite::Connection>>,
+}
+
+impl ReplMountFactory {
+    /// The factory over one client database's live connection.
+    pub(crate) fn over(db: &ClientDatabase) -> Self {
+        ReplMountFactory {
+            connection: db.connection_arc(),
+        }
+    }
 }
 
 impl delightql_types::ConnectionFactory for ReplMountFactory {
     fn create(
         &self,
         uri: &str,
-    ) -> std::result::Result<
-        delightql_types::ConnectionComponents,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> std::result::Result<delightql_types::ConnectionComponents, delightql_types::DelightQLError>
+    {
         if uri != REPL_SESSION_LOCATOR {
             return delightql_types::ConnectionFactory::create(
                 &crate::connection_factory::CliConnectionFactory,
@@ -93,10 +102,13 @@ impl delightql_types::ConnectionFactory for ReplMountFactory {
         uri: &str,
     ) -> std::result::Result<
         Vec<(String, delightql_types::ConnectionComponents)>,
-        Box<dyn std::error::Error + Send + Sync>,
+        delightql_types::DelightQLError,
     > {
         if uri == REPL_SESSION_LOCATOR {
-            return Err("the REPL session database has no schemas; mount! it directly".into());
+            return Err(delightql_types::diagnostic::Mount::Locator {
+                message: "the REPL session database has no schemas; mount! it directly".to_string(),
+            }
+            .into());
         }
         delightql_types::ConnectionFactory::create_tree(
             &crate::connection_factory::CliConnectionFactory,
@@ -105,33 +117,13 @@ impl delightql_types::ConnectionFactory for ReplMountFactory {
     }
 }
 
-/// Open a `DqlHandle` over the client database: the ordinary CLI handle —
-/// same API factory, same embedded-image bindings, same `cli::surface`
-/// attach — with the client mount factory in the types-level seat.
-pub fn open_client_handle(db: &ClientDatabase) -> anyhow::Result<Box<dyn DqlHandle>> {
-    let factory = Box::new(crate::connection_factory::CliConnectionFactory);
-    let mount_factory = Box::new(ReplMountFactory {
-        connection: db.connection_arc(),
-    });
-    let mut handle = delightql_core::api::open(factory, Some(mount_factory))
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    handle
-        .bind_static_bytes("book", crate::embedded_db::BOOK_BYTES)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    handle
-        .bind_static_bytes("man", crate::embedded_db::MAN_BYTES)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    handle
-        .bind_static_bytes("editor", crate::embedded_db::EDITOR_BYTES)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    crate::cli_surface::attach(handle)
-}
-
 /// Mount the live database at `repl::data`, install the fixed wrapper
-/// definitions, and verify one known public relation answers. Used when a
-/// handle opens, in every mode, and again after a successful Core session
-/// recovery — the catalog mapping dies with the session; the client-owned
-/// connection does not.
+/// definitions, and verify one known public relation answers. Performed
+/// by the client profile when it opens a handle over a client database,
+/// and again after a successful interactive session recovery — the
+/// catalog mapping dies with the session; the client-owned connection
+/// does not. On a handle whose factory knows no session locator (the
+/// server profile) the first `mount!` refuses and nothing is installed.
 pub fn install_repl_namespace(handle: &mut dyn DqlHandle) -> anyhow::Result<()> {
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
     install_repl_namespace_with(&mut |dql| {
@@ -140,11 +132,8 @@ pub fn install_repl_namespace(handle: &mut dyn DqlHandle) -> anyhow::Result<()> 
 }
 
 /// The same install over ONE executor of DQL text — the road a host takes
-/// when it holds no session of its own. The server holds a protocol relay
-/// (which borrows the handle for the connection's life) and reinstalls
-/// through it after every reset the client sends: the catalog mapping
-/// died with the reset, the client-owned connection did not. The executor
-/// answers the row count of what it ran.
+/// when it holds no session of its own. The executor answers the row count
+/// of what it ran.
 pub fn install_repl_namespace_with(
     run: &mut dyn FnMut(&str) -> anyhow::Result<usize>,
 ) -> anyhow::Result<()> {

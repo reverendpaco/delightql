@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 
+use crate::diagnostic::{Constraint, Effect, Internal, Resolution, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
@@ -32,7 +33,8 @@ fn current_occurrence(
     source: crate::relation::PortId,
 ) -> Result<crate::relation::PortId> {
     crate::relation::landed_in(identities, available, source)?.ok_or_else(|| {
-        DelightQLError::parse_error(
+        Internal::invariant(
+            "resolver::resolving::operators::schema_ops",
             "A resolved rename source has no occurrence in the pipe heading",
         )
     })
@@ -78,8 +80,10 @@ pub(super) fn resolve_project_out(
         .collect();
 
     if kept.is_empty() {
-        return Err(DelightQLError::parse_error(
-            "Cannot remove all columns - would create empty table",
+        return Err(crate::diagnostic::DelightQLError::from(
+            crate::diagnostic::Constraint::General {
+                message: "Cannot remove all columns - would create empty table".to_string(),
+            },
         ));
     }
     if removed.is_empty() && !available.is_empty() {
@@ -108,11 +112,15 @@ pub(super) fn resolve_rename_cover(
         // regex or glob covers. It reaches them through the one expansion
         // authority every selector uses.
         let resolved = match spec.from {
-            ast_unresolved::RenameSource::Reference(reference) => resolve_expressions_via_fold(
-                fold,
-                vec![ast_unresolved::DomainExpression::Reference(reference)],
-                available,
-            )?,
+            ast_unresolved::RenameSource::Reference(reference) => {
+                fold.judged_here("a rename inside the interior", |fold| {
+                    resolve_expressions_via_fold(
+                        fold,
+                        vec![ast_unresolved::DomainExpression::Reference(reference)],
+                        available,
+                    )
+                })?
+            }
             ast_unresolved::RenameSource::Regex(regex) => {
                 super::super::domain_expressions::projection::expand_spread(
                     fold,
@@ -158,7 +166,12 @@ pub(super) fn resolve_rename_cover(
                             position.expect("resolved column has an input position"),
                         )
                         .ok_or_else(|| {
-                            DelightQLError::parse_error("Cannot expand {@} for an anonymous column")
+                            crate::diagnostic::DelightQLError::from(
+                                crate::diagnostic::Constraint::General {
+                                    message: "Cannot expand {@} for an anonymous column"
+                                        .to_string(),
+                                },
+                            )
                         })?,
                     ast_unresolved::ColumnAlias::Literal(literal) => {
                         fold.core.identities.intern(literal, false)
@@ -180,11 +193,9 @@ pub(super) fn resolve_rename_cover(
             .any(|(other, (candidate, _))| other != index && candidate == source)
     });
     if duplicate_source {
-        return Err(DelightQLError::validation_error_categorized(
-            "constraint",
-            "Each rename source must be named once",
-            "in rename-cover operator",
-        ));
+        return Err(DelightQLError::from(Constraint::General {
+            message: "Each rename source must be named once".to_string(),
+        }));
     }
     for (index, target) in target_names.iter().enumerate() {
         let duplicate_target = target_names
@@ -196,11 +207,11 @@ pub(super) fn resolve_rename_cover(
                 && fold.core.identities.published_sym(column.column()) == Some(*target)
         });
         if duplicate_target || passthrough_collision {
-            return Err(DelightQLError::validation_error_categorized(
-                "constraint",
-                "Rename targets must be unique and must not collide with passthrough columns",
-                "in rename-cover operator",
-            ));
+            return Err(DelightQLError::from(Constraint::General {
+                message:
+                    "Rename targets must be unique and must not collide with passthrough columns"
+                        .to_string(),
+            }));
         }
     }
 
@@ -224,22 +235,29 @@ pub(in crate::pipeline::resolver) fn resolve_reposition(
 ) -> Result<(ast_resolved::Step, Vec<crate::relation::PortId>)> {
     let mut pending_moves = Vec::new();
     for spec in moves {
-        let resolved = resolve_expressions_via_fold(
-            fold,
-            vec![ast_unresolved::DomainExpression::Reference(spec.column)],
-            available,
-        )?
-        .into_iter()
-        .next()
-        .expect("one reposition reference resolves to one expression");
+        let resolved = fold
+            .judged_here("a reposition inside the interior", |fold| {
+                resolve_expressions_via_fold(
+                    fold,
+                    vec![ast_unresolved::DomainExpression::Reference(spec.column)],
+                    available,
+                )
+            })?
+            .into_iter()
+            .next()
+            .expect("one reposition reference resolves to one expression");
         if resolved_column(&resolved).is_none() {
-            return Err(DelightQLError::parse_error(
-                "Reposition only supports columns and ordinals",
+            return Err(crate::diagnostic::DelightQLError::from(
+                crate::diagnostic::Constraint::General {
+                    message: "Reposition only supports columns and ordinals".to_string(),
+                },
             ));
         }
         let ast_resolved::DomainExpression::Reference(reference) = resolved else {
-            return Err(DelightQLError::parse_error(
-                "Reposition only supports columns and ordinals",
+            return Err(crate::diagnostic::DelightQLError::from(
+                crate::diagnostic::Constraint::General {
+                    message: "Reposition only supports columns and ordinals".to_string(),
+                },
             ));
         };
         pending_moves.push(crate::relation::pending::Move {
@@ -302,10 +320,10 @@ pub(in crate::pipeline::resolver) fn resolve_access(
     if let ast_resolved::Access::Dequalify(columns) = &access {
         for name in columns {
             if unique_named(identities, available, name).is_none() {
-                return Err(DelightQLError::column_not_found_error(
-                    name.as_str(),
-                    "in USING operator",
-                ));
+                return Err(DelightQLError::from(Resolution::Column {
+                    column: name.as_str().to_string(),
+                    context: "in USING operator".to_string(),
+                }));
             }
         }
     }
@@ -327,19 +345,18 @@ pub(in crate::pipeline::resolver) fn resolve_interior_drill_down(
     // reading it unstropped is what it has always meant.
     // The nest was addressed through the frontier where the step stands.
     if crate::relation::interior_conflict(identities, drilled) {
-        return Err(DelightQLError::validation_error_categorized(
-            "effect/ledger/mixed_release",
-            format!(
+        return Err(DelightQLError::from(Effect::LedgerMixedRelease {
+            message: format!(
                 "releasing '{column}' across ledger arms whose declared interior headings differ"
             ),
-            "narrow the ledger to arms with one interior heading before releasing",
-        ));
+        }));
     }
     let interior = crate::relation::interior(identities, drilled)?.ok_or_else(|| {
-        DelightQLError::validation_error(
-            format!("Interior drill-down: column '{column}' has no known interior heading"),
-            "Use ~= destructuring for values without a statically known heading",
-        )
+        crate::diagnostic::DelightQLError::from(crate::diagnostic::Constraint::General {
+            message: format!(
+                "Interior drill-down: column '{column}' has no known interior heading"
+            ),
+        })
     })?;
     let interior_columns = crate::relation::published_ports(identities, &interior)?;
     let selected = if glob {
@@ -357,14 +374,14 @@ pub(in crate::pipeline::resolver) fn resolve_interior_drill_down(
         // subset of a wider interior, expand with `(*)` and project, or narrow
         // with braces.
         if columns.len() != interior_columns.len() {
-            return Err(DelightQLError::validation_error(
-                format!(
-                    "drill-down into '{column}' names {} columns; its interior has {}",
-                    columns.len(),
-                    interior_columns.len()
-                ),
-                "An argumentative drill-down binds the interior's columns by position, one \
-                 name each. Expand with (*) and project to keep a subset.",
+            return Err(crate::diagnostic::DelightQLError::from(
+                crate::diagnostic::Constraint::General {
+                    message: format!(
+                        "drill-down into '{column}' names {} columns; its interior has {}",
+                        columns.len(),
+                        interior_columns.len()
+                    ),
+                },
             ));
         }
         // The names bound here are programmer-authored and a heading, so they
@@ -375,12 +392,12 @@ pub(in crate::pipeline::resolver) fn resolve_interior_drill_down(
         for name in columns.iter().filter(|name| *name != "_") {
             let spelling = identities.canonical(identities.intern(name, false));
             if bound.contains(&spelling) {
-                return Err(DelightQLError::validation_error(
+                return Err(Internal::invariant(
+                    "resolver::resolving::operators::schema_ops",
                     format!(
                         "Duplicate column '{name}' in drill-down into '{column}': \
                          programmer-authored names must be unique. Rename one to disambiguate"
                     ),
-                    "in output schema",
                 ));
             }
             bound.push(spelling);
@@ -484,14 +501,12 @@ pub(in crate::pipeline::resolver) fn resolve_narrowing_destructure(
         .as_deref()
         .is_some_and(crate::pipeline::asts::core::metadata::is_plainly_scalar_declaration)
     {
-        return Err(DelightQLError::ValidationError {
+        return Err(DelightQLError::from(Semantic::CompoundScalarColumn {
             message: format!(
                 "cannot narrow into column '{}': a plain scalar has no rows to iterate",
                 spelled
             ),
-            context: "resolver::narrowing_destructure".to_string(),
-            subcategory: Some(crate::uri_registry::subcat::COMPOUND_SCALAR_COLUMN),
-        });
+        }));
     }
 
     identities

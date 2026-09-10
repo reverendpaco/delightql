@@ -28,6 +28,7 @@
 //! reads policy at its door.
 
 use crate::compiler_limits::NestingBudget;
+use crate::diagnostic::Parse;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::syntax::{cst, CompanionColumn, Defect, DefectKind, Parser, Root, SyntaxTree};
 
@@ -143,13 +144,15 @@ pub(crate) fn statement_extents(tree: &SyntaxTree) -> Vec<std::ops::Range<usize>
     extents
 }
 
-/// The canonical entrance: definitions and explicit `?-` goals.
+/// The canonical entrance: definitions and explicit `?-` goals. Its refusal
+/// is attributed to the CLAUSE that failed, as the utility entrance's is to
+/// the statement: a teaching read from a sibling clause's tokens would
+/// describe a definition the author wrote correctly.
 pub fn definition_file(source: &str) -> Result<SyntaxTree> {
-    checked(
-        Parser::new().parse_definition_file(source),
-        Category::Definitions,
-        NestingBudget::current(),
-    )
+    let tree = Parser::new().parse_definition_file(source);
+    let owner = failing_form(&tree);
+    attributed(tree, Category::Definitions, owner, NestingBudget::current())
+        .map_err(|refusal| refusal.error)
 }
 
 /// Normalize a parsed sequence with a fresh identity arena.
@@ -186,9 +189,100 @@ pub fn companion_cell(column: CompanionColumn, cell: &str) -> Result<SyntaxTree>
 /// it can plainly see the pieces of into one undivided extent, handing the
 /// first form's declaration to the last form's failure.
 pub(crate) fn query_spans(tree: &SyntaxTree) -> Vec<std::ops::Range<usize>> {
-    crate::pipeline::syntax::outermost(tree, &[cst::Kind::Relex, cst::Kind::Effrelex])
+    spans_of(tree, &[cst::Kind::Relex, cst::Kind::Effrelex])
+}
+
+/// Every top-level form recovery proved, at the grain of the entrance the
+/// tree was read through: statements in a sequence, clauses and goals and
+/// file-scope blocks in a definition file. A companion cell is one form by
+/// contract. Each form comes with its AUTHORED extent and the parse state a
+/// form BEGINS in — the state its first token was read in — which is how an
+/// abandoned tail proves that no form of its own begins there.
+fn forms(tree: &SyntaxTree) -> Vec<(std::ops::Range<usize>, u16)> {
+    let kinds: &[cst::Kind] = match tree.entrance() {
+        Root::QuerySequence => &[cst::Kind::Relex, cst::Kind::Effrelex],
+        Root::DefinitionFile => definition_form_kinds(),
+        Root::CompanionCell => &[],
+    };
+    crate::pipeline::syntax::outermost(tree, kinds)
+        .filter_map(|form| Some((tree.byte_range(form)?, opening_state(form))))
+        .collect()
+}
+
+fn spans_of(tree: &SyntaxTree, kinds: &[cst::Kind]) -> Vec<std::ops::Range<usize>> {
+    crate::pipeline::syntax::outermost(tree, kinds)
         .filter_map(|form| tree.byte_range(form))
         .collect()
+}
+
+/// The parse state a form's first token was read in: the state in which a
+/// form may begin.
+fn opening_state(form: cst::AnyNode<'_>) -> u16 {
+    let mut node = crate::pipeline::syntax::TypedNode::node(&form);
+    while let Some(first) = node.child(0) {
+        node = first;
+    }
+    node.parse_state()
+}
+
+/// The first non-blank byte at or after `from`.
+fn first_token_at(source: &str, from: usize) -> usize {
+    source[from.min(source.len())..]
+        .find(|c: char| !c.is_whitespace())
+        .map_or(source.len(), |offset| from + offset)
+}
+
+/// Whether NO FORM CAN BEGIN at `at`: the parser's own table for the state a
+/// form begins in does not admit the token standing there. Such text has
+/// exactly one form it can be read with — the one before it — so a clause's
+/// abandoned tail (`, orders:(…)`, `|> …`) is proved the clause's own by
+/// exclusion. A token the table admits as a form's first token, or one it
+/// cannot name, proves nothing, and the closed answer is that no form owns
+/// the text.
+fn begins_no_form(tree: &SyntaxTree, opening: u16, at: usize) -> bool {
+    if opening == 0 || opening == u16::MAX {
+        return false;
+    }
+    let raw_at = at + tree.selector().len();
+    let root = tree.raw().root_node();
+    let Some(leaf) = root.descendant_for_byte_range(raw_at, raw_at) else {
+        return false;
+    };
+    if leaf.child_count() != 0 || leaf.start_byte() != raw_at || leaf.is_missing() {
+        return false;
+    }
+    let language = tree.raw().language();
+    let Some(mut admitted) = language.lookahead_iterator(opening) else {
+        return false;
+    };
+    let names_it = language
+        .lookahead_iterator(opening)
+        .is_some_and(|mut it| it.iter_names().any(|name| name == leaf.kind()));
+    // Admission by symbol id, or by name where the id is a wrapper's: either
+    // way an admitted token proves nothing.
+    !(admitted.any(|symbol| symbol == leaf.kind_id()) || names_it)
+}
+
+/// The concrete kinds a definition file's forms take, read from the grammar's
+/// own supertype table so a rule form added later is a form here without
+/// anyone remembering to list it: every member `entity_definition` bottoms out
+/// in, the explicit goal, and the file-scope block.
+fn definition_form_kinds() -> &'static [cst::Kind] {
+    static KINDS: std::sync::OnceLock<Vec<cst::Kind>> = std::sync::OnceLock::new();
+    KINDS.get_or_init(|| {
+        fn concrete(supertype: &str, out: &mut Vec<cst::Kind>) {
+            for member in cst::subtypes_of(supertype) {
+                if cst::subtypes_of(member).is_empty() {
+                    out.extend(cst::Kind::from_str(member));
+                } else {
+                    concrete(member, out);
+                }
+            }
+        }
+        let mut kinds = vec![cst::Kind::TopLevelGoal, cst::Kind::DdlAnnotation];
+        concrete("entity_definition", &mut kinds);
+        kinds
+    })
 }
 
 /// The extent a DEFECT belongs to, drawn by what the parse PROVED.
@@ -214,7 +308,8 @@ fn owning_form(
     tree: &SyntaxTree,
     defect: &std::ops::Range<usize>,
 ) -> Option<std::ops::Range<usize>> {
-    let spans = query_spans(tree);
+    let forms = forms(tree);
+    let spans: Vec<std::ops::Range<usize>> = forms.iter().map(|(span, _)| span.clone()).collect();
     let at =
         unclaimed_start(tree.source(), defect, &spans, &separators(tree)).unwrap_or(defect.start);
     if let Some(span) = spans
@@ -223,11 +318,10 @@ fn owning_form(
     {
         return Some(span.clone());
     }
-    let preceding = spans
+    let preceding = forms
         .iter()
-        .filter(|span| span.end <= at)
-        .map(|span| span.end)
-        .max();
+        .filter(|(span, _)| span.end <= at)
+        .max_by_key(|(span, _)| span.end);
     let following = spans
         .iter()
         .filter(|span| span.start > at)
@@ -241,7 +335,28 @@ fn owning_form(
         // holding neither the query's own teaching nor its declaration.
         (None, Some(next)) => Some(0..next.end),
         (preceding, next) => {
-            let start = preceding.unwrap_or(0);
+            // A STATEMENT's abandoned tail is its own region: a proven
+            // sibling's tokens never lend it a teaching. A CLAUSE's tail
+            // reaches back to the clause's head ONLY when the parse proves
+            // no form of its own begins there — the form-start state does
+            // not admit the tail's first token — so the clause before it is
+            // the one form the tail can be read with. Then the clause's
+            // teachings, read from head, neck and body together (a pure head
+            // over an effectful body, a head that computes, a body that
+            // names), see the clause whole. Unproven, the tail is text no
+            // form owns, and a proven sibling lends it nothing.
+            // The token judged is the FIRST of the tail — what stands right
+            // after the clause — not the defect's own first byte: recovery
+            // may place its defect deep inside the tail, and what begins the
+            // tail is what decides whether a form begins there.
+            let start = preceding.map_or(0, |(span, opening)| match tree.entrance() {
+                Root::DefinitionFile
+                    if begins_no_form(tree, *opening, first_token_at(tree.source(), span.end)) =>
+                {
+                    span.start
+                }
+                Root::DefinitionFile | Root::QuerySequence | Root::CompanionCell => span.end,
+            });
             let end = next.map_or_else(|| tree.source().len(), |span| span.start);
             (start < end).then_some(start..end)
         }
@@ -347,11 +462,13 @@ enum Category {
 }
 
 impl Category {
-    fn subcategory(self) -> Option<&'static str> {
+    /// The parse identity a failure of this reading carries when no more
+    /// specific teaching applies.
+    fn refusal(self, message: String) -> DelightQLError {
         match self {
-            Category::Query => None,
-            Category::Definitions => Some(crate::uri_registry::subcat::PARSE_DDL),
-            Category::Companion => Some(crate::uri_registry::subcat::PARSE_SIGIL),
+            Category::Query => Parse::General { message }.into(),
+            Category::Definitions => Parse::Ddl { message }.into(),
+            Category::Companion => Parse::Sigil { message }.into(),
         }
     }
 }
@@ -470,7 +587,6 @@ fn refusal(
     within: Option<&std::ops::Range<usize>>,
 ) -> DelightQLError {
     let source = tree.source();
-    let subcategory = category.subcategory();
 
     // A MISPLACED HEADER OUTRANKS EVERYTHING. It is why the rest of the file
     // was read the way it was, so whatever the misreading produced downstream
@@ -483,15 +599,11 @@ fn refusal(
         .find(|defect| defect.kind == DefectKind::MisplacedHeader)
     {
         let (row, column) = line_and_column(source, defect.byte_range.start);
-        return DelightQLError::ParseError {
-            message: format!(
-                "Parse error at line {row}:{column}\n\
-                 {header} must be the first nonblank line",
-                header = delightql_cst::QUERY_SEQUENCE_HEADER,
-            ),
-            source: None,
-            subcategory,
-        };
+        return category.refusal(format!(
+            "Parse error at line {row}:{column}\n\
+             {header} must be the first nonblank line",
+            header = delightql_cst::QUERY_SEQUENCE_HEADER,
+        ));
     }
 
     // WHAT THE FAILING FORM TYPED, and nothing a sibling typed. A teaching
@@ -506,11 +618,7 @@ fn refusal(
         .filter(|token| inside(token.start, token.end))
         .collect();
     if let Some(found) = diagnosis::diagnose(&tokens, source) {
-        return DelightQLError::ParseError {
-            message: found.message,
-            source: None,
-            subcategory: Some(found.subcategory),
-        };
+        return found;
     }
 
     let defects: Vec<_> = tree
@@ -519,11 +627,7 @@ fn refusal(
         .filter(|defect| inside(defect.byte_range.start, defect.byte_range.end))
         .collect();
     if let Some(message) = defects.iter().find_map(|d| homoglyph(d, source)) {
-        return DelightQLError::ParseError {
-            message,
-            source: None,
-            subcategory,
-        };
+        return category.refusal(message);
     }
 
     // A MISSING token names what the grammar required, which is more specific
@@ -554,11 +658,7 @@ fn refusal(
         None => "Parse tree contains errors - syntax is invalid".to_string(),
     };
 
-    DelightQLError::ParseError {
-        message,
-        source: None,
-        subcategory,
-    }
+    category.refusal(message)
 }
 
 /// A Unicode confusable standing where its ASCII twin belongs.
@@ -764,6 +864,67 @@ mod tests {
             .expect("unmarked text is one submission");
         assert_eq!(unmarked.entrance(), Root::DefinitionFile);
         assert!(!unmarked.has_defects(), "{:?}", unmarked.defects());
+    }
+
+    /// DIAGNOSIS AND OWNERSHIP ARE ONE ACT at the canonical entrance too. Two
+    /// lawful clauses, one with `and` and one with `or`, precede a malformed
+    /// third; the refusal is the third clause's own, never a mixture read
+    /// across the two that parsed.
+    #[test]
+    fn a_definition_refusal_belongs_to_the_clause_that_failed() {
+        let lawful = "p(x) :- x = 1 and x = 2\nq(x) :- x = 1 or x = 2\n";
+        assert!(definition_file(lawful).is_ok());
+        let Err(error) = definition_file(&format!("{lawful}r(x) :- ???")) else {
+            panic!("a malformed clause refuses");
+        };
+        assert_eq!(error.id().hierarchy(), "parse/ddl", "{error}");
+        // The failing clause's OWN mixture is recognized whole — the witness
+        // the grammar keeps for it — and refused where it is normalized.
+        assert!(definition_file(&format!("{lawful}r(x) :- x = 1 or x = 2 and x = 3")).is_ok());
+        // And a malformed FIRST clause does not borrow the lawful ones after it.
+        let Err(error) = definition_file(&format!("r(x) :- x = 1 or ???\n{lawful}")) else {
+            panic!("a malformed clause refuses");
+        };
+        assert_eq!(error.id().hierarchy(), "parse/ddl", "{error}");
+    }
+
+    /// AN UNRECOGNIZED TAIL BORROWS NO SIBLING. Malformed text after a lawful
+    /// clause, beginning with a word or a mark no clause state admits, is text
+    /// no form owns: its refusal is generic, whichever connective the lawful
+    /// clause used and whichever the tail contains.
+    #[test]
+    fn an_unrecognized_tail_borrows_no_sibling() {
+        for source in [
+            "q(x) :- x = 1 or x = 2\ngarbage and ???",
+            "p(x) :- x = 1 and x = 2\ngarbage or ???",
+            "p(x) :- x = 1 and x = 2\nr(x) ??? and",
+            "p(x) :- x = 1 and x = 2\n??? or garbage",
+            "q(x) :- x = 1 or x = 2\n??? and garbage",
+        ] {
+            let Err(error) = definition_file(source) else {
+                panic!("malformed text refuses: {source:?}");
+            };
+            assert_eq!(error.id().hierarchy(), "parse/ddl", "{source:?}: {error}");
+        }
+    }
+
+    /// A CLAUSE'S TEACHINGS READ ITS HEAD. Recovery proves the head and the
+    /// first member of this rule and abandons the rest; the purity teaching
+    /// needs the pure head beside the directive in the abandoned tail, so the
+    /// failing clause's region reaches back to its head — after a lawful
+    /// sibling as well as alone.
+    #[test]
+    fn a_clause_refusal_reads_its_own_head() {
+        let sneaky = "sneaky(*) :- orders(*), orders:(|> insert!(orders_eu(*))(*)) = 1";
+        for source in [
+            sneaky.to_string(),
+            format!("p(x) :- x = 1 and x = 2\n{sneaky}"),
+        ] {
+            let Err(error) = definition_file(&source) else {
+                panic!("a pure head over an effectful body refuses");
+            };
+            assert_eq!(error.id().hierarchy(), "parse/effect/purity", "{error}");
+        }
     }
 
     #[test]

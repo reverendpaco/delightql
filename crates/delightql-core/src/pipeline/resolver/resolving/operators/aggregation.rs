@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 
+use crate::diagnostic::Constraint;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::resolver::resolver_fold::ResolverFold;
@@ -67,15 +68,13 @@ fn check_duplicate_user_names(
                 )
             });
         if seen.contains(&canonical) {
-            return Err(DelightQLError::validation_error_categorized(
-                "constraint",
-                format!(
+            return Err(DelightQLError::from(Constraint::General {
+                message: format!(
                     "Duplicate column '{}': programmer-authored names must be unique. \
                      Rename one with 'as' to disambiguate",
                     authored_name,
                 ),
-                "in output schema",
-            ));
+            }));
         }
         seen.push(canonical);
     }
@@ -281,85 +280,6 @@ fn expand_pivot_template(
     }
 }
 
-/// Attach the interior heading a RECORD construction publishes.
-///
-/// The record's own members name the interior's columns, in written order;
-/// an induced member's target is the level beneath it. A published value
-/// that is not a record has no interior heading to attach.
-pub(crate) fn attach_record_interior(
-    authority: &crate::relation::SemanticBuilder<'_>,
-    owner: crate::relation::PortId,
-    expression: &ast_resolved::DomainExpression,
-) -> Result<bool> {
-    use crate::pipeline::asts::core::Enclyph;
-
-    let ast_resolved::DomainExpression::Application(ast_resolved::FunctionApplication::Enclyph(
-        Enclyph::Record(record),
-    )) = expression
-    else {
-        return Ok(false);
-    };
-    let body = record_relation(authority, record)?;
-    authority.derive(crate::relation::RelForm::Interior(
-        crate::relation::form::InteriorSpec { owner, body },
-    ))?;
-    Ok(true)
-}
-
-fn record_relation(
-    authority: &crate::relation::SemanticBuilder<'_>,
-    record: &ast_resolved::Record,
-) -> Result<crate::relation::SemanticRelation> {
-    use crate::pipeline::asts::core::{Enclyph, NamedReference, RecordMember};
-
-    let mut slots = Vec::new();
-    let mut nested = Vec::new();
-    for (position, member) in record.members.iter().enumerate() {
-        let (published, child) = match member {
-            RecordMember::SelfKeyed(NamedReference(occurrence)) => (
-                authority.names().published(occurrence.column.column()),
-                None,
-            ),
-            RecordMember::Keyed { key, .. } | RecordMember::Metadata { key, .. } => {
-                (Some(authority.names().intern(key, false)), None)
-            }
-            RecordMember::Induced { key, value } => (
-                Some(authority.names().intern(key, false)),
-                match value.as_ref() {
-                    // A tuple publishes by position and names nothing, so it
-                    // contributes no interior heading.
-                    Enclyph::Record(nested) => Some(nested),
-                    Enclyph::EmptyRecord(_) => None,
-                    Enclyph::Tuple(_) => None,
-                },
-            ),
-            RecordMember::Spread(spread) => spread.expanded(),
-        };
-        slots.push(crate::relation::form::AnonymousSlot::Declared {
-            position: position as u32,
-            named: published,
-        });
-        nested.push(child);
-    }
-    let relation = authority.derive(crate::relation::RelForm::Anonymous(
-        crate::relation::form::AnonymousSpec {
-            shape: crate::relation::form::AnonymousShape::Tabular,
-            slots: &slots,
-            answers_to: None,
-        },
-    ))?;
-    let ports = authority.interface(&relation)?.ports().to_vec();
-    for (owner, child) in ports.into_iter().zip(nested) {
-        if let Some(child) = child {
-            let body = record_relation(authority, child)?;
-            authority.derive(crate::relation::RelForm::Interior(
-                crate::relation::form::InteriorSpec { owner, body },
-            ))?;
-        }
-    }
-    Ok(relation)
-}
-
 fn duplicate_published(
     identities: &crate::relation::Planning,
     columns: &[crate::relation::PortId],
@@ -418,6 +338,29 @@ pub(super) fn resolve_group_via_fold(
             let by = super::super::domain_expressions::projection::resolve_out_items_via_fold(
                 fold, keys, available, false,
             )?;
+            // A GROUPING-KEY RECORD'S COLLECTORS are collectors: an induced
+            // or metadata member of a key record gathers the group's rows
+            // like one after `~>`, and its members answer to the same law.
+            for key in by.iter() {
+                let Some(expr) = key.value() else {
+                    continue;
+                };
+                let crate::pipeline::asts::resolved::DomainExpression::Application(
+                    crate::pipeline::asts::resolved::FunctionApplication::Enclyph(
+                        crate::pipeline::asts::core::Enclyph::Record(record),
+                    ),
+                ) = expr
+                else {
+                    continue;
+                };
+                if let crate::defuse::bound_use::ReductionStanding::Nested { teaching } =
+                    crate::defuse::bound_use::judge_key_record_collectors(fold.core, record)
+                {
+                    return Err(DelightQLError::from(Constraint::NestedReduction {
+                        message: teaching,
+                    }));
+                }
+            }
             // REDUCTION-SLOT MEMBERS RESOLVE UNDER THE REDUCING GRADE:
             // the position's expectation is present while each member's
             // value — and any consulted definition it opens — resolves.
@@ -443,47 +386,54 @@ pub(super) fn resolve_group_via_fold(
                 use crate::pipeline::asts::core::Reference;
                 let group_keys: std::collections::HashSet<crate::relation::PortId> = by
                     .iter()
-                    .filter_map(|key| match key {
-                        crate::relation::pending::Position::Authored { expr, .. }
-                        | crate::relation::pending::Position::Expanded { expr, .. } => match expr {
-                            crate::pipeline::asts::resolved::DomainExpression::Reference(
-                                Reference::Named(named),
-                            ) => Some(named.column().column),
-                            _ => None,
-                        },
-                        crate::relation::pending::Position::Whole => None,
+                    .filter_map(|key| match key.value() {
+                        Some(crate::pipeline::asts::resolved::DomainExpression::Reference(
+                            Reference::Named(named),
+                        )) => Some(named.column().column),
+                        _ => None,
                     })
                     .collect();
                 for item in on.iter() {
-                    let Reduction::Out(
-                        crate::relation::pending::Position::Authored { expr, naming }
-                        | crate::relation::pending::Position::Expanded { expr, naming },
-                    ) = item
-                    else {
-                        continue;
+                    let (standing, naming) = match item {
+                        Reduction::Out(position) => match position.value() {
+                            Some(expr) => (
+                                crate::defuse::bound_use::judge_grade(
+                                    fold.core,
+                                    crate::defuse::bound_use::CallableGrade::Reducing,
+                                    &group_keys,
+                                    expr,
+                                ),
+                                position.naming(),
+                            ),
+                            None => continue,
+                        },
+                        // A metadata group's target collects each key's
+                        // partition: the same law over its members.
+                        Reduction::Metadata { group, naming } => (
+                            crate::defuse::bound_use::judge_metadata_reduction(fold.core, group),
+                            naming.as_ref(),
+                        ),
+                        Reduction::Pivot(_) => continue,
                     };
-                    let value = expr;
-                    match crate::defuse::bound_use::judge_grade(
-                        fold.core,
-                        crate::defuse::bound_use::CallableGrade::Reducing,
-                        &group_keys,
-                        value,
-                    ) {
+                    match standing {
                         crate::defuse::bound_use::ReductionStanding::Lawful => {}
+                        crate::defuse::bound_use::ReductionStanding::Nested { teaching } => {
+                            return Err(DelightQLError::from(Constraint::NestedReduction {
+                                message: teaching,
+                            }));
+                        }
                         crate::defuse::bound_use::ReductionStanding::PerRow => {
                             let label = naming
                                 .as_ref()
                                 .map(|name| format!("'{name}'"))
                                 .unwrap_or_else(|| "this member".to_string());
-                            return Err(DelightQLError::validation_error_categorized(
-                                "constraint/implicit_aggregation",
-                                format!(
+                            return Err(DelightQLError::from(Constraint::ImplicitAggregation {
+                                message: format!(
                                     "the group has many rows and the member {label} has one \
                                      slot: a value with one answer per row cannot stand alone \
                                      in a reduction, and there is no implicit aggregation, ever"
                                 ),
-                                "write the reduction, e.g. `sum:(expr)`",
-                            ));
+                            }));
                         }
                     }
                 }
@@ -501,17 +451,16 @@ pub(super) fn resolve_group_via_fold(
                         PivotValueJudgment::Ready(source, values) => (source, values),
                         PivotValueJudgment::Unnameable(source) => {
                             let key = pivot_key_teaching(source, &fold.core.identities);
-                            return Err(DelightQLError::validation_error(
-                                format!(
+                            return Err(crate::diagnostic::DelightQLError::from(crate::diagnostic::Constraint::Pivot { message: format!(
                                     "Pivot key '{key}' has a matching IN predicate whose values cannot name output columns"
-                                ),
-                                "Use string values for the pivot heading until the numeric-key ruling is settled",
-                            ));
+                                ) }));
                         }
                         PivotValueJudgment::Missing => {
-                            return Err(DelightQLError::validation_error(
-                                "Pivot key requires a matching IN predicate",
-                                "Add an IN predicate with literal values for a referenced column",
+                            return Err(crate::diagnostic::DelightQLError::from(
+                                crate::diagnostic::Constraint::Pivot {
+                                    message: "Pivot key requires a matching IN predicate"
+                                        .to_string(),
+                                },
                             ))
                         }
                     };
@@ -560,9 +509,10 @@ pub(super) fn resolve_group_via_fold(
                 resolved_delegates.push(Delegate { payload, order });
             }
 
-            // OUTWARD-ACTING: a metadata group summarizes the group of
-            // rows its record stands for. With no keys written, `~> {`
-            // makes one record PER ROW, and a single row is not a group.
+            // A metadata member stands under WRITTEN grouping keys. With
+            // none written the record is refused rather than keyed by its
+            // own plain members; whether the nested-tree keying should
+            // extend to it is not ruled.
             if by.is_empty() {
                 for item in &on {
                     let Reduction::Out(out) = item else { continue };
@@ -578,15 +528,13 @@ pub(super) fn resolve_group_via_fold(
                         ast_resolved::RecordMember::Metadata { key, .. } => Some(key.clone()),
                         _ => None,
                     }) {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "constraint/metadata_per_row",
-                            format!(
-                                "`~> {{` makes one record PER ROW, and the metadata group \
-                                 '{key}' inside it has no group of rows to summarize"
+                        return Err(DelightQLError::from(Constraint::MetadataPerRow {
+                            message: format!(
+                                "the metadata group '{key}' stands in a record with no \
+                                 grouping keys written; write the keys the record stands \
+                                 for: `%(keys ~> {{ …, \"{key}\": col:~> {{…}} }})`"
                             ),
-                            "write the grouping keys, so the record stands for a group: \
-                             `%(keys ~> {{ … }})`",
-                        ));
+                        }));
                     }
                 }
             }
@@ -623,15 +571,14 @@ pub(super) fn resolve_group_via_fold(
     }
     if let Some(duplicate) = duplicate_published(&fold.core.identities, &output) {
         if pivot_names.contains(&duplicate) {
-            return Err(DelightQLError::validation_error_categorized(
-                "constraint/pivot",
-                "Duplicate pivot column name",
-                "Disambiguate pivot values with a format string",
-            ));
+            return Err(DelightQLError::from(Constraint::Pivot {
+                message: "Duplicate pivot column name".to_string(),
+            }));
         }
-        return Err(DelightQLError::validation_error(
-            "Duplicate output name in grouped projection",
-            "Rename one output or disambiguate pivot values with a format string",
+        return Err(crate::diagnostic::DelightQLError::from(
+            crate::diagnostic::Constraint::General {
+                message: "Duplicate output name in grouped projection".to_string(),
+            },
         ));
     }
 

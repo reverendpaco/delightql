@@ -3,6 +3,7 @@
 // Modularized resolver components
 // These handle the actual resolution of AST nodes from unresolved to resolved state
 
+use crate::diagnostic::Internal;
 pub(super) mod domain_expressions;
 pub(super) mod functions;
 pub(super) mod helpers;
@@ -13,7 +14,6 @@ pub(crate) mod tree_group_analysis;
 // Re-export the public interface functions for use by the resolver
 pub(in crate::pipeline::resolver) use predicates::build_using_all_correlation_filters;
 pub(in crate::pipeline::resolver) use predicates::build_using_correlation_filters;
-pub(in crate::pipeline::resolver) use predicates::synthesize_using_correlation;
 
 pub(in crate::pipeline::resolver) use operators::resolve_operator_via_fold;
 
@@ -92,9 +92,9 @@ fn declared_environment(
         .map(|(position, metadata)| {
             let column = metadata.identity();
             let named = registry.identities.published(column).ok_or_else(|| {
-                crate::error::DelightQLError::database_error(
+                Internal::invariant(
+                    "resolver::resolving::mod",
                     "a declared DDL column has no published name",
-                    "DDL declaration environment",
                 )
             })?;
             Ok(crate::relation::form::AnonymousSlot::Binder {
@@ -106,11 +106,11 @@ fn declared_environment(
         })
         .collect::<crate::error::Result<_>>()?;
     super::ResolvedRelation::declared_row(
-        crate::relation::form::AnonymousSpec {
-            shape: crate::relation::form::AnonymousShape::Tabular,
-            slots: &slots,
-            answers_to: None,
-        },
+        crate::relation::form::AnonymousSpec::plain(
+            crate::relation::form::AnonymousShape::Tabular,
+            &slots,
+            None,
+        ),
         &registry.identities,
     )
 }

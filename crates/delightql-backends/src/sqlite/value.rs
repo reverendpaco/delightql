@@ -3,7 +3,6 @@
 /// Type-safe SQL value representation
 ///
 /// Preserves type information for NULL values and provides proper display formatting
-
 use std::fmt;
 
 /// Represents a SQL value with proper type information
@@ -26,7 +25,7 @@ impl SqlValue {
     pub fn is_null(&self) -> bool {
         matches!(self, SqlValue::Null)
     }
-    
+
     /// Convert to display string for output formatting
     pub fn to_display_string(&self) -> String {
         match self {
@@ -37,11 +36,11 @@ impl SqlValue {
             SqlValue::Blob(b) => format!("<blob:{} bytes>", b.len()),
         }
     }
-    
+
     /// Convert from rusqlite Value
     pub fn from_rusqlite_value(row: &rusqlite::Row, index: usize) -> rusqlite::Result<Self> {
         use rusqlite::types::ValueRef;
-        
+
         match row.get_ref(index)? {
             ValueRef::Null => Ok(SqlValue::Null),
             ValueRef::Integer(i) => Ok(SqlValue::Integer(i)),
@@ -61,16 +60,22 @@ impl fmt::Display for SqlValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_sql_value_display() {
         assert_eq!(SqlValue::Null.to_display_string(), "NULL");
         assert_eq!(SqlValue::Integer(42).to_display_string(), "42");
         assert_eq!(SqlValue::Real(3.14).to_display_string(), "3.14");
-        assert_eq!(SqlValue::Text("hello".to_string()).to_display_string(), "hello");
-        assert_eq!(SqlValue::Blob(vec![1, 2, 3]).to_display_string(), "<blob:3 bytes>");
+        assert_eq!(
+            SqlValue::Text("hello".to_string()).to_display_string(),
+            "hello"
+        );
+        assert_eq!(
+            SqlValue::Blob(vec![1, 2, 3]).to_display_string(),
+            "<blob:3 bytes>"
+        );
     }
-    
+
     #[test]
     fn test_null_checking() {
         assert!(SqlValue::Null.is_null());

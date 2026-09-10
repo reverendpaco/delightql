@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 use crate::duckdb::connection::DuckDBConnectionManager;
+use delightql_types::diagnostic::{DuckDb, Resolution, Runtime};
 /// DuckDB SQL Execution Interface
 ///
 /// Provides SQL execution capabilities for DuckDB databases with support for
@@ -84,7 +85,7 @@ impl DuckDBPreparedStatement {
 impl PreparedStatement for DuckDBPreparedStatement {
     fn execute(&mut self, params: &[&dyn std::fmt::Display]) -> Result<QueryResult> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -93,9 +94,9 @@ impl PreparedStatement for DuckDBPreparedStatement {
             )
         })?;
 
-        let mut stmt = conn
-            .prepare(&self.sql)
-            .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        let mut stmt = conn.prepare(&self.sql).map_err(|e| DuckDb::Engine {
+            message: format!("DuckDB error: {}", e),
+        })?;
 
         // Convert parameters to rusqlite format
         let param_values: Vec<String> = params.iter().map(|p| p.to_string()).collect();
@@ -125,11 +126,19 @@ impl PreparedStatement for DuckDBPreparedStatement {
                 }
                 Ok(row_values)
             })
-            .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("DuckDB error: {}", e),
+                })
+            })?;
 
         let mut result_rows = Vec::new();
         for row in rows {
-            result_rows.push(row.map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?);
+            result_rows.push(row.map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("DuckDB error: {}", e),
+                })
+            })?);
         }
 
         Ok(QueryResult::new(columns, result_rows))
@@ -137,7 +146,7 @@ impl PreparedStatement for DuckDBPreparedStatement {
 
     fn execute_statement(&mut self, params: &[&dyn std::fmt::Display]) -> Result<usize> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -146,9 +155,9 @@ impl PreparedStatement for DuckDBPreparedStatement {
             )
         })?;
 
-        let mut stmt = conn
-            .prepare(&self.sql)
-            .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        let mut stmt = conn.prepare(&self.sql).map_err(|e| DuckDb::Engine {
+            message: format!("DuckDB error: {}", e),
+        })?;
 
         // Convert parameters to rusqlite format
         let param_values: Vec<String> = params.iter().map(|p| p.to_string()).collect();
@@ -157,9 +166,11 @@ impl PreparedStatement for DuckDBPreparedStatement {
             .map(|s| s as &dyn duckdb::ToSql)
             .collect();
 
-        let affected = stmt
-            .execute(param_refs.as_slice())
-            .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        let affected = stmt.execute(param_refs.as_slice()).map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("DuckDB error: {}", e),
+            })
+        })?;
 
         Ok(affected)
     }
@@ -202,7 +213,7 @@ impl DuckDBExecutorImpl {
 impl DuckDBExecutor for DuckDBExecutorImpl {
     fn execute_query(&mut self, sql: &str) -> Result<QueryResult> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -211,14 +222,11 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
             )
         })?;
 
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| DelightQLError::DatabaseOperationError {
-                message: "Failed to prepare SQL statement".to_string(),
-                details: format!("DuckDB error: {}", e),
-                source: Some(Box::new(e)),
-                subcategory: None,
-            })?;
+        let mut stmt = conn.prepare(sql).map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("Failed to prepare SQL statement: DuckDB error: {}", e),
+            })
+        })?;
 
         // Execute the query - this makes column info available
         let rows = stmt
@@ -236,21 +244,19 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
                 }
                 Ok(values)
             })
-            .map_err(|e| DelightQLError::DatabaseOperationError {
-                message: "Failed to execute query".to_string(),
-                details: format!("DuckDB error: {}", e),
-                source: Some(Box::new(e)),
-                subcategory: None,
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to execute query: DuckDB error: {}", e),
+                })
             })?;
 
         // Collect rows first
         let mut result_rows = Vec::new();
         for row_result in rows {
-            let row = row_result.map_err(|e| DelightQLError::DatabaseOperationError {
-                message: "Failed to fetch row".to_string(),
-                details: format!("DuckDB error: {}", e),
-                source: Some(Box::new(e)),
-                subcategory: None,
+            let row = row_result.map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to fetch row: DuckDB error: {}", e),
+                })
             })?;
             result_rows.push(row);
         }
@@ -271,7 +277,7 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
 
     fn execute_statement(&mut self, sql: &str) -> Result<usize> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -280,14 +286,18 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
             )
         })?;
 
-        let affected = conn.execute(sql, []).map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        let affected = conn.execute(sql, []).map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("DuckDB error: {}", e),
+            })
+        })?;
 
         Ok(affected)
     }
 
     fn execute_transaction(&mut self, statements: &[&str]) -> Result<Vec<usize>> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -297,8 +307,11 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
         })?;
 
         // Begin transaction
-        conn.execute("BEGIN TRANSACTION", [])
-            .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        conn.execute("BEGIN TRANSACTION", []).map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("DuckDB error: {}", e),
+            })
+        })?;
 
         let mut results = Vec::new();
 
@@ -309,14 +322,19 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
                 Err(e) => {
                     // Rollback on error
                     let _ = conn.execute("ROLLBACK", []);
-                    return Err(DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()));
+                    return Err(DelightQLError::from(DuckDb::Engine {
+                        message: format!("DuckDB error: {}", e),
+                    }));
                 }
             }
         }
 
         // Commit transaction
-        conn.execute("COMMIT", [])
-            .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        conn.execute("COMMIT", []).map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("DuckDB error: {}", e),
+            })
+        })?;
 
         Ok(results)
     }
@@ -330,7 +348,7 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
 
     fn table_exists(&self, table_name: &str) -> Result<bool> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -342,14 +360,18 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
         let sql = "SELECT COUNT(*) FROM sqlite_master WHERE name=?";
         let count: i64 = conn
             .query_row(sql, [table_name], |row| row.get(0))
-            .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("DuckDB error: {}", e),
+                })
+            })?;
 
         Ok(count > 0)
     }
 
     fn get_table_schema(&self, table_name: &str) -> Result<TableSchema> {
         let conn = self.connection.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Database connection lock was poisoned",
                 format!(
                     "Previous operation panicked. Consider restarting the connection. Error: {}",
@@ -362,18 +384,27 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
         let sql = "SELECT COUNT(*) FROM sqlite_master WHERE name=?";
         let count: i64 = conn
             .query_row(sql, [table_name], |row| row.get(0))
-            .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("DuckDB error: {}", e),
+                })
+            })?;
 
         if count == 0 {
-            return Err(DelightQLError::validation_error(
-                format!("Table '{}' does not exist", table_name),
-                "Schema introspection",
-            ));
+            return Err(Resolution::Table {
+                table: table_name.to_string(),
+                context: "Schema introspection".to_string(),
+            }
+            .into());
         }
 
         // Get column information using PRAGMA table_info
         let sql = format!("PRAGMA table_info({})", table_name);
-        let mut stmt = conn.prepare(&sql).map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+        let mut stmt = conn.prepare(&sql).map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("DuckDB error: {}", e),
+            })
+        })?;
 
         let column_rows = stmt
             .query_map([], |row| {
@@ -392,11 +423,19 @@ impl DuckDBExecutor for DuckDBExecutorImpl {
                     primary_key: pk,
                 })
             })
-            .map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?;
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("DuckDB error: {}", e),
+                })
+            })?;
 
         let mut columns = Vec::new();
         for column in column_rows {
-            columns.push(column.map_err(|e| DelightQLError::database_error(format!("DuckDB error: {}", e), String::new()))?);
+            columns.push(column.map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("DuckDB error: {}", e),
+                })
+            })?);
         }
 
         Ok(TableSchema {

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-// inner_relation.rs - INNER-RELATION pattern handling and correlation filter hoisting
+// inner_relation.rs - INNER-RELATION pattern handling and correlation hoisting
 
 use super::context::FlattenContext;
 use super::expression::add_predicate;
-use super::rewrite::rewrite_with_hygienic_names;
 use super::types::{FlatSegment, FlatTable};
+use crate::diagnostic::Internal;
 use crate::error::Result;
 use crate::pipeline::asts::resolved::{self, InnerRelationPattern};
 
-/// Flatten an INNER-RELATION (correlated subquery)
+/// Flatten an INNER-RELATION (a derived table, correlated or not).
+///
+/// THE CORRELATIONS ARE THE PATTERN'S. Classification took the typed
+/// correlated steps out of the subquery and holds their conditions on the
+/// pattern; the flattener hoists them onto the enclosing segment exactly as
+/// written, where the analyzer places them on the join that brings the
+/// derived table in. The interior occurrences a hoisted condition names are
+/// readable at the boundary BY CONSTRUCTION — every relation from the
+/// correlation act to the boundary carried them — so the condition is
+/// neither renamed nor searched for a carrier, and the boundary answers for
+/// those occurrences when the analyzer asks which table owns them.
 pub(super) fn flatten_inner_relation(
     pattern: InnerRelationPattern<resolved::Resolved>,
     head: resolved::Grelex,
@@ -18,171 +28,62 @@ pub(super) fn flatten_inner_relation(
     segment: &mut FlatSegment,
     ctx: &mut FlattenContext,
 ) -> Result<()> {
-    // INNER-RELATION: Pattern-specific handling
-
-    // For CDT-SJ and CDT-GJ: Extract correlation filters from inside subquery
-    // and add them as segment predicates so FAR can handle them
-    // Extract hygienic injections if present
-    // PHASE 3 FIX: Re-classify Indeterminate patterns
-    // During resolution, some patterns may be left as Indeterminate because
-    // correlation detection couldn't run (e.g., unresolved qualifiers).
-    // Now in the refiner, we can re-run pattern classification.
-    //
-    // NOTE: Only Indeterminate patterns are reclassified. UncorrelatedDerivedTable
-    // patterns are trusted — the resolver creates them for view expansions where
-    // the subquery is definitionally uncorrelated. Reclassifying UDT would cause
-    // the correlation heuristic to misidentify internal join conditions (e.g.,
-    // u.id = r.user_id) as correlation filters, hoisting them out of the subquery.
-    let pattern = if matches!(
-        pattern,
-        resolved::InnerRelationPattern::Indeterminate { .. }
-    ) {
-        match pattern {
-            resolved::InnerRelationPattern::Indeterminate {
-                identifier,
-                subquery,
-                ..
-            } => {
-                // Re-run pattern classification
-                // This fixes cases where pattern classification failed during resolution
-                // because qualifiers weren't fully resolved yet
-                super::super::pattern_classifier::classify_inner_relation_pattern(
-                    identifier.clone(),
-                    *subquery.clone(),
-                    &ctx.identities,
-                )?
-            }
-            other => panic!(
-                "catch-all hit in flattener/inner_relation.rs (re-classify pattern): {:?}",
-                other
-            ),
-        }
-    } else {
-        pattern.clone()
-    };
-
-    crate::probe::probe!(
-        spec,
-        "flatten_inner_relation: {:?} -> FlatTable with a hardcoded Glob",
-        std::mem::discriminant(&pattern)
-    );
-    // What the subquery publishes for a stripped correlation column is a
-    // question its own heading answers. Asking it here, rather than reading a
-    // list the classifier attached, means the carriers a boundary republished
-    // and the carriers a hoisted condition names cannot come apart.
-    let carriers = match &pattern {
-        resolved::InnerRelationPattern::CorrelatedScalarJoin { subquery, .. }
-        | resolved::InnerRelationPattern::CorrelatedGroupJoin { subquery, .. } => {
-            super::super::pattern_classifier::correlation_carriers(subquery, &ctx.identities)?
-        }
-        resolved::InnerRelationPattern::UncorrelatedDerivedTable { .. }
-        | resolved::InnerRelationPattern::Indeterminate { .. } => vec![],
-    };
-
-    match &pattern {
-        resolved::InnerRelationPattern::CorrelatedScalarJoin {
-            identifier: _,
-            correlation_filters,
-            subquery,
-            ..
-        }
-        | resolved::InnerRelationPattern::CorrelatedGroupJoin {
-            identifier: _,
-            correlation_filters,
-            aggregations: _,
-            subquery,
-            ..
-        } => {
-            // PHASE 3: RECURSIVELY FLATTEN THE SUBQUERY
-            // CRITICAL: Remove correlation filters from the subquery AST BEFORE flattening
-            // The filters have been extracted by pattern_classifier but are still in the AST
-            // We need to remove them so they don't get flattened into the child segment
-            let cleaned_subquery = super::super::rebuilder::remove_correlation_filters_from_expr(
+    let (subquery, correlation_filters): (resolved::Chain, &[resolved::TruthExpression]) =
+        match &pattern {
+            InnerRelationPattern::CorrelatedScalarJoin {
                 subquery,
                 correlation_filters,
-            );
-
-            let operand = cleaned_subquery.semantic_relation();
-            let flattened_subquery = super::flatten(cleaned_subquery, operand, ctx.identities)?;
-
-            // Extract correlation filters and add to PARENT segment predicates
-            // This hoists them out of the subquery so they become JOIN ON clauses
-            for filter in correlation_filters {
-                let mut rewritten_filter = filter.clone();
-
-                if !carriers.is_empty() {
-                    rewritten_filter = rewrite_with_hygienic_names(rewritten_filter, &carriers)?;
-                }
-
-                add_predicate(
-                    rewritten_filter,
-                    resolved::FilterOrigin::UserWritten,
-                    segment,
-                    ctx,
-                );
+                ..
             }
+            | InnerRelationPattern::CorrelatedGroupJoin {
+                subquery,
+                correlation_filters,
+                ..
+            } => ((**subquery).clone(), correlation_filters.as_slice()),
+            InnerRelationPattern::UncorrelatedDerivedTable { subquery, .. } => {
+                ((**subquery).clone(), &[])
+            }
+            InnerRelationPattern::Indeterminate { .. } => {
+                return Err(Internal::invariant(
+                    "refiner::flattener",
+                    "an unclassified interior reached the flattener: every inner relation is \
+                     classified before the segment standing over it flattens",
+                ));
+            }
+        };
 
-            let identity = result;
-            // Add the table with BOTH the pattern AND the flattened subquery
-            // The pattern is kept for metadata, the flattened subquery is used by rebuilder
-            segment.tables.push(FlatTable {
-                relation: identity,
-                head: Some(head),
-                position: ctx.position,
-                _scope_id: ctx.scope_id,
-                access: resolved::Access::All,
-                outer,
-                anonymous_data: None,
-                subquery_segment: Some(Box::new(flattened_subquery)), // PHASE 3: Store flattened subquery
-                pipe_expr: None,
-                _table_filters: vec![],
-                tvf_data: None,
-            });
-            ctx.position += 1;
-        }
-        _ => {
-            // UDT patterns are trusted as uncorrelated — the resolver creates them
-            // for view expansions where the subquery is definitionally uncorrelated.
-            // Do NOT re-run correlation detection here; the heuristic would misidentify
-            // internal join conditions (e.g., u.id = r.user_id) as correlation filters
-            // and hoist them out of the subquery, producing wrong results.
-
-            // Default: UDT with no correlation, or Indeterminate
-            let subquery_opt = match &pattern {
-                resolved::InnerRelationPattern::Indeterminate { .. } => None,
-                resolved::InnerRelationPattern::UncorrelatedDerivedTable { subquery, .. } => {
-                    Some(subquery)
-                }
-                // These shouldn't reach here (handled above), but for completeness
-                resolved::InnerRelationPattern::CorrelatedScalarJoin { .. }
-                | resolved::InnerRelationPattern::CorrelatedGroupJoin { .. } => None,
-            };
-
-            // Recursively flatten subquery if present, passing through inherited scope
-            let flattened_subquery_opt = if let Some(subquery) = subquery_opt {
-                let subquery = (**subquery).clone();
-                let operand = subquery.semantic_relation();
-                Some(Box::new(super::flatten(subquery, operand, ctx.identities)?))
-            } else {
-                None
-            };
-
-            segment.tables.push(FlatTable {
-                relation: result,
-                head: Some(head),
-                position: ctx.position,
-                _scope_id: ctx.scope_id,
-                access: resolved::Access::All,
-                outer,
-                anonymous_data: None,
-                subquery_segment: flattened_subquery_opt,
-                pipe_expr: None,
-                _table_filters: vec![],
-                tvf_data: None,
-            });
-            ctx.position += 1;
-        }
+    // The subquery is flattened for the nested FAR cycle; the hoisted
+    // conditions join the PARENT segment's predicates so they become the
+    // enclosing join's own.
+    let operand = subquery.semantic_relation();
+    let flattened_subquery = super::flatten(subquery, operand, ctx.identities)?;
+    for filter in correlation_filters {
+        add_predicate(
+            filter.clone(),
+            resolved::FilterOrigin::UserWritten,
+            segment,
+            ctx,
+        );
     }
+
+    // The head travels with the table: the rebuilder crosses it into the
+    // refined phase, keeping what it publishes, and rebuilds the subquery
+    // from the flattened segment beside it.
+    segment.tables.push(FlatTable {
+        relation: result,
+        head: Some(head),
+        position: ctx.position,
+        _scope_id: ctx.scope_id,
+        access: resolved::Access::All,
+        outer,
+        anonymous_data: None,
+        narrowed: None,
+        subquery_segment: Some(Box::new(flattened_subquery)),
+        pipe_expr: None,
+        _table_filters: vec![],
+        tvf_data: None,
+    });
+    ctx.position += 1;
 
     Ok(())
 }

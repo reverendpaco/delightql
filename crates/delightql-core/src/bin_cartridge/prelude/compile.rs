@@ -19,6 +19,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::{DirectiveBinding, Effect};
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::literals::LiteralValue;
@@ -85,13 +86,12 @@ impl EffectExecutable for CompilePredicate {
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
         if arguments.len() != 2 {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(DirectiveBinding::Arity {
+                message: format!(
                     "sys::execution.compile() expects 2 arguments (stage, source), got {}",
                     arguments.len()
                 ),
-                "Invalid argument count",
-            ));
+            }));
         }
 
         let stage = extract_string_literal(&arguments[0], "stage")?;
@@ -210,17 +210,15 @@ fn compile_to_stage(
     if !matches!(stage, "cst" | "ast-unresolved") {
         pipeline.execute_to_query_unresolved()?;
         if pipeline.has_inline_ddl_blocks() {
-            return Err(DelightQLError::validation_error_categorized(
-                "effect/compile/purity",
-                format!(
+            return Err(DelightQLError::from(Effect::CompilePurity {
+                message: format!(
                     "sys::execution.compile is pure: compiling to stage '{stage}' \
                      would process an inline (~~ddl ~~) block, which registers \
                      namespaces and entities in the session. Compile to 'cst' or \
                      'ast-unresolved' to inspect this source, or run it as a query \
                      to execute it."
                 ),
-                "compile purity",
-            ));
+            }));
         }
         let query = pipeline
             .query_unresolved()
@@ -237,13 +235,12 @@ fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<Str
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
             Ok(s.clone())
         }
-        _ => Err(DelightQLError::database_error(
-            format!(
+        _ => Err(DelightQLError::from(DirectiveBinding::Value {
+            message: format!(
                 "sys::execution.compile() {} must be a string literal",
                 arg_name
             ),
-            "Invalid argument type",
-        )),
+        })),
     }
 }
 
@@ -321,9 +318,9 @@ mod purity_tests {
         }
     }
 
-    fn fresh_system() -> crate::system::DelightQLSystem {
+    fn fresh_system() -> crate::system::ReadySystem {
         let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        crate::system::DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+        crate::system::ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh in-memory system should build")
     }
 

@@ -7,6 +7,7 @@ that are both semantic and syntactic in nature (and often times both).
  - **Null semantics**: delightql opts to provide null-safe equality in contrast to SQL's `=` operator
  - **SQL semantics**: delightql defines its primary semantics via a direct mapping to SQL
  - **Evaluation**: delightql evaluates left-to-right in a manner remeniscent of concatenative languages and eschewing parenthesization
- - **Scoping**: delightql scopes left-to-right with well-known scope barriers that delimit what sections of the code may access which logic variables
+ - **Column Scoping**: delightql scopes left-to-right with well-known scope barriers that delimit what sections of the code may access which logic variables
+ - **Entity Scoping**: delightql has certain rules about what scope contexts may or may not shadow existing entities with the same name
  - **Column access**: delightql makes strong choices about how a programmer may access columns by always providing ordinal access, and forbidding named access to ambiguous or generated columns
  - **Moding rules and currying with higher-order rules**:  delightql, like Prolog, has a mechanism to mark syntax as moded for input vs output

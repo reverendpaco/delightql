@@ -1,9 +1,10 @@
 
 # Data-Oriented Tree Grouping {.dqlh}
 
-Data-oriented tree grouping uses `~>`{.delightql} followed by a compound constructor. The
-result is an array of objects (or tuples), one per distinct combination of tree
-grouping variables.
+Data-oriented tree grouping uses `~>`{.delightql} followed by a compound
+constructor. Within each stated group it collects objects or tuples from the
+input rows. Nested boundaries state the grouping hierarchy; a flat collector
+does not deduplicate its members merely because their values agree.
 
 **Simple example:**
 ```delightql
@@ -141,5 +142,4 @@ The relationship between siblings---which person was in which city -- is not
 preserved. This is inherent to the structure: siblings represent independent
 projections of the grouped data. [Trees with siblings satisfy TNF-G but not
 TNF-R; they cannot round-trip losslessly. (See Appendix A.)]{.sidenote}
-
 

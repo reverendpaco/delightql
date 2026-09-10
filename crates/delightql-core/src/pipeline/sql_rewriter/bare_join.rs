@@ -97,7 +97,7 @@ mod tests {
             .select(SelectItem::star_over_nothing())
             .from_tables(vec![from]))
         .standing_at(at)
-        .map_err(crate::error::DelightQLError::parse_error)
+        .map_err(|e| crate::diagnostic::Internal::invariant("sql_rewriter::bare_join", e))
         .expect("a star publishes no heading of its own")
     }
 
@@ -187,7 +187,7 @@ mod tests {
                 query: Box::new(QueryExpression::Select(Box::new(inner))),
             }))
         .standing_at(f.t)
-        .map_err(crate::error::DelightQLError::parse_error)
+        .map_err(|e| crate::diagnostic::Internal::invariant("sql_rewriter::bare_join", e))
         .expect("a star publishes no heading of its own");
         let stmt = legalize_bare_joins(query_stmt(outer));
         let SqlStatement::Query {

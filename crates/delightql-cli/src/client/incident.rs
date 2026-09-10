@@ -12,6 +12,8 @@
 
 use std::sync::Mutex;
 
+use delightql_types::diagnostic::{Client, DelightQLError, Internal};
+
 use super::context::process_database;
 
 /// The one severity domain, shared with `sys::diagnostics.finding`.
@@ -81,13 +83,33 @@ pub struct Incident {
 }
 
 impl Incident {
-    /// A warning or error with an identity and no input.
-    pub fn plain(kind: IncidentKind, road: &'static str, hierarchy: &str, message: String) -> Self {
+    /// One incident for an error received over the protocol: the identity
+    /// is the peer's, kept as received. Without one, the incident is the
+    /// client's unbadged row.
+    pub fn received(
+        kind: IncidentKind,
+        road: &'static str,
+        identity: Option<&str>,
+        message: &str,
+    ) -> Self {
+        let unbadged = Client::Unbadged {
+            message: message.to_string(),
+        };
+        let mut incident = Incident::of(kind, road, &unbadged.into());
+        if let Some(identity) = identity {
+            incident.uri = identity.to_string();
+        }
+        incident
+    }
+
+    /// One incident for one typed diagnostic: the identity and the prose
+    /// are the diagnostic's own, never spelled here.
+    pub fn of(kind: IncidentKind, road: &'static str, diagnostic: &DelightQLError) -> Self {
         Incident {
             kind,
             road,
-            uri: badge(hierarchy),
-            message,
+            uri: diagnostic.error_uri(),
+            message: diagnostic.to_string(),
             location: None,
             thread: None,
             input: None,
@@ -137,72 +159,34 @@ impl Incident {
 /// The full badge for a client hierarchy (`client/worker/budget` →
 /// `delightql-error://client/worker/budget`). Every hierarchy used here
 /// is a registered row; the registry test pins that.
-pub fn badge(hierarchy: &str) -> String {
-    format!("delightql-error://{hierarchy}")
+/// The identity a panic wears, as the taxonomy spells it.
+pub fn panic_uri() -> String {
+    DelightQLError::from(Internal::Panic {
+        message: String::new(),
+        location: None,
+    })
+    .error_uri()
 }
 
-pub const PANIC_URI: &str = "delightql-error://internal/panic";
-
-/// Client identities. Constants, never literals at the sites — a typo
-/// would mint a phantom no registry row explains.
-pub mod hierarchy {
-    pub const WORKER_UNAVAILABLE: &str = "client/worker/unavailable";
-    pub const WORKER_BUDGET: &str = "client/worker/budget";
-    pub const ASSISTANCE_DISABLED: &str = "client/assistance/disabled";
-    pub const PREFLIGHT_REFUSED: &str = "client/preflight/refused";
-    pub const LEDGER_WRITE_LOST: &str = "client/ledger/write_lost";
-    pub const NAMESPACE_INSTALL: &str = "client/namespace/install";
-    pub const CONFIG: &str = "client/config";
-    pub const TERMINAL: &str = "client/terminal";
-    pub const ARGUMENT: &str = "client/argument";
-    pub const FORMAT: &str = "client/format";
-    pub const SANITIZE_DISABLED: &str = "client/sanitize/disabled";
-    pub const DATABASE_UNAVAILABLE: &str = "client/database/unavailable";
-    pub const UNBADGED: &str = "client/unbadged";
-    pub const REPORT_DESCRIPTION: &str = "client/report/description";
-
-    /// Every hierarchy above, for the registry test.
-    pub const ALL: &[&str] = &[
-        WORKER_UNAVAILABLE,
-        WORKER_BUDGET,
-        ASSISTANCE_DISABLED,
-        PREFLIGHT_REFUSED,
-        LEDGER_WRITE_LOST,
-        NAMESPACE_INSTALL,
-        CONFIG,
-        TERMINAL,
-        ARGUMENT,
-        FORMAT,
-        SANITIZE_DISABLED,
-        DATABASE_UNAVAILABLE,
-        UNBADGED,
-        REPORT_DESCRIPTION,
-    ];
-}
-
-/// Say it on stderr AND record it. The one road for a client warning or
-/// error that is not already a row somewhere (a submission's error is the
-/// ledger's; a budget incident is recorded before it is announced).
-/// Without a process database the words still reach the human.
-pub fn report(kind: IncidentKind, road: &'static str, hierarchy: &str, message: String) {
+pub fn report(kind: IncidentKind, road: &'static str, diagnostic: Client) {
     let label = match kind {
         IncidentKind::Warning => "warning",
         IncidentKind::Error => "error",
         IncidentKind::Info => "info",
         IncidentKind::Panic => "panic",
     };
-    eprintln!("{label}: {message}");
+    eprintln!("{label}: {diagnostic}");
     if let Some(db) = process_database() {
-        db.record_incident(Incident::plain(kind, road, hierarchy, message));
+        db.record_incident(Incident::of(kind, road, &diagnostic.into()));
     }
 }
 
-pub fn warning(road: &'static str, hierarchy: &str, message: String) {
-    report(IncidentKind::Warning, road, hierarchy, message)
+pub fn warning(road: &'static str, diagnostic: Client) {
+    report(IncidentKind::Warning, road, diagnostic)
 }
 
-pub fn error(road: &'static str, hierarchy: &str, message: String) {
-    report(IncidentKind::Error, road, hierarchy, message)
+pub fn error(road: &'static str, diagnostic: Client) {
+    report(IncidentKind::Error, road, diagnostic)
 }
 
 /// A panic as the hook saw it: message, location, and the thread it was
@@ -249,7 +233,7 @@ impl PanicRecord {
         Incident {
             kind: IncidentKind::Panic,
             road,
-            uri: PANIC_URI.to_string(),
+            uri: panic_uri(),
             message: self.message,
             location: self.location,
             thread: Some(self.thread),
@@ -269,8 +253,9 @@ mod tests {
     /// ordinary handle — and nothing registered under client/ lacks a
     /// constant here.
     #[test]
-    fn every_client_hierarchy_is_registered() {
-        let mut handle = crate::connection::open_handle().expect("handle");
+    fn every_client_leaf_is_registered() {
+        let mut handle = crate::connection::open_handle(crate::connection::SessionProfile::client())
+            .expect("handle");
         let mut session = handle.session().expect("session");
         let rows = crate::exec_ng::run_dql_query(
             "sys::identifiers.identifier(*), kind = \"error\" |> (hierarchy)",
@@ -278,29 +263,40 @@ mod tests {
         )
         .expect("the registry answers");
         let col = rows.columns.iter().position(|c| c == "hierarchy").unwrap();
-        let registered: std::collections::BTreeSet<String> =
-            rows.rows.iter().map(|r| r[col].clone()).collect();
-        for hierarchy in hierarchy::ALL {
-            assert!(
-                registered.contains(*hierarchy),
-                "client hierarchy '{hierarchy}' has no registry row"
-            );
-        }
-        for h in registered.iter().filter(|h| h.starts_with("client/")) {
-            assert!(
-                hierarchy::ALL.contains(&h.as_str()),
-                "registry row '{h}' has no client constant"
-            );
-        }
+        let registered: std::collections::BTreeSet<String> = rows
+            .rows
+            .iter()
+            .map(|r| r[col].clone())
+            .filter(|h| h.starts_with("client/"))
+            .collect();
+        let declared: std::collections::BTreeSet<String> = delightql_types::diagnostic::inventory()
+            .into_iter()
+            .map(|row| row.hierarchy)
+            .filter(|h| h.starts_with("client/"))
+            .collect();
+        assert_eq!(
+            registered, declared,
+            "the client rows are the client leaves"
+        );
     }
 
-    /// The dedup key ignores the message and honors every identity field.
     #[test]
     fn specimen_keys_distinguish_identity_not_wording() {
-        let a = Incident::plain(IncidentKind::Warning, "ledger", hierarchy::LEDGER_WRITE_LOST, "x".into());
+        let a = Incident::of(
+            IncidentKind::Warning,
+            "ledger",
+            &Client::LedgerWriteLost {
+                message: "x".into(),
+            }
+            .into(),
+        );
         let mut b = a.clone();
         b.message = "y".into();
-        assert_eq!(a.specimen_key(), b.specimen_key(), "wording is not identity");
+        assert_eq!(
+            a.specimen_key(),
+            b.specimen_key(),
+            "wording is not identity"
+        );
         let mut c = a.clone();
         c.road = "main";
         assert_ne!(a.specimen_key(), c.specimen_key());
@@ -312,12 +308,24 @@ mod tests {
         assert_ne!(a.specimen_key(), e.specimen_key());
 
         // A panic's input is reproduction, not identity.
-        let mut p = Incident::plain(IncidentKind::Panic, "parser_worker", "internal/panic", "boom".into());
+        let mut p = Incident::of(
+            IncidentKind::Panic,
+            "parser_worker",
+            &Internal::Panic {
+                message: "boom".into(),
+                location: None,
+            }
+            .into(),
+        );
         p.location = Some("w.rs:9".into());
         p.input = Some("u".into());
         let mut q = p.clone();
         q.input = Some("us".into());
-        assert_eq!(p.specimen_key(), q.specimen_key(), "prefixes of one line are one defect");
+        assert_eq!(
+            p.specimen_key(),
+            q.specimen_key(),
+            "prefixes of one line are one defect"
+        );
         let mut r = p.clone();
         r.location = Some("w.rs:10".into());
         assert_ne!(p.specimen_key(), r.specimen_key());

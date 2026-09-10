@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use delightql_cli::client::context::Mode;
 use delightql_cli::client::database::{ClientDatabase, InputKind, InputOutcome};
-use delightql_cli::client::mount::{install_repl_namespace, open_client_handle};
+use delightql_cli::connection::{open_handle, SessionProfile};
 
 fn dql_exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_dql"))
@@ -113,8 +113,7 @@ fn a_tarball_replays_with_its_recorded_arguments_and_extracted_database() {
 
     // A recorded session: argv names the database; the ledger queries it.
     let db = Arc::new(ClientDatabase::open_on(Mode::Other).unwrap());
-    let mut handle = open_client_handle(&db).expect("handle");
-    install_repl_namespace(&mut *handle).expect("install repl::*");
+    let mut handle = open_handle(SessionProfile::Client(Some(db.clone()))).expect("handle");
     let (id, _) = db.record_input(InputKind::Dql, "orders(*)");
     db.close_input(id, InputOutcome::Succeeded, None, None, Some(1.0));
     let report = delightql_cli::client::bug::write_bug_report(&db, &mut *handle, None, Some(&user_db))

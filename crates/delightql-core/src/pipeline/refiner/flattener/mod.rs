@@ -9,7 +9,6 @@ mod context;
 mod expression;
 mod inner_relation;
 mod predicates;
-mod rewrite;
 mod types;
 
 // Re-export public types

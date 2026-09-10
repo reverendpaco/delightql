@@ -106,20 +106,22 @@ fn main() {
             .unwrap_or_else(|| "\x1E".to_string());
         emit_error_record(
             &prefix,
-            Some(delightql_cli::client::incident::PANIC_URI),
+            Some(&delightql_cli::client::incident::panic_uri()),
             &format!(
                 "{msg}{at} — this is a dql bug, please report it \
                  (`dql explain internal/panic`; RUST_BACKTRACE=1 for a backtrace)"
             ),
         );
-        delightql_cli::client::incident::queue_panic(delightql_cli::client::incident::PanicRecord {
-            message: msg,
-            location,
-            thread: std::thread::current()
-                .name()
-                .unwrap_or("unnamed")
-                .to_string(),
-        });
+        delightql_cli::client::incident::queue_panic(
+            delightql_cli::client::incident::PanicRecord {
+                message: msg,
+                location,
+                thread: std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_string(),
+            },
+        );
         if std::env::var_os("RUST_BACKTRACE").is_some() {
             default_hook(info);
         }
@@ -146,35 +148,38 @@ fn main() {
 
         let error_display = format!("{}", e);
         // Core's errors are core's rows (sys::diagnostics.finding, written
-        // where they were raised). Everything else reaching this boundary
-        // is the client's, badged or not, and is recorded as such.
-        use delightql_cli::client::incident::{hierarchy, Incident, IncidentKind};
+        // where they were raised) and carry their own identity. Everything
+        // else reaching this boundary is the client's and unbadged.
+        use delightql_cli::client::incident::{Incident, IncidentKind};
         if let Some(dql_err) = e.downcast_ref::<delightql_core::error::DelightQLError>() {
             emit_error_record(&prefix, Some(&dql_err.error_uri()), &error_display);
-        } else if let Some(rest) = error_display
-            .strip_prefix('[')
-            .and_then(|r| r.split_once("] "))
-        {
-            // Identity prefix from protocol error: "[dql/parse/general] Syntax: ..."
-            emit_error_record(&prefix, Some(rest.0), rest.1);
+        } else if let Some(api_err) = e.downcast_ref::<delightql_core::api::ApiError>() {
+            // A received error: the identity is the server's, carried as
+            // bytes and shown as received. The client's ledger records it
+            // under that identity, badged by the server rather than here.
+            let message = match api_err.kind {
+                Some(kind) => format!("{kind:?}: {}", api_err.message),
+                None => api_err.message.clone(),
+            };
+            emit_error_record(&prefix, api_err.identity.as_deref(), &message);
             if let Some(db) = delightql_cli::client::context::process_database() {
-                let mut incident = Incident::plain(
+                db.record_incident(Incident::received(
                     IncidentKind::Error,
                     "main",
-                    hierarchy::UNBADGED,
-                    rest.1.to_string(),
-                );
-                incident.uri = rest.0.to_string();
-                db.record_incident(incident);
+                    api_err.identity.as_deref(),
+                    &message,
+                ));
             }
         } else {
             emit_error_record(&prefix, None, &error_display);
             if let Some(db) = delightql_cli::client::context::process_database() {
-                db.record_incident(Incident::plain(
+                db.record_incident(Incident::of(
                     IncidentKind::Error,
                     "main",
-                    hierarchy::UNBADGED,
-                    error_display.clone(),
+                    &delightql_types::diagnostic::Client::Unbadged {
+                        message: error_display.clone(),
+                    }
+                    .into(),
                 ));
             }
         }

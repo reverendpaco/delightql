@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use super::{ColumnInfo, Schema, TableInfo};
 /// DuckDB Schema Provider
 ///
 /// Implements schema introspection for DuckDB databases using information_schema.
-use super::{ColumnInfo, Schema, TableInfo};
+use delightql_types::diagnostic::{DuckDb, Resolution, Runtime, Semantic};
 use delightql_types::{DelightQLError, Result};
 use duckdb::{params, Connection};
 use std::fmt::Debug;
@@ -45,7 +46,7 @@ impl Schema for DuckDBSchema {
         // Handle SQLite system tables specially since they don't appear in sqlite_master
         if table.starts_with("sqlite_") {
             let conn = self.conn.lock().map_err(|poison_err| {
-                DelightQLError::connection_poison_error(
+                Runtime::poisoned(
                     "Failed to acquire database lock for schema operations",
                     format!("Connection was poisoned. Error: {}", poison_err),
                 )
@@ -60,7 +61,9 @@ impl Schema for DuckDBSchema {
         self.get_table_info(_schema, table)
             .map(|_| true)
             .or_else(|e| match e {
-                DelightQLError::TableNotFoundError { .. } => Ok(false),
+                DelightQLError::Semantic(Semantic::Resolution(Resolution::Table { .. })) => {
+                    Ok(false)
+                }
                 _ => Err(e),
             })
     }
@@ -70,7 +73,7 @@ impl Schema for DuckDBSchema {
         // The schema parameter is ignored
 
         let conn = self.conn.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire database lock for schema operations",
                 format!("Connection was poisoned. Error: {}", poison_err),
             )
@@ -92,21 +95,20 @@ impl Schema for DuckDBSchema {
         };
 
         if !exists {
-            return Err(DelightQLError::table_not_found_error(
-                table,
-                "Table does not exist in database",
-            ));
+            return Err(Resolution::Table {
+                table: table.to_string(),
+                context: "Table does not exist in database".to_string(),
+            }
+            .into());
         }
 
         // Use PRAGMA table_info to get column information
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info({})", table))
             .map_err(|e| {
-                DelightQLError::database_error_with_source(
-                    "Failed to prepare PRAGMA statement",
-                    e.to_string(),
-                    Box::new(e),
-                )
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to prepare PRAGMA statement: {}", e),
+                })
             })?;
 
         let columns = stmt
@@ -127,19 +129,15 @@ impl Schema for DuckDBSchema {
                 })
             })
             .map_err(|e| {
-                DelightQLError::database_error_with_source(
-                    "Failed to query table info",
-                    e.to_string(),
-                    Box::new(e),
-                )
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to query table info: {}", e),
+                })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
-                DelightQLError::database_error_with_source(
-                    "Failed to collect column info",
-                    e.to_string(),
-                    Box::new(e),
-                )
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to collect column info: {}", e),
+                })
             })?;
 
         Ok(TableInfo {
@@ -151,7 +149,7 @@ impl Schema for DuckDBSchema {
 
     fn list_tables(&self, _schema: Option<&str>) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|poison_err| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire database lock for schema operations",
                 format!("Connection was poisoned. Error: {}", poison_err),
             )
@@ -160,29 +158,23 @@ impl Schema for DuckDBSchema {
         let mut stmt = conn
             .prepare("SELECT DISTINCT name FROM sqlite_master ORDER BY name")
             .map_err(|e| {
-                DelightQLError::database_error_with_source(
-                    "Failed to prepare table list query",
-                    e.to_string(),
-                    Box::new(e),
-                )
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to prepare table list query: {}", e),
+                })
             })?;
 
         let tables = stmt
             .query_map([], |row| row.get(0))
             .map_err(|e| {
-                DelightQLError::database_error_with_source(
-                    "Failed to query table list",
-                    e.to_string(),
-                    Box::new(e),
-                )
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to query table list: {}", e),
+                })
             })?
             .collect::<std::result::Result<Vec<String>, _>>()
             .map_err(|e| {
-                DelightQLError::database_error_with_source(
-                    "Failed to collect table names",
-                    e.to_string(),
-                    Box::new(e),
-                )
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to collect table names: {}", e),
+                })
             })?;
 
         Ok(tables)
@@ -335,10 +327,14 @@ mod tests {
         let result = schema.get_table_info(None, "nonexistent");
         assert!(result.is_err());
 
-        if let Err(DelightQLError::TranspilationError { message, .. }) = result {
-            assert!(message.contains("not found"));
-        } else {
-            panic!("Expected TranspilationError");
+        match result {
+            Err(DelightQLError::Semantic(Semantic::Resolution(Resolution::Table {
+                table,
+                ..
+            }))) => {
+                assert_eq!(table, "nonexistent");
+            }
+            other => panic!("expected a table-not-found refusal, got {other:?}"),
         }
     }
 }

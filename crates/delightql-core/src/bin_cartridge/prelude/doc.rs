@@ -19,6 +19,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::{DirectiveBinding, Runtime};
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::*;
@@ -73,24 +74,22 @@ impl EffectExecutable for DocPredicate {
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
         if arguments.len() != 2 {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(DirectiveBinding::Arity {
+                message: format!(
                     "doc!() expects 2 arguments (target, doc), got {}. \
                      Pipe a relation of (target, doc): `... |> doc!(*)`.",
                     arguments.len()
                 ),
-                "Invalid argument count",
-            ));
+            }));
         }
 
         let target = extract_string_literal(&arguments[0], "target")?;
         let doc = extract_string_literal(&arguments[1], "doc")?;
 
         if target.is_empty() {
-            return Err(DelightQLError::database_error(
-                "doc!() target cannot be empty",
-                "Empty target",
-            ));
+            return Err(DelightQLError::from(DirectiveBinding::Value {
+                message: "doc!() target cannot be empty".to_string(),
+            }));
         }
 
         let (target, doc) = system.set_entity_doc(&target, &doc)?;
@@ -125,22 +124,20 @@ impl EffectExecutable for DocPredicate {
         let mut validated: Vec<(String, String)> = Vec::with_capacity(rows.len());
         for row in rows {
             if row.len() != 2 {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(DirectiveBinding::Arity {
+                    message: format!(
                         "doc!() expects rows of (target, doc), got a {}-column row. \
                          Pipe a relation of (target, doc): `... |> doc!(*)`.",
                         row.len()
                     ),
-                    "Invalid argument count",
-                ));
+                }));
             }
             let target = extract_string_literal(&row[0], "target")?;
             let doc = extract_string_literal(&row[1], "doc")?;
             if target.is_empty() {
-                return Err(DelightQLError::database_error(
-                    "doc!() target cannot be empty",
-                    "Empty target",
-                ));
+                return Err(DelightQLError::from(DirectiveBinding::Value {
+                    message: "doc!() target cannot be empty".to_string(),
+                }));
             }
             validated.push((target, doc));
         }
@@ -154,14 +151,14 @@ impl EffectExecutable for DocPredicate {
         fn bootstrap_txn(system: &crate::system::DelightQLSystem, sql: &str) -> Result<()> {
             let conn = system.get_bootstrap_connection();
             let guard = conn.lock().map_err(|e| {
-                DelightQLError::connection_poison_error(
+                Runtime::poisoned(
                     "Failed to acquire bootstrap lock for doc! batch",
                     format!("Connection was poisoned: {}", e),
                 )
             })?;
-            guard.execute_batch(sql).map_err(|e| {
-                DelightQLError::database_error(format!("doc! batch {sql}: {e}"), "doc! atomicity")
-            })
+            guard
+                .execute_batch(sql)
+                .map_err(|e| Runtime::catalog(format!("doc! batch {sql}: {e}"), "doc! atomicity"))
         }
         bootstrap_txn(system, "BEGIN")?;
         let mut echo_rows: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len().max(1));
@@ -198,9 +195,8 @@ fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<Str
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
             Ok(s.clone())
         }
-        _ => Err(DelightQLError::database_error(
-            format!("doc!() {} must be a string literal", arg_name),
-            "Invalid argument type",
-        )),
+        _ => Err(DelightQLError::from(DirectiveBinding::Value {
+            message: format!("doc!() {} must be a string literal", arg_name),
+        })),
     }
 }

@@ -19,25 +19,19 @@
 //! (`RelayHooks::on_ship`), the same machinery emit streams already ride.
 //! No wire-protocol change.
 
-use delightql_protocol::{Cell, ErrorKind, QueryResponse, ServerTerm, Transport};
+use delightql_protocol::{Cell, QueryResponse, ServerTerm, Transport};
 
-use super::{EagerBuffer, RelayParty};
+use super::{error_term, EagerBuffer, ExecutionFailure, RelayParty};
+use crate::diagnostic::{Authored, Runtime};
 use crate::pipeline::{
     compiled_query::{CompiledPlan, PlanEntry},
     verdict,
 };
 
-/// An engine-side execution failure: compilation succeeded and the
-/// database refused the SQL (or a transaction statement) at run time.
-/// Badged runtime/execution so the error is explainable and
-/// annotation-matchable; the protocol-level Connection kind stays for
-/// wire compatibility.
-fn connection_error(msg: String) -> ServerTerm {
-    ServerTerm::Error {
-        kind: ErrorKind::Connection,
-        identity: b"delightql-error://runtime/execution".to_vec(),
-        message: crate::relay::teach_runtime_message(msg).into_bytes(),
-    }
+/// An execution failure's wire term: the one projection of the typed
+/// diagnostic, whether this process minted it or admitted it at ingress.
+fn connection_error(failure: ExecutionFailure) -> ServerTerm {
+    error_term(&failure)
 }
 
 impl<'a, T: Transport> RelayParty<'a, T> {
@@ -70,11 +64,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             .system
             .require_healthy()
             .expect_err("session-health error requested while healthy");
-        ServerTerm::Error {
-            kind: ErrorKind::Connection,
-            identity: error.error_uri().into_bytes(),
-            message: error.to_string().into_bytes(),
-        }
+        error_term(&error)
     }
 
     /// Play a `CompiledPlan` start to finish (the pump, plan §3.2).
@@ -155,10 +145,10 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 let mut trace: Vec<Option<(&'static str, Option<String>)>> =
                     vec![None; typed.steps.len()];
                 let term = self.play_typed(plan, typed, &mut trace, &run_id);
-                let is_error = matches!(term, ServerTerm::Error { .. });
+                let is_error = matches!(term, ServerTerm::Error(_));
                 let err_msg = match &term {
-                    ServerTerm::Error { message, .. } => {
-                        Some(String::from_utf8_lossy(message).to_string())
+                    ServerTerm::Error(error) => {
+                        Some(String::from_utf8_lossy(error.message()).to_string())
                     }
                     _ => None,
                 };
@@ -219,12 +209,15 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         trace[idx] = Some(("skipped", Some(closed_detail)));
                         continue;
                     }
-                    Err(msg) => {
+                    Err(failure) => {
                         // Attribution: a guard-sampling failure IS the
                         // step's failure — never "pending".
-                        trace[idx] = Some(("error", Some(format!("guard sampling failed: {msg}"))));
+                        trace[idx] = Some((
+                            "error",
+                            Some(format!("guard sampling failed: {}", failure.to_string())),
+                        ));
                         self.rollback_open_bracket(&mut open_bracket);
-                        return connection_error(msg);
+                        return connection_error(failure);
                     }
                 }
             }
@@ -233,9 +226,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 EffectAction::Begin { connection_id } => {
                     match self.execute_sql_routed("BEGIN", *connection_id) {
                         Ok(_) => open_bracket = Some(*connection_id),
-                        Err(msg) => {
+                        Err(failure) => {
                             self.rollback_open_bracket(&mut open_bracket);
-                            return connection_error(msg);
+                            return connection_error(failure);
                         }
                     }
                 }
@@ -251,9 +244,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     }
                     match self.execute_sql_routed("COMMIT", *connection_id) {
                         Ok(_) => open_bracket = None,
-                        Err(msg) => {
+                        Err(failure) => {
                             self.rollback_open_bracket(&mut open_bracket);
-                            return connection_error(msg);
+                            return connection_error(failure);
                         }
                     }
                 }
@@ -263,38 +256,32 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     Ok((_cols, rows)) => {
                         let passed = super::cell_says_yes(rows.first());
                         if !passed {
-                            let (identity, message) = match refusal {
-                                Some(refusal) => (
-                                    format!("delightql-error://{}", refusal.identity),
-                                    refusal.message.clone(),
-                                ),
-                                None => (
-                                    "delightql-error://runtime/obligation".to_string(),
-                                    format!("Compiler obligation failed\n  SQL: {}", statement.sql),
-                                ),
+                            let refused = match refusal {
+                                Some(refusal) => refusal.clone(),
+                                None => Runtime::Obligation {
+                                    sql: statement.sql.clone(),
+                                }
+                                .into(),
                             };
-                            trace[idx] = Some(("error", Some(message.clone())));
+                            trace[idx] = Some(("error", Some(refused.to_string())));
                             self.rollback_open_bracket(&mut open_bracket);
-                            return ServerTerm::Error {
-                                kind: ErrorKind::Permission,
-                                identity: identity.into_bytes(),
-                                message: message.into_bytes(),
-                            };
+                            return error_term(&refused);
                         }
                     }
-                    Err(msg) => {
-                        trace[idx] = Some(("error", Some(msg.clone())));
+                    Err(failure) => {
+                        trace[idx] = Some(("error", Some(failure.to_string())));
                         self.rollback_open_bracket(&mut open_bracket);
-                        return connection_error(msg);
+                        return connection_error(failure);
                     }
                 },
                 EffectAction::Terminal(terminal) => match terminal {
                     TerminalAction::Exit { statements } => {
                         for st in statements {
-                            if let Err(msg) = self.execute_sql_routed(&st.sql, st.connection_id) {
-                                trace[idx] = Some(("error", Some(msg.clone())));
+                            if let Err(failure) = self.execute_sql_routed(&st.sql, st.connection_id)
+                            {
+                                trace[idx] = Some(("error", Some(failure.to_string())));
                                 self.rollback_open_bracket(&mut open_bracket);
-                                return connection_error(msg);
+                                return connection_error(failure);
                             }
                         }
                     }
@@ -304,19 +291,16 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         provenance,
                     } => {
                         for st in statements {
-                            if let Err(msg) = self.execute_sql_routed(&st.sql, st.connection_id) {
-                                trace[idx] = Some(("error", Some(msg.clone())));
+                            if let Err(failure) = self.execute_sql_routed(&st.sql, st.connection_id)
+                            {
+                                trace[idx] = Some(("error", Some(failure.to_string())));
                                 self.rollback_open_bracket(&mut open_bracket);
-                                return connection_error(msg);
+                                return connection_error(failure);
                             }
                         }
-                        let (identity, label) = match provenance {
-                            AbortProvenance::Authored { identity, label } => {
-                                (identity.as_str(), label.as_str())
-                            }
-                            AbortProvenance::Assertion { label } => {
-                                ("runtime/assertion", label.as_str())
-                            }
+                        let label = match provenance {
+                            AbortProvenance::Authored { label } => label.as_str(),
+                            AbortProvenance::Assertion { label } => label.as_str(),
                         };
                         match self.execute_sql_routed(&probe.sql, probe.connection_id) {
                             Ok((_columns, rows)) if rows.is_empty() => {
@@ -341,8 +325,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                 }
                             }
                             Ok((_columns, _rows)) => {
-                                let mut detail = format!("{label}\n  abort input was nonempty");
+                                let detail = format!("{label}\n  abort input was nonempty");
                                 self.rollback_open_bracket(&mut open_bracket);
+                                let mut observation_failure = None;
                                 if matches!(provenance, AbortProvenance::Assertion { .. }) {
                                     if let Err(failure) = self.observe_assertion_verdict(
                                         verdict::Verdict {
@@ -356,22 +341,25 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                         run_id,
                                     ) {
                                         self.quarantine_assertion_observation(failure.clone());
-                                        detail.push_str(&format!(
-                                            "\n  assertion observation failed; session quarantined: {failure}"
-                                        ));
+                                        observation_failure = Some(failure);
                                     }
                                 }
-                                trace[idx] = Some(("error", Some(detail.clone())));
-                                return ServerTerm::Error {
-                                    kind: ErrorKind::Permission,
-                                    identity: format!("delightql-error://{identity}").into_bytes(),
-                                    message: detail.into_bytes(),
-                                };
+                                // The ONE identity a reached abort has,
+                                // authored or assertion-reached: the label
+                                // is prose, the observation incident rides
+                                // beside it.
+                                let abort: crate::diagnostic::DelightQLError = Authored::Abort {
+                                    label: label.to_string(),
+                                    observation_failure,
+                                }
+                                .into();
+                                trace[idx] = Some(("error", Some(abort.to_string())));
+                                return error_term(&abort);
                             }
-                            Err(msg) => {
-                                trace[idx] = Some(("error", Some(msg.clone())));
+                            Err(failure) => {
+                                trace[idx] = Some(("error", Some(failure.to_string())));
                                 self.rollback_open_bracket(&mut open_bracket);
-                                return connection_error(msg);
+                                return connection_error(failure);
                             }
                         }
                     }
@@ -385,17 +373,17 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         continue;
                     }
                     for st in stmts {
-                        if let Err(msg) = self.execute_sql_routed(&st.sql, st.connection_id) {
+                        if let Err(failure) = self.execute_sql_routed(&st.sql, st.connection_id) {
                             self.rollback_open_bracket(&mut open_bracket);
-                            return connection_error(msg);
+                            return connection_error(failure);
                         }
                     }
                 }
                 action => {
                     for st in action.statements() {
-                        if let Err(msg) = self.execute_sql_routed(&st.sql, st.connection_id) {
+                        if let Err(failure) = self.execute_sql_routed(&st.sql, st.connection_id) {
                             self.rollback_open_bracket(&mut open_bracket);
-                            return connection_error(msg);
+                            return connection_error(failure);
                         }
                     }
                     if let Some(ship) = action.ship() {
@@ -407,9 +395,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                     hook(&columns, &rows);
                                 }
                             }
-                            Err(msg) => {
+                            Err(failure) => {
                                 self.rollback_open_bracket(&mut open_bracket);
-                                return connection_error(msg);
+                                return connection_error(failure);
                             }
                         }
                     }
@@ -441,9 +429,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                 PlanEntry::BeginTransaction { connection_id, .. } => {
                     match self.execute_sql_routed("BEGIN", *connection_id) {
                         Ok(_) => open_bracket = Some(*connection_id),
-                        Err(msg) => {
+                        Err(failure) => {
                             self.rollback_open_bracket(&mut open_bracket);
-                            return connection_error(msg);
+                            return connection_error(failure);
                         }
                     }
                 }
@@ -453,17 +441,17 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         Ok(_) => {
                             open_bracket = None;
                         }
-                        Err(msg) => {
+                        Err(failure) => {
                             self.rollback_open_bracket(&mut open_bracket);
-                            return connection_error(msg);
+                            return connection_error(failure);
                         }
                     }
                 }
 
                 PlanEntry::Statement(st) => {
-                    if let Err(msg) = self.execute_sql_routed(&st.sql, st.connection_id) {
+                    if let Err(failure) = self.execute_sql_routed(&st.sql, st.connection_id) {
                         self.rollback_open_bracket(&mut open_bracket);
-                        return connection_error(msg);
+                        return connection_error(failure);
                     }
                 }
 
@@ -478,9 +466,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                     hook(&columns, &rows);
                                 }
                             }
-                            Err(msg) => {
+                            Err(failure) => {
                                 self.rollback_open_bracket(&mut open_bracket);
-                                return connection_error(msg);
+                                return connection_error(failure);
                             }
                         }
                     } else if idx + 1 == plan.entries.len() && st.connection_id.unwrap_or(2) == 2 {
@@ -500,21 +488,15 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                     dimensions,
                                 };
                             }
-                            Ok(QueryResponse::Error {
-                                kind,
-                                identity,
-                                message,
-                            }) => {
+                            Ok(QueryResponse::Error(received)) => {
                                 self.rollback_open_bracket(&mut open_bracket);
-                                return ServerTerm::Error {
-                                    kind,
-                                    identity,
-                                    message,
-                                };
+                                return error_term(&super::admitted(received));
                             }
                             Err(e) => {
                                 self.rollback_open_bracket(&mut open_bracket);
-                                return connection_error(e.message);
+                                return error_term(
+                                    &Runtime::Transport { message: e.message }.into(),
+                                );
                             }
                         }
                     } else {
@@ -525,9 +507,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                             Ok((columns, rows)) => {
                                 final_response = Some(self.eager_header(&columns, rows));
                             }
-                            Err(msg) => {
+                            Err(failure) => {
                                 self.rollback_open_bracket(&mut open_bracket);
-                                return connection_error(msg);
+                                return connection_error(failure);
                             }
                         }
                     }
@@ -538,30 +520,20 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         Ok((_cols, rows)) => {
                             let passed = super::cell_says_yes(rows.first());
                             if !passed {
-                                let (identity, message) = match refusal {
-                                    Some(refusal) => (
-                                        format!("delightql-error://{}", refusal.identity),
-                                        refusal.message.clone(),
-                                    ),
-                                    None => (
-                                        "delightql-error://runtime/obligation".to_string(),
-                                        format!(
-                                            "Compiler obligation failed\n  SQL: {}",
-                                            statement.sql
-                                        ),
-                                    ),
+                                let refused = match refusal {
+                                    Some(refusal) => refusal.clone(),
+                                    None => Runtime::Obligation {
+                                        sql: statement.sql.clone(),
+                                    }
+                                    .into(),
                                 };
                                 self.rollback_open_bracket(&mut open_bracket);
-                                return ServerTerm::Error {
-                                    kind: ErrorKind::Permission,
-                                    identity: identity.into_bytes(),
-                                    message: message.into_bytes(),
-                                };
+                                return error_term(&refused);
                             }
                         }
-                        Err(msg) => {
+                        Err(failure) => {
                             self.rollback_open_bracket(&mut open_bracket);
-                            return connection_error(msg);
+                            return connection_error(failure);
                         }
                     }
                 }
@@ -585,7 +557,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         &mut self,
         step: &crate::pipeline::compiled_query::EffectStep,
         guards: &[crate::pipeline::compiled_query::GuardDefinition],
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, ExecutionFailure> {
         use crate::pipeline::compiled_query::GuardPolarity;
         for req in &step.requirements {
             let guard = &guards[req.guard_id];

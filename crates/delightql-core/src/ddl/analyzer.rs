@@ -39,7 +39,7 @@ use crate::pipeline::asts::unresolved::*;
 
 /// A reference found in a definition body
 #[derive(Debug, Clone, PartialEq)]
-pub struct ExtractedReference {
+pub(crate) struct ExtractedReference {
     /// Name of the referenced entity
     pub name: String,
     /// Namespace qualification (if any)
@@ -48,38 +48,280 @@ pub struct ExtractedReference {
     pub apparent_type: i32,
 }
 
-/// Extract all entity references from a full query (view body, may include CTEs)
-pub fn extract_references_from_query(query: &Query) -> Vec<ExtractedReference> {
-    let mut refs = Vec::new();
-    for cfe in query.cfes() {
-        walk_domain(&cfe.body, &mut refs);
-    }
-    for cte in query.ctes() {
-        walk_relational(cte.body(), &mut refs);
-    }
-    walk_relational(&query.body, &mut refs);
-    refs
+/// ONE SET OF NAMES standing over the walk.
+enum Declarations {
+    /// A definition's declared parameters — its own, or a query-local
+    /// parameterized definition's.
+    Parameters(Vec<delightql_types::SqlIdentifier>),
+    /// A query block's own claims, in the order the block minted them.
+    Block(crate::pipeline::asts::core::QueryLocalNames),
 }
 
-/// Extract all entity references from a domain expression (function body)
-/// The same census over a TRUTH body — a sigma rule's, which names relations
-/// the same way a value body does.
-pub fn extract_references_from_truth(expr: &TruthExpression) -> Vec<ExtractedReference> {
-    let mut refs = Vec::new();
-    walk_boolean(expr, &mut refs);
-    refs
+impl Declarations {
+    fn declares(&self, name: &delightql_types::SqlIdentifier) -> bool {
+        match self {
+            Declarations::Parameters(names) => names.iter().any(|param| param == name),
+            Declarations::Block(names) => names.declares(name),
+        }
+    }
 }
 
-pub fn extract_references_from_domain(expr: &DomainExpression) -> Vec<ExtractedReference> {
-    let mut refs = Vec::new();
-    walk_domain(expr, &mut refs);
-    refs
+/// THE CENSUS OF ONE DEFINITION BODY, and the lexical declarations standing
+/// over the walk.
+///
+/// A body's own parameters, every query block it contains, and every
+/// query-local parameterized definition inside those blocks DECLARE names.
+/// A mention of such a name reaches that declaration — it is not a
+/// reference to an entity, and it must never become a `referenced_entity`
+/// row, because grounding admission judges every unqualified row against a
+/// data world and a lexical name has no answer there.
+///
+/// The declarations are pushed and popped as the walk enters and leaves the
+/// thing that owns them, so this judgment is made where the binding
+/// structure is still in hand. It is not a list of spellings filtered out
+/// afterwards: a name the walk never saw declared cannot be excused by one.
+pub(crate) struct Census {
+    refs: Vec<ExtractedReference>,
+    /// Every name the walked bodies MENTION, as written: each ground
+    /// relation reference and each callee, qualified or not. An unqualified
+    /// callee is no `referenced_entity` row (the grounding contract reads
+    /// unqualified rows as data-namespace variables), but it is a mention,
+    /// and the recursion authority selects every mention through the
+    /// definition-use authority to learn, by identity, whether a clause
+    /// reads the instance being opened. Nothing here compares spellings.
+    mentions: Vec<Mention>,
+    /// Outermost first.
+    scopes: Vec<Declarations>,
+    /// A clause body that is BROKEN rather than merely unsubstituted. The
+    /// walkers answer nothing, so the refusal is held here and spent by
+    /// `finish` — the census never turns an unreadable body into "no
+    /// dependencies".
+    refusal: Option<crate::error::DelightQLError>,
+}
+
+impl Census {
+    fn new() -> Self {
+        Census {
+            refs: Vec::new(),
+            mentions: Vec::new(),
+            scopes: Vec::new(),
+            refusal: None,
+        }
+    }
+
+    /// Walk one query block's bodies under its own claims: its value
+    /// definitions, its parameterized definitions, its relation bindings,
+    /// and then the query body itself. The block's claims stand over all
+    /// four, which is why a clause-local binding is lexical even where a
+    /// sibling binding mentions it.
+    fn in_query(&mut self, query: &Query) {
+        self.scopes
+            .push(Declarations::Block(query.local_names().clone()));
+        for cfe in query.cfes() {
+            walk_domain(&cfe.body, self);
+        }
+        for ho in query.hos() {
+            self.in_scoped_parameterized(ho);
+        }
+        for cte in query.ctes() {
+            walk_relational(cte.body(), self);
+        }
+        walk_relational(&query.body, self);
+        self.scopes.pop();
+    }
+
+    /// A QUERY-LOCAL PARAMETERIZED DEFINITION'S CLAUSES, under the block's
+    /// claims and this definition's OWN declared parameters.
+    ///
+    /// Its body is a definition body like any other, so it crosses the same
+    /// per-clause road every consulted clause crosses — including the
+    /// deferred one, where the authored characters are read back with
+    /// proffer stand-ins for the arguments. A dependency named only here is
+    /// therefore a recorded reference, not one that surfaces when the
+    /// definition is finally invoked.
+    fn in_scoped_parameterized(&mut self, definition: &crate::pipeline::asts::core::HoDefinition) {
+        for clause in definition.group().clauses() {
+            self.in_clause(clause);
+        }
+    }
+
+    /// ONE CLAUSE BODY, whatever kind it is. The one road every definition
+    /// clause's references are read on — a consulted clause and a
+    /// query-local parameterized clause alike.
+    fn in_clause(&mut self, clause: &crate::pipeline::asts::ddl::Clause) {
+        // THIS CLAUSE'S OWN PARAMETERS, over this clause's own body. The
+        // assembler makes sibling clauses agree on parameter COUNT and
+        // deliberately lets each ground different positions, so a name
+        // bound in one clause's head is not a declaration in another's:
+        // `f(x)(*) : a(x)` declares `x`, and `f("k")(*) : x(*)` reads the
+        // relation `x`. Taking the family's names from the first clause
+        // would make the recorded dependencies depend on authored order.
+        self.scopes.push(Declarations::Parameters(
+            clause
+                .head
+                .bound_param_names()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        self.in_clause_body(clause);
+        self.scopes.pop();
+    }
+
+    fn in_clause_body(&mut self, clause: &crate::pipeline::asts::ddl::Clause) {
+        use crate::pipeline::asts::ddl::DdlBody;
+        match &clause.body {
+            DdlBody::Scalar(expr) => walk_domain(expr, self),
+            DdlBody::Truth(expr) => walk_boolean(expr, self),
+            DdlBody::Relational(query) => self.in_query(query),
+            // A mode's references live in every authored output cell,
+            // including the default. Read them directly: a default-bearing
+            // mode has no relational body to synthesize merely for analysis.
+            DdlBody::FactFunction(definition) => {
+                let mode = definition.mode();
+                for arm in mode.arms.iter() {
+                    for output in arm.outputs.iter() {
+                        walk_domain(output, self);
+                    }
+                }
+                if let Some(default) = &mode.default {
+                    for output in default.iter() {
+                        walk_domain(output, self);
+                    }
+                }
+            }
+            // A deferred TEMPLATE has no parsed body to read, so it is
+            // proffer-parsed: synthetic bindings stand in for the call
+            // site's arguments, which is enough to reach the references and
+            // to catch a body that is broken rather than merely
+            // unsubstituted. The deferral is the BODY's; the group it
+            // belongs to was assembled with everyone else's.
+            DdlBody::Deferred { source } => {
+                let identities = crate::relation::Planning::open(crate::names::Registry::new(&[]));
+                let proffered = crate::pipeline::resolver::grounding::create_proffer_bindings(
+                    &clause.head,
+                    &identities,
+                )
+                .and_then(|bindings| crate::ddl::reconstruct::bound_relex(source, bindings));
+                match proffered {
+                    Ok(query) => self.in_query(&query),
+                    // A REFUSAL THAT AWAITS SUBSTITUTION IS THE DEFERRAL
+                    // ITSELF. The proffer supplies stand-ins, and a stand-in
+                    // cannot be the integer a bound wants — so refusing here
+                    // would undo the deferral the clause already made. THE
+                    // LATER BOUNDARY IS THE BODY'S OWN RESOLUTION, in the
+                    // world its declaration names, where the real arguments
+                    // stand and a free name is a data hole that refuses.
+                    Err(error) if crate::pipeline::normalize::awaits_substitution(&error) => {}
+                    // Anything else is a body that cannot be read at all.
+                    // It refuses HERE, at consultation, rather than being
+                    // recorded as a definition with no dependencies.
+                    Err(error) => self.refuse(error),
+                }
+            }
+        }
+    }
+
+    /// Hold the first refusal a clause body produced.
+    fn refuse(&mut self, error: crate::error::DelightQLError) {
+        if self.refusal.is_none() {
+            self.refusal = Some(error);
+        }
+    }
+
+    /// Whether a BARE name reaches a declaration standing over this walk.
+    fn declared(&self, name: &delightql_types::SqlIdentifier) -> bool {
+        self.scopes.iter().any(|scope| scope.declares(name))
+    }
+
+    /// THE ONE ROAD A REFERENCE ROW IS BORN ON. A qualified name always
+    /// names an entity in the namespace it spells; a bare name does so only
+    /// when no enclosing declaration owns it.
+    fn record(&mut self, identifier: &QualifiedName, apparent_type: i32) {
+        let namespace = namespace_from_path(&identifier.namespace_path);
+        if namespace.is_none() && self.declared(&identifier.name) {
+            return;
+        }
+        self.mentions.push(Mention {
+            name: identifier.name.clone(),
+            namespace: namespace.clone(),
+        });
+        self.refs.push(ExtractedReference {
+            name: identifier.name.to_string(),
+            namespace,
+            apparent_type,
+        });
+    }
+
+    /// A callee spelled with its namespace: never a query-local name.
+    fn record_qualified(&mut self, name: String, namespace: String, apparent_type: i32) {
+        self.refs.push(ExtractedReference {
+            name,
+            namespace: Some(namespace),
+            apparent_type,
+        });
+    }
+
+    /// A callee, however spelled. A declared query-local name is a
+    /// declaration, not a mention of an entity.
+    fn record_callee(&mut self, name: &str, namespace: Option<String>) {
+        let name = delightql_types::SqlIdentifier::new(name);
+        if namespace.is_none() && self.declared(&name) {
+            return;
+        }
+        self.mentions.push(Mention { name, namespace });
+    }
+
+    /// The rows this census recorded — or the refusal of a body it could
+    /// not read. A caller that must judge every dependency at ONE boundary
+    /// never receives a silently empty answer for an unreadable body.
+    pub(crate) fn finish(self) -> crate::error::Result<Vec<ExtractedReference>> {
+        match self.refusal {
+            Some(error) => Err(error),
+            None => Ok(self.refs),
+        }
+    }
+}
+
+/// THE CENSUS OF ONE DEFINITION GROUP: every clause, each under ITS OWN
+/// declared parameters.
+pub(crate) fn census_of_group(group: &crate::pipeline::asts::ddl::DefinitionGroup) -> Census {
+    let mut census = Census::new();
+    for clause in group.clauses() {
+        census.in_clause(clause);
+    }
+    census
+}
+
+/// ONE NAME A BODY MENTIONS, AS WRITTEN: the identifier with its strop and
+/// the namespace path it was qualified with, if any. A mention names
+/// nothing by itself — the definition-use authority selects what it names.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Mention {
+    pub(crate) name: delightql_types::SqlIdentifier,
+    pub(crate) namespace: Option<String>,
+}
+
+/// EVERY NAME ONE CLAUSE MENTIONS — read on the same census road every
+/// clause's references are read on, under the clause's own parameter
+/// declarations and each block's own claims, so a clause-local binding
+/// spelled like an entity is a declaration and never a mention. A body
+/// that is broken rather than merely unsubstituted refuses here.
+pub(crate) fn clause_mentions(
+    clause: &crate::pipeline::asts::ddl::Clause,
+) -> crate::error::Result<Vec<Mention>> {
+    let mut census = Census::new();
+    census.in_clause(clause);
+    if let Some(refusal) = census.refusal.take() {
+        return Err(refusal);
+    }
+    Ok(census.mentions)
 }
 
 // --- Walkers ---
 
 #[stacksafe::stacksafe]
-fn walk_relational(expr: &Chain, refs: &mut Vec<ExtractedReference>) {
+fn walk_relational(expr: &Chain, refs: &mut Census) {
     match expr.head().form() {
         GroundForm::Reference(rel) => walk_relation(rel, refs),
         GroundForm::Literal(anon) => walk_anon_table(&anon.table, refs),
@@ -88,6 +330,8 @@ fn walk_relational(expr: &Chain, refs: &mut Vec<ExtractedReference>) {
         match continuation {
             Continuation::Access { access, .. } => walk_access(access, refs),
             Continuation::Restrict { condition, .. } => walk_boolean(condition, refs),
+            // Nothing is correlated before names resolve.
+            Continuation::Correlated(never) => match *never {},
             // A correlation names two arms by spelling; it holds no
             // reference to a definition.
             Continuation::Bound { .. } | Continuation::Correlate { .. } => {}
@@ -128,7 +372,7 @@ fn walk_relational(expr: &Chain, refs: &mut Vec<ExtractedReference>) {
     }
 }
 
-fn walk_anon_table(anon: &AnonTable, refs: &mut Vec<ExtractedReference>) {
+fn walk_anon_table(anon: &AnonTable, refs: &mut Census) {
     if let Some(headers) = &anon.body.header {
         for h in headers.iter() {
             if let Some(term) = h.term() {
@@ -143,22 +387,13 @@ fn walk_anon_table(anon: &AnonTable, refs: &mut Vec<ExtractedReference>) {
     }
 }
 
-fn walk_relation(rel: &Relation, refs: &mut Vec<ExtractedReference>) {
+fn walk_relation(rel: &Relation, refs: &mut Census) {
     match rel {
         Relation::Ground {
             mention: GroundMention::Named { identifier, .. },
             ..
         } => {
-            let namespace = if identifier.namespace_path.is_empty() {
-                None
-            } else {
-                Some(identifier.namespace_path.to_string())
-            };
-            refs.push(ExtractedReference {
-                name: identifier.name.to_string(),
-                namespace,
-                apparent_type: EntityType::DbPermanentTable.as_i32(),
-            });
+            refs.record(identifier, EntityType::DbPermanentTable.as_i32());
         }
         // A plan read names compiler-owned storage by identity: no authored
         // spelling participates, so it contributes no reference a DDL body
@@ -177,27 +412,21 @@ fn walk_relation(rel: &Relation, refs: &mut Vec<ExtractedReference>) {
             walk_inner_relation_pattern(pattern, refs);
         }
         Relation::ConsultedView { body, .. } => {
-            // Recursively extract references from the consulted view body
-            for cte in body.ctes() {
-                walk_relational(cte.body(), refs);
-            }
-            walk_relational(&body.body, refs);
+            // The nested body is its own query block: its claims stand over
+            // its bodies exactly as the outer block's stand over this one.
+            refs.in_query(body);
         }
     }
 }
 
-fn walk_inner_relation_pattern(pattern: &InnerRelationPattern, refs: &mut Vec<ExtractedReference>) {
+fn walk_inner_relation_pattern(pattern: &InnerRelationPattern, refs: &mut Census) {
     match pattern {
         InnerRelationPattern::Indeterminate {
             identifier,
             subquery,
             ..
         } => {
-            refs.push(ExtractedReference {
-                name: identifier.name.to_string(),
-                namespace: namespace_from_path(&identifier.namespace_path),
-                apparent_type: EntityType::DbPermanentTable.as_i32(),
-            });
+            refs.record(&identifier, EntityType::DbPermanentTable.as_i32());
             walk_relational(subquery, refs);
         }
         InnerRelationPattern::UncorrelatedDerivedTable {
@@ -205,11 +434,7 @@ fn walk_inner_relation_pattern(pattern: &InnerRelationPattern, refs: &mut Vec<Ex
             subquery,
             ..
         } => {
-            refs.push(ExtractedReference {
-                name: identifier.name.to_string(),
-                namespace: namespace_from_path(&identifier.namespace_path),
-                apparent_type: EntityType::DbPermanentTable.as_i32(),
-            });
+            refs.record(&identifier, EntityType::DbPermanentTable.as_i32());
             walk_relational(subquery, refs);
         }
         InnerRelationPattern::CorrelatedScalarJoin {
@@ -218,11 +443,7 @@ fn walk_inner_relation_pattern(pattern: &InnerRelationPattern, refs: &mut Vec<Ex
             subquery,
             ..
         } => {
-            refs.push(ExtractedReference {
-                name: identifier.name.to_string(),
-                namespace: namespace_from_path(&identifier.namespace_path),
-                apparent_type: EntityType::DbPermanentTable.as_i32(),
-            });
+            refs.record(&identifier, EntityType::DbPermanentTable.as_i32());
             for filter in correlation_filters {
                 walk_boolean(filter, refs);
             }
@@ -235,11 +456,7 @@ fn walk_inner_relation_pattern(pattern: &InnerRelationPattern, refs: &mut Vec<Ex
             subquery,
             ..
         } => {
-            refs.push(ExtractedReference {
-                name: identifier.name.to_string(),
-                namespace: namespace_from_path(&identifier.namespace_path),
-                apparent_type: EntityType::DbPermanentTable.as_i32(),
-            });
+            refs.record(&identifier, EntityType::DbPermanentTable.as_i32());
             for filter in correlation_filters {
                 walk_boolean(filter, refs);
             }
@@ -251,7 +468,7 @@ fn walk_inner_relation_pattern(pattern: &InnerRelationPattern, refs: &mut Vec<Ex
     }
 }
 
-fn walk_domain(expr: &DomainExpression, refs: &mut Vec<ExtractedReference>) {
+fn walk_domain(expr: &DomainExpression, refs: &mut Census) {
     match expr {
         DomainExpression::Application(func) => walk_function(func, refs),
         DomainExpression::Reference(Reference::Named(NamedReference(_)))
@@ -261,21 +478,14 @@ fn walk_domain(expr: &DomainExpression, refs: &mut Vec<ExtractedReference>) {
 }
 
 /// A RELATION MADE ONE VALUE names the relation it compresses.
-fn walk_scalar_relation(
-    relation: &crate::pipeline::asts::core::ScalarRelation,
-    refs: &mut Vec<ExtractedReference>,
-) {
+fn walk_scalar_relation(relation: &crate::pipeline::asts::core::ScalarRelation, refs: &mut Census) {
     if let crate::pipeline::asts::core::ScalarRelation::Named { identifier, .. } = relation {
-        refs.push(ExtractedReference {
-            name: identifier.name.to_string(),
-            namespace: namespace_from_path(&identifier.namespace_path),
-            apparent_type: EntityType::DbPermanentTable.as_i32(),
-        });
+        refs.record(&identifier, EntityType::DbPermanentTable.as_i32());
     }
     walk_relational(relation.body().body(), refs);
 }
 
-fn walk_function(func: &FunctionApplication, refs: &mut Vec<ExtractedReference>) {
+fn walk_function(func: &FunctionApplication, refs: &mut Census) {
     match func {
         crate::pipeline::asts::core::FunctionApplication::Ground(_)
         | crate::pipeline::asts::core::FunctionApplication::Open(_) => {}
@@ -321,7 +531,7 @@ fn walk_function(func: &FunctionApplication, refs: &mut Vec<ExtractedReference>)
     }
 }
 
-fn walk_boolean(expr: &TruthExpression, refs: &mut Vec<ExtractedReference>) {
+fn walk_boolean(expr: &TruthExpression, refs: &mut Census) {
     match expr {
         TruthExpression::Comparison(Comparison { left, right, .. }) => {
             walk_domain(left, refs);
@@ -338,11 +548,10 @@ fn walk_boolean(expr: &TruthExpression, refs: &mut Vec<ExtractedReference>) {
             relation: subquery,
             ..
         }) => {
-            refs.push(ExtractedReference {
-                name: addressing.identifier.name.to_string(),
-                namespace: namespace_from_path(&addressing.identifier.namespace_path),
-                apparent_type: EntityType::DbPermanentTable.as_i32(),
-            });
+            refs.record(
+                &addressing.identifier,
+                EntityType::DbPermanentTable.as_i32(),
+            );
             walk_relational(subquery, refs);
         }
         TruthExpression::Membership(Membership { probe, rows, .. }) => {
@@ -364,11 +573,10 @@ fn walk_boolean(expr: &TruthExpression, refs: &mut Vec<ExtractedReference>) {
             for value in probe.values() {
                 walk_domain(value, refs);
             }
-            refs.push(ExtractedReference {
-                name: addressing.identifier.name.to_string(),
-                namespace: namespace_from_path(&addressing.identifier.namespace_path),
-                apparent_type: EntityType::DbPermanentTable.as_i32(),
-            });
+            refs.record(
+                &addressing.identifier,
+                EntityType::DbPermanentTable.as_i32(),
+            );
             walk_relational(subquery, refs);
         }
         // An authored application observes a CALL: the body slot is
@@ -384,7 +592,7 @@ fn walk_boolean(expr: &TruthExpression, refs: &mut Vec<ExtractedReference>) {
     }
 }
 
-fn walk_functor_call(call: &FunctorCall, refs: &mut Vec<ExtractedReference>) {
+fn walk_functor_call(call: &FunctorCall, refs: &mut Census) {
     // A QUALIFIED callee is a reference to the entity it names — the
     // executable boundary asks the catalog which definitions reach a
     // runtime-served relation, and the callee is how a body reaches one.
@@ -393,12 +601,16 @@ fn walk_functor_call(call: &FunctorCall, refs: &mut Vec<ExtractedReference>) {
     // not.
     let namespace = call.call().callee.namespace_texts();
     if !namespace.is_empty() {
-        refs.push(ExtractedReference {
-            name: call.call().callee.name_text().to_string(),
-            namespace: Some(namespace.join("::")),
-            apparent_type: EntityType::DbPermanentTable.as_i32(),
-        });
+        refs.record_qualified(
+            call.call().callee.name_text().to_string(),
+            namespace.join("::"),
+            EntityType::DbPermanentTable.as_i32(),
+        );
     }
+    refs.record_callee(
+        &call.call().callee.name_text(),
+        (!namespace.is_empty()).then(|| namespace.join("::")),
+    );
     for rel in call.call().relations() {
         walk_relational(rel, refs);
     }
@@ -410,10 +622,7 @@ fn walk_functor_call(call: &FunctorCall, refs: &mut Vec<ExtractedReference>) {
 }
 
 /// A COVER'S CALLABLE, walked as the form it is.
-fn walk_callable(
-    callable: &crate::pipeline::asts::core::Callable,
-    refs: &mut Vec<ExtractedReference>,
-) {
+fn walk_callable(callable: &crate::pipeline::asts::core::Callable, refs: &mut Census) {
     match callable {
         crate::pipeline::asts::core::Callable::Functor(application) => {
             walk_standard_application(application, refs)
@@ -433,7 +642,7 @@ fn walk_callable(
 /// and the guard it is filtered by.
 fn walk_standard_application(
     application: &crate::pipeline::asts::core::StandardApplication,
-    refs: &mut Vec<ExtractedReference>,
+    refs: &mut Census,
 ) {
     walk_functor_call(application.call(), refs);
     if let Some(window) = &application.window {
@@ -452,7 +661,7 @@ fn walk_standard_application(
     }
 }
 
-fn walk_window_frame(frame: &WindowFrame, refs: &mut Vec<ExtractedReference>) {
+fn walk_window_frame(frame: &WindowFrame, refs: &mut Census) {
     let mut walk_bound = |bound: &FrameBound| match bound {
         FrameBound::Preceding(expr) | FrameBound::Following(expr) => walk_domain(expr, refs),
         FrameBound::Unbounded | FrameBound::CurrentRow => {}
@@ -461,7 +670,7 @@ fn walk_window_frame(frame: &WindowFrame, refs: &mut Vec<ExtractedReference>) {
     walk_bound(&frame.end);
 }
 
-fn walk_case(case: &CaseExpression, refs: &mut Vec<ExtractedReference>) {
+fn walk_case(case: &CaseExpression, refs: &mut Census) {
     let default = match case {
         CaseExpression::Anchored {
             anchor,
@@ -487,10 +696,7 @@ fn walk_case(case: &CaseExpression, refs: &mut Vec<ExtractedReference>) {
     }
 }
 
-fn walk_enclyph(
-    enclyph: &crate::pipeline::asts::core::Enclyph,
-    refs: &mut Vec<ExtractedReference>,
-) {
+fn walk_enclyph(enclyph: &crate::pipeline::asts::core::Enclyph, refs: &mut Census) {
     use crate::pipeline::asts::core::{Enclyph, RecordMember};
     match enclyph {
         Enclyph::Record(record) => {
@@ -521,10 +727,7 @@ fn walk_enclyph(
     }
 }
 
-fn walk_metadata_group(
-    group: &crate::pipeline::asts::core::MetadataGroup,
-    refs: &mut Vec<ExtractedReference>,
-) {
+fn walk_metadata_group(group: &crate::pipeline::asts::core::MetadataGroup, refs: &mut Census) {
     use crate::pipeline::asts::core::MetadataTarget;
     match &group.target {
         MetadataTarget::Enclyph(enclyph) => walk_enclyph(enclyph, refs),
@@ -534,7 +737,7 @@ fn walk_metadata_group(
 
 /// A publication item references what its value references. A spread names
 /// columns of the operand rather than referring to a declared entity.
-fn walk_out_item(item: &crate::pipeline::asts::core::OutItem, refs: &mut Vec<ExtractedReference>) {
+fn walk_out_item(item: &crate::pipeline::asts::core::OutItem, refs: &mut Census) {
     if let Some(expr) = item.value() {
         walk_domain(expr, refs);
     }
@@ -542,10 +745,7 @@ fn walk_out_item(item: &crate::pipeline::asts::core::OutItem, refs: &mut Vec<Ext
 
 /// A reduction publishes one column: a value, or a metadata level whose
 /// target holds the references.
-fn walk_reduction_item(
-    item: &crate::pipeline::asts::core::ReductionItem,
-    refs: &mut Vec<ExtractedReference>,
-) {
+fn walk_reduction_item(item: &crate::pipeline::asts::core::ReductionItem, refs: &mut Census) {
     use crate::pipeline::asts::core::ReductionItem;
     match item {
         ReductionItem::Out(item) => walk_out_item(item, refs),
@@ -565,7 +765,7 @@ fn walk_reduction_item(
     }
 }
 
-fn walk_group_spec(spec: &GroupSpec, refs: &mut Vec<ExtractedReference>) {
+fn walk_group_spec(spec: &GroupSpec, refs: &mut Census) {
     match spec {
         GroupSpec::Distinct { keys } => {
             for col in keys.iter() {
@@ -587,7 +787,7 @@ fn walk_group_spec(spec: &GroupSpec, refs: &mut Vec<ExtractedReference>) {
     }
 }
 
-fn walk_access(spec: &Access, refs: &mut Vec<ExtractedReference>) {
+fn walk_access(spec: &Access, refs: &mut Census) {
     match spec {
         Access::All => {}
         Access::Dequalify(_) => {}
@@ -603,7 +803,7 @@ fn walk_access(spec: &Access, refs: &mut Vec<ExtractedReference>) {
     }
 }
 
-fn walk_unary_operator(op: &PipeOp, refs: &mut Vec<ExtractedReference>) {
+fn walk_unary_operator(op: &PipeOp, refs: &mut Census) {
     match op {
         PipeOp::Project(items) | PipeOp::Embed(items) => {
             for item in items {
@@ -647,40 +847,37 @@ fn namespace_from_path(path: &NamespacePath) -> Option<String> {
 mod tests {
     use super::*;
     use crate::ddl::reconstruct;
-    use crate::pipeline::asts::ddl::DdlBody;
 
-    /// The clause a stored definition reconstructs to, by body position.
-    fn scalar(source: &str) -> crate::pipeline::asts::unresolved::DomainExpression {
-        match reconstruct::clauses(source).unwrap().remove(0).body {
-            DdlBody::Scalar(expr) => expr,
-            other => panic!("expected a value body, got {other:?}"),
-        }
+    /// THE PRODUCTION CENSUS over one authored definition — the same road
+    /// consultation takes, so a test cannot pass through a walk the catalog
+    /// does not use.
+    fn census(source: &str) -> Vec<ExtractedReference> {
+        let decls = reconstruct::clauses(source).expect("the source is one definition");
+        let group = crate::pipeline::asts::ddl::DefinitionGroup::assemble(decls)
+            .expect("the clauses assemble");
+        census_of_group(&group)
+            .finish()
+            .expect("every clause body reads")
     }
 
-    fn relational(source: &str) -> crate::pipeline::asts::unresolved::Query {
-        match reconstruct::clauses(source).unwrap().remove(0).body {
-            DdlBody::Relational(query) => query,
-            other => panic!("expected a relational body, got {other:?}"),
-        }
+    fn names(refs: &[ExtractedReference]) -> Vec<&str> {
+        refs.iter().map(|r| r.name.as_str()).collect()
     }
 
     #[test]
     fn test_function_body_no_references() {
         // x * 2 has no entity references (just parameter lvars and literals)
-        let expr = scalar("f:(x) :- x * 2");
-        let refs = extract_references_from_domain(&expr);
+        let refs = census("f:(x) :- x * 2");
         assert!(
             refs.is_empty(),
-            "Function body 'x * 2' should have no references, got: {:?}",
-            refs
+            "Function body 'x * 2' should have no references, got: {refs:?}"
         );
     }
 
     #[test]
     fn test_view_body_table_reference() {
         // users(*), balance > 1000 references the "users" table
-        let query = relational("v(*) :- users(*), balance > 1000");
-        let refs = extract_references_from_query(&query);
+        let refs = census("v(*) :- users(*), balance > 1000");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].name, "users");
         assert_eq!(refs[0].apparent_type, EntityType::DbPermanentTable.as_i32());
@@ -689,20 +886,15 @@ mod tests {
 
     #[test]
     fn test_view_body_multiple_references() {
-        // users(*), orders(*) references both tables
-        let query = relational("v(*) :- users(*), orders(*)");
-        let refs = extract_references_from_query(&query);
+        let refs = census("v(*) :- users(*), orders(*)");
         assert_eq!(refs.len(), 2);
-        let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"users"));
-        assert!(names.contains(&"orders"));
+        assert!(names(&refs).contains(&"users"));
+        assert!(names(&refs).contains(&"orders"));
     }
 
     #[test]
     fn test_view_body_with_pipe_preserves_table_ref() {
-        // users(*) |> (first_name, last_name) still references "users"
-        let query = relational("v(*) :- users(*) |> (first_name, last_name)");
-        let refs = extract_references_from_query(&query);
+        let refs = census("v(*) :- users(*) |> (first_name, last_name)");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].name, "users");
     }
@@ -712,8 +904,106 @@ mod tests {
         // `round:(x)` is a curried call and IS a reference; `round(x)` is a
         // regular SQL function and is not. Neither stands here: `x + 10` is
         // two leaves.
-        let expr = scalar("f:(x) :- x + 10");
-        let refs = extract_references_from_domain(&expr);
-        assert!(refs.is_empty());
+        assert!(census("f:(x) :- x + 10").is_empty());
+    }
+
+    /// A CLAUSE-LOCAL BINDING IS NOT A REFERENCE. Its spelling reaches
+    /// the declaration in the same clause, so grounding admission — which
+    /// judges every unqualified row against a data world — must never be
+    /// handed one.
+    #[test]
+    fn a_clause_local_relation_binding_is_not_a_reference() {
+        let refs = census("v(id) :- low(id) : users(*) |> (id)\n  low(id), orders(*) |> (id)");
+        let names = names(&refs);
+        assert!(
+            names.contains(&"users"),
+            "the body's own reads stand: {names:?}"
+        );
+        assert!(
+            names.contains(&"orders"),
+            "the body's own reads stand: {names:?}"
+        );
+        assert!(
+            !names.contains(&"low"),
+            "a clause-local binding is lexical, not a reference: {names:?}"
+        );
+    }
+
+    /// The same law for a clause-local PARAMETERIZED binding, mentioned as
+    /// a relation actual — the shape a post-hoc spelling filter would have
+    /// had to be told about separately.
+    #[test]
+    fn a_clause_local_parameterized_binding_is_not_a_reference() {
+        let refs = census("v(id) :- pass(T(*))(*) : T(*)\n  pass(users(*))(*) |> (id)");
+        let names = names(&refs);
+        assert!(
+            names.contains(&"users"),
+            "the body's own reads stand: {names:?}"
+        );
+        assert!(
+            !names.contains(&"pass"),
+            "a clause-local parameterized binding is lexical: {names:?}"
+        );
+    }
+
+    /// A DEPENDENCY NAMED ONLY INSIDE A QUERY-LOCAL PARAMETERIZED BODY is
+    /// still this definition's dependency. The census walks that body, so
+    /// the row exists at the one boundary grounding judges — it does not
+    /// surface when the local definition is finally invoked.
+    #[test]
+    fn a_dependency_named_only_in_a_scoped_parameterized_body_is_a_reference() {
+        let refs = census(
+            "v(id) :- wrap(T(*))(*) : T(*), missing(id) |> (id)\n  wrap(users(*))(*) |> (id)",
+        );
+        let names = names(&refs);
+        assert!(
+            names.contains(&"missing"),
+            "the local body's own external read is recorded: {names:?}"
+        );
+        assert!(names.contains(&"users"), "so is the actual: {names:?}");
+    }
+
+    /// THE CONTROL: inside that same body, neither the local definition's
+    /// own name nor its relation formal is a catalog hole.
+    #[test]
+    fn a_scoped_parameterized_definitions_name_and_formal_are_not_references() {
+        let refs = census(
+            "v(id) :- wrap(T(*))(*) : T(*), missing(id) |> (id)\n  wrap(users(*))(*) |> (id)",
+        );
+        let names = names(&refs);
+        assert!(
+            !names.contains(&"wrap"),
+            "the definition's own name is lexical: {names:?}"
+        );
+        assert!(
+            !names.contains(&"T"),
+            "its relation formal is bound, not free: {names:?}"
+        );
+    }
+
+    /// A SIBLING BINDING OF THE ENCLOSING BLOCK is lexical inside a
+    /// query-local parameterized body too: the block's claims stand over
+    /// the body, which is why the walk pushes rather than replaces.
+    #[test]
+    fn an_enclosing_blocks_binding_is_lexical_inside_a_scoped_body() {
+        let refs = census(
+            "v(id) :- low(id) : users(*) |> (id)\n  wrap(T(*))(*) : T(*), low(id) |> (id)\n  wrap(orders(*))(*) |> (id)",
+        );
+        let names = names(&refs);
+        assert!(
+            !names.contains(&"low"),
+            "the enclosing block's binding is lexical here: {names:?}"
+        );
+        assert!(names.contains(&"users"));
+        assert!(names.contains(&"orders"));
+    }
+
+    /// A DEFINITION'S OWN PARAMETER is a declaration standing over the
+    /// whole body — judged where the binding structure is, not filtered
+    /// out of the finished list afterwards.
+    #[test]
+    fn a_declared_parameter_is_not_a_reference() {
+        let refs = census("v(T(*))(*) :- T(*), users(*) |> (id)");
+        assert_eq!(names(&refs), vec!["users"], "only the catalog read stands");
     }
 }

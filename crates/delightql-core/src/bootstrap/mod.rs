@@ -3,9 +3,13 @@
 // DelightQL Bootstrap Module
 //
 // This module implements the bootstrap initialization system for the DDL-LIGHT metadata
-// infrastructure (NON-REUSABLE: runs once per session):
+// infrastructure. Canonical construction runs ONCE per native system, to
+// build the pristine world that every reset is instantiated from
+// (`system::world`); nothing here runs at reset.
 // - Creating the _bootstrap SQLite database schema
 // - Inserting seed data for reference tables
+// - The one connection-configuration judgment every bootstrap connection
+//   receives, constructed or restored
 
 pub mod bin_sync;
 pub(crate) mod guard;
@@ -17,7 +21,7 @@ pub(crate) use crate::enums::{ConnectionType, EntityType, Language, SourceType};
 // Re-export bin sync function for convenience
 pub use bin_sync::sync_bin_cartridges_to_bootstrap;
 
-use crate::error::DelightQLError;
+use crate::diagnostic::Runtime;
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
@@ -133,12 +137,62 @@ fn seed_enum_tables(conn: &Connection) -> Result<()> {
 /// initialize_bootstrap_db(&conn).unwrap();
 /// ```
 pub fn initialize_bootstrap_db(conn: &Connection) -> Result<()> {
+    // Step 0: connection-local policy, before any statement depends on it
+    configure_connection(conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     // Step 1: Execute schema DDL
     conn.execute_batch(BOOTSTRAP_SCHEMA)?;
 
     // Step 2: Seed enum tables from Rust definitions (SINGLE SOURCE OF TRUTH)
     seed_enum_tables(conn)?;
 
+    // Step 3: Project the typed error hierarchy into the identifier registry
+    seed_error_identifiers(conn)?;
+
+    Ok(())
+}
+
+/// The ONE judgment of connection-local policy for a bootstrap connection.
+///
+/// SQLite serialization carries database pages, never connection settings,
+/// so a restored connection has exactly the policy this function gives it
+/// — and a freshly constructed one must have the same, or the world that is
+/// frozen and the world that is instantiated obey different rules. Both
+/// roads call this and nothing else configures the connection.
+///
+/// Foreign-key enforcement is connection-local and OFF by SQLite's own
+/// default; the bundled build's compile-time default is a build flag, not
+/// a guarantee. The pragma is issued here, outside any transaction, because
+/// inside one it is silently a no-op.
+///
+/// This is not the place for performance pragmas: a setting is admitted
+/// here only when its semantics are required of every bootstrap connection.
+pub fn configure_connection(conn: &Connection) -> crate::error::Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;").map_err(|e| {
+        Runtime::catalog("configure bootstrap connection", e.to_string())
+    })?;
+    Ok(())
+}
+
+/// Every error hierarchy the typed taxonomy declares becomes one
+/// `identifier` row with its declared role. The Rust hierarchy is the active
+/// mint authority; this table is its queryable projection, the surface
+/// `dql explain` and `sys::identifiers.identifier(*)` read. Nothing is
+/// authored here: a row exists exactly because a family, leaf, external root
+/// or retired identity is declared in `delightql_types::diagnostic`.
+pub fn seed_error_identifiers(conn: &Connection) -> Result<()> {
+    let mut insert = conn.prepare(
+        "INSERT INTO identifier (kind, hierarchy, summary, explanation, role)
+         VALUES ('error', ?1, ?2, ?3, ?4)",
+    )?;
+    for row in delightql_types::diagnostic::inventory() {
+        insert.execute(params![
+            row.hierarchy,
+            row.summary,
+            row.explanation,
+            row.role.word()
+        ])?;
+    }
     Ok(())
 }
 
@@ -366,8 +420,8 @@ mod tests {
 // Session-scoped tables
 //
 // The verdict tables a compilation writes into: assertions, dangers and
-// errors. They are session state, recreated on every `reinit_bootstrap`, and
-// have nothing to do with reading source.
+// errors. Their definitions and canonical defaults are part of the pristine
+// world; their rows are session state and exist only in one instance.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -391,7 +445,7 @@ pub fn setup_assertions_table_on_bootstrap(
         [],
     )
     .map_err(|e| {
-        DelightQLError::database_error(
+        Runtime::catalog(
             "Failed to create assertions table on bootstrap",
             e.to_string(),
         )
@@ -415,9 +469,7 @@ pub fn setup_danger_table_on_bootstrap(conn: &rusqlite::Connection) -> crate::er
         )",
         [],
     )
-    .map_err(|e| {
-        DelightQLError::database_error("Failed to create danger table on bootstrap", e.to_string())
-    })?;
+    .map_err(|e| Runtime::catalog("Failed to create danger table on bootstrap", e.to_string()))?;
 
     // Seed default rows for all known danger URIs
     let defaults = [
@@ -446,10 +498,7 @@ pub fn setup_danger_table_on_bootstrap(conn: &rusqlite::Connection) -> crate::er
             rusqlite::params![uri, state, *cli_overridable as i32, description],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to seed danger row '{}': {}", uri, e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to seed danger row '{}': {}", uri, e), e.to_string())
         })?;
     }
 
@@ -477,9 +526,7 @@ pub fn setup_finding_table_on_bootstrap(conn: &rusqlite::Connection) -> crate::e
         )",
         [],
     )
-    .map_err(|e| {
-        DelightQLError::database_error("Failed to create finding table on bootstrap", e.to_string())
-    })?;
+    .map_err(|e| Runtime::catalog("Failed to create finding table on bootstrap", e.to_string()))?;
 
     Ok(())
 }

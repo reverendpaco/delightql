@@ -30,6 +30,7 @@ const AUTHORITY_FILES: &[&str] = &[
     "carrier.rs",
     "fences.rs",
     "form.rs",
+    "interior.rs",
     "law.rs",
     "minus.rs",
     "mod.rs",
@@ -37,6 +38,7 @@ const AUTHORITY_FILES: &[&str] = &[
     "port.rs",
     "set.rs",
     "store.rs",
+    "support.rs",
 ];
 
 /// Types whose every field must be private to the authority.
@@ -55,6 +57,7 @@ const SEALED_TYPES: &[&str] = &[
     "Planning",
     "Vec2",
     "SetStep",
+    "Correlated",
 ];
 
 /// Opaque identity newtypes: one private field, no public constructor.
@@ -92,6 +95,7 @@ const TOTAL_JUDGMENTS: &[&str] = &[
     "set_step",
     "merge",
     "dependencies_of",
+    "support_law_of",
     "storage_of",
     "entity_of",
     "read_source_of",

@@ -20,14 +20,14 @@
 //! SignedWitness` — a plain-pipeline citizen (resolver + transformer)
 //! as well as a value-position lowering in the effect transformer.
 
-use super::core::definitions::HoParam;
 #[cfg(test)]
 use super::core::Continuation;
 use super::core::{
     Access, Chain, CteBinding, DomainExpression, GroundMention, PipeOp, Query, Relation,
     TruthExpression, Unresolved,
 };
-use super::ddl::{DdlBody, DefinitionGroup, Head};
+use super::ddl::{DdlBody, DefinitionGroup};
+use crate::diagnostic::{Directive, DirectiveBinding, Internal};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_visit::{
     walk_visit_access, walk_visit_boolean, walk_visit_domain, walk_visit_operator,
@@ -178,8 +178,26 @@ pub struct DirectiveDescriptor {
     /// lifted argument table (`consult!`, `doc!`).
     pub receipt_input_echo: bool,
     pub receipt_payload: ReceiptPayload,
+    /// How this directive ENDS an effect-rule clause: whether its receipt
+    /// is its own to sink into the clause ledger.
+    pub ledger: LedgerEnding,
     /// Side-effect character (compile is the notable pure entity).
     pub side_effects: bool,
+}
+
+/// WHAT A DIRECTIVE'S RECEIPT DOES AT THE END OF A CLAUSE — a declared
+/// policy of the descriptor, read by the effect walk's ledger law and
+/// never inferred from a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerEnding {
+    /// The terminal writes its own declared receipt into the shared clause
+    /// shell: a database writer, an assertion, an abort, `returning_other!`.
+    SelfSinking,
+    /// A compositional ending with the universal receipt shape, sunk by the
+    /// invocation loop: the tees that pass their input through.
+    Universal,
+    /// Not a receipt-producing ending of a clause.
+    NotAnEnding,
 }
 
 impl DirectiveDescriptor {
@@ -250,9 +268,8 @@ impl DirectiveDescriptor {
         } else {
             format!("{required}..{maximum}")
         };
-        Err(DelightQLError::validation_error_categorized(
-            "directive/binding/arity",
-            format!(
+        Err(DelightQLError::from(DirectiveBinding::Arity {
+            message: format!(
                 "{}! expects {expectation} argument(s) ({}), got {supplied}",
                 self.name,
                 self.params
@@ -261,8 +278,7 @@ impl DirectiveDescriptor {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            "directive arity",
-        ))
+        }))
     }
 
     /// Judge receipt access against the descriptor's declared heading.
@@ -274,9 +290,8 @@ impl DirectiveDescriptor {
         }
         let declared = self.receipt_columns();
         let Some(binders) = access.binders() else {
-            return Err(DelightQLError::validation_error_categorized(
-                "directive/invocation/access",
-                format!(
+            return Err(DelightQLError::from(Directive::InvocationAccess {
+                message: format!(
                     "the visible group on {}! is RECEIPT access, not its ordinary arguments; \
                      receipt access must be a positional list of plain names with {} column(s) \
                      ({}) or (*). Write the argument group first: {}!(arguments)(*)",
@@ -289,15 +304,13 @@ impl DirectiveDescriptor {
                         .join(", "),
                     self.name,
                 ),
-                "receipt access",
-            ));
+            }));
         };
         if binders.len() == declared.len() {
             return Ok(());
         }
-        Err(DelightQLError::validation_error_categorized(
-            "directive/invocation/access",
-            format!(
+        Err(DelightQLError::from(Directive::InvocationAccess {
+            message: format!(
                 "receipt access on {}! binds {} column(s) but the declared receipt has {} ({}) \
                  — positional binding requires the exact arity, or (*) for the whole receipt",
                 self.name,
@@ -309,27 +322,24 @@ impl DirectiveDescriptor {
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
-            "receipt access",
-        ))
+        }))
     }
 
     /// Whether this directive is an AD-HOC STATEMENT TERMINAL: its meaning is
     /// realized by the typed effect plan and requires the relation a pipe
     /// hands it.
     ///
-    /// The realization says its meaning REQUIRES the piped input, so there is
-    /// no callable entity to invoke instead. Every such directive needs the
-    /// statement road rather than the entity road, and the relay asks this rather than
-    /// keeping a list of the names that answer it today — declaring one more
-    /// reaches the routing, and changing a realization retires it.
+    /// The REALIZATION is the whole answer. A syntax pipe terminal has no
+    /// callable entity to invoke instead, so every such directive — a
+    /// database writer, an assertion, a utility that ships, returns or
+    /// stops — takes the statement road, and the relay asks this rather
+    /// than keeping a list of the names that answer it today: declaring one
+    /// more reaches the routing, and changing a realization retires it. A
+    /// category subset here would leave a lawful terminal unrouted.
     ///
     /// `imprint!` is DDL realized as an ENTITY and answers no.
     pub fn is_adhoc_statement_terminal(&self) -> bool {
-        (matches!(
-            self.category,
-            DirectiveCategory::Ddl | DirectiveCategory::Dml(_)
-        ) || matches!(self.name, "assert" | "abort"))
-            && matches!(self.realization, DirectiveRealization::SyntaxPipeTerminal)
+        matches!(self.realization, DirectiveRealization::SyntaxPipeTerminal)
     }
 }
 
@@ -410,6 +420,7 @@ macro_rules! declare_directives {
         receipt_echoes: $echoes:expr,
         receipt_input_echo: $input_echo:expr,
         receipt_payload: $payload:expr,
+        ledger: $ledger:expr,
         side_effects: $side_effects:expr $(,)?
     }),+ $(,)?) => {
         /// THE CLOSED DIRECTIVE KIND — one variant per declared built-in.
@@ -443,6 +454,7 @@ macro_rules! declare_directives {
                 receipt_echoes: $echoes,
                 receipt_input_echo: $input_echo,
                 receipt_payload: $payload,
+                ledger: $ledger,
                 side_effects: $side_effects,
             }
         ),+];
@@ -458,6 +470,7 @@ declare_directives! {
         receipt_echoes: &[],
         receipt_input_echo: true,
         receipt_payload: ReceiptPayload::Namespaces,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     ConsultTree = "consult_tree" {
@@ -467,6 +480,7 @@ declare_directives! {
         receipt_echoes: &[e("path"), e("namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::ConsultedFiles,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Reconsult = "reconsult" {
@@ -483,6 +497,7 @@ declare_directives! {
         receipt_echoes: &[e("namespace"), eo("path")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Unconsult = "unconsult" {
@@ -492,6 +507,7 @@ declare_directives! {
         receipt_echoes: &[e("namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Mount = "mount" {
@@ -501,6 +517,7 @@ declare_directives! {
         receipt_echoes: &[e("path"), e("namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     MountNew = "mount_new" {
@@ -510,6 +527,7 @@ declare_directives! {
         receipt_echoes: &[e("path"), e("namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     MountTree = "mount_tree" {
@@ -519,6 +537,7 @@ declare_directives! {
         receipt_echoes: &[e("path"), e("namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::Namespaces,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Unmount = "unmount" {
@@ -528,6 +547,7 @@ declare_directives! {
         receipt_echoes: &[e("namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Refresh = "refresh" {
@@ -537,6 +557,7 @@ declare_directives! {
         receipt_echoes: &[e("namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Ground = "ground" {
@@ -546,6 +567,7 @@ declare_directives! {
         receipt_echoes: &[e("data_namespace"), e("lib_namespace"), e("namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Enlist = "enlist" {
@@ -555,6 +577,7 @@ declare_directives! {
         receipt_echoes: &[e("namespace"), eo("into")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Delist = "delist" {
@@ -564,6 +587,7 @@ declare_directives! {
         receipt_echoes: &[e("namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Alias = "alias" {
@@ -573,6 +597,7 @@ declare_directives! {
         receipt_echoes: &[e("namespace"), e("shorthand")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Expose = "expose" {
@@ -582,6 +607,7 @@ declare_directives! {
         receipt_echoes: &[],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Doc = "doc" {
@@ -591,6 +617,7 @@ declare_directives! {
         receipt_echoes: &[],
         receipt_input_echo: true,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     // --- DDL (5): create database objects. THE TARGET IS A PARAMETER: a
@@ -603,6 +630,7 @@ declare_directives! {
         receipt_echoes: &[e("name")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::SelfSinking,
         side_effects: true,
     },
     Table = "table" {
@@ -612,6 +640,7 @@ declare_directives! {
         receipt_echoes: &[e("name")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::SelfSinking,
         side_effects: true,
     },
     TempView = "temp_view" {
@@ -621,6 +650,7 @@ declare_directives! {
         receipt_echoes: &[e("name")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::SelfSinking,
         side_effects: true,
     },
     Imprint = "imprint" {
@@ -630,6 +660,7 @@ declare_directives! {
         receipt_echoes: &[e("source_namespace"), e("target_namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::MaterializedEntities,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     ImprintReplace = "imprint_replace" {
@@ -639,6 +670,7 @@ declare_directives! {
         receipt_echoes: &[e("source_namespace"), e("target_namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::MaterializedEntities,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     // --- DML (3): write rows in user tables.
@@ -649,6 +681,7 @@ declare_directives! {
         receipt_echoes: &[e("target")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::SelfSinking,
         side_effects: true,
     },
     Update = "update" {
@@ -658,6 +691,7 @@ declare_directives! {
         receipt_echoes: &[e("target")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::SelfSinking,
         side_effects: true,
     },
     Delete = "delete" {
@@ -667,6 +701,7 @@ declare_directives! {
         receipt_echoes: &[e("target")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::SelfSinking,
         side_effects: true,
     },
     // --- Execution (2): start runs.
@@ -677,6 +712,7 @@ declare_directives! {
         receipt_echoes: &[e("path")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::RunResult,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     RunNamespace = "run_namespace" {
@@ -686,6 +722,7 @@ declare_directives! {
         receipt_echoes: &[e("namespace")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::RunResult,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     // --- Utility: direct the run itself.
@@ -696,15 +733,17 @@ declare_directives! {
         receipt_echoes: &[],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::NotAnEnding,
         side_effects: true,
     },
     Abort = "abort" {
         category: DirectiveCategory::Utility,
         realization: DirectiveRealization::SyntaxPipeTerminal,
-        params: &[p("identity"), po("label")],
+        params: &[po("label")],
         receipt_echoes: &[],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::None,
+        ledger: LedgerEnding::SelfSinking,
         side_effects: true,
     },
     Assert = "assert" {
@@ -714,6 +753,7 @@ declare_directives! {
         receipt_echoes: &[eo("label")],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::Assertion,
+        ledger: LedgerEnding::SelfSinking,
         side_effects: true,
     },
     Returning = "returning" {
@@ -723,6 +763,7 @@ declare_directives! {
         receipt_echoes: &[],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::Input,
+        ledger: LedgerEnding::Universal,
         side_effects: false,
     },
     ReturningOther = "returning_other" {
@@ -732,6 +773,7 @@ declare_directives! {
         receipt_echoes: &[],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::OtherRelation,
+        ledger: LedgerEnding::SelfSinking,
         side_effects: false,
     },
     Stdout = "stdout" {
@@ -741,6 +783,7 @@ declare_directives! {
         receipt_echoes: &[],
         receipt_input_echo: false,
         receipt_payload: ReceiptPayload::Input,
+        ledger: LedgerEnding::Universal,
         side_effects: true,
     },
 }
@@ -857,10 +900,10 @@ pub fn descriptor(name: &str) -> Option<&'static DirectiveDescriptor> {
 /// tables, derived expressions — refuses with a teaching diagnostic: a
 /// target NAMES where the effect lands, it is not a relation to
 /// evaluate. One interpreter for DDL and DML; the
-/// badge and verb phrase say which family taught the refusal.
+/// refusal constructor and verb phrase say which family taught the refusal.
 pub fn target_designator(
     bare: &str,
-    badge: &'static str,
+    refuse: fn(String) -> DelightQLError,
     verb_phrase: &str,
     argument: &Chain<Unresolved>,
 ) -> Result<(String, Option<String>)> {
@@ -886,16 +929,12 @@ pub fn target_designator(
         };
         return Ok((identifier.name.to_string(), ns));
     }
-    Err(DelightQLError::validation_error_categorized(
-        badge,
-        format!(
-            "{bare}!'s target is a whole-table DESIGNATOR — `name(*)`, optionally \
-             namespace-qualified (`my::ns.name(*)`) — {verb_phrase}; \
-             filters, projections, and derived relations do not belong in a \
-             target"
-        ),
-        "target designator",
-    ))
+    Err(refuse(format!(
+        "{bare}!'s target is a whole-table DESIGNATOR — `name(*)`, optionally \
+         namespace-qualified (`my::ns.name(*)`) — {verb_phrase}; \
+         filters, projections, and derived relations do not belong in a \
+         target"
+    )))
 }
 
 /// Classify a directive name (with or without the trailing `!`). Derived
@@ -913,7 +952,6 @@ pub fn is_liminal_eligible(name: &str) -> bool {
 }
 
 /// Badge for the liminal-eligibility refusal.
-pub const LIMINAL_NOT_ELIGIBLE_BADGE: &str = "directive/liminal/not_eligible";
 
 /// The liminal-eligibility refusal message. Substring pinned red-first by the
 /// effects ball (liminal--41_dml_not_eligible, liminal--42_run_not_eligible:
@@ -967,12 +1005,12 @@ pub struct LiminalDirective {
 // Effect rules (R1–R9)
 // ============================================================================
 
-/// One clause (arm) of an effect rule (R5: clauses are arms).
+/// One clause (arm) of an effect rule (R5: clauses are arms). The head is
+/// not carried: the family's declared row was judged at admission, and a
+/// body binds its parameter references through the frame and the bound
+/// input, never by reading a head at invocation.
 #[derive(Debug, Clone)]
 pub struct EffectClause {
-    /// The clause's head — the same `Head` every other neck carries. An
-    /// effect rule is a `!`-marked SUBJECT, not a parallel head family.
-    pub head: Head,
     /// The clause body, with effect-CTE definitions separated out.
     pub body: EffectBody,
 }
@@ -999,10 +1037,10 @@ fn assemble_cte_subjects(ctes: Vec<CteBinding<Unresolved>>) -> Result<Vec<CteBin
         // An effect body's bindings are authored: a generated or structural
         // subject is a compiler product, and none exists in an authored body.
         let Some(name) = cte.subject().authored_name().cloned() else {
-            return Err(DelightQLError::transformation_error(
+            return Err(Internal::invariant(
+                "effect_cte",
                 "an effect body's binding carries no authored subject; compiler-built \
                  bindings cannot stand in an authored body",
-                "effect_cte",
             ));
         };
         if !groups.contains_key(&name) {
@@ -1090,18 +1128,17 @@ impl EffectRule {
         let mut clauses = Vec::new();
         for def in group.clauses() {
             let DdlBody::Relational(ref query) = def.body else {
-                return Err(DelightQLError::validation_error_categorized(
-                    "effect/rule/body_grammar",
-                    format!(
-                        "effect rule '{}': body is not a relational expression \
+                return Err(DelightQLError::from(
+                    crate::diagnostic::EffectRule::BodyGrammar {
+                        message: format!(
+                            "effect rule '{}': body is not a relational expression \
                          (EFFECT-ALGEBRA R3)",
-                        name
-                    ),
-                    "non-relational effect body",
+                            name
+                        ),
+                    },
                 ));
             };
             clauses.push(EffectClause {
-                head: def.head.clone(),
                 body: EffectBody::from_query(query)?,
             });
         }
@@ -1109,21 +1146,6 @@ impl EffectRule {
             name: name.to_string(),
             clauses,
         })
-    }
-
-    /// Drop the declared scalar and rule-valued formals from every clause
-    /// HEAD: the bound parameters leave the head, so landing decisions
-    /// read only what the rule still wants. The BODIES are untouched —
-    /// their parameter references bind through the invocation's formal
-    /// frame, never by substituting caller text.
-    pub fn strip_bound_param_heads(&mut self) {
-        for clause in &mut self.clauses {
-            if let Some(params) = clause.head.ho_params.as_mut() {
-                params.retain(|param| {
-                    !matches!(param, HoParam::Scalar { .. } | HoParam::Rule { .. })
-                });
-            }
-        }
     }
 }
 
@@ -1152,6 +1174,46 @@ pub fn collect_directive_invocations_in_query(
     let mut c = DirectiveDemandCollector::default();
     let _ = walk_visit_query(&mut c, query);
     c.out
+}
+
+/// THE DESCRIPTOR'S POLICY REFUSAL for a pipe terminal invoked with no
+/// piped relation: its meaning REQUIRES the input the pipe hands it, so
+/// there is nothing to invoke. One teaching, whichever road asks.
+pub fn pipe_terminal_policy_refusal(name: &str) -> DelightQLError {
+    let bare = name.strip_suffix('!').unwrap_or(name);
+    DelightQLError::from(crate::diagnostic::DirectiveContext::PipeTerminal {
+        message: format!(
+            "'{bare}!' is a pipe terminal, not a callable pseudo-predicate — it needs its \
+             piped input relation: source |> {bare}!(…)(*)"
+        ),
+    })
+}
+
+/// THE EFFECT FENCE AT A PURE CALL: an authored relation or rule argument
+/// is an ENCLOSED position, not the evaluation spine. A directive demanded
+/// inside one is not executed by the walk that executes the spine — it is
+/// refused here, before anything runs. The landed member is the spine's
+/// and is not inspected by this fence.
+pub fn refuse_enclosed_effects(
+    call: &crate::pipeline::asts::core::FunctorCall<Unresolved>,
+) -> crate::error::Result<()> {
+    for enclosed in call.arguments.authored_relations() {
+        if let Some(demanded) = collect_directive_invocations(enclosed).first() {
+            return Err(DelightQLError::from(
+                crate::diagnostic::Effect::CompilePurity {
+                    message: format!(
+                        "directive '{}' is demanded inside an authored relation argument of \
+                     '{}': an enclosed argument is not on the evaluation spine, so the \
+                     effect cannot execute there. Land the effect's relation with a pipe, \
+                     or name its released payload and pass the name.",
+                        demanded.name,
+                        call.callee.name_text(),
+                    ),
+                },
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Does this expression demand a directive, directly or through a nested
@@ -1500,7 +1562,6 @@ mod tests {
             relation: Box::new(sub),
             addressing: ProbeAddressing {
                 identifier: qn("p"),
-                using_columns: vec![],
             },
             negated: false,
         })
@@ -1530,7 +1591,6 @@ mod tests {
             relation: Box::new(sub),
             addressing: ProbeAddressing {
                 identifier: qn("p"),
-                using_columns: vec![],
             },
         })
     }

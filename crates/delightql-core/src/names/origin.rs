@@ -97,8 +97,6 @@ pub enum ScopeKind {
     SetArm { arm: u16 },
     /// A resolver-phase scope.
     Resolution { entity: EntityId },
-    /// An entity-relationship chain hop.
-    ErHop { hop: u16 },
     /// A higher-order carrier.
     HoCarrier { role: HoRole },
     /// An effect-plan scratch table. These outlive a single statement,

@@ -427,11 +427,11 @@ mod occurrence_tests {
             .collect();
         planning
             .authority()
-            .derive(RelForm::Anonymous(AnonymousSpec {
-                shape: AnonymousShape::Tabular,
-                slots: &slots,
-                answers_to: None,
-            }))
+            .derive(RelForm::Anonymous(AnonymousSpec::plain(
+                AnonymousShape::Tabular,
+                &slots,
+                None,
+            )))
             .expect("an anonymous relation derives")
     }
 

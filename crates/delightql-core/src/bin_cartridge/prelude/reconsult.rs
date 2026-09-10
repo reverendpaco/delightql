@@ -16,6 +16,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::DirectiveBinding;
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::*;
@@ -68,22 +69,20 @@ impl EffectExecutable for ReconsultPredicate {
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
         if arguments.is_empty() || arguments.len() > 2 {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(DirectiveBinding::Arity {
+                message: format!(
                     "reconsult!() expects 1 or 2 arguments (namespace[, new_file_path]), got {}",
                     arguments.len()
                 ),
-                "Invalid argument count",
-            ));
+            }));
         }
 
         let namespace = extract_string_literal(&arguments[0], "namespace")?;
 
         if namespace.is_empty() {
-            return Err(DelightQLError::database_error(
-                "reconsult!() namespace cannot be empty",
-                "Empty namespace name",
-            ));
+            return Err(DelightQLError::from(DirectiveBinding::Value {
+                message: "reconsult!() namespace cannot be empty".to_string(),
+            }));
         }
 
         let new_file = if arguments.len() == 2 {
@@ -107,12 +106,11 @@ fn extract_string_literal(expr: &DomainExpression, param_name: &str) -> Result<S
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
             Ok(s.clone())
         }
-        _ => Err(DelightQLError::database_error(
-            format!(
+        _ => Err(DelightQLError::from(DirectiveBinding::Value {
+            message: format!(
                 "reconsult!() expects '{}' to be a string literal, got: {:?}",
                 param_name, expr
             ),
-            "Invalid argument type (expected string literal)",
-        )),
+        })),
     }
 }

@@ -19,6 +19,7 @@
 use crate::bin_cartridge::{
     BinEntity, EntitySignature, GeneratorContext, OutputSchema, Parameter, SqlGeneratable,
 };
+use crate::diagnostic::{DelightQLError, Semantic};
 use crate::enums::EntityType;
 use crate::error::Result;
 use crate::pipeline::sql_ast::{BinaryOperator, DomainExpression};
@@ -78,14 +79,13 @@ fn generate(
     negated: bool,
 ) -> Result<String> {
     let [left, right] = args else {
-        return Err(crate::error::DelightQLError::validation_error(
-            &format!(
+        return Err(DelightQLError::from(Semantic::Arity {
+            message: format!(
                 "{} expects 2 arguments, got {}",
                 comparison.name(),
                 args.len()
             ),
-            "SqlComparison::generate_sql",
-        ));
+        }));
     };
     // The comparison is built as an ordinary SQL-AST node and rendered by
     // the generator, so the dialect's operator spelling applies to it

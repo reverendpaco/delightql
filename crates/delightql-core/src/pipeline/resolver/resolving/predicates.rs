@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::diagnostic::{Internal, Resolution};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_unresolved;
@@ -13,71 +14,6 @@ use delightql_types::SqlIdentifier;
 // USING correlation synthesis for semi-joins
 // =============================================================================
 
-/// Wrap a resolved subquery with correlation predicates derived from USING columns.
-/// For `+orders(*.(status))`, this produces:
-///   Filter(subquery, outer.status IS NOT DISTINCT FROM orders.status)
-pub(in crate::pipeline::resolver) fn synthesize_using_correlation(
-    subquery: ast_resolved::Chain,
-    using_columns: &[SqlIdentifier],
-    outer_available: &[crate::relation::PortId],
-    identities: &crate::relation::Planning,
-) -> Result<ast_resolved::Chain> {
-    use crate::pipeline::asts::core::FilterOrigin;
-
-    if using_columns.is_empty() {
-        return Ok(subquery);
-    }
-
-    let inner_schema = subquery.semantic_relation();
-    let inner = crate::relation::published_ports(identities, &inner_schema)?;
-
-    // Build one comparison per USING column
-    let mut comparisons: Vec<ast_resolved::TruthExpression> = Vec::new();
-    for col_name in using_columns {
-        // As written — a strop makes the name case-sensitive, and the lvar
-        // this step unifies with is the one the author spelled.
-        let spelling = identities.intern(col_name.as_str(), col_name.is_stropped());
-        let name = identities.canonical(spelling);
-        let outer_hits: Vec<_> = outer_available
-            .iter()
-            .copied()
-            .filter(|column| identities.published_sym(column.column()) == Some(name))
-            .collect();
-        let inner_hits: Vec<_> = inner
-            .iter()
-            .copied()
-            .filter(|column| identities.published_sym(column.column()) == Some(name))
-            .collect();
-        let outer = unique_using_column(col_name, "outer", &outer_hits)?;
-        let inner = unique_using_column(col_name, "inner", &inner_hits)?;
-        let lhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-            ColumnOccurrence::engine(outer),
-        )));
-        let rhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-            ColumnOccurrence::engine(inner),
-        )));
-
-        comparisons.push(ast_resolved::TruthExpression::Comparison(Comparison {
-            operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
-            left: Box::new(lhs),
-            right: Box::new(rhs),
-        }));
-    }
-
-    // Combine with AND
-    let combined = ast_resolved::TruthExpression::all(comparisons)
-        .expect("a non-empty USING list produces one comparison per column");
-
-    // Wrap subquery in Filter. A filter publishes its source's heading, and
-    // this one is built in the resolved phase, so it carries that heading
-    // rather than leaving a phantom for a later phase to fill: nothing runs
-    // between here and the refiner that would.
-    Ok(subquery.transparently(ast_resolved::Transparent::Restrict {
-        condition: combined,
-        origin: FilterOrigin::Generated,
-    }))
-}
-
 fn unique_using_column(
     name: &SqlIdentifier,
     side: &str,
@@ -85,23 +21,21 @@ fn unique_using_column(
 ) -> Result<crate::relation::PortId> {
     match hits {
         [column] => Ok(*column),
-        [] => Err(DelightQLError::column_not_found_error(
-            name.as_str(),
-            format!("in {side} heading for USING correlation"),
-        )),
-        _ => Err(DelightQLError::validation_error_categorized(
-            "resolution/ambiguous",
-            format!("USING column '{name}' appears more than once in the {side} heading"),
-            "publish a unique name on each side before correlating",
-        )),
+        [] => Err(DelightQLError::from(Resolution::Column {
+            column: name.as_str().to_string(),
+            context: format!("in {side} heading for USING correlation"),
+        })),
+        _ => Err(DelightQLError::from(Resolution::Ambiguous {
+            message: format!("USING column '{name}' appears more than once in the {side} heading"),
+        })),
     }
 }
 
-/// Build individual correlation SigmaConditions from USING columns.
-/// Returns one SigmaCondition per column (not combined with AND), so that
-/// `insert_filter_at_base` can wrap them as separate Filter nodes.
-/// This matches the structure the explicit comma path produces, which the
-/// CDT-SJ classifier and hygienic injection mechanism expect.
+/// The correlations a `.(cols)` run asks for: one per column, each pairing
+/// the interior column of that name with the enclosing row's. One per
+/// column rather than one conjunction, which is the structure the authored
+/// comma spelling produces too. Conditions only: which occurrences a
+/// correlation owes is the correlation act's own derivation.
 pub(in crate::pipeline::resolver) fn build_using_correlation_filters(
     using_columns: &[SqlIdentifier],
     outer_available: &[crate::relation::PortId],
@@ -128,20 +62,26 @@ pub(in crate::pipeline::resolver) fn build_using_correlation_filters(
                 .collect();
             let outer = unique_using_column(col_name, "outer", &outer)?;
             let inner = unique_using_column(col_name, "inner", &inner)?;
-            let lhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                ColumnOccurrence::engine(outer),
-            )));
-            let rhs = ast_resolved::DomainExpression::Reference(Reference::Named(NamedReference(
-                ColumnOccurrence::engine(inner),
-            )));
-
-            Ok(ast_resolved::TruthExpression::Comparison(Comparison {
-                operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
-                left: Box::new(lhs),
-                right: Box::new(rhs),
-            }))
+            Ok(using_condition(outer, inner))
         })
         .collect()
+}
+
+/// `outer = inner`, in the language's own equality; the class it is
+/// settled to is the join's question, asked where the condition lands.
+fn using_condition(
+    outer: crate::relation::PortId,
+    inner: crate::relation::PortId,
+) -> ast_resolved::TruthExpression {
+    ast_resolved::TruthExpression::Comparison(Comparison {
+        operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
+        left: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
+            NamedReference(ColumnOccurrence::engine(outer)),
+        ))),
+        right: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
+            NamedReference(ColumnOccurrence::engine(inner)),
+        ))),
+    })
 }
 
 /// The filters `.*` asks for: one per name BOTH sides publish.
@@ -164,17 +104,7 @@ pub(in crate::pipeline::resolver) fn build_using_all_correlation_filters(
             identities,
         )?
         .into_iter()
-        .map(|shared| {
-            ast_resolved::TruthExpression::Comparison(Comparison {
-                operator: crate::pipeline::asts::vocabulary::CmpOp::NullSafeEqual,
-                left: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
-                    NamedReference(ColumnOccurrence::engine(shared.left)),
-                ))),
-                right: Box::new(ast_resolved::DomainExpression::Reference(Reference::Named(
-                    NamedReference(ColumnOccurrence::engine(shared.right)),
-                ))),
-            })
-        })
+        .map(|shared| using_condition(shared.left, shared.right))
         .collect(),
     )
 }
@@ -276,7 +206,8 @@ fn bind_pattern_name(
     seen: &mut Vec<delightql_types::SqlIdentifier>,
 ) -> Result<()> {
     if seen.contains(name) {
-        return Err(DelightQLError::validation_error(
+        return Err(Internal::invariant(
+            "resolver::resolving::predicates",
             format!(
                 "destructure pattern binds '{}' more than once — the bindings \
                  share one output heading, so one extraction silently overwrites \
@@ -284,7 +215,6 @@ fn bind_pattern_name(
                  key: \"{}\": other_name",
                 name, name
             ),
-            "destructuring",
         ));
     }
     seen.push(name.clone());
@@ -371,14 +301,11 @@ pub(in crate::pipeline::resolver) fn validate_no_sibling_explosions(
         })
         .count();
     if explosion_count > 1 {
-        return Err(DelightQLError::validation_error(
-            "Multiple array explosions (~>) at the same pattern level create ambiguous cartesian product.\n\
+        return Err(crate::diagnostic::DelightQLError::from(crate::diagnostic::Resolution::Ambiguous { message: "Multiple array explosions (~>) at the same pattern level create ambiguous cartesian product.\n\
              Use sequential steps instead:\n\
              Example:\n\
              - Step 1: data ~= ~> {{\"users\": users_data, \"orders\": orders_data}}\n\
-             - Step 2: users_data ~= ~> {{first_name}}",
-            "destructuring"
-        ));
+             - Step 2: users_data ~= ~> {{first_name}}".to_string() }));
     }
     for member in record.members.iter() {
         match member {
@@ -465,7 +392,8 @@ fn destructure_column(
         .get(&identities.canonical(spelling))
         .copied()
         .ok_or_else(|| {
-            DelightQLError::parse_error(
+            Internal::invariant(
+                "resolver::resolving::predicates",
                 "destructuring pattern output has no structural column occurrence",
             )
         })
@@ -490,10 +418,14 @@ pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
     use crate::pipeline::ast_transform::AstTransform;
 
     if arguments.is_empty() {
-        return Err(DelightQLError::parse_error(format!(
-            "Sigma predicate '+{}()' requires at least one argument",
-            table_name
-        )));
+        return Err(crate::diagnostic::DelightQLError::from(
+            crate::diagnostic::Semantic::Arity {
+                message: format!(
+                    "Sigma predicate '+{}()' requires at least one argument",
+                    table_name
+                ),
+            },
+        ));
     }
 
     // The arguments are written in the ENCLOSING clause, so they are resolved
@@ -539,7 +471,6 @@ pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
             relation: Box::new(subquery),
             addressing: ProbeAddressing {
                 identifier: table_ident,
-                using_columns: vec![],
             },
         }))?;
     let ast_resolved::TruthExpression::Existence(Existence {
@@ -548,10 +479,10 @@ pub(in crate::pipeline::resolver) fn expand_table_as_sigma(
         ..
     }) = resolved
     else {
-        return Err(DelightQLError::transformation_error(
+        return Err(Internal::invariant(
+            "sigma_expansion",
             "resolving a sigma predicate's fact relation did not produce a \
              membership test",
-            "sigma_expansion",
         ));
     };
 
@@ -585,13 +516,14 @@ fn synthesize_argument_correlation(
     let fact_scope = subquery.semantic_relation();
     let dimensions = crate::relation::published_ports(identities, &fact_scope)?;
     if dimensions.len() < arguments.len() {
-        return Err(DelightQLError::validation_error(
-            format!(
-                "a fact taking {} arguments has only {} dimensions",
-                arguments.len(),
-                dimensions.len()
-            ),
-            "in a sigma predicate",
+        return Err(crate::diagnostic::DelightQLError::from(
+            crate::diagnostic::Semantic::Arity {
+                message: format!(
+                    "a fact taking {} arguments has only {} dimensions",
+                    arguments.len(),
+                    dimensions.len()
+                ),
+            },
         ));
     }
 
@@ -636,6 +568,7 @@ mod sigma_argument_tests {
                 position: position as u32,
                 named: Some(registry.intern(column, false)),
                 declared_type: None,
+                interior: false,
             })
             .collect();
         registry

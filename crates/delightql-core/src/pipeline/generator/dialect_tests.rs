@@ -50,6 +50,7 @@ impl TestGenerator {
                     scopes: vec![at],
                     headings: vec![heading.clone()],
                     refs: heading,
+                    ..Default::default()
                 }])
                 .reserve_authored(registry),
             )
@@ -670,7 +671,11 @@ fn tvf_join_case(
         source_column,
     )))
     .standing_at(source_scope)
-    .map_err(crate::error::DelightQLError::parse_error)
+    .map_err(|e| {
+        crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+            message: e.to_string(),
+        })
+    })
     .unwrap();
     let tvf = TableExpression::TVF {
         function,
@@ -692,7 +697,11 @@ fn tvf_join_case(
         .select(SelectItem::star_over_nothing())
         .from_tables(vec![joined]))
     .standing_at(result_scope)
-    .map_err(crate::error::DelightQLError::parse_error)
+    .map_err(|e| {
+        crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+            message: e.to_string(),
+        })
+    })
     .unwrap();
     let statement = SqlStatement::with_ctes(None, QueryExpression::Select(Box::new(select)));
     let names = Box::leak(Box::new(
@@ -702,6 +711,7 @@ fn tvf_join_case(
                 scopes: vec![source_scope, tvf_scope, result_scope],
                 headings: vec![vec![source_column]],
                 refs: vec![source_column],
+                ..Default::default()
             }])
             .reserve_authored(registry),
         )
@@ -1148,14 +1158,22 @@ fn once_only_cte_case(
         cte_column,
     )))
     .standing_at(cte_scope)
-    .map_err(crate::error::DelightQLError::parse_error)
+    .map_err(|e| {
+        crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+            message: e.to_string(),
+        })
+    })
     .unwrap();
     let outer = || {
         (SelectStatement::builder()
             .select(SelectItem::star_over_nothing())
             .from_tables(vec![TableExpression::Scope(cte_scope)]))
         .standing_at(result_scope)
-        .map_err(crate::error::DelightQLError::parse_error)
+        .map_err(|e| {
+            crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+                message: e.to_string(),
+            })
+        })
         .unwrap()
     };
     let ordinary = Cte::ordinary(cte_scope, QueryExpression::Select(Box::new(body.clone())));
@@ -1168,6 +1186,7 @@ fn once_only_cte_case(
                 scopes: vec![cte_scope, result_scope],
                 headings: vec![vec![cte_column]],
                 refs: vec![cte_column],
+                ..Default::default()
             }])
             .reserve_authored(registry),
         )

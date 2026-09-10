@@ -5,7 +5,8 @@
 // These traits decouple delightql-core from specific database implementations (rusqlite, DuckDB, WASM bridge, mocks).
 // Core code uses these traits, while concrete implementations live in delightql-backends.
 
-use crate::error::{DelightQLError, Result};
+use crate::diagnostic::Runtime;
+use crate::error::Result;
 use std::fmt::Debug;
 
 /// Value that can be bound to SQL parameters or returned from queries
@@ -171,10 +172,12 @@ pub trait DatabaseConnection: Send + Sync {
         _sql: &str,
         _params: &[DbValue],
     ) -> Result<(Vec<String>, Vec<Vec<DbValue>>)> {
-        Err(DelightQLError::validation_error(
-            "query_all_rows not implemented for this connection type",
-            "This connection does not support full result set queries",
-        ))
+        Err(Runtime::Unsupported {
+            message: "query_all_rows not implemented for this connection type: it does not \
+                      support full result set queries"
+                .to_string(),
+        }
+        .into())
     }
 
     /// Attach a read-only in-memory schema deserialized from a static SQLite
@@ -183,10 +186,12 @@ pub trait DatabaseConnection: Send + Sync {
     /// native SQLite adapter overrides this; pipe, fatboy, DuckDB, and WASM
     /// connections refuse with an actionable error.
     fn attach_static_bytes(&self, _schema_alias: &str, _bytes: &'static [u8]) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "delightql-bytes:// mounts require a native SQLite primary connection",
-            "This connection type cannot attach a deserialized in-memory schema",
-        ))
+        Err(Runtime::Unsupported {
+            message: "delightql-bytes:// mounts require a native SQLite primary connection: \
+                      this connection type cannot attach a deserialized in-memory schema"
+                .to_string(),
+        }
+        .into())
     }
 
     /// The owned-buffer sibling of `attach_static_bytes`: the image is
@@ -199,10 +204,12 @@ pub trait DatabaseConnection: Send + Sync {
     /// Not-for-writing is the host's convention until the delightql-level
     /// DML gate lands.
     fn attach_bytes_copied(&self, _schema_alias: &str, _bytes: &[u8]) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "delightql-bytes:// mounts require a native SQLite primary connection",
-            "This connection type cannot attach a deserialized in-memory schema",
-        ))
+        Err(Runtime::Unsupported {
+            message: "delightql-bytes:// mounts require a native SQLite primary connection: \
+                      this connection type cannot attach a deserialized in-memory schema"
+                .to_string(),
+        }
+        .into())
     }
 }
 
@@ -239,18 +246,24 @@ impl<T: DatabaseConnection + ?Sized> DatabaseConnectionExt for T {
                 impl Row for VecRow {
                     fn get_value(&self, idx: usize) -> Result<DbValue> {
                         self.0.get(idx).cloned().ok_or_else(|| {
-                            DelightQLError::validation_error(
-                                "Column index out of bounds",
-                                format!("Index {} exceeds column count {}", idx, self.0.len()),
-                            )
+                            Runtime::Value {
+                                message: format!(
+                                    "Column index out of bounds: index {} exceeds column count {}",
+                                    idx,
+                                    self.0.len()
+                                ),
+                            }
+                            .into()
                         })
                     }
 
                     fn get_value_by_name(&self, _name: &str) -> Result<DbValue> {
-                        Err(DelightQLError::validation_error(
-                            "Cannot get value by name from Vec<DbValue>",
-                            "Use get_value with index instead",
-                        ))
+                        Err(Runtime::Value {
+                            message: "Cannot get value by name from Vec<DbValue>: use get_value \
+                                      with index instead"
+                                .to_string(),
+                        }
+                        .into())
                     }
 
                     fn column_count(&self) -> usize {
@@ -258,10 +271,12 @@ impl<T: DatabaseConnection + ?Sized> DatabaseConnectionExt for T {
                     }
 
                     fn column_name(&self, _idx: usize) -> Result<&str> {
-                        Err(DelightQLError::validation_error(
-                            "Column names not available from Vec<DbValue>",
-                            "Use index-based access",
-                        ))
+                        Err(Runtime::Value {
+                            message: "Column names not available from Vec<DbValue>: use \
+                                      index-based access"
+                                .to_string(),
+                        }
+                        .into())
                     }
                 }
 
@@ -277,10 +292,12 @@ impl<T: DatabaseConnection + ?Sized> DatabaseConnectionExt for T {
         F: FnMut(&dyn Row) -> Result<()>,
     {
         // Not implemented in blanket impl - concrete types should override
-        Err(DelightQLError::validation_error(
-            "query() not implemented for trait object",
-            "Use concrete type or implement DatabaseConnectionExt",
-        ))
+        Err(Runtime::Unsupported {
+            message: "query() not implemented for trait object: use a concrete type or \
+                      implement DatabaseConnectionExt"
+                .to_string(),
+        }
+        .into())
     }
 }
 
@@ -337,10 +354,10 @@ impl FromDbValue for i64 {
     fn from_db_value(value: &DbValue) -> Result<Self> {
         match value {
             DbValue::Integer(i) => Ok(*i),
-            _ => Err(DelightQLError::validation_error(
-                "Expected integer",
-                format!("Got {:?}", value),
-            )),
+            _ => Err(Runtime::Value {
+                message: format!("Expected integer, got {:?}", value),
+            }
+            .into()),
         }
     }
 }
@@ -350,10 +367,10 @@ impl FromDbValue for f64 {
         match value {
             DbValue::Real(f) => Ok(*f),
             DbValue::Integer(i) => Ok(*i as f64),
-            _ => Err(DelightQLError::validation_error(
-                "Expected real",
-                format!("Got {:?}", value),
-            )),
+            _ => Err(Runtime::Value {
+                message: format!("Expected real, got {:?}", value),
+            }
+            .into()),
         }
     }
 }
@@ -362,10 +379,10 @@ impl FromDbValue for String {
     fn from_db_value(value: &DbValue) -> Result<Self> {
         match value {
             DbValue::Text(s) => Ok(s.clone()),
-            _ => Err(DelightQLError::validation_error(
-                "Expected text",
-                format!("Got {:?}", value),
-            )),
+            _ => Err(Runtime::Value {
+                message: format!("Expected text, got {:?}", value),
+            }
+            .into()),
         }
     }
 }
@@ -374,10 +391,10 @@ impl FromDbValue for Vec<u8> {
     fn from_db_value(value: &DbValue) -> Result<Self> {
         match value {
             DbValue::Blob(b) => Ok(b.clone()),
-            _ => Err(DelightQLError::validation_error(
-                "Expected blob",
-                format!("Got {:?}", value),
-            )),
+            _ => Err(Runtime::Value {
+                message: format!("Expected blob, got {:?}", value),
+            }
+            .into()),
         }
     }
 }
@@ -386,10 +403,10 @@ impl FromDbValue for bool {
     fn from_db_value(value: &DbValue) -> Result<Self> {
         match value {
             DbValue::Integer(i) => Ok(*i != 0),
-            _ => Err(DelightQLError::validation_error(
-                "Expected boolean (integer)",
-                format!("Got {:?}", value),
-            )),
+            _ => Err(Runtime::Value {
+                message: format!("Expected boolean (integer), got {:?}", value),
+            }
+            .into()),
         }
     }
 }

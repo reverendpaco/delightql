@@ -12,6 +12,11 @@ pub(crate) struct NameCollector<'a> {
     identities: &'a Registry,
     scopes: Vec<ScopeId>,
     refs: Vec<ColId>,
+    /// The statement-level bindings this statement publishes — its `WITH`
+    /// names, which stand over every relation name it writes.
+    bindings: Vec<ScopeId>,
+    /// The catalog relations it reads by their own spelling.
+    entities: Vec<crate::names::EntityId>,
 }
 
 impl<'a> NameCollector<'a> {
@@ -20,6 +25,34 @@ impl<'a> NameCollector<'a> {
             identities,
             scopes: Vec::new(),
             refs: Vec::new(),
+            bindings: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
+
+    /// ONE ROAD for a `WITH` list, wherever it stands — a statement's own,
+    /// a nested one, or a DML statement's. Every name it binds stands over
+    /// the relation names of the statement it belongs to, so every one of
+    /// them is recorded as a binding here and nowhere else.
+    fn ctes(&mut self, ctes: &[super::Cte]) {
+        for cte in ctes {
+            self.scope(cte.scope());
+            self.binding(cte.scope());
+            for part in cte.body().parts() {
+                self.query(part);
+            }
+        }
+    }
+
+    fn binding(&mut self, scope: ScopeId) {
+        if !self.bindings.contains(&scope) {
+            self.bindings.push(scope);
+        }
+    }
+
+    fn entity(&mut self, entity: crate::names::EntityId) {
+        if !self.entities.contains(&entity) {
+            self.entities.push(entity);
         }
     }
 
@@ -114,7 +147,8 @@ impl<'a> NameCollector<'a> {
             TableExpression::Scope(scope) | TableExpression::QualifiedScope { scope, .. } => {
                 self.scope(*scope)
             }
-            TableExpression::Entity { alias, .. } => {
+            TableExpression::Entity { entity, alias } => {
+                self.entity(*entity);
                 if let Some(alias) = alias {
                     self.scope(*alias);
                 }
@@ -202,12 +236,7 @@ impl<'a> NameCollector<'a> {
                 }
             }
             QueryExpression::WithCte { ctes, query } => {
-                for cte in ctes {
-                    self.scope(cte.scope());
-                    for part in cte.body().parts() {
-                        self.query(part);
-                    }
-                }
+                self.ctes(ctes);
                 self.query(query);
             }
         }
@@ -224,6 +253,8 @@ impl<'a> NameCollector<'a> {
             scopes: self.scopes,
             headings,
             refs: self.refs,
+            bindings: self.bindings,
+            entities: self.entities,
         }
     }
 }
@@ -234,14 +265,7 @@ pub fn statement_names(statement: &SqlStatement, identities: &Registry) -> crate
         // The name is the relation's own; there is nothing inside to walk.
         SqlStatement::DropTempTable { table } => names.scope(*table),
         SqlStatement::Query { with_clause, query } => {
-            if let Some(ctes) = with_clause {
-                for cte in ctes {
-                    names.scope(cte.scope());
-                    for part in cte.body().parts() {
-                        names.query(part);
-                    }
-                }
-            }
+            cte_names(with_clause, &mut names);
             names.query(query);
         }
         SqlStatement::CreateTempTable {
@@ -255,14 +279,7 @@ pub fn statement_names(statement: &SqlStatement, identities: &Registry) -> crate
             query,
         } => {
             names.scope(*table);
-            if let Some(ctes) = with_clause {
-                for cte in ctes {
-                    names.scope(cte.scope());
-                    for part in cte.body().parts() {
-                        names.query(part);
-                    }
-                }
-            }
+            cte_names(with_clause, &mut names);
             names.query(query);
         }
         SqlStatement::Delete {
@@ -317,12 +334,7 @@ pub fn statement_names(statement: &SqlStatement, identities: &Registry) -> crate
 
 fn cte_names(ctes: &Option<Vec<super::Cte>>, names: &mut NameCollector<'_>) {
     if let Some(ctes) = ctes {
-        for cte in ctes {
-            names.scope(cte.scope());
-            for part in cte.body().parts() {
-                names.query(part);
-            }
-        }
+        names.ctes(ctes);
     }
 }
 

@@ -13,6 +13,8 @@
 //! 3. Compiling body via `compile_source_to_sql(body, &EmptySchema)` → SQL
 //! 4. Executing SQL on bootstrap connection → get rows
 
+use crate::ddl::lifecycle::{Catalog, LiveNamespace};
+use crate::diagnostic::{Manifest as ManifestDiagnostic, Runtime};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{DelightQLError, Result};
@@ -34,15 +36,13 @@ impl Materialization {
         match raw {
             "table" => Ok(Materialization::Table),
             "view" => Ok(Materialization::View),
-            other => Err(DelightQLError::validation_error_categorized(
-                "imprint/manifest/materialization",
-                format!(
+            other => Err(DelightQLError::from(ManifestDiagnostic::Materialization {
+                message: format!(
                     "imprinting() materialization '{}' is not recognized — \
                      valid values are \"table\" or \"view\"",
                     other
                 ),
-                "invalid materialization",
-            )),
+            })),
         }
     }
 }
@@ -64,15 +64,13 @@ impl Extent {
         match raw {
             "permanent" => Ok(Extent::Permanent),
             "temporary" => Ok(Extent::Temporary),
-            other => Err(DelightQLError::validation_error_categorized(
-                "imprint/manifest/extent",
-                format!(
+            other => Err(DelightQLError::from(ManifestDiagnostic::Extent {
+                message: format!(
                     "imprinting() extent '{}' is not recognized — \
                      valid values are \"permanent\" or \"temporary\"",
                     other
                 ),
-                "invalid extent",
-            )),
+            })),
         }
     }
 }
@@ -88,15 +86,13 @@ impl Extent {
 /// `manifest::tests::entity_name_rejects_embedded_quote`.
 fn validate_entity_name(name: &str) -> Result<()> {
     if name.contains('"') {
-        return Err(DelightQLError::validation_error_categorized(
-            "imprint/manifest/entity_name",
-            format!(
+        return Err(DelightQLError::from(ManifestDiagnostic::EntityName {
+            message: format!(
                 "imprint entity name '{}' contains a '\"' — entity names may not \
                  contain double quotes",
                 name
             ),
-            "invalid entity name",
-        ));
+        }));
     }
     Ok(())
 }
@@ -146,11 +142,67 @@ impl delightql_types::schema::DatabaseSchema for EmptySchema {
     }
 }
 
+/// A live library's `_internal` companion namespace, opened for reading
+/// from the catalog its source was judged in.
+///
+/// Companion rows are the DDL a materialization act executes, so they are
+/// reachable only through a judged [`LiveNamespace`] and read only from
+/// that proof's [`Catalog`]: no reader takes a connection, a namespace id,
+/// or a spelling. Copying the handle copies the borrow, so a retained copy
+/// keeps the system borrowed and cannot outlive the lock or survive a
+/// consume.
+#[derive(Clone, Copy, Debug)]
+pub struct Manifest<'c> {
+    catalog: &'c Catalog<'c>,
+    internal_ns_id: i32,
+}
+
+impl<'c> Manifest<'c> {
+    /// Open the companions of a live source. `Ok(None)`: the source declares
+    /// no `_internal` block — the caller says what that means for its act.
+    pub fn open(source: &LiveNamespace<'c>) -> Result<Option<Manifest<'c>>> {
+        let catalog = source.catalog();
+        Ok(
+            internal_namespace_id(catalog, source.fq())?.map(|internal_ns_id| Manifest {
+                catalog,
+                internal_ns_id,
+            }),
+        )
+    }
+
+    /// The `imprinting()` rows: (entity, materialization, extent). Empty
+    /// when the companion is absent.
+    pub fn imprinting(&self) -> Result<Vec<ImprintingRow>> {
+        read_imprinting(self.catalog, self.internal_ns_id)
+    }
+
+    /// Every entity name that has `schema` rows — the discovery road when
+    /// `imprinting()` is absent.
+    pub fn schema_entities(&self) -> Result<Vec<String>> {
+        discover_schema_entities(self.catalog, self.internal_ns_id)
+    }
+
+    /// `schema("entity", column, type)` rows for one entity.
+    pub fn schema(&self, entity: &str) -> Result<Vec<SchemaRow>> {
+        read_schema(self.catalog, self.internal_ns_id, entity)
+    }
+
+    /// `constraints("entity", column, constraint, name)` rows for one entity.
+    pub fn constraints(&self, entity: &str) -> Result<Vec<ConstraintRow>> {
+        read_constraints(self.catalog, self.internal_ns_id, entity)
+    }
+
+    /// `defaults("entity", column, value[, generated])` rows for one entity.
+    pub fn defaults(&self, entity: &str) -> Result<Vec<DefaultRow>> {
+        read_defaults(self.catalog, self.internal_ns_id, entity)
+    }
+}
+
 /// Find the `_internal` child namespace ID for a given source namespace.
 ///
 /// The `_internal` namespace is created by `(~~ddl:"_internal" ... ~~)` blocks
 /// and has `fq_name = "{source_ns}::_internal"`.
-pub fn find_internal_ns(conn: &Connection, source_ns: &str) -> Result<Option<i32>> {
+fn internal_namespace_id(conn: &Connection, source_ns: &str) -> Result<Option<i32>> {
     let internal_fq = format!("{}::_internal", source_ns);
     conn.query_row(
         "SELECT id FROM namespace WHERE fq_name = ?1",
@@ -159,7 +211,7 @@ pub fn find_internal_ns(conn: &Connection, source_ns: &str) -> Result<Option<i32
     )
     .optional()
     .map_err(|e| {
-        DelightQLError::database_error(
+        Runtime::catalog(
             format!("Failed to look up _internal namespace for '{}'", source_ns),
             e.to_string(),
         )
@@ -170,7 +222,7 @@ pub fn find_internal_ns(conn: &Connection, source_ns: &str) -> Result<Option<i32
 ///
 /// Returns the list of (entity, materialization, extent) tuples.
 /// Returns empty vec if `imprinting` entity doesn't exist.
-pub fn read_imprinting(conn: &Connection, internal_ns_id: i32) -> Result<Vec<ImprintingRow>> {
+fn read_imprinting(conn: &Connection, internal_ns_id: i32) -> Result<Vec<ImprintingRow>> {
     // imprinting is a regular (non-HO) entity — no ground value matching needed
     let clauses = read_entity_clauses(conn, internal_ns_id, "imprinting")?;
     if clauses.is_empty() {
@@ -182,7 +234,7 @@ pub fn read_imprinting(conn: &Connection, internal_ns_id: i32) -> Result<Vec<Imp
         let body = crate::ddl::reconstruct::body_text(clause_def);
         let sql = compile_body(&body)?;
         let mut stmt = conn.prepare(&sql).map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to prepare imprinting SQL: {}", sql),
                 e.to_string(),
             )
@@ -198,16 +250,13 @@ pub fn read_imprinting(conn: &Connection, internal_ns_id: i32) -> Result<Vec<Imp
                     strip_dql_quotes(&extent).to_string(),
                 ))
             })
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to execute imprinting query", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to execute imprinting query", e.to_string()))?;
         // Parse enums / validate names OUTSIDE the rusqlite closure so the loud
         // manifest-validation errors (imprint/manifest/*) propagate as
         // DelightQLError, not swallowed into a rusqlite row error.
         for r in result_rows {
-            let (entity, materialization, extent) = r.map_err(|e| {
-                DelightQLError::database_error("Failed to read imprinting row", e.to_string())
-            })?;
+            let (entity, materialization, extent) =
+                r.map_err(|e| Runtime::catalog("Failed to read imprinting row", e.to_string()))?;
             validate_entity_name(&entity)?;
             rows.push(ImprintingRow {
                 entity,
@@ -221,7 +270,7 @@ pub fn read_imprinting(conn: &Connection, internal_ns_id: i32) -> Result<Vec<Imp
 }
 
 /// Read `schema("entity_name", column, type)` from `_internal` namespace.
-pub fn read_schema(conn: &Connection, internal_ns_id: i32, entity: &str) -> Result<Vec<SchemaRow>> {
+fn read_schema(conn: &Connection, internal_ns_id: i32, entity: &str) -> Result<Vec<SchemaRow>> {
     let clauses = read_relation_clauses_by_ground_value(conn, internal_ns_id, "schema", entity)?;
     if clauses.is_empty() {
         return Ok(Vec::new());
@@ -232,7 +281,7 @@ pub fn read_schema(conn: &Connection, internal_ns_id: i32, entity: &str) -> Resu
         let body = crate::ddl::reconstruct::body_text(clause_def);
         let sql = compile_body(&body)?;
         let mut stmt = conn.prepare(&sql).map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to prepare schema SQL: {}", sql),
                 e.to_string(),
             )
@@ -244,13 +293,9 @@ pub fn read_schema(conn: &Connection, internal_ns_id: i32, entity: &str) -> Resu
                     col_type: row.get(1)?,
                 })
             })
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to execute schema query", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to execute schema query", e.to_string()))?;
         for r in result_rows {
-            rows.push(r.map_err(|e| {
-                DelightQLError::database_error("Failed to read schema row", e.to_string())
-            })?);
+            rows.push(r.map_err(|e| Runtime::catalog("Failed to read schema row", e.to_string()))?);
         }
     }
 
@@ -258,7 +303,7 @@ pub fn read_schema(conn: &Connection, internal_ns_id: i32, entity: &str) -> Resu
 }
 
 /// Read `constraints("entity_name", column, constraint, name)`.
-pub fn read_constraints(
+fn read_constraints(
     conn: &Connection,
     internal_ns_id: i32,
     entity: &str,
@@ -274,7 +319,7 @@ pub fn read_constraints(
         let body = crate::ddl::reconstruct::body_text(clause_def);
         let sql = compile_body(&body)?;
         let mut stmt = conn.prepare(&sql).map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to prepare constraints SQL: {}", sql),
                 e.to_string(),
             )
@@ -287,13 +332,11 @@ pub fn read_constraints(
                     constraint_name: row.get(2)?,
                 })
             })
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to execute constraints query", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to execute constraints query", e.to_string()))?;
         for r in result_rows {
-            rows.push(r.map_err(|e| {
-                DelightQLError::database_error("Failed to read constraint row", e.to_string())
-            })?);
+            rows.push(
+                r.map_err(|e| Runtime::catalog("Failed to read constraint row", e.to_string()))?,
+            );
         }
     }
 
@@ -304,11 +347,7 @@ pub fn read_constraints(
 ///
 /// Defaults may have 2 columns (column, default_val) or 3 columns
 /// (column, default_val, generated). We detect the column count from the SQL.
-pub fn read_defaults(
-    conn: &Connection,
-    internal_ns_id: i32,
-    entity: &str,
-) -> Result<Vec<DefaultRow>> {
+fn read_defaults(conn: &Connection, internal_ns_id: i32, entity: &str) -> Result<Vec<DefaultRow>> {
     let clauses = read_relation_clauses_by_ground_value(conn, internal_ns_id, "defaults", entity)?;
     if clauses.is_empty() {
         return Ok(Vec::new());
@@ -319,7 +358,7 @@ pub fn read_defaults(
         let body = crate::ddl::reconstruct::body_text(clause_def);
         let sql = compile_body(&body)?;
         let mut stmt = conn.prepare(&sql).map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to prepare defaults SQL: {}", sql),
                 e.to_string(),
             )
@@ -343,13 +382,11 @@ pub fn read_defaults(
                     generated: if col_count >= 3 { row.get(2)? } else { None },
                 })
             })
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to execute defaults query", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to execute defaults query", e.to_string()))?;
         for r in result_rows {
-            rows.push(r.map_err(|e| {
-                DelightQLError::database_error("Failed to read default row", e.to_string())
-            })?);
+            rows.push(
+                r.map_err(|e| Runtime::catalog("Failed to read default row", e.to_string()))?,
+            );
         }
     }
 
@@ -360,7 +397,7 @@ pub fn read_defaults(
 ///
 /// Used as fallback when `imprinting()` is absent — we discover entities
 /// from the first ground head position of every active `schema` clause.
-pub fn discover_schema_entities(conn: &Connection, internal_ns_id: i32) -> Result<Vec<String>> {
+fn discover_schema_entities(conn: &Connection, internal_ns_id: i32) -> Result<Vec<String>> {
     let clauses = read_entity_clauses(conn, internal_ns_id, "schema")?;
     let mut names = std::collections::BTreeSet::new();
     for clause in clauses {
@@ -391,7 +428,7 @@ fn read_entity_clauses(
              ORDER BY ec.ordinal",
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to query entity clauses for '{}'", entity_name),
                 e.to_string(),
             )
@@ -402,7 +439,7 @@ fn read_entity_clauses(
             row.get::<_, String>(0)
         })
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to execute clause query for '{}'", entity_name),
                 e.to_string(),
             )
@@ -410,7 +447,7 @@ fn read_entity_clauses(
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to read clauses for '{}'", entity_name),
                 e.to_string(),
             )
@@ -457,28 +494,24 @@ fn companion_clause_entity(relation_name: &str, source: &str) -> Result<String> 
         .listed()
         .and_then(|items| items.first())
         .ok_or_else(|| {
-            DelightQLError::validation_error_categorized(
-                "imprint/manifest/companion_key",
-                format!(
+DelightQLError::from(ManifestDiagnostic::CompanionKey {
+                message: format!(
                     "ordinary companion '{relation_name}' has no first head position naming its entity"
                 ),
-                "write the companion as relation(\"entity\" as entity, ...)",
-            )
+            })
         })?;
     match &first.supply {
         Supply::Ground(LiteralValue::String(entity)) => Ok(entity.clone()),
-        Supply::Ground(other) => Err(DelightQLError::validation_error_categorized(
-            "imprint/manifest/companion_key",
-            format!("ordinary companion '{relation_name}' uses non-string entity key {other}"),
-            "the first companion position is a string entity name",
-        )),
-        Supply::Ref(_) => Err(DelightQLError::validation_error_categorized(
-            "imprint/manifest/companion_key",
-            format!(
+        Supply::Ground(other) => Err(DelightQLError::from(ManifestDiagnostic::CompanionKey {
+            message: format!(
+                "ordinary companion '{relation_name}' uses non-string entity key {other}"
+            ),
+        })),
+        Supply::Ref(_) => Err(DelightQLError::from(ManifestDiagnostic::CompanionKey {
+            message: format!(
                 "ordinary companion '{relation_name}' leaves its manifest entity key data-dependent"
             ),
-            "each stored companion clause grounds and labels its first entity position",
-        )),
+        })),
     }
 }
 

@@ -7,6 +7,7 @@
 use super::super::{LiteralValue, Phase, Unresolved};
 use super::domain::DomainExpression;
 use super::truth::TruthExpression;
+use crate::diagnostic::Internal;
 use crate::{enums::EntityType, lispy::ToLispy, ToLispy};
 use std::ops::Deref;
 
@@ -483,9 +484,9 @@ impl<P: Phase> ScalarizedRelation<P> {
         use super::chain::Continuation;
 
         let missing = || {
-            crate::error::DelightQLError::transformation_error(
-                "a scalarized relation lost the compression it was built with",
+            Internal::invariant(
                 "scalarization",
+                "a scalarized relation lost the compression it was built with",
             )
         };
         let closing = chain.steps_mut().pop().ok_or_else(missing)?;

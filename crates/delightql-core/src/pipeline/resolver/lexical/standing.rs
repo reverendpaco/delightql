@@ -18,6 +18,7 @@
 //! consumed is gone rather than merely unused.
 
 use super::Frontier;
+use crate::diagnostic::Internal;
 use crate::error::Result;
 use crate::pipeline::{ast_resolved, ast_unresolved};
 
@@ -37,7 +38,9 @@ impl ResolvedRelation {
     /// literal, projection, or expansion. What answers over it is what it
     /// publishes, so the scope is read off the relation rather than
     /// supplied beside it.
-    pub(in crate::pipeline::resolver) fn answering_for_itself(chain: ast_resolved::Chain) -> ResolvedRelation {
+    pub(in crate::pipeline::resolver) fn answering_for_itself(
+        chain: ast_resolved::Chain,
+    ) -> ResolvedRelation {
         let frontier = Frontier::of(chain.semantic_relation());
         ResolvedRelation { chain, frontier }
     }
@@ -72,8 +75,7 @@ impl ResolvedRelation {
             core: fold.core,
             env: fold.env,
             instances: &fold.config.instances,
-            formals: None,
-            horizon: None,
+            scoped: None,
         };
         let pattern = super::pattern::resolve(
             access,
@@ -339,9 +341,9 @@ impl ResolvedRelation {
         let relation = chain.semantic_relation();
         let ports = crate::relation::published_ports(identities, &relation)?;
         if ports.len() != exports.len() {
-            return Err(crate::error::DelightQLError::transformation_error(
-                "an edge boundary published a heading of a different width than its exports",
+            return Err(Internal::invariant(
                 "edge boundary",
+                "an edge boundary published a heading of a different width than its exports",
             ));
         }
         let mut frontier = Frontier::of(relation);
@@ -504,30 +506,82 @@ impl ResolvedRelation {
         })
     }
 
-    /// A RESTRICTION ATTACHED AT THE BASE — the USING correlation.
+    /// THE DEQUALIFYING CORRELATION — `.(cols)` or `.*` — performed where
+    /// it is written, on the relation standing here.
     ///
-    /// Rows drop and nothing is republished, so what answers over the
-    /// relation still answers and the scope travels. The relation never
-    /// leaves: the closure is shown the base the filters are computed
-    /// against and answers with FILTERS, not with a chain, so there is no
-    /// other relation this act could end up holding.
-    pub(crate) fn restricted_at_base(
+    /// The run names the columns; the row it looks left into is every
+    /// position in view at the fold's position; and each pairing is one
+    /// restriction on THIS relation, attached before anything derives over
+    /// it — so an ordering, a bound, a grouping or a set written after the
+    /// run derives over the correlated relation and judges what it owes,
+    /// exactly as it does for the spelled-out `col = outer.col`. The two
+    /// spellings reach the one correlation act. In an interior the enclosing
+    /// join evaluates, each restriction IS that act; in an interior
+    /// evaluated in place it is the target's own correlated predicate and
+    /// owes nothing. The relation never leaves: the builders are shown the
+    /// standing chain and answer with conditions, so there is no other
+    /// relation this act could end up holding.
+    pub(crate) fn correlated_by_name(
         self,
+        run: crate::pipeline::resolver::CorrelatingRun<'_>,
+        fold: &mut crate::pipeline::resolver::resolver_fold::ResolverFold<'_, '_>,
+    ) -> Result<ResolvedRelation> {
+        use crate::pipeline::resolver::CorrelatingRun;
+        let identities = fold.core.identities;
+        let outer = fold.lexical.row_in_view(&identities)?;
+        let correlations = fold.correlations;
+        let ResolvedRelation {
+            mut chain,
+            frontier,
+        } = self;
+        let conditions = match run {
+            CorrelatingRun::Named(columns) => {
+                crate::pipeline::resolver::resolving::build_using_correlation_filters(
+                    columns,
+                    &outer,
+                    &chain,
+                    &identities,
+                )?
+            }
+            CorrelatingRun::All => {
+                crate::pipeline::resolver::resolving::build_using_all_correlation_filters(
+                    &outer,
+                    &chain,
+                    &identities,
+                )?
+            }
+        };
+        for condition in conditions {
+            chain = match correlations {
+                crate::pipeline::resolver::Correlations::Hoisted => identities
+                    .authority()
+                    .correlate(chain, condition, super::Terminal::judged())?,
+                crate::pipeline::resolver::Correlations::InPlace => {
+                    chain.transparently(ast_resolved::Transparent::Restrict {
+                        condition,
+                        origin: ast_resolved::FilterOrigin::Generated,
+                    })
+                }
+            };
+        }
+        Ok(ResolvedRelation { chain, frontier })
+    }
+
+    /// A RESTRICTION THAT READS THE ENCLOSING ROW, performed as the one
+    /// correlation act. The lexical position judged the condition a
+    /// correlation; the act derives from the condition and this relation
+    /// which occurrences are interior and owed, so nothing here chooses
+    /// one and nothing here could hand the act a list.
+    pub(crate) fn correlated(
+        self,
+        condition: ast_resolved::TruthExpression,
         identities: &crate::relation::Planning,
-        filters: impl FnOnce(&ast_resolved::Chain) -> Result<Vec<ast_resolved::TruthExpression>>,
     ) -> Result<ResolvedRelation> {
         let ResolvedRelation { chain, frontier } = self;
-        // THE BASE IS WHAT THE STEP NAMED. A pipe publishes its own
-        // heading, so the column the run named may be gone by the end of
-        // the chain; the filters are read where they will stand.
-        let (base, trailing) = chain
-            .peel_while(|form| matches!(form, ast_resolved::Continuation::Pipe { .. }))
-            .into_parts();
-        let filters = filters(&base)?;
-        let correlated =
-            crate::pipeline::resolver::insert_filters_at_base(base, filters, identities)?;
         Ok(ResolvedRelation {
-            chain: identities.authority().reland_all(correlated, trailing)?,
+            chain: identities
+                .authority()
+                .correlate(chain, condition, super::Terminal::judged())?,
             frontier,
         })
     }
@@ -679,18 +733,6 @@ impl ResolvedRelation {
         )
     }
 
-    /// The correlation filters an interior relation's scope carries, for
-    /// the hygienic injection that has to survive a projection.
-    pub(crate) fn correlation_filters(
-        &self,
-        identities: &crate::relation::Planning,
-    ) -> Result<Vec<ast_resolved::TruthExpression>> {
-        crate::pipeline::refiner::correlation_analyzer::detect_correlation_filters_in_scope(
-            &self.chain,
-            identities,
-        )
-    }
-
     /// THE GROUND HEAD a served bootstrap read stands on: the relation it
     /// publishes and its outerness. `None` when the head is not a ground
     /// reference at all.
@@ -780,16 +822,6 @@ pub(crate) struct ResolvedJoin {
     pending: Vec<crate::pipeline::resolver::unification::ColumnReference>,
 }
 
-/// Where an ANONYMOUS right member goes: a membership test against the
-/// left row, or on as the join's right operand.
-pub(crate) enum AnonRouting {
-    /// Every header was a probe: this is not a relation but a truth about
-    /// the left row, and what stands is the left relation restricted.
-    Membership(ResolvedRelation),
-    /// The headers name a relation; the join goes on.
-    Join(ResolvedJoin),
-}
-
 impl ResolvedJoin {
     /// The left columns this join's relationships are decided against —
     /// read off the left relation this artifact owns, never supplied.
@@ -812,6 +844,26 @@ impl ResolvedJoin {
             let left_columns = self.left_columns(identities)?;
             let right_ports =
                 crate::relation::published_ports(identities, &self.right.semantic_relation())?;
+            // AS WRITTEN: the dequalifying step names a column of the member
+            // it parameterizes, and this join — which claimed the access
+            // and handed the member's read `All` — is what decides whether
+            // that member has it.
+            for column in columns {
+                let name = super::lookup::written_name(column, identities);
+                if !right_ports
+                    .iter()
+                    .any(|port| identities.published_sym(port.column()) == Some(name))
+                {
+                    return Err(crate::error::DelightQLError::from(
+                        crate::diagnostic::Resolution::Column {
+                            column: column.to_string(),
+                            context: format!(
+                                "USING column '{column}' not found in the member it dequalifies"
+                            ),
+                        },
+                    ));
+                }
+            }
             self.directed = Some(super::join::create_using_condition(
                 columns,
                 &left_columns,
@@ -837,67 +889,6 @@ impl ResolvedJoin {
             identities,
         )?);
         Ok(self)
-    }
-
-    /// An ANONYMOUS right member: whether its headers unify with columns
-    /// in scope is decided here, from both headings. An ALIASED anonymous
-    /// table is a closed relation — its headers declare under the alias,
-    /// so they neither unify bare nor collide, and the refusal-free probe
-    /// only detects membership shape.
-    ///
-    /// The answer routes the member: an anonymous table whose every header
-    /// is a probe — a ground literal, or an lvar that unifies with a
-    /// column in scope — is not a relation but a MEMBERSHIP test, and what
-    /// stands is the left relation restricted by it. The plain comma form
-    /// takes that road whenever every column unifies, because multi-row
-    /// unification is membership: a duplicate row cannot multiply outer
-    /// rows, and a null component is a value the probe can match.
-    pub(crate) fn unifying_anonymously(
-        mut self,
-        headers: Option<&[crate::pipeline::ast_unresolved::DomainExpression]>,
-        alias: Option<&delightql_types::SqlIdentifier>,
-        identities: &crate::relation::Planning,
-    ) -> Result<AnonRouting> {
-        let left_columns = self.left_columns(identities)?;
-        let visible = &self.left.frontier;
-        if let Some(headers) = headers {
-            let right_ports =
-                crate::relation::published_ports(identities, &self.right.semantic_relation())?;
-            self.directed = if alias.is_some() {
-                super::join::aliased_anon_would_unify(
-                    headers,
-                    &left_columns,
-                    &right_ports,
-                    visible,
-                    identities,
-                )?
-            } else {
-                super::join::detect_anonymous_table_unification(
-                    headers,
-                    &left_columns,
-                    &right_ports,
-                    visible,
-                    identities,
-                )?
-            };
-        }
-        match super::join::build_anon_membership(
-            headers,
-            &self.directed,
-            &left_columns,
-            &self.right.chain,
-            alias,
-            visible,
-            identities,
-        )? {
-            Some(membership) => Ok(AnonRouting::Membership(self.left.transparently(
-                ast_resolved::Transparent::Restrict {
-                    condition: membership,
-                    origin: ast_resolved::FilterOrigin::UserWritten,
-                },
-            ))),
-            None => Ok(AnonRouting::Join(self)),
-        }
     }
 
     /// AN AUTHORED CONDITION DEFERS. `a, b : cond` states the join's
@@ -1022,9 +1013,9 @@ impl ResolvedJoin {
                 }),
                 [] => {}
                 [_, _, ..] => {
-                    return Err(crate::error::DelightQLError::transformation_error(
-                        "one relation carries a residual row token more than once",
+                    return Err(Internal::invariant(
                         "resolved join",
+                        "one relation carries a residual row token more than once",
                     ));
                 }
             }
@@ -1092,6 +1083,20 @@ impl ResolvedJoin {
                     ))
                 }
             };
+        }
+        // THE JOIN'S OWN CONDITION HAS NO VALUE FOR A POSITION THE JOIN
+        // COMPUTES: an interior boundary's position the enclosing join
+        // realizes is computed over the join's row, after the condition
+        // that admits the row — a condition reading it refuses.
+        if let Some(ast_resolved::MemberCorrelation::Condition(condition)) = &directed {
+            if crate::relation::support::ports_read_by_deep(condition)
+                .into_iter()
+                .any(|port| crate::relation::realized_at_boundary(identities, port))
+            {
+                return Err(crate::relation::enclosing_position_refusal(
+                    "the join's own condition",
+                ));
+            }
         }
         // THE CORRELATION IS THE MERGE. A correspondence says which pairs
         // the join merges; the heading it publishes is derived from that
@@ -1185,7 +1190,6 @@ impl ResolvedJoin {
                             input,
                             why: crate::relation::form::ProjectWhy::Restate,
                             slots: &slots,
-                            dependencies: &[],
                         },
                     ),
                     sources,

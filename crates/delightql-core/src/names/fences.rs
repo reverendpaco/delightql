@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 /// equality). Definitions and call sites alike — that is what makes the
 /// count mechanical.
 const INVENTORY: &[(&str, usize, usize, usize)] = &[
-    ("names/birth.rs", 2, 26, 0),
+    ("names/birth.rs", 2, 25, 0),
     ("names/registry.rs", 3, 4, 0),
-    ("names/tests.rs", 17, 18, 0),
+    ("names/tests.rs", 19, 20, 0),
 ];
 
 /// Spellings that must not occur ANYWHERE under `src/`, with the reason a

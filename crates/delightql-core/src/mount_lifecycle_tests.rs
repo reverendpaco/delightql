@@ -17,7 +17,8 @@
 //! The world here is that session — a real file-backed rusqlite connection,
 //! the shape `ConnectionManager::open` builds for `--db <path>`.
 
-use crate::system::DelightQLSystem;
+use crate::diagnostic::{DelightQLError, Runtime};
+use crate::system::ReadySystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::{DatabaseConnection, DbValue};
 use std::sync::{Arc, Mutex};
@@ -38,14 +39,18 @@ fn to_rusqlite(value: &DbValue) -> rusqlite::types::Value {
 
 impl DatabaseConnection for RealSqliteConnection {
     fn execute(&self, sql: &str, params: &[DbValue]) -> delightql_types::Result<usize> {
-        let conn = self.conn.lock().map_err(|e| {
-            delightql_types::DelightQLError::connection_poison_error("poisoned", e.to_string())
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Runtime::poisoned("poisoned", e.to_string()))?;
         let vals: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite).collect();
         let refs: Vec<&dyn rusqlite::ToSql> =
             vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
         conn.execute(sql, refs.as_slice()).map_err(|e| {
-            delightql_types::DelightQLError::database_error("Execute failed", e.to_string())
+            DelightQLError::from(Runtime::General {
+                message: "Execute failed".to_string(),
+                details: e.to_string(),
+            })
         })
     }
 
@@ -66,14 +71,18 @@ impl DatabaseConnection for RealSqliteConnection {
         sql: &str,
         params: &[DbValue],
     ) -> delightql_types::Result<(Vec<String>, Vec<Vec<DbValue>>)> {
-        let conn = self.conn.lock().map_err(|e| {
-            delightql_types::DelightQLError::connection_poison_error("poisoned", e.to_string())
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Runtime::poisoned("poisoned", e.to_string()))?;
         let vals: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite).collect();
         let refs: Vec<&dyn rusqlite::ToSql> =
             vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
         let mut stmt = conn.prepare(sql).map_err(|e| {
-            delightql_types::DelightQLError::database_error("Prepare failed", e.to_string())
+            DelightQLError::from(Runtime::General {
+                message: "Prepare failed".to_string(),
+                details: e.to_string(),
+            })
         })?;
         let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let width = cols.len();
@@ -94,13 +103,19 @@ impl DatabaseConnection for RealSqliteConnection {
                 Ok(out)
             })
             .map_err(|e| {
-                delightql_types::DelightQLError::database_error("Query failed", e.to_string())
+                DelightQLError::from(Runtime::General {
+                    message: "Query failed".to_string(),
+                    details: e.to_string(),
+                })
             })?
             .collect();
         Ok((
             cols,
             rows.map_err(|e| {
-                delightql_types::DelightQLError::database_error("Row read failed", e.to_string())
+                DelightQLError::from(Runtime::General {
+                    message: "Row read failed".to_string(),
+                    details: e.to_string(),
+                })
             })?,
         ))
     }
@@ -144,8 +159,7 @@ fn open_schemas(raw: &Arc<Mutex<rusqlite::Connection>>) -> Vec<String> {
 
 /// A session whose user connection opens the database file DIRECTLY, so the
 /// file is SQLite's own `main` on that connection.
-fn session_over_its_own_file() -> (
-    DelightQLSystem,
+fn session_over_its_own_file() -> (ReadySystem,
     Arc<Mutex<rusqlite::Connection>>,
     String,
     tempfile::TempDir,
@@ -162,7 +176,7 @@ fn session_over_its_own_file() -> (
     ));
     let adapter: Arc<Mutex<dyn DatabaseConnection>> =
         Arc::new(Mutex::new(RealSqliteConnection { conn: raw.clone() }));
-    let system = DelightQLSystem::new(adapter, Box::new(OneTable), "sqlite").expect("system");
+    let system = ReadySystem::new(adapter, Box::new(OneTable), "sqlite").expect("system");
     let path = db_path.to_str().expect("utf-8 path").to_string();
     (system, raw, path, dir)
 }

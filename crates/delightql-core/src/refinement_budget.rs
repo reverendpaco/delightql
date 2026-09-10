@@ -123,19 +123,15 @@ impl Drop for RefinementFrame<'_> {
 /// teaching about. A literal here would be a second authority the catalog
 /// could not correct.
 fn refusal(attempted: usize, max: usize) -> crate::error::DelightQLError {
-    crate::error::DelightQLError::validation_error_categorized(
-        REFINEMENT_DEPTH.refusal(),
-        format!(
-            "refinement reached {attempted} nested steps; this session's budget is {max}. \
+    (REFINEMENT_DEPTH.refusal())(format!(
+        "refinement reached {attempted} nested steps; this session's budget is {max}. \
              This usually means an unusually deep query, or a cycle in the compiler \
              itself. An operator may raise the session budget ({knob}), up to the \
              safety ceiling of {ceiling}; sys::execution.compiler_limit(*) reports the \
              effective setting.",
-            knob = REFINEMENT_DEPTH.knob(),
-            ceiling = REFINEMENT_DEPTH.ceiling(),
-        ),
-        "refinement budget",
-    )
+        knob = REFINEMENT_DEPTH.knob(),
+        ceiling = REFINEMENT_DEPTH.ceiling(),
+    ))
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@
 // 2. Implement apply_transformer() that walks the AST recursively
 // 3. Each pass implements its own transformer that focuses on the optimization logic
 
+use crate::diagnostic::Internal;
 use crate::error::Result;
 use crate::pipeline::sql_ast::{
     DomainExpression, QueryExpression, SelectStatement, SqlStatement, TableExpression,
@@ -221,14 +222,9 @@ fn transform_select<T: QueryTransformer>(
         builder = builder.limit_from(limit_clause.clone());
     }
 
-    let rebuilt =
-        builder
-            .rebuilding(&stmt)
-            .map_err(|e| crate::error::DelightQLError::ParseError {
-                message: format!("Failed to rebuild SELECT: {}", e),
-                source: None,
-                subcategory: None,
-            })?;
+    let rebuilt = builder.rebuilding(&stmt).map_err(|e| {
+        Internal::invariant("sql_optimizer", format!("Failed to rebuild SELECT: {}", e))
+    })?;
 
     // Apply the transformer to the rebuilt statement
     match transformer.transform_select(rebuilt.clone())? {

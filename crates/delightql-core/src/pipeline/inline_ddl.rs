@@ -8,7 +8,8 @@
 //! inside load publication), namespace collision, redefinition, registration,
 //! and rollback through whatever transaction the caller already holds.
 
-use crate::error::{DelightQLError, Result};
+use crate::diagnostic::Runtime;
+use crate::error::Result;
 use crate::system::DelightQLSystem;
 
 use super::asts::unresolved as ast_unresolved;
@@ -30,7 +31,7 @@ pub(crate) fn register_prompt_blocks(
             None => "home".to_string(),
         };
         register_inline_ddl_block(&ddl.body, &namespace, system).map_err(|error| {
-            DelightQLError::database_error(format!("Inline DDL error: {error}"), "inline DDL")
+            Runtime::catalog(format!("Inline DDL error: {error}"), "inline DDL")
         })?;
     }
     Ok(())
@@ -61,7 +62,7 @@ pub fn register_inline_ddl_block(
             body.definitions.clone(),
         ))
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Inline DDL registration failed: {}", e),
                 "consult error",
             )

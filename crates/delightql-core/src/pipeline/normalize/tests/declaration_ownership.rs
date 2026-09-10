@@ -37,10 +37,8 @@ fn judged(source: &str) -> Option<String> {
     // alternative — reading the submission — is what lets a later query claim
     // an earlier query's outcome.
     let owner = owner?;
-    let expected = declared_error_within(&tree, &owner)?;
-    expected
-        .matches(&error.error_uri())
-        .then(|| expected.display_uri())
+    let expected = declared_error_within(&tree, &owner).ok()??;
+    expected.matches(&error.id()).then(|| expected.display())
 }
 
 /// The refusal the first form makes, spelled so the tests read as one

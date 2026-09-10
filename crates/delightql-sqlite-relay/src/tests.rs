@@ -11,8 +11,8 @@
 use std::sync::{Arc, Mutex};
 
 use delightql_protocol::{
-    Client, CloseResponse, DirectTransport, FetchResponse, Orientation, Projection,
-    QueryResponse, Session, VersionResult,
+    Client, CloseResponse, DirectTransport, FetchResponse, Orientation, Projection, QueryResponse,
+    Session, VersionResult,
 };
 
 use crate::SqlParty;
@@ -30,8 +30,8 @@ fn fixture_conn() -> rusqlite::Connection {
     )
     .unwrap();
     let names = [
-        "John", "Jane", "Ada", "Grace", "Alan", "Edsger", "Barbara", "Donald",
-        "Tony", "Leslie", "Ken", "Dennis", "Bjarne", "Guido", "Anders",
+        "John", "Jane", "Ada", "Grace", "Alan", "Edsger", "Barbara", "Donald", "Tony", "Leslie",
+        "Ken", "Dennis", "Bjarne", "Guido", "Anders",
     ];
     for (i, name) in names.iter().enumerate() {
         conn.execute(
@@ -79,11 +79,8 @@ fn make_sql_session() -> Session<DirectTransport<SqlParty>> {
         .expect("version handshake failed")
     {
         VersionResult::Accepted(s) => s,
-        VersionResult::Rejected { message, .. } => {
-            panic!(
-                "version rejected: {}",
-                String::from_utf8_lossy(&message)
-            )
+        VersionResult::Rejected(error) => {
+            panic!("version rejected: {}", error.message_str())
         }
     }
 }
@@ -105,7 +102,8 @@ fn raw_sql_select_star() {
             assert_eq!(dimensions[1].name, b("first_name"));
             handle
         }
-        QueryResponse::Error { message, .. } => {
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
             panic!(
                 "expected Header, got Error: {}",
                 String::from_utf8_lossy(&message)
@@ -146,7 +144,8 @@ fn raw_sql_streaming_batches() {
     let resp = session.query(b("SELECT * FROM users")).unwrap();
     let handle = match resp {
         QueryResponse::Header { handle, .. } => handle,
-        QueryResponse::Error { message, .. } => {
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
             panic!(
                 "expected Header, got Error: {}",
                 String::from_utf8_lossy(&message)
@@ -159,20 +158,16 @@ fn raw_sql_streaming_batches() {
     let mut batch_sizes = Vec::new();
 
     loop {
-        let resp = session
-            .fetch(&handle, Projection::All, 10, rows)
-            .unwrap();
+        let resp = session.fetch(&handle, Projection::All, 10, rows).unwrap();
         match resp {
             FetchResponse::Data { cells } => {
                 batch_sizes.push(cells.len());
                 total += cells.len();
             }
             FetchResponse::End => break,
-            FetchResponse::Error { message, .. } => {
-                panic!(
-                    "unexpected error: {}",
-                    String::from_utf8_lossy(&message)
-                );
+            FetchResponse::Error(error) => {
+                let message = error.message().to_vec();
+                panic!("unexpected error: {}", String::from_utf8_lossy(&message));
             }
         }
     }
@@ -198,7 +193,8 @@ fn raw_sql_null_fidelity() {
             assert_eq!(dimensions.len(), 2);
             handle
         }
-        QueryResponse::Error { message, .. } => {
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
             panic!(
                 "expected Header, got Error: {}",
                 String::from_utf8_lossy(&message)
@@ -206,9 +202,7 @@ fn raw_sql_null_fidelity() {
         }
     };
 
-    let resp = session
-        .fetch(&handle, Projection::All, 10, rows)
-        .unwrap();
+    let resp = session.fetch(&handle, Projection::All, 10, rows).unwrap();
     match resp {
         FetchResponse::Data { cells } => {
             assert_eq!(cells.len(), 1);
@@ -218,9 +212,7 @@ fn raw_sql_null_fidelity() {
         other => panic!("expected Data, got {:?}", other),
     }
 
-    let resp = session
-        .fetch(&handle, Projection::All, 10, rows)
-        .unwrap();
+    let resp = session.fetch(&handle, Projection::All, 10, rows).unwrap();
     assert_eq!(resp, FetchResponse::End);
 
     session.close(handle).unwrap();
@@ -234,8 +226,11 @@ fn raw_sql_error() {
 
     let resp = session.query(b("SELECT * FROM nonexistent_table")).unwrap();
     match resp {
-        QueryResponse::Error { kind, .. } => {
-            assert_eq!(kind, delightql_protocol::ErrorKind::Syntax);
+        QueryResponse::Error(error) => {
+            assert_eq!(error.kind(), delightql_protocol::ErrorKind::Syntax);
+            assert!(error
+                .identity_str()
+                .starts_with("delightql-error://target/sqlite/syntax/"));
         }
         QueryResponse::Header { .. } => {
             panic!("expected Error, got Header");
@@ -253,7 +248,8 @@ fn raw_sql_close_mid_stream() {
     let resp = session.query(b("SELECT * FROM users")).unwrap();
     let handle = match resp {
         QueryResponse::Header { handle, .. } => handle,
-        QueryResponse::Error { message, .. } => {
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
             panic!(
                 "expected Header, got Error: {}",
                 String::from_utf8_lossy(&message)
@@ -262,9 +258,7 @@ fn raw_sql_close_mid_stream() {
     };
 
     // Fetch just one batch (10 of 15 rows)
-    let resp = session
-        .fetch(&handle, Projection::All, 10, rows)
-        .unwrap();
+    let resp = session.fetch(&handle, Projection::All, 10, rows).unwrap();
     match resp {
         FetchResponse::Data { cells } => {
             assert_eq!(cells.len(), 10);
@@ -284,9 +278,7 @@ fn raw_sql_empty_result() {
     let mut session = make_sql_session();
     let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
-    let resp = session
-        .query(b("SELECT * FROM users WHERE 1=0"))
-        .unwrap();
+    let resp = session.query(b("SELECT * FROM users WHERE 1=0")).unwrap();
     let handle = match resp {
         QueryResponse::Header {
             handle, dimensions, ..
@@ -294,7 +286,8 @@ fn raw_sql_empty_result() {
             assert_eq!(dimensions.len(), 10);
             handle
         }
-        QueryResponse::Error { message, .. } => {
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
             panic!(
                 "expected Header, got Error: {}",
                 String::from_utf8_lossy(&message)
@@ -333,16 +326,14 @@ fn raw_sql_dml_affected_rows() {
         .unwrap()
     {
         VersionResult::Accepted(s) => s,
-        VersionResult::Rejected { message, .. } => {
-            panic!("version rejected: {}", String::from_utf8_lossy(&message))
+        VersionResult::Rejected(error) => {
+            panic!("version rejected: {}", error.message_str())
         }
     };
     let rows = session.agreed_orientation(Orientation::Rows).unwrap();
 
     // DELETE 2 of 3 rows
-    let resp = session
-        .query(b("DELETE FROM t WHERE id > 1"))
-        .unwrap();
+    let resp = session.query(b("DELETE FROM t WHERE id > 1")).unwrap();
     let handle = match resp {
         QueryResponse::Header {
             handle, dimensions, ..
@@ -351,7 +342,8 @@ fn raw_sql_dml_affected_rows() {
             assert_eq!(dimensions[0].name, b("affected_rows"));
             handle
         }
-        QueryResponse::Error { message, .. } => {
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
             panic!(
                 "expected Header, got Error: {}",
                 String::from_utf8_lossy(&message)
@@ -359,9 +351,7 @@ fn raw_sql_dml_affected_rows() {
         }
     };
 
-    let resp = session
-        .fetch(&handle, Projection::All, 10, rows)
-        .unwrap();
+    let resp = session.fetch(&handle, Projection::All, 10, rows).unwrap();
     match resp {
         FetchResponse::Data { cells } => {
             assert_eq!(cells.len(), 1);
@@ -370,9 +360,7 @@ fn raw_sql_dml_affected_rows() {
         other => panic!("expected Data, got {:?}", other),
     }
 
-    let resp = session
-        .fetch(&handle, Projection::All, 10, rows)
-        .unwrap();
+    let resp = session.fetch(&handle, Projection::All, 10, rows).unwrap();
     assert_eq!(resp, FetchResponse::End);
 
     session.close(handle).unwrap();
@@ -397,8 +385,8 @@ fn raw_sql_dml_insert_then_select() {
         .unwrap()
     {
         VersionResult::Accepted(s) => s,
-        VersionResult::Rejected { message, .. } => {
-            panic!("version rejected: {}", String::from_utf8_lossy(&message))
+        VersionResult::Rejected(error) => {
+            panic!("version rejected: {}", error.message_str())
         }
     };
     let rows = session.agreed_orientation(Orientation::Rows).unwrap();
@@ -414,37 +402,33 @@ fn raw_sql_dml_insert_then_select() {
             assert_eq!(dimensions[0].name, b("affected_rows"));
             handle
         }
-        QueryResponse::Error { message, .. } => {
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
             panic!("insert error: {}", String::from_utf8_lossy(&message));
         }
     };
 
-    let resp = session
-        .fetch(&handle, Projection::All, 10, rows)
-        .unwrap();
+    let resp = session.fetch(&handle, Projection::All, 10, rows).unwrap();
     match resp {
         FetchResponse::Data { cells } => {
             assert_eq!(cells[0][0], int_cell(3)); // inserted 3 rows
         }
         other => panic!("expected Data, got {:?}", other),
     }
-    session
-        .fetch(&handle, Projection::All, 10, rows)
-        .unwrap();
+    session.fetch(&handle, Projection::All, 10, rows).unwrap();
     session.close(handle).unwrap();
 
     // Now SELECT to verify the rows are there
     let resp = session.query(b("SELECT * FROM t ORDER BY id")).unwrap();
     let handle = match resp {
         QueryResponse::Header { handle, .. } => handle,
-        QueryResponse::Error { message, .. } => {
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
             panic!("select error: {}", String::from_utf8_lossy(&message));
         }
     };
 
-    let resp = session
-        .fetch(&handle, Projection::All, 10, rows)
-        .unwrap();
+    let resp = session.fetch(&handle, Projection::All, 10, rows).unwrap();
     match resp {
         FetchResponse::Data { cells } => {
             assert_eq!(cells.len(), 3);
@@ -456,9 +440,7 @@ fn raw_sql_dml_insert_then_select() {
         other => panic!("expected Data, got {:?}", other),
     }
 
-    session
-        .fetch(&handle, Projection::All, 10, rows)
-        .unwrap();
+    session.fetch(&handle, Projection::All, 10, rows).unwrap();
     session.close(handle).unwrap();
 }
 
@@ -506,7 +488,8 @@ fn expression_descriptors_fall_back_to_storage_class() {
             assert_eq!(dimensions[4].descriptor, b("")); // NULL declares nothing
             handle
         }
-        QueryResponse::Error { message, .. } => {
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
             panic!(
                 "expected Header, got Error: {}",
                 String::from_utf8_lossy(&message)
@@ -516,9 +499,7 @@ fn expression_descriptors_fall_back_to_storage_class() {
 
     // The peeked first row must still arrive as data — peeking must
     // not eat it.
-    let resp = session
-        .fetch(&handle, Projection::All, 10, rows)
-        .unwrap();
+    let resp = session.fetch(&handle, Projection::All, 10, rows).unwrap();
     match resp {
         FetchResponse::Data { cells } => {
             assert_eq!(cells.len(), 1);
@@ -555,20 +536,28 @@ fn probe(sql: &str) -> (String, Vec<Option<Vec<u8>>>) {
                 String::from_utf8_lossy(&last.descriptor).to_string(),
             )
         }
-        QueryResponse::Error { message, .. } => {
-            panic!("expected Header, got Error: {}", String::from_utf8_lossy(&message))
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
+            panic!(
+                "expected Header, got Error: {}",
+                String::from_utf8_lossy(&message)
+            )
         }
     };
     let mut collected = Vec::new();
     loop {
-        match session.fetch(&handle, Projection::All, 10000, rows).unwrap() {
+        match session
+            .fetch(&handle, Projection::All, 10000, rows)
+            .unwrap()
+        {
             FetchResponse::Data { cells } => {
                 for row in cells {
                     collected.push(row.last().unwrap().clone());
                 }
             }
             FetchResponse::End => break,
-            FetchResponse::Error { message, .. } => {
+            FetchResponse::Error(error) => {
+                let message = error.message().to_vec();
                 panic!("fetch error: {}", String::from_utf8_lossy(&message))
             }
         }
@@ -596,13 +585,14 @@ fn descriptor_elects_from_first_non_null_not_row_zero() {
 // `null;5` gave "" — RED.
 #[test]
 fn descriptor_is_row_order_independent() {
-    let (fwd, _) =
-        probe("SELECT column2 AS x FROM (VALUES (1, 5), (2, NULL)) ORDER BY column1");
-    let (rev, _) =
-        probe("SELECT column2 AS x FROM (VALUES (1, NULL), (2, 5)) ORDER BY column1");
+    let (fwd, _) = probe("SELECT column2 AS x FROM (VALUES (1, 5), (2, NULL)) ORDER BY column1");
+    let (rev, _) = probe("SELECT column2 AS x FROM (VALUES (1, NULL), (2, 5)) ORDER BY column1");
     assert_eq!(fwd, "INTEGER");
     assert_eq!(rev, "INTEGER");
-    assert_eq!(fwd, rev, "reversed rows, identical data → identical descriptor");
+    assert_eq!(
+        fwd, rev,
+        "reversed rows, identical data → identical descriptor"
+    );
 }
 
 // (c) An all-NULL undeclared column has no non-NULL value to elect from and
@@ -626,16 +616,26 @@ fn descriptor_election_is_bounded_to_the_peek_window() {
         "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 64) \
          SELECT CASE WHEN n = 64 THEN 5 END AS x FROM seq ORDER BY n",
     );
-    assert_eq!(in_window, "INTEGER", "non-NULL at row 64 is inside the window");
+    assert_eq!(
+        in_window, "INTEGER",
+        "non-NULL at row 64 is inside the window"
+    );
 
     // First non-NULL at row 65 → beyond the window → does NOT elect.
     let (out_window, cells) = probe(
         "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 65) \
          SELECT CASE WHEN n = 65 THEN 5 END AS x FROM seq ORDER BY n",
     );
-    assert_eq!(out_window, "", "non-NULL at row 65 is beyond the 64-row window");
+    assert_eq!(
+        out_window, "",
+        "non-NULL at row 65 is beyond the 64-row window"
+    );
     assert_eq!(cells.len(), 65, "all rows still stream through");
-    assert_eq!(cell_text(&cells[64]), "5", "the row-65 value still arrives as data");
+    assert_eq!(
+        cell_text(&cells[64]),
+        "5",
+        "the row-65 value still arrives as data"
+    );
 }
 
 // (e) Election is not INTEGER-only: a TEXT-leading undeclared column elects
@@ -657,20 +657,21 @@ fn descriptor_election_is_per_column_independent() {
     let mut session = make_sql_session();
     let rows = session.agreed_orientation(Orientation::Rows).unwrap();
     let resp = session
-        .query(b(
-            "SELECT column2 AS a, column3 AS b \
-             FROM (VALUES (1, 10, NULL), (2, 20, 30)) ORDER BY column1",
-        ))
+        .query(b("SELECT column2 AS a, column3 AS b \
+             FROM (VALUES (1, 10, NULL), (2, 20, 30)) ORDER BY column1"))
         .unwrap();
     let (handle, descs) = match resp {
-        QueryResponse::Header { handle, dimensions, .. } => (
+        QueryResponse::Header {
+            handle, dimensions, ..
+        } => (
             handle,
             dimensions
                 .iter()
                 .map(|d| String::from_utf8_lossy(&d.descriptor).to_string())
                 .collect::<Vec<_>>(),
         ),
-        QueryResponse::Error { message, .. } => {
+        QueryResponse::Error(error) => {
+            let message = error.message().to_vec();
             panic!("error: {}", String::from_utf8_lossy(&message))
         }
     };

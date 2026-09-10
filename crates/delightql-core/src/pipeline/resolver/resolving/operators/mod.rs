@@ -4,7 +4,6 @@
 // Each module handles a specific category of unary relational operators
 
 mod aggregation;
-pub(crate) use aggregation::attach_record_interior;
 pub(in crate::pipeline::resolver) mod helpers;
 pub(in crate::pipeline::resolver) mod ordering;
 mod projection;

@@ -27,7 +27,6 @@ pub type Continuation =
     crate::pipeline::asts::core::Continuation<crate::pipeline::asts::core::Refined>;
 pub type StructuralForm =
     crate::pipeline::asts::core::StructuralForm<crate::pipeline::asts::core::Refined>;
-pub type AnonTable = crate::pipeline::asts::core::AnonTable<crate::pipeline::asts::core::Refined>;
 pub type AnonRelation =
     crate::pipeline::asts::core::AnonRelation<crate::pipeline::asts::core::Refined>;
 pub type Datum = crate::pipeline::asts::core::Datum<crate::pipeline::asts::core::Refined>;
@@ -72,6 +71,8 @@ pub type ReductionPlan =
 pub type DelegateSpec =
     crate::pipeline::asts::core::DelegateSpec<crate::pipeline::asts::core::Refined>;
 pub type OutItem = crate::pipeline::asts::core::OutItem<crate::pipeline::asts::core::Refined>;
+pub type DeferredItem =
+    crate::pipeline::asts::core::expressions::DeferredItem<crate::pipeline::asts::core::Refined>;
 pub type ReductionItem =
     crate::pipeline::asts::core::ReductionItem<crate::pipeline::asts::core::Refined>;
 pub type Reference = crate::pipeline::asts::core::Reference<crate::pipeline::asts::core::Refined>;
@@ -90,6 +91,6 @@ pub type InnerRelationPattern = crate::pipeline::asts::core::expressions::InnerR
     crate::pipeline::asts::core::Refined,
 >;
 pub use crate::pipeline::asts::core::{
-    DestructureMapping, DestructureMode, FilterOrigin, JoinType, LiteralValue, OrderDirection,
-    Refined, SetOperator, TreeGroupLocation,
+    DestructureMapping, DestructureMode, JoinType, LiteralValue, OrderDirection, Refined,
+    SetOperator, TreeGroupLocation,
 };

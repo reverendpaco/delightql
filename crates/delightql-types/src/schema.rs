@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::error::Result;
 /// Database Schema Abstraction
 ///
 /// This module provides the core database schema trait and types needed by
 /// both delightql-core (for resolution) and delightql-backends (for implementations).
-
 use crate::identifier::SqlIdentifier;
-use crate::error::Result;
 
 /// Information about a database column (simple version for trait interface)
 #[derive(Debug, Clone)]
@@ -21,6 +20,11 @@ pub struct ColumnInfo {
     /// intent metadata, used where any consistent type beats none (e.g.
     /// typing corresponding-union NULL pads for strict targets).
     pub declared_type: Option<String>,
+    /// The column carries a nested relation payload (a tree-group column
+    /// the catalog registered as an interior entity). A materialization
+    /// keeps the shape it was given; a catalog that never learned one
+    /// answers false, and no reader guesses it from the cell's text.
+    pub interior: bool,
 }
 
 /// Core database schema trait used by the resolver

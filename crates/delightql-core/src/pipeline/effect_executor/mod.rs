@@ -38,6 +38,9 @@
 //! essential setup operations (like mounting databases).
 
 use crate::bin_cartridge::EffectExecutable;
+use crate::diagnostic::{
+    Directive, DirectiveContext, Effect, EffectBin, Internal, Resolution, Runtime,
+};
 use crate::error::{DelightQLError, Result};
 use crate::names::Registry;
 use crate::pipeline::ast_visit::{
@@ -190,11 +193,9 @@ const NESTED_SESSION_DIRECTIVE_MESSAGE: &str =
     "session directives are legal only at the REPL/CLI top level or the liminal space — not nested in a query";
 
 fn nested_session_directive_error(name: &str) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "effect/session/position",
-        format!("{name}: {NESTED_SESSION_DIRECTIVE_MESSAGE}"),
-        "EFFECT-ALGEBRA R9",
-    )
+    DelightQLError::from(Effect::SessionPosition {
+        message: format!("{name}: {NESTED_SESSION_DIRECTIVE_MESSAGE}"),
+    })
 }
 
 /// A tenant on the shared whole-tree visitor. It names only the semantic
@@ -244,9 +245,8 @@ struct ExecutingDemandGuard<'a> {
 
 impl ExecutingDemandGuard<'_> {
     fn refuse(&self, name: &str) -> DelightQLError {
-        DelightQLError::validation_error_categorized(
-            "effect/compile/purity",
-            format!(
+        DelightQLError::from(Effect::CompilePurity {
+            message: format!(
                 "sys::execution.compile is pure: compiling to stage '{}' would \
                  execute '{}' — inspection must never mutate the namespace, \
                  database, filesystem, output, or session. Compile to 'cst' or \
@@ -254,8 +254,7 @@ impl ExecutingDemandGuard<'_> {
                  to execute it.",
                 self.stage, name
             ),
-            "compile purity",
-        )
+        })
     }
 
     fn is_bin_executable<S: AsRef<str>>(&self, ns: &[S], name: &str) -> bool {
@@ -429,27 +428,24 @@ fn execute_effects_in_read(
                             .enumerate()
                             .map(|(index, slot)| {
                                 slot.term().ok_or_else(|| {
-                                    DelightQLError::validation_error_categorized(
-                                        "effect/bin/valueless_argument",
-                                        format!(
+                                    DelightQLError::from(EffectBin::ValuelessArgument {
+                                        message: format!(
                                             "'{}' was given a slot that supplies no value at \
                                              argument {}; this bin relation takes values there",
                                             identifier.name,
                                             index + 1
                                         ),
-                                        "write the value the argument names",
-                                    )
+                                    })
                                 })
                             })
                             .collect::<Result<Vec<_>>>()?,
                         _ => {
-                            return Err(DelightQLError::database_error(
-                                format!(
+                            return Err(DelightQLError::from(Directive::InvocationAccess {
+                                message: format!(
                                     "Bin relation '{}' requires positional arguments",
                                     identifier.name
                                 ),
-                                "Invalid access for bin relation",
-                            ))
+                            }))
                         }
                     };
                     let alias_str = alias.as_ref().map(|s| s.to_string());
@@ -665,12 +661,11 @@ fn execute_functor_call(
                     // open slot is not one, so it is refused where it is
                     // read. Neither is the context-mode marker.
                     ScalarArgument::Callable(_) | ScalarArgument::Context(_) => {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "effect/directive/valueless_argument",
-                            "a directive's argument is a value; a callable or a context \
-                             marker is not one",
-                            "write the namespace, path, or flag the directive names",
-                        ))
+                        return Err(DelightQLError::from(Effect::DirectiveValuelessArgument {
+                            message: "a directive's argument is a value; a callable or a context \
+                             marker is not one"
+                                .to_string(),
+                        }))
                     }
                     // THE GLOB IS THE WHOLE ROW: it enumerates the source's
                     // values in header order rather than naming one.
@@ -703,9 +698,9 @@ fn execute_functor_call(
                     .and_then(
                         |result| match result.into_bare_head().map(Grelex::into_form) {
                             Some(head) => Ok(head),
-                            None => Err(DelightQLError::database_error(
+                            None => Err(Internal::invariant(
+                                "effect_executor",
                                 format!("bin relation '{}' did not produce a relation", name),
-                                "Bin relation result",
                             )),
                         },
                     );
@@ -747,18 +742,21 @@ fn execute_functor_call(
         )?;
         return match result.into_bare_head() {
             Some(head) => Ok(head.into_form()),
-            None => Err(DelightQLError::database_error(
+            None => Err(Internal::invariant(
+                "effect_executor",
                 format!("effect call '{}' did not produce a relation", name),
-                "Effect call result",
             )),
         };
     }
 
-    let has_table_arguments = !table_arguments.is_empty();
-    if has_table_arguments {
-        // WHAT A POSITION CARRIES, not what it is: executing the effects in
-        // a relation replaces the relation, and a landed member stays landed.
-        call.call_mut().arguments.rewrite_relations(|source| {
+    if !table_arguments.is_empty() {
+        // THE LANDED MEMBER IS THE SPINE: executing the effects in the
+        // relation the pipe flowed here replaces that relation, and the
+        // member stays landed. An authored relation or rule argument is an
+        // enclosed position: an effect demanded inside one is fenced, not
+        // executed.
+        crate::pipeline::asts::effects::refuse_enclosed_effects(call.call())?;
+        call.call_mut().arguments.rewrite_landed(|source| {
             execute_effects_in_expression(source.clone(), locals, system, registry)
         })?;
     }
@@ -821,17 +819,15 @@ fn scalar_bin_arguments(
             HoArgument::Value(value) => scalars.push(value.value.clone()),
             HoArgument::Landing(_) | HoArgument::Skip => {}
             HoArgument::Relation(_) | HoArgument::Rule(_) | HoArgument::Landed(_) => {
-                return Err(DelightQLError::validation_error_categorized(
-                    "effect/bin/table_argument",
-                    format!(
+                return Err(DelightQLError::from(EffectBin::TableArgument {
+                    message: format!(
                         "{identity} received a table-valued argument at position {}; \
                          bin executables consume scalar arguments in this call shape. \
                          The table argument cannot be discarded or shift the later \
                          arguments. Pass scalar expressions in the first parentheses.",
                         index + 1
                     ),
-                    "bin executable argument shape",
-                ));
+                }));
             }
         }
     }
@@ -947,9 +943,8 @@ fn execute_directive_pipe(
                 });
             if let (Some(arity), Some(width)) = (terminal_arity, receipt_width) {
                 if width != arity {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "directive/chain/receipt_shape",
-                        format!(
+                    return Err(DelightQLError::from(Directive::ChainReceiptShape {
+                        message: format!(
                             "{source_name} |> {terminal_name} pipes a WHOLE receipt \
                          ({width} declared column(s)) into {bare}!'s \
                          {arity}-parameter argumentative functor — a shape error. \
@@ -957,8 +952,7 @@ fn execute_directive_pipe(
                          {source_name}(…) |> .returned(*) |> {terminal_name}(*) \
                          (EFFECT-ALGEBRA §3)",
                         ),
-                        "receipt into directive",
-                    ));
+                    }));
                 }
             }
         }
@@ -1015,9 +1009,8 @@ fn execute_directive_pipe(
                 // with the effect machinery's own voice, never a lookup that
                 // denies a name the same session reflects in full detail.
                 if let Some(desc) = descriptor {
-                    return DelightQLError::validation_error_categorized(
-                        "effect/realization/context",
-                        format!(
+                    return DelightQLError::from(Effect::RealizationContext {
+    message: format!(
                             "'{terminal_name}' is a declared directive with no standalone \
                              statement realization ({}): it executes where its category \
                              places it — inside a run's effect body — and this position \
@@ -1031,18 +1024,16 @@ fn execute_directive_pipe(
                                     "it is legal only in a consulted file's liminal space",
                             }
                         ),
-                        "directive out of its realization context",
-                    );
+});
                 }
-                DelightQLError::database_error(
-                    format!("Unknown pseudo-predicate: {}", terminal_name),
-                    "Entity not found",
-                )
+                DelightQLError::from(Directive::Unknown {
+                    message: format!("Unknown pseudo-predicate: {}", terminal_name),
+                })
             })?;
         let executable = entity.as_effect_executable().ok_or_else(|| {
-            DelightQLError::database_error(
+            Internal::invariant(
+                "effect_executor",
                 format!("Entity '{}' is not effect-executable", terminal_name),
-                "Not an effect-executable entity",
             )
         })?;
         system.note_effect_executed();
@@ -1123,27 +1114,23 @@ fn extract_rows(
         system,
         crate::relation::Planning::open(crate::names::Registry::new(&[])),
     );
+    // The wrap is kept for its prose (pinned by the corpus): a pipe source
+    // that does not compile is reported as that, under the broad identity.
     let sql = pipeline.execute_to_sql().map_err(|e| {
-        DelightQLError::database_error(
-            format!("Failed to compile pipe source to SQL: {}", e),
-            "Pipe source compilation",
-        )
+        DelightQLError::from(Runtime::General {
+            message: format!("Failed to compile pipe source to SQL: {}", e),
+            details: "Pipe source compilation".to_string(),
+        })
     })?;
     let sql = sql.to_string();
 
-    let conn = system.connection.lock().map_err(|e| {
-        DelightQLError::database_error(
-            format!("Failed to acquire connection lock: {}", e),
-            "Connection lock",
-        )
-    })?;
+    let conn = system
+        .connection
+        .lock()
+        .map_err(|e| Runtime::poisoned("Failed to acquire connection lock", e))?;
 
-    let (col_names, value_rows) = conn.query_all_rows(&sql, &[]).map_err(|e| {
-        DelightQLError::database_error(
-            format!("Failed to execute pipe source query: {}", e),
-            "Pipe source execution",
-        )
-    })?;
+    // The connection's own typed refusal crosses whole.
+    let (col_names, value_rows) = conn.query_all_rows(&sql, &[])?;
 
     // Every materialized cell becomes a string literal, NULL included: what
     // a pipe source's values are — and whether a null may be one — is a
@@ -1221,11 +1208,13 @@ fn extract_anonymous_rows(expr: &Chain) -> Result<(Vec<String>, Vec<Vec<DomainEx
 
             Ok((headers, row_values))
         }
-        _ => Err(DelightQLError::database_error(
-            "Directive pipe terminal requires a directive source (e.g., consult!, mount!), \
-             not a table or subquery. Only directive results can be piped to other directives.",
-            "Invalid directive pipe source",
-        )),
+        _ => Err(DelightQLError::from(Runtime::General {
+            message: "Directive pipe terminal requires a directive source (e.g., consult!, \
+                      mount!), not a table or subquery. Only directive results can be piped \
+                      to other directives."
+                .to_string(),
+            details: "Invalid directive pipe source".to_string(),
+        })),
     }
 }
 
@@ -1297,22 +1286,19 @@ fn bind_directive_args(
                     if idx < row_values.len() {
                         bound.push(row_values[idx].clone());
                     } else {
-                        return Err(DelightQLError::database_error(
+                        return Err(Internal::invariant(
+                            "effect_executor: directive pipe argument binding",
                             format!(
                                 "Column '{}' found in headers but row has too few values",
                                 col_name
                             ),
-                            "Directive pipe argument binding",
                         ));
                     }
                 } else {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "Column '{}' not found in directive source. Available columns: {:?}",
-                            col_name, headers
-                        ),
-                        "Directive pipe argument binding",
-                    ));
+                    return Err(DelightQLError::from(Resolution::Column {
+                        column: col_name.to_string(),
+                        context: format!("directive source; available columns: {:?}", headers),
+                    }));
                 }
             }
             // Literals and other expressions pass through unchanged
@@ -1361,31 +1347,22 @@ fn execute_pseudo_predicate(
         if let Some(desc) = descriptor {
             match desc.realization {
                 DirectiveRealization::SyntaxPipeTerminal => {
-                    return DelightQLError::validation_error_categorized(
-                        "directive/context/pipe_terminal",
-                        format!(
-                            "'{bare}!' is a pipe terminal, not a callable \
-                             pseudo-predicate — it needs its piped input \
-                             relation: source |> {bare}!(…)(*)"
-                        ),
-                        "directive policy",
-                    );
+                    return crate::pipeline::asts::effects::pipe_terminal_policy_refusal(bare);
                 }
                 DirectiveRealization::LiminalOnly => {
-                    return DelightQLError::validation_error_categorized(
-                        "directive/context/liminal_only",
-                        format!(
+                    return DelightQLError::from(DirectiveContext::LiminalOnly {
+                        message: format!(
                             "'{bare}!' is legal only in the liminal space of a \
                              consulted file, not as a query invocation"
                         ),
-                        "directive policy",
-                    );
+                    });
                 }
                 DirectiveRealization::Entity => {
                     // A registered entity that this lookup could not see:
                     // either a wrong qualifier or non-universal visibility.
-                    return DelightQLError::database_error(
-                        format!(
+                    return DelightQLError::from(Runtime::General {
+                        details: "effect rule visibility".to_string(),
+                        message: format!(
                             "'{}!' is not visible {} — its identity is {}.{bare}!",
                             bare,
                             if ns_strs.is_empty() {
@@ -1395,16 +1372,16 @@ fn execute_pseudo_predicate(
                             },
                             desc.namespace,
                         ),
-                        "Directive not visible",
-                    );
+                    });
                 }
             }
         }
         if let Some(desc) = local_descriptor
             .filter(|descriptor| descriptor.realization == DirectiveRealization::Entity)
         {
-            return DelightQLError::database_error(
-                format!(
+            return DelightQLError::from(Runtime::General {
+                details: "effect rule visibility".to_string(),
+                message: format!(
                     "'{}!' is not visible {} — its identity is {}.{bare}!",
                     bare,
                     if ns_strs.is_empty() {
@@ -1414,8 +1391,7 @@ fn execute_pseudo_predicate(
                     },
                     desc.namespace,
                 ),
-                "Directive not visible",
-            );
+            });
         }
         // Do not point end users at "register it in a bin cartridge" —
         // that is a compiler-internal mechanism, and naming it here reads
@@ -1426,9 +1402,8 @@ fn execute_pseudo_predicate(
         // prompt statement is an implicit run. Reaching this arm therefore
         // means the name resolved to nothing at all, so the refusal must not
         // suggest that direct demand is the problem.
-        DelightQLError::validation_error_categorized(
-            "directive/unknown",
-            format!(
+        DelightQLError::from(Directive::Unknown {
+            message: format!(
                 "Unknown directive '{}'. If this is YOUR effect rule, it is \
                  not in scope here: consult! the file that defines it, and demand \
                  it under the namespace it was consulted into. Otherwise, check \
@@ -1439,8 +1414,7 @@ fn execute_pseudo_predicate(
                     format!("{}.{bare}!", namespace.join("::"))
                 }
             ),
-            "unknown directive",
-        )
+        })
     })?;
     // Registry borrow ends here, but Arc keeps entity alive
 
@@ -1460,13 +1434,13 @@ fn execute_pseudo_predicate(
 
     // Downcast to EffectExecutable
     let executable = entity.as_effect_executable().ok_or_else(|| {
-        DelightQLError::database_error(
+        Internal::invariant(
+            "effect_executor",
             format!(
                 "Entity '{}' is not executable in the effect executor. \
                  Only entities implementing EffectExecutable can be executed here.",
                 name
             ),
-            "Not an effect-executable entity",
         )
     })?;
 
@@ -1519,14 +1493,12 @@ fn read_receipt_access(
         return Ok(ReceiptBinding::Whole);
     }
     let Some(binders) = access.binders() else {
-        return Err(DelightQLError::validation_error_categorized(
-            "directive/invocation/access",
-            format!(
+        return Err(DelightQLError::from(Directive::InvocationAccess {
+            message: format!(
                 "receipt access on {directive_name} must be a positional \
                  binding list of plain names, got {access:?}"
             ),
-            "receipt access",
-        ));
+        }));
     };
     match schema {
         crate::bin_cartridge::OutputSchema::Relation(cols) => {
@@ -1536,9 +1508,8 @@ fn read_receipt_access(
                     .map(|(n, _)| n.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                return Err(DelightQLError::validation_error_categorized(
-                    "directive/invocation/access",
-                    format!(
+                return Err(DelightQLError::from(Directive::InvocationAccess {
+                    message: format!(
                         "receipt access on {directive_name} binds {} column(s) but \
                          the declared receipt has {} ({heading}) — positional \
                          binding requires the exact arity, or (*) for the whole \
@@ -1546,8 +1517,7 @@ fn read_receipt_access(
                         binders.len(),
                         cols.len()
                     ),
-                    "receipt access",
-                ));
+                }));
             }
             Ok(ReceiptBinding::Rename(
                 binders
@@ -1557,14 +1527,12 @@ fn read_receipt_access(
             ))
         }
         crate::bin_cartridge::OutputSchema::Void => {
-            Err(DelightQLError::validation_error_categorized(
-                "directive/invocation/access",
-                format!(
+            Err(DelightQLError::from(Directive::InvocationAccess {
+                message: format!(
                     "receipt access on {directive_name}: this entity declares no \
                      receipt columns — use (*)"
                 ),
-                "receipt access",
-            ))
+            }))
         }
     }
 }
@@ -1573,14 +1541,12 @@ fn read_receipt_access(
 /// that pairing, so arriving here means the reader and the binder saw
 /// different schemas.
 fn internal_receipt_error(directive_name: &str) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "directive/invocation/access",
-        format!(
+    DelightQLError::from(Directive::InvocationAccess {
+        message: format!(
             "receipt access on {directive_name}: this entity declares no \
              receipt columns — use (*)"
         ),
-        "receipt access",
-    )
+    })
 }
 
 /// Bind a read receipt access to the relation the directive returned.
@@ -1652,14 +1618,12 @@ fn bind_receipt(
         outer,
     }) = relation
     else {
-        return Err(DelightQLError::validation_error_categorized(
-            "directive/invocation/access",
-            format!(
+        return Err(DelightQLError::from(Directive::InvocationAccess {
+            message: format!(
                 "receipt access on {directive_name}: the directive result is \
                  not an inline receipt relation"
             ),
-            "receipt access",
-        ));
+        }));
     };
 
     let receipt_width = header
@@ -1681,17 +1645,15 @@ fn bind_receipt(
                     .join(", ")
             })
             .unwrap_or_default();
-        return Err(DelightQLError::validation_error_categorized(
-            "directive/invocation/access",
-            format!(
+        return Err(DelightQLError::from(Directive::InvocationAccess {
+            message: format!(
                 "receipt access on {directive_name} binds {} column(s) but the \
                  receipt has {} ({heading}) — positional binding requires the \
                  exact arity, or (*) for the whole receipt",
                 binder_names.len(),
                 receipt_width
             ),
-            "receipt access",
-        ));
+        }));
     }
 
     let bound_headers = binder_names

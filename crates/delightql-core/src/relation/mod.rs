@@ -31,22 +31,26 @@
 //! mutability: lowering binds ports to physical slots and has nothing to
 //! mint a port with.
 
+use crate::diagnostic::Internal;
 mod alignment;
 pub mod builder;
 pub mod carrier;
 #[cfg(test)]
 mod fences;
 pub mod form;
+mod interior;
 pub mod law;
 pub mod minus;
 pub(crate) mod pending;
 pub mod port;
 pub mod set;
 mod store;
+pub(crate) mod support;
 
-pub use builder::{Refinement, Relations, SemanticBuilder, TotalPortMap};
+pub use builder::{Refinement, Relations, Replacement, SemanticBuilder, TotalPortMap};
 pub use carrier::StructuralRelation;
 pub use store::RelationStore;
+pub use support::Correlated;
 
 /// THE OPEN SEMANTIC EPOCH — the capability to construct relations.
 ///
@@ -296,6 +300,43 @@ pub(crate) fn published_ports(
 /// Whether one carried position is compiler support rather than part of the
 /// language-visible heading. Row-token provenance is decisive even across a
 /// publication boundary that legitimately changes the column's address role.
+/// Whether this exact position is EVALUATED AT ITS INTERIOR'S BOUNDARY: a
+/// publication from the enclosing row, readable only past the boundary
+/// that spends it. A construction fact the deriving act recorded.
+pub(crate) fn evaluated_at_boundary(registry: &crate::names::Registry, port: PortId) -> bool {
+    registry.relations().is_deferred_port(port)
+}
+
+/// Whether this exact position is one an interior boundary spent outward:
+/// the enclosing join computes it, and nothing between the boundary and
+/// that join has its value.
+pub(crate) fn realized_at_boundary(registry: &crate::names::Registry, port: PortId) -> bool {
+    registry.relations().is_realized_port(port)
+}
+
+/// Whether this exact position is the ONE ITS PUBLICATION STATED as
+/// evaluated at the boundary — the originating item, not a later carry of
+/// it. The join computes the originating item's value once; the carries
+/// continue that one position.
+pub(crate) fn deferred_by_publication(registry: &crate::names::Registry, port: PortId) -> bool {
+    let store = registry.relations();
+    store
+        .relation_of(port)
+        .is_some_and(|relation| store.deferred_marks(relation).contains(&port))
+}
+
+/// The refusal a read of a boundary-evaluated position earns. `what` names
+/// the reader, in the author's terms.
+pub(crate) fn enclosing_position_refusal(what: &str) -> crate::error::DelightQLError {
+    crate::error::DelightQLError::from(crate::diagnostic::Interior::EnclosingPosition {
+        message: format!(
+            "a position computed from the enclosing row is evaluated at the enclosing join, \
+             where that row is readable, and cannot be read by {what}: move the read past \
+             the interior, or compute the position outside it"
+        ),
+    })
+}
+
 pub(crate) fn is_higher_order_support(registry: &crate::names::Registry, port: PortId) -> bool {
     registry.addressing(port.column()) == crate::names::Addressing::Hygienic
         || registry.relations().residual_row_token(port).is_some()
@@ -420,9 +461,9 @@ pub(crate) fn landed_in(
     match landed.as_slice() {
         [] => Ok(None),
         [port] => Ok(Some(*port)),
-        _ => Err(crate::error::DelightQLError::transformation_error(
-            "an addressed position stands at more than one position of this heading",
+        _ => Err(Internal::invariant(
             "semantic relation",
+            "an addressed position stands at more than one position of this heading",
         )),
     }
 }
@@ -466,11 +507,11 @@ pub(crate) fn sealed_empty() -> (std::rc::Rc<crate::names::Registry>, Relations)
 #[cfg(test)]
 pub(crate) fn any_relation(registry: &crate::names::Registry) -> SemanticRelation {
     SemanticBuilder::new(registry)
-        .derive(RelForm::Anonymous(form::AnonymousSpec {
-            shape: form::AnonymousShape::Tabular,
-            slots: &[],
-            answers_to: None,
-        }))
+        .derive(RelForm::Anonymous(form::AnonymousSpec::plain(
+            form::AnonymousShape::Tabular,
+            &[],
+            None,
+        )))
         .expect("an anonymous relation takes no input to refuse")
 }
 
@@ -478,16 +519,16 @@ pub(crate) fn any_relation(registry: &crate::names::Registry) -> SemanticRelatio
 pub(crate) fn named_port(registry: &crate::names::Registry, name: &str) -> PortId {
     let named = registry.intern(name, false);
     let relation = SemanticBuilder::new(registry)
-        .derive(RelForm::Anonymous(form::AnonymousSpec {
-            shape: form::AnonymousShape::Tabular,
-            slots: &[form::AnonymousSlot::Binder {
+        .derive(RelForm::Anonymous(form::AnonymousSpec::plain(
+            form::AnonymousShape::Tabular,
+            &[form::AnonymousSlot::Binder {
                 position: 0,
                 named,
                 declared_type: None,
                 shape: crate::names::ValueShape::Unknown,
             }],
-            answers_to: None,
-        }))
+            None,
+        )))
         .expect("a named test position is a complete anonymous interface");
     published_ports(registry, &relation).expect("the derived interface")[0]
 }

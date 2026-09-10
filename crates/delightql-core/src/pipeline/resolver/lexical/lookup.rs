@@ -5,10 +5,11 @@
 //! hand it its own ports and relations would be writing a second lookup.
 
 use super::Binding;
+use crate::diagnostic::{DelightQLError, Pipe, Resolution};
 use crate::names::{Addressing, Sym};
 use crate::pipeline::asts::core::literals::column_ordinal_text;
 use crate::pipeline::asts::core::ColumnOccurrence;
-use crate::pipeline::resolver::unification::{ColumnReference, Refusal, UnificationResult};
+use crate::pipeline::resolver::unification::{ColumnReference, UnificationResult};
 use crate::relation::{PortId, SemanticRelation};
 use delightql_types::SqlIdentifier;
 
@@ -70,11 +71,11 @@ pub(super) fn live_bare_reuse(
         {
             Ok(None)
         }
-        _ => Err(crate::error::DelightQLError::validation_error_categorized(
-            "resolution/ambiguous",
-            format!("the spelling '{name}' has more than one live bare candidate to reuse"),
-            "name one candidate with `as` or address one qualified",
-        )),
+        _ => Err(DelightQLError::from(Resolution::Ambiguous {
+            message: format!(
+                "the spelling '{name}' has more than one live bare candidate to reuse"
+            ),
+        })),
     }
 }
 
@@ -93,7 +94,7 @@ fn gather_search(
     visible: &[Binding],
     qualified: bool,
     registry: &crate::relation::Planning,
-) -> Result<(Vec<Binding>, Vec<PortId>), Refusal> {
+) -> Result<(Vec<Binding>, Vec<PortId>), DelightQLError> {
     let mut relations = Vec::new();
     let mut candidates = Vec::new();
     for port in available {
@@ -112,10 +113,10 @@ fn gather_search(
             let interface = registry
                 .authority()
                 .interface(&binding.relation)
-                .map_err(|error| Refusal {
-                    subcategory: "resolution/scope/stale",
-                    message: error.to_string(),
-                    context: "the live semantic relation environment",
+                .map_err(|error| {
+                    DelightQLError::from(Resolution::ScopeStale {
+                        message: error.to_string(),
+                    })
                 })?;
             for port in interface.ports() {
                 if !crate::relation::is_higher_order_support(registry, *port)
@@ -345,18 +346,20 @@ impl QualifiedError {
         match self {
             QualifiedError::NoScope => UnificationResult::Unresolved(name.to_owned()),
             QualifiedError::Opaque => UnificationResult::Opaque,
-            QualifiedError::NoUnnamedPipe => UnificationResult::Refused(Refusal {
-                subcategory: "resolution/pipe/no_unnamed_pipe",
-                message: format!("`_.{name}`: there is no unnamed pipe here for `_` to select"),
-                context: "the deictic `_`",
-            }),
-            QualifiedError::TwoUnnamedPipes => UnificationResult::Refused(Refusal {
-                subcategory: "resolution/pipe/two_unnamed_pipes",
-                message: format!(
-                    "`_.{name}`: two unnamed pipes are in scope and `_` names neither"
-                ),
-                context: "the deictic `_`",
-            }),
+            QualifiedError::NoUnnamedPipe => UnificationResult::Refused(
+                Pipe::NoUnnamedPipe {
+                    message: format!("`_.{name}`: there is no unnamed pipe here for `_` to select"),
+                }
+                .into(),
+            ),
+            QualifiedError::TwoUnnamedPipes => UnificationResult::Refused(
+                Pipe::TwoUnnamedPipes {
+                    message: format!(
+                        "`_.{name}`: two unnamed pipes are in scope and `_` names neither"
+                    ),
+                }
+                .into(),
+            ),
         }
     }
 }
@@ -459,28 +462,25 @@ pub(super) fn qualify_ports(
 ) -> Result<Vec<PortId>, crate::error::DelightQLError> {
     let written = qualifier;
     let qualifier = written_name(qualifier, registry);
-    let (relations, _) =
-        gather_search(&[], visible, true, registry).map_err(Refusal::into_error)?;
+    let (relations, _) = gather_search(&[], visible, true, registry)?;
     qualified_candidates(qualifier, &relations, registry).map_err(|error| match error {
         // A qualifier that names no relation in view is the same absence
         // a qualified name meets: the scope is not here.
         QualifiedError::NoScope => match missing_scope("*", written.as_str(), &relations, registry)
         {
-            UnificationResult::Unresolved(text) => {
-                crate::error::DelightQLError::column_not_found_error(
-                    text,
-                    "in qualified enumeration",
-                )
-            }
+            UnificationResult::Unresolved(text) => DelightQLError::from(Resolution::Column {
+                column: text.to_string(),
+                context: "in qualified enumeration".to_string(),
+            }),
             other => unreachable!("a missing scope is reported as unresolved: {other:?}"),
         },
         other => match other.with_name("*") {
-            UnificationResult::Refused(refusal) => refusal.into_error(),
+            UnificationResult::Refused(refusal) => refusal,
             UnificationResult::Opaque => crate::pipeline::resolver::opaque_reference_refusal(),
-            _ => crate::error::DelightQLError::column_not_found_error(
-                "qualified enumeration",
-                "in qualified enumeration",
-            ),
+            _ => DelightQLError::from(Resolution::Column {
+                column: "qualified enumeration".to_string(),
+                context: "in qualified enumeration".to_string(),
+            }),
         },
     })
 }
@@ -539,6 +539,7 @@ mod tests {
                     position: position as u32,
                     named: Some(registry.intern(name, *stropped)),
                     declared_type: None,
+                    interior: false,
                 },
             )
             .collect();
@@ -774,7 +775,6 @@ mod tests {
     fn a_declared_row_answers_by_its_declaration_alone() {
         use super::super::{Position, Reach, ResolvedRelation};
         let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
-        let mut witness = super::super::Witness::default();
         let slot = |name: &str| crate::relation::form::AnonymousSlot::Binder {
             position: 0,
             named: registry.intern(name, false),
@@ -784,11 +784,11 @@ mod tests {
         let declared = |name: &str, answer: Option<&str>| {
             let slots = vec![slot(name)];
             ResolvedRelation::declared_row(
-                crate::relation::form::AnonymousSpec {
-                    shape: crate::relation::form::AnonymousShape::ArgumentRow,
-                    slots: &slots,
-                    answers_to: answer.map(|answer| registry.intern(answer, false)),
-                },
+                crate::relation::form::AnonymousSpec::plain(
+                    crate::relation::form::AnonymousShape::ArgumentRow,
+                    &slots,
+                    answer.map(|answer| registry.intern(answer, false)),
+                ),
                 &registry,
             )
             .unwrap()
@@ -800,14 +800,14 @@ mod tests {
         let mut position = Position::root();
         position.enter(named_row, Reach::Row);
         let qualified = position
-            .address(named("x", Some("source")), false, &mut witness, &registry)
+            .address(named("x", Some("source")), false, &registry)
             .unwrap();
         assert!(
             matches!(&qualified, UnificationResult::Resolved(found) if found.column == port),
             "the declared answer reaches the row's own position: {qualified:?}"
         );
         let bare = position
-            .address(named("x", None), false, &mut witness, &registry)
+            .address(named("x", None), false, &registry)
             .unwrap();
         assert!(matches!(&bare, UnificationResult::Resolved(found) if found.column == port));
 
@@ -817,11 +817,11 @@ mod tests {
         let mut position = Position::root();
         position.enter(unnamed_row, Reach::Row);
         let bare = position
-            .address(named("y", None), false, &mut witness, &registry)
+            .address(named("y", None), false, &registry)
             .unwrap();
         assert!(matches!(&bare, UnificationResult::Resolved(found) if found.column == port));
         let qualified = position
-            .address(named("y", Some("anything")), false, &mut witness, &registry)
+            .address(named("y", Some("anything")), false, &registry)
             .unwrap();
         assert!(
             matches!(qualified, UnificationResult::Unresolved(_)),
@@ -855,15 +855,9 @@ mod tests {
             .unwrap();
         let mut position = Position::root();
         position.enter(ResolvedRelation::answering_for_itself(chain), Reach::Row);
-        let mut witness = super::super::Witness::default();
 
         let qualified = position
-            .address(
-                named("returned", Some("source")),
-                false,
-                &mut witness,
-                &registry,
-            )
+            .address(named("returned", Some("source")), false, &registry)
             .unwrap();
         assert!(
             matches!(qualified, UnificationResult::Unresolved(_)),
@@ -871,7 +865,7 @@ mod tests {
         );
 
         let bare = position
-            .address(named("returned", None), false, &mut witness, &registry)
+            .address(named("returned", None), false, &registry)
             .unwrap();
         assert!(matches!(bare, UnificationResult::Resolved(found) if found.column == after));
     }

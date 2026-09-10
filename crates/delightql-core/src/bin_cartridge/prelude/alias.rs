@@ -15,6 +15,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::DirectiveBinding;
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::*;
@@ -68,40 +69,30 @@ impl EffectExecutable for AliasPredicate {
         system: &mut crate::system::DelightQLSystem,
     ) -> Result<EntityResult> {
         if arguments.len() != 2 {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(DirectiveBinding::Arity {
+                message: format!(
                     "alias!() expects 2 arguments (namespace, shorthand), got {}",
                     arguments.len()
                 ),
-                "Invalid argument count",
-            ));
+            }));
         }
 
         let namespace = extract_string_literal(&arguments[0], "namespace")?;
         let shorthand = extract_string_literal(&arguments[1], "shorthand")?;
 
         if namespace.is_empty() {
-            return Err(DelightQLError::database_error(
-                "alias!() namespace cannot be empty",
-                "Empty namespace name",
-            ));
+            return Err(DelightQLError::from(DirectiveBinding::Value {
+                message: "alias!() namespace cannot be empty".to_string(),
+            }));
         }
 
         if shorthand.is_empty() {
-            return Err(DelightQLError::database_error(
-                "alias!() shorthand cannot be empty",
-                "Empty shorthand name",
-            ));
+            return Err(DelightQLError::from(DirectiveBinding::Value {
+                message: "alias!() shorthand cannot be empty".to_string(),
+            }));
         }
 
-        system
-            .register_namespace_alias(&shorthand, &namespace)
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("alias!() failed: {}", e),
-                    "Alias registration failed",
-                )
-            })?;
+        system.register_namespace_alias(&shorthand, &namespace)?;
 
         Ok(EntityResult::Relation(super::descriptor_core_receipt(
             "alias",
@@ -117,12 +108,11 @@ fn extract_string_literal(expr: &DomainExpression, param_name: &str) -> Result<S
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
             Ok(s.clone())
         }
-        _ => Err(DelightQLError::database_error(
-            format!(
+        _ => Err(DelightQLError::from(DirectiveBinding::Value {
+            message: format!(
                 "alias!() expects '{}' to be a string literal, got: {:?}",
                 param_name, expr
             ),
-            "Invalid argument type (expected string literal)",
-        )),
+        })),
     }
 }

@@ -1366,12 +1366,14 @@ mod tests {
     }
 
     fn specimen(input: &str, budget_ms: u64, containment: &'static str) -> Incident {
-        use super::super::incident::{hierarchy, IncidentKind, WorkerEvidence};
-        let mut incident = Incident::plain(
+        use super::super::incident::{IncidentKind, WorkerEvidence};
+        let mut incident = Incident::of(
             IncidentKind::Error,
             "parser_worker",
-            hierarchy::WORKER_BUDGET,
-            "prompt parser exceeded its budget".to_string(),
+            &delightql_types::diagnostic::Client::WorkerBudget {
+                message: "prompt parser exceeded its budget".to_string(),
+            }
+            .into(),
         );
         incident.input = Some(input.to_string());
         incident.cursor_byte = Some(input.len() as u64);
@@ -1504,12 +1506,14 @@ mod over_cap_tests {
     use super::*;
 
     fn giant_specimen(bytes: usize) -> Incident {
-        use super::super::incident::{hierarchy, IncidentKind, WorkerEvidence};
-        let mut incident = Incident::plain(
+        use super::super::incident::{IncidentKind, WorkerEvidence};
+        let mut incident = Incident::of(
             IncidentKind::Error,
             "parser_worker",
-            hierarchy::WORKER_BUDGET,
-            "prompt parser exceeded its budget".to_string(),
+            &delightql_types::diagnostic::Client::WorkerBudget {
+                message: "prompt parser exceeded its budget".to_string(),
+            }
+            .into(),
         );
         incident.input = Some("x".repeat(bytes));
         incident.worker = Some(WorkerEvidence {

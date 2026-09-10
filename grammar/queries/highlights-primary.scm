@@ -23,13 +23,13 @@
 ;; The query-scoped parameterized rule — a CHOE. Its subject is a definition
 ;; subject with a query's lifetime, so it takes the ho_rule's colour under the
 ;; common-expression module.
-(ho_cte name:(predicate_identifier name:(identifier) @type.definition.ho))
-(effect_ho_cte name:(effect_identifier) @keyword.directive.defin)
+; (ho_cte name:(predicate_identifier name:(identifier) @type.definition.ho))
+; (effect_ho_cte name:(effect_identifier) @keyword.directive.defin)
 
 (label_cte (":") @label)
 (standard_cte (":") @label)
-(ho_cte (":") @label)
-(effect_ho_cte (":") @label)
+; (ho_cte (":") @label)
+; (effect_ho_cte (":") @label)
 (definition_neck) @label
 (cfe (":") @label)
 
@@ -37,7 +37,7 @@
 (head_term (identifier)@variable.parameter)
 (plain_param (identifier)@variable.parameter)
 (ho_rule (scalar_param)@variable.parameter.input)
-(ho_cte (scalar_param)@variable.parameter.input)
+; (ho_cte (scalar_param)@variable.parameter.input)
 (fact_function inputs:(identifier) @variable.parameter)
 (fact_function outputs:(identifier) @variable.parameter)
 (record "{" @function.call "}" @function.call)
@@ -71,6 +71,7 @@
 ;; Function calls
 (scalar_subquery (relation_name (predicate_identifier) @markup.quote))
 (callee (predicate_identifier name:(identifier) @function.call))
+; (citation name:(identifier) @function.call)
 (case_like ("_:") @function.call)
 (lambda (":(") @function.call (")") @function.call)
 (scalar_subquery (":(") @function.call (")") @function.call)
@@ -121,7 +122,7 @@
 
 
 (symbol) @string.special.symbol
-(citation) @function
+; (citation) @function
 
 (positional_reference) @variable.parameter.ordinal
 (positional_span) @variable.parameter.ordinal

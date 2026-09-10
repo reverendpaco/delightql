@@ -15,7 +15,7 @@
 
 use crate::pipeline::asts::resolved as ast_resolved;
 use crate::pipeline::Pipeline;
-use crate::system::DelightQLSystem;
+use crate::system::ReadySystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 use std::sync::{Arc, Mutex};
@@ -35,8 +35,8 @@ impl DatabaseIntrospector for NoTables {
     }
 }
 
-fn world_with(source: &str) -> DelightQLSystem {
-    let mut system = DelightQLSystem::new(
+fn world_with(source: &str) -> ReadySystem {
+    let mut system = ReadySystem::new(
         Arc::new(Mutex::new(MockDatabaseConnection::new())),
         Box::new(NoTables),
         "sqlite",

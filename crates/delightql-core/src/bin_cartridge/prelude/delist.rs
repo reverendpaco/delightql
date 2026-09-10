@@ -17,6 +17,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::DirectiveBinding;
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::*;
@@ -64,13 +65,12 @@ impl EffectExecutable for DelistPredicate {
     ) -> Result<EntityResult> {
         // Validate argument count
         if arguments.len() != 1 {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(DirectiveBinding::Arity {
+                message: format!(
                     "delist!() expects 1 argument (namespace), got {}",
                     arguments.len()
                 ),
-                "Invalid argument count",
-            ));
+            }));
         }
 
         // Extract namespace from first argument (must be string literal)
@@ -78,10 +78,9 @@ impl EffectExecutable for DelistPredicate {
 
         // Validate namespace name
         if namespace.is_empty() {
-            return Err(DelightQLError::database_error(
-                "delist!() namespace cannot be empty",
-                "Empty namespace name",
-            ));
+            return Err(DelightQLError::from(DirectiveBinding::Value {
+                message: "delist!() namespace cannot be empty".to_string(),
+            }));
         }
 
         // Execute the side effect - delegate to system
@@ -103,12 +102,11 @@ fn extract_string_literal(expr: &DomainExpression, param_name: &str) -> Result<S
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
             Ok(s.clone())
         }
-        _ => Err(DelightQLError::database_error(
-            format!(
+        _ => Err(DelightQLError::from(DirectiveBinding::Value {
+            message: format!(
                 "delist!() expects '{}' to be a string literal, got: {:?}",
                 param_name, expr
             ),
-            "Invalid argument type (expected string literal)",
-        )),
+        })),
     }
 }

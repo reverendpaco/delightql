@@ -5,6 +5,7 @@
 // Implements DatabaseIntrospector trait for user-facing DuckDB databases.
 // This is for transpilation TARGETS, not runtime infrastructure.
 
+use delightql_types::diagnostic::{DuckDb, Runtime};
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::{DelightQLError, Result};
 use duckdb::Connection;
@@ -33,7 +34,7 @@ impl DatabaseIntrospector for DuckDBIntrospector {
 
     fn introspect_entities_in_schema(&self, schema: &str) -> Result<Vec<DiscoveredEntity>> {
         let conn = self.connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire lock on DuckDB connection",
                 format!("Connection was poisoned: {}", e),
             )
@@ -54,30 +55,29 @@ impl DatabaseIntrospector for DuckDBIntrospector {
         );
 
         let mut stmt = conn.prepare(&table_query).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to prepare DuckDB introspection query: {}", e),
-                e.to_string(),
-            )
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("Failed to prepare DuckDB introspection query: {}", e),
+            })
         })?;
 
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?, // table_name
-                row.get::<_, String>(1)?, // table_type
-            ))
-        }).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to execute DuckDB introspection query: {}", e),
-                e.to_string(),
-            )
-        })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?, // table_name
+                    row.get::<_, String>(1)?, // table_type
+                ))
+            })
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to execute DuckDB introspection query: {}", e),
+                })
+            })?;
 
         for result in rows {
             let (table_name, table_type) = result.map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to read DuckDB table row: {}", e),
-                    e.to_string(),
-                )
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to read DuckDB table row: {}", e),
+                })
             })?;
 
             // Determine entity type: 10=DBPermanentTable, 11=DBPermanentView
@@ -126,32 +126,31 @@ fn introspect_table_columns(
     );
 
     let mut stmt = conn.prepare(&query).map_err(|e| {
-        DelightQLError::database_error(
-            format!("Failed to prepare DuckDB column introspection query: {}", e),
-            e.to_string(),
-        )
+        DelightQLError::from(DuckDb::Engine {
+            message: format!("Failed to prepare DuckDB column introspection query: {}", e),
+        })
     })?;
 
-    let rows = stmt.query_map([table_name], |row| {
-        Ok((
-            row.get::<_, String>(0)?, // column_name
-            row.get::<_, String>(1)?, // data_type
-            row.get::<_, i32>(2)?,    // ordinal_position
-            row.get::<_, String>(3)?, // is_nullable ('YES' or 'NO')
-        ))
-    }).map_err(|e| {
-        DelightQLError::database_error(
-            format!("Failed to execute DuckDB column introspection query: {}", e),
-            e.to_string(),
-        )
-    })?;
+    let rows = stmt
+        .query_map([table_name], |row| {
+            Ok((
+                row.get::<_, String>(0)?, // column_name
+                row.get::<_, String>(1)?, // data_type
+                row.get::<_, i32>(2)?,    // ordinal_position
+                row.get::<_, String>(3)?, // is_nullable ('YES' or 'NO')
+            ))
+        })
+        .map_err(|e| {
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("Failed to execute DuckDB column introspection query: {}", e),
+            })
+        })?;
 
     for result in rows {
         let (name, data_type, position, is_nullable_str) = result.map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to read DuckDB column row: {}", e),
-                e.to_string(),
-            )
+            DelightQLError::from(DuckDb::Engine {
+                message: format!("Failed to read DuckDB column row: {}", e),
+            })
         })?;
 
         attributes.push(DiscoveredAttribute {

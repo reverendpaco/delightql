@@ -20,11 +20,11 @@ use delightql_core::uri_registry::{
 /// querying the burned table — the same ~25ms a `dql query` pays, so
 /// explain's latency is unchanged (measured).
 fn load_rows() -> Result<Vec<IdentifierEntry>> {
-    let mut handle = crate::connection::open_handle()?;
+    let mut handle = crate::connection::open_handle(crate::connection::SessionProfile::client())?;
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
     let results = crate::exec_ng::fetch_all(
         &mut *session,
-        "sys::identifiers.identifier(*) |> (kind, hierarchy, summary, explanation)",
+        "sys::identifiers.identifier(*) |> (kind, hierarchy, summary, explanation, role)",
     )?;
     results
         .rows
@@ -37,6 +37,7 @@ fn load_rows() -> Result<Vec<IdentifierEntry>> {
                 hierarchy: row[1].clone(),
                 summary: row[2].clone(),
                 explanation: row[3].clone(),
+                role: row[4].clone(),
             })
         })
         .collect()
@@ -49,8 +50,7 @@ pub fn handle_explain(identifier: &str) -> Result<()> {
         None => {
             // Bare hierarchy: search across kinds.
             let bare = identifier.trim_matches('/');
-            let hits: Vec<&IdentifierEntry> =
-                rows.iter().filter(|e| e.hierarchy == bare).collect();
+            let hits: Vec<&IdentifierEntry> = rows.iter().filter(|e| e.hierarchy == bare).collect();
             match hits.len() {
                 1 => {
                     let (kind, hierarchy) = (hits[0].kind, hits[0].hierarchy.clone());
@@ -161,7 +161,11 @@ fn print_kind_facts(entry: &IdentifierEntry) {
         UriKind::Diagnostic => {
             println!();
             println!("Surfaced by: dql selftest (provider '{}')", {
-                entry.hierarchy.split('/').next().unwrap_or(&entry.hierarchy)
+                entry
+                    .hierarchy
+                    .split('/')
+                    .next()
+                    .unwrap_or(&entry.hierarchy)
             });
         }
     }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::diagnostic::{Constraint, DelightQLError, Manifest, Semantic};
 use crate::pipeline::asts::core::expressions::domain::DomainExpression;
 use crate::pipeline::asts::core::expressions::functions::FunctionApplication;
 use crate::pipeline::asts::core::expressions::truth::TruthExpression;
@@ -148,32 +149,30 @@ fn transform_table_constraint(
             columns: cols.clone(),
         }),
         DdlConstraint::PrimaryKey { .. } => {
-            Err(crate::DelightQLError::validation_error_categorized(
-                "imprint/manifest/table_constraint_columns",
-                "A table-level primary key must name at least one column",
-                "use \"%%(column, ...)\" on the \"_\" constraint row",
-            ))
+            Err(DelightQLError::from(Manifest::TableConstraintColumns {
+                message: "A table-level primary key must name at least one column".to_string(),
+            }))
         }
         DdlConstraint::Unique {
             columns: Some(cols),
         } if !cols.is_empty() => Ok(SqlTableConstraint::Unique {
             columns: cols.clone(),
         }),
-        DdlConstraint::Unique { .. } => Err(crate::DelightQLError::validation_error_categorized(
-            "imprint/manifest/table_constraint_columns",
-            "A table-level unique constraint must name at least one column",
-            "use \"%(column, ...)\" on the \"_\" constraint row",
-        )),
+        DdlConstraint::Unique { .. } => {
+            Err(DelightQLError::from(Manifest::TableConstraintColumns {
+                message: "A table-level unique constraint must name at least one column"
+                    .to_string(),
+            }))
+        }
         DdlConstraint::Check { expr } => {
             let sql_expr = transform_check(expr.clone(), None, identities)?;
             Ok(SqlTableConstraint::Check { expr: sql_expr })
         }
         DdlConstraint::NotNull => {
             // Table-level NOT NULL doesn't make sense; shouldn't reach here
-            Err(crate::DelightQLError::transpilation_error(
-                "NotNull constraint at table level is invalid",
-                "ddl_pipeline::transformer",
-            ))
+            Err(DelightQLError::from(Constraint::General {
+                message: "NotNull constraint at table level is invalid".to_string(),
+            }))
         }
         DdlConstraint::ForeignKey { table, columns } => {
             let ref_columns = columns
@@ -242,13 +241,12 @@ fn transform_ddl_expression(
             crate::pipeline::asts::core::FunctionApplication::Ground(value),
         ) => Ok(SqlExpression::Literal(value)),
         DomainExpression::Application(func) => transform_ddl_function(func, column, identities),
-        other => Err(crate::DelightQLError::transpilation_error(
-            format!(
+        other => Err(DelightQLError::from(Constraint::Unsupported {
+            message: format!(
                 "Unsupported DDL expression variant: {:?}",
                 std::mem::discriminant(&other)
             ),
-            "ddl_pipeline::transformer",
-        )),
+        })),
     }
 }
 
@@ -275,9 +273,9 @@ fn transform_ddl_function(
                 identities
                     .write_function(call.callee, &mut crate::names::sink::Teaching(&mut name))
                     .map_err(|error| {
-                        crate::DelightQLError::transpilation_error(
-                            format!("cannot render DDL callable: {error:?}"),
+                        crate::diagnostic::Internal::invariant(
                             "ddl_pipeline::transformer",
+                            format!("cannot render DDL callable: {error:?}"),
                         )
                     })?;
                 name
@@ -288,10 +286,9 @@ fn transform_ddl_function(
                 crate::pipeline::asts::core::operators::CallArguments::Scalar(members) => members,
                 crate::pipeline::asts::core::operators::CallArguments::None => Vec::new(),
                 crate::pipeline::asts::core::operators::CallArguments::HigherOrder(_) => {
-                    return Err(crate::DelightQLError::transpilation_error(
-                        "DDL scalar call cannot contain a relational argument",
-                        "ddl_pipeline::transformer",
-                    ))
+                    return Err(DelightQLError::from(Constraint::General {
+                        message: "DDL scalar call cannot contain a relational argument".to_string(),
+                    }))
                 }
             }
             .into_iter()
@@ -301,16 +298,15 @@ fn transform_ddl_function(
                 }
                 crate::pipeline::asts::core::operators::ScalarArgument::Spread(_)
                 | crate::pipeline::asts::core::operators::ScalarArgument::Star => {
-                    Err(crate::DelightQLError::transpilation_error(
-                        "a DDL scalar call cannot contain an enumerating argument",
-                        "ddl_pipeline::transformer",
-                    ))
+                    Err(DelightQLError::from(Constraint::General {
+                        message: "a DDL scalar call cannot contain an enumerating argument"
+                            .to_string(),
+                    }))
                 }
                 crate::pipeline::asts::core::operators::ScalarArgument::Callable(_) => {
-                    Err(crate::DelightQLError::transpilation_error(
-                        "a DDL scalar call cannot contain a callable argument",
-                        "ddl_pipeline::transformer",
-                    ))
+                    Err(DelightQLError::from(Constraint::General {
+                        message: "a DDL scalar call cannot contain a callable argument".to_string(),
+                    }))
                 }
             })
             .collect::<Result<Vec<_>>>()?;
@@ -398,13 +394,12 @@ fn transform_ddl_function(
             identities,
             TruthConsumer::Value,
         ),
-        other => Err(crate::DelightQLError::transpilation_error(
-            format!(
+        other => Err(DelightQLError::from(Constraint::Unsupported {
+            message: format!(
                 "Unsupported DDL function variant: {:?}",
                 std::mem::discriminant(&other)
             ),
-            "ddl_pipeline::transformer",
-        )),
+        })),
     }
 }
 
@@ -496,14 +491,12 @@ fn transform_ddl_predicate(
                 // stopping at the shorter side, which would silently narrow
                 // the test rather than name the error.
                 let pairs = probes.clone().zip_exact(row.0).ok_or_else(|| {
-                    crate::error::DelightQLError::validation_error_categorized(
-                        "membership/arity",
-                        format!(
+                    DelightQLError::from(Semantic::MembershipArity {
+                        message: format!(
                             "membership candidate has {} value(s) but the probe has {}",
                             row_width, probe_width
                         ),
-                        "every candidate must match the probe's width",
-                    )
+                    })
                 })?;
                 Ok(pairs
                     .try_map(|(probe, value)| -> Result<_> {
@@ -542,10 +535,10 @@ fn transform_ddl_predicate(
         TruthExpression::Sigma(SigmaApplication {
             proof: crate::pipeline::asts::core::NamedProof::Body(_),
             ..
-        }) => Err(crate::DelightQLError::transpilation_error(
+        }) => Err(crate::diagnostic::Internal::invariant(
+            "ddl_pipeline::transformer",
             "a DDL constraint observes a built-in predicate; a truth rule's body has no \
              lowering here",
-            "ddl_pipeline::transformer",
         )),
         // THE SAME PREDICATE IDENTITY AS THE QUERY ROAD: the call lowers to
         // the predicate rewrite the generator resolves through the bin
@@ -565,9 +558,9 @@ fn transform_ddl_predicate(
                 identities
                     .write_function(call.callee, &mut crate::names::sink::Teaching(&mut name))
                     .map_err(|error| {
-                        crate::DelightQLError::transpilation_error(
-                            format!("cannot render DDL sigma callable: {error:?}"),
+                        crate::diagnostic::Internal::invariant(
                             "ddl_pipeline::transformer",
+                            format!("cannot render DDL sigma callable: {error:?}"),
                         )
                     })?;
                 name
@@ -613,13 +606,12 @@ fn transform_ddl_predicate(
                 },
             )
         }
-        other => Err(crate::DelightQLError::transpilation_error(
-            format!(
+        other => Err(DelightQLError::from(Constraint::Unsupported {
+            message: format!(
                 "Unsupported DDL boolean expression variant: {:?}",
                 std::mem::discriminant(&other)
             ),
-            "ddl_pipeline::transformer",
-        )),
+        })),
     }
 }
 

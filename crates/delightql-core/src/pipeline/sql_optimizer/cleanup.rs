@@ -7,6 +7,7 @@
 //! stay in place; removing one there also changes the join's exposed scope
 //! and needs a separate structural proof.
 
+use crate::diagnostic::Internal;
 use std::collections::{HashMap, HashSet};
 
 use crate::error::Result;
@@ -200,7 +201,7 @@ impl QueryTransformer for CollapseTransformer {
         }
         let collapsed = builder
             .rebuilding(outer)
-            .map_err(crate::error::DelightQLError::parse_error)?;
+            .map_err(|e| Internal::invariant("sql_optimizer", e))?;
         Ok(Some(QueryExpression::Select(Box::new(collapsed))))
     }
 }

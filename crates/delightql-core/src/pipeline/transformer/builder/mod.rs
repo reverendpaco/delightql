@@ -32,6 +32,7 @@ pub(in crate::pipeline) mod layout;
 pub(in crate::pipeline) mod names;
 pub(in crate::pipeline) mod state;
 
+use crate::diagnostic::Internal;
 use std::marker::PhantomData;
 
 use crate::error::Result;
@@ -121,7 +122,8 @@ pub(in crate::pipeline::transformer) fn stand_cte_body_at(
             ..
         } = item
         else {
-            return Err(crate::error::DelightQLError::parse_error(
+            return Err(Internal::invariant(
+                "transformer::builder",
                 "a CTE body has an output it does not name",
             ));
         };
@@ -313,9 +315,10 @@ pub(crate) trait Qualify {
         match matches.as_slice() {
             [] => Ok(column),
             [landed] => Ok(*landed),
-            _ => Err(crate::error::DelightQLError::parse_error(format!(
-                "physical column {column:?} occurs at more than one exact SQL site"
-            ))),
+            _ => Err(Internal::invariant(
+                "transformer::builder",
+                format!("physical column {column:?} occurs at more than one exact SQL site"),
+            )),
         }
     }
 
@@ -370,9 +373,10 @@ impl<T: Emitting + ?Sized> Emitted for T {
             .bindings()
             .physical_slot_at(self.site(), column)?
             .ok_or_else(|| {
-                crate::error::DelightQLError::parse_error(format!(
-                    "physical column {column:?} is absent from this exact SQL site"
-                ))
+                Internal::invariant(
+                    "transformer::builder",
+                    format!("physical column {column:?} is absent from this exact SQL site"),
+                )
             })
     }
 
@@ -491,6 +495,10 @@ pub struct CteBody {
     /// The exact physical aliases the body used before standing at its own
     /// SQL scope, in output order.
     pub physical_aliases: Vec<crate::names::ColId>,
+    /// The binding is read more than once and must be evaluated into
+    /// storage first: every reader sees one evaluation of its rows. The
+    /// target answers whether it can promise that.
+    pub materialized_once: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1607,7 +1615,8 @@ impl Builder<Unprojected> {
             .iter()
             .position(|candidate| candidate.identity() == column)
             .ok_or_else(|| {
-                crate::error::DelightQLError::parse_error(
+                Internal::invariant(
+                    "transformer::builder",
                     "json expansion source column is not in the input heading",
                 )
             })?;
@@ -1709,7 +1718,7 @@ impl Builder<Unprojected> {
         }
         let select = (select)
             .standing_at(output_scope)
-            .map_err(crate::error::DelightQLError::parse_error)?;
+            .map_err(|e| Internal::invariant("transformer::builder", e))?;
         let query = QueryExpression::Select(Box::new(select));
         let mut result = Builder::from_query(
             query,
@@ -1880,7 +1889,8 @@ impl Builder<Projected> {
                 let input_site = input_scope.site();
                 let input_columns = input_scope.outputs().to_vec();
                 if before_wrap.len() != input_columns.len() {
-                    return Err(crate::error::DelightQLError::parse_error(
+                    return Err(Internal::invariant(
+                        "transformer::builder",
                         "a window wrap changed the width of its exact input publication",
                     ));
                 }
@@ -2026,12 +2036,15 @@ impl Builder<Projected> {
         for (state, names) in [(self.state, &self.names), (right.state, &right.names)] {
             let branch = state.publication().clone();
             if branch.outputs().len() != outputs.len() {
-                return Err(crate::error::DelightQLError::parse_error(format!(
-                    "a set branch publishing {} positions cannot stack under a result \
+                return Err(Internal::invariant(
+                    "transformer::builder",
+                    format!(
+                        "a set branch publishing {} positions cannot stack under a result \
                      publishing {}",
-                    branch.outputs().len(),
-                    outputs.len()
-                )));
+                        branch.outputs().len(),
+                        outputs.len()
+                    ),
+                ));
             }
             let paired: Vec<_> = branch
                 .outputs()
@@ -2140,7 +2153,8 @@ impl Builder<Projected> {
         let output_columns =
             build_cte_output_columns(&cte_body.output_columns, &self.identities, cte_identity);
         if cte_body.input_slots.len() != output_columns.len() {
-            return Err(crate::error::DelightQLError::parse_error(
+            return Err(Internal::invariant(
+                "transformer::builder",
                 "a CTE body and its physical slot map have different widths",
             ));
         }
@@ -2163,8 +2177,12 @@ impl Builder<Projected> {
         )?;
 
         // Accumulate the CTE
-        self.accumulated_ctes
-            .push(Cte::ordinary(cte_identity, cte_body.query));
+        let cte = Cte::ordinary(cte_identity, cte_body.query);
+        self.accumulated_ctes.push(if cte_body.materialized_once {
+            cte.requiring_materialization()
+        } else {
+            cte
+        });
 
         // Transition to a new Select FROM the CTE.
         // The old state is discarded — the closure already used it to build the CTE body.
@@ -2304,6 +2322,36 @@ pub(in crate::pipeline::transformer) struct JoinOperand {
     pub ctes: Vec<Cte>,
 }
 
+impl JoinOperand {
+    /// THE PRESENCE WITNESS this operand emits: the one scaffold an
+    /// interior boundary places after its support when the enclosing join
+    /// computes positions for it — non-null wherever the boundary
+    /// contributed a row. An operand that emits none, or more than one
+    /// column standing for no port and no support, has no witness to
+    /// answer with.
+    pub(in crate::pipeline::transformer) fn presence_witness(
+        &self,
+    ) -> Result<crate::names::ColId> {
+        let bindings = self.identities.bindings();
+        let site = self.publication.site();
+        let mut scaffolds = Vec::new();
+        for column in self.publication.outputs() {
+            let column = column.identity();
+            if !bindings.binds_a_port(site, column)? && !bindings.is_support(site, column)? {
+                scaffolds.push(column);
+            }
+        }
+        match scaffolds.as_slice() {
+            [witness] => Ok(*witness),
+            _ => Err(Internal::invariant(
+                "transformer::builder",
+                "a padded operand the join computes positions for emits no single presence \
+                 witness",
+            )),
+        }
+    }
+}
+
 impl Qualify for JoinOperand {
     fn identities(&self) -> &crate::names::Registry {
         &self.identities
@@ -2384,6 +2432,15 @@ pub(in crate::pipeline::transformer) struct ChainedQualify<'a> {
 /// Refinement may move a predicate from a join result into the join itself.
 /// Its ports remain ports of that exact result; the construction-owned
 /// ancestry is the only evidence that can translate them onto an operand.
+///
+/// THE ONLY DIRECTION IS INTO THIS OPERATION. A reference is answered when
+/// it names a position an operand emits, or a position construction carried
+/// INTO one of this operation's outputs. A port that merely shares an
+/// ancestor with an output — a sibling read of the same definition — is
+/// not realized here, and walking from it back to that ancestor answers a
+/// question about the sibling with this operand's column. That is the
+/// tempting regression: an enclosing read's port is a REFUSAL at this
+/// level, which is what lets the exact enclosing site answer it.
 pub(in crate::pipeline::transformer) struct AncestralQualify<'a> {
     operands: &'a dyn Qualify,
     /// THE TOTAL MAP, built ONCE from the construction record.
@@ -2395,10 +2452,6 @@ pub(in crate::pipeline::transformer) struct AncestralQualify<'a> {
     /// names: nothing below searches, and nothing below picks a winner
     /// among candidates one reference at a time.
     landed: std::collections::HashMap<crate::relation::PortId, crate::names::ColId>,
-    /// The record the lazy descent below reads: a recorded pair may name a
-    /// port of a relation the rebuild replaced without a replacement row —
-    /// its own carry edges still say which base positions realize it.
-    relations: crate::relation::Relations,
 }
 
 impl<'a> AncestralQualify<'a> {
@@ -2410,15 +2463,17 @@ impl<'a> AncestralQualify<'a> {
     /// and it is read HERE — once, for every position at once — rather
     /// than consulted per reference.
     ///
-    /// A position several operand columns realize is left OUT of the map:
-    /// a reference to it has no one column it could mean, and the refusal
-    /// belongs where the reference is written, naming the port.
+    /// A position several operand columns realize is left OUT of the map —
+    /// whether one output descends to two operand columns or one ancestor
+    /// was carried into two outputs, `(q.*, q.*)`. A reference to it has
+    /// no one column it could mean, and the refusal belongs where the
+    /// reference is written, naming the port. Emission order is not an
+    /// addressing law, so the first output to reach it does not win.
     pub(in crate::pipeline::transformer) fn over(
         operation: &crate::relation::SemanticRelation,
         relations: &crate::relation::Relations,
         operands: &'a dyn Qualify,
     ) -> Result<Self> {
-        let mut landed = std::collections::HashMap::new();
         let published = relations.interface(operation)?.ports().to_vec();
         // Each position of the operation, and each position of a relation
         // this operation replaced — both are things a reference here can
@@ -2444,16 +2499,19 @@ impl<'a> AncestralQualify<'a> {
         for (old, new) in relations.translated_ports(operation)? {
             sources.push((old, new));
         }
+        // EVERY column a named position reaches, across every output that
+        // carries it. The map is closed only after all of them are in.
+        let mut reached: std::collections::HashMap<
+            crate::relation::PortId,
+            Vec<crate::names::ColId>,
+        > = std::collections::HashMap::new();
         for (named, output) in sources {
-            if landed.contains_key(&named) {
-                continue;
-            }
             // The walk DESCENDS the carry edges construction wrote and
             // stops each branch the moment an operand realizes it: a
             // merged key two joins deep is still the record's answer, one
             // recorded edge at a time. Nothing here reads position,
             // spelling, or width.
-            let mut columns = Vec::new();
+            let columns = reached.entry(named).or_default();
             let mut frontier = vec![output];
             let mut walked: Vec<crate::relation::PortId> = Vec::new();
             while let Some(port) = frontier.pop() {
@@ -2471,15 +2529,15 @@ impl<'a> AncestralQualify<'a> {
                 }
                 frontier.extend(relations.carried_from(port));
             }
-            if let [column] = columns.as_slice() {
-                landed.insert(named, *column);
-            }
         }
-        Ok(AncestralQualify {
-            operands,
-            landed,
-            relations: relations.clone(),
-        })
+        let landed = reached
+            .into_iter()
+            .filter_map(|(named, columns)| match columns.as_slice() {
+                [column] => Some((named, *column)),
+                _ => None,
+            })
+            .collect();
+        Ok(AncestralQualify { operands, landed })
     }
 }
 
@@ -2493,45 +2551,21 @@ impl Qualify for AncestralQualify<'_> {
         if let Ok(column) = self.operands.rebind_port(port) {
             return Ok(column);
         }
+        // A POSITION CARRIED INTO THIS OPERATION is the output's answer.
         if let Some(column) = self.landed.get(&port) {
             return Ok(*column);
         }
-        // A recorded pair may name a port of a relation the rebuild stood
-        // over without writing a replacement row for it — an intermediate
-        // join's merged output. Its own carry edges still say which
-        // positions realize it: descend them, stopping each branch at the
-        // first position an operand emits. One column is the answer;
-        // several is an ambiguity, and none is the refusal below.
-        let mut columns: Vec<crate::names::ColId> = Vec::new();
-        let mut frontier = self.relations.carried_from(port);
-        let mut walked: Vec<crate::relation::PortId> = vec![port];
-        while let Some(ancestor) = frontier.pop() {
-            if walked.contains(&ancestor) {
-                continue;
-            }
-            walked.push(ancestor);
-            if let Ok(column) = self.operands.rebind_port(ancestor) {
-                if !columns.contains(&column) {
-                    columns.push(column);
-                }
-                continue;
-            }
-            if let Some(column) = self.landed.get(&ancestor) {
-                if !columns.contains(column) {
-                    columns.push(*column);
-                }
-                continue;
-            }
-            frontier.extend(self.relations.carried_from(ancestor));
-        }
-        if let [column] = columns.as_slice() {
-            return Ok(*column);
-        }
-        Err(crate::error::DelightQLError::parse_error(format!(
-            "an operation-result port {port:?} has no construction-recorded \
+        // Anything else is not realized at this level. There is no walk
+        // from the port to its ancestors: a shared source is not evidence
+        // that this operand emits the occurrence asked for.
+        Err(Internal::invariant(
+            "transformer::builder",
+            format!(
+                "an operation-result port {port:?} has no construction-recorded \
              physical operand among {:?}",
-            self.operands.sql_sites(),
-        )))
+                self.operands.sql_sites(),
+            ),
+        ))
     }
 
     fn sql_sites(&self) -> Vec<crate::sql_binding::SqlSiteId> {

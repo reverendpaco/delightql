@@ -52,7 +52,7 @@ pub fn execute_query(
 ) -> Result<Option<ResultMetadata>> {
     // The session's one backend is created by the mount! below, not by a
     // pre-opened manager — so build the handle straight from the factories.
-    let mut handle = crate::connection::open_handle()?;
+    let mut handle = crate::connection::open_handle(crate::connection::SessionProfile::client())?;
 
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
 

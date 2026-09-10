@@ -5,9 +5,11 @@
 //!
 //! REDUCTION POSITION ONLY. A metadata group is not a domain expression and
 //! not a record constructor member: it yields an interior RECORD keyed by
-//! data, which only a reduction can compress. Its key is phase-selected, so
-//! the authored characters and the bound occurrence are one carrier rather
-//! than an authored/resolved pair that can drift.
+//! data, which only a reduction can compress. Its target is a COLLECTOR like
+//! the record after `~>`: each key holds the rows of its partition, and the
+//! target's members cannot change that. Its key is phase-selected, so the
+//! authored characters and the bound occurrence are one carrier rather than
+//! an authored/resolved pair that can drift.
 
 use super::super::{Phase, Unresolved};
 use super::enclyph::Enclyph;
@@ -24,10 +26,6 @@ pub struct MetadataGroup<P: Phase = Unresolved> {
     /// What the reduction lowering owes this level. `None` until the
     /// tree-group analysis has decided.
     pub cte_requirements: Option<CteRequirements<P>>,
-    /// Whether the target SUMMARIZES its group — every constructed member
-    /// reduces — so each key holds one object rather than an array of the
-    /// group's rows. Decided at resolution, where reductions are known.
-    pub summary: bool,
 }
 
 /// `meta_target = enclyph_like | metadata_group` — the levels chain, and the

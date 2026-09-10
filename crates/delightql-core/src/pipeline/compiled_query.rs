@@ -191,20 +191,17 @@ pub struct Requirement {
 /// structurally inexpressible; only Host and Return can ship. Each
 /// SQL-bearing variant owns its LOWERED statement stream in emission
 /// order — the DML/receipt adjacency discipline lives here.
-/// A compiler-written check's refusal: the identifier the program sees and
-/// the sentence that explains it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Refusal {
-    pub identity: String,
-    pub message: String,
-}
+/// A compiler-written check's refusal: the typed diagnostic the program
+/// receives when the check answers no. Constructed where the check is
+/// written, carried whole, projected at the wire.
+pub type Refusal = crate::diagnostic::DelightQLError;
 
 /// Why a reached abort exists. The provenance is typed so an authored abort
-/// cannot accidentally report an assertion verdict, and an assertion cannot
-/// acquire an arbitrary authored error identity.
+/// cannot accidentally report an assertion verdict. Both reach the one fixed
+/// `authored/abort` identity; the label is occurrence prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AbortProvenance {
-    Authored { identity: String, label: String },
+    Authored { label: String },
     Assertion { label: String },
 }
 
@@ -514,6 +511,11 @@ pub struct PlanCreatedObject {
     pub is_view: bool,
     /// The connection the object was created on (`None` = session default).
     pub connection_id: Option<i64>,
+    /// The positions, in the created heading's order, whose values are
+    /// nested relation payloads (tree-group columns). The engine's own
+    /// read-back cannot know this — a CTAS declares no type for them — so
+    /// the plan that knew the heading says it, and the catalog records it.
+    pub interior_positions: Vec<usize>,
 }
 // see dead_code note on PlanStatement
 impl From<CompiledQuery> for CompiledPlan {
@@ -541,7 +543,7 @@ impl From<CompiledQuery> for CompiledPlan {
                 statement: PlanStatement {
                     sql: obligation.sql,
                     connection_id: q.connection_id,
-                    comment: Some(obligation.refusal.identity.clone()),
+                    comment: Some(obligation.refusal.error_uri()),
                 },
                 refusal: Some(obligation.refusal),
             });
@@ -704,10 +706,10 @@ mod tests {
             kind: SqlKind::Query,
             obligations: vec![CompiledObligation {
                 sql: "SELECT count(*) > 0 FROM t".to_string(),
-                refusal: Refusal {
-                    identity: "runtime/precondition".to_string(),
+                refusal: crate::diagnostic::Runtime::Precondition {
                     message: "rows required".to_string(),
-                },
+                }
+                .into(),
             }],
             prepare_sqls: vec![],
             cleanup_sqls: vec![],
@@ -720,8 +722,8 @@ mod tests {
                 assert_eq!(statement.sql, "SELECT count(*) > 0 FROM t");
                 assert_eq!(statement.connection_id, Some(7));
                 assert_eq!(
-                    refusal.as_ref().map(|refusal| refusal.identity.as_str()),
-                    Some("runtime/precondition")
+                    refusal.as_ref().map(|refusal| refusal.error_uri()),
+                    Some("delightql-error://runtime/precondition".to_string())
                 );
             }
             other => panic!("entry 0: expected Check, got {:?}", other),

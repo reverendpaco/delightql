@@ -37,12 +37,10 @@ use std::time::Instant;
 use delightql_backends::duckdb::executor::QueryResult;
 use delightql_backends::{DuckDBConnectionManager, DuckDBExecutor, DuckDBExecutorImpl};
 use delightql_protocol::{
-    resolve_projection, Cell, ClientTerm, Dimension, ErrorKind, Handle, Handler, MetaItem,
-    Orientation, Projection, ServerTerm,
+    resolve_projection, Cell, ClientTerm, Dimension, Handle, Handler, MetaItem, Orientation,
+    Projection, ServerTerm, WireError,
 };
-
-const IDENT_DUCK_ERROR: &str = "delightql-error://target/duckdb/error";
-const IDENT_UNIMPLEMENTED: &str = "delightql-error://target/duckdb/unimplemented";
+use delightql_types::diagnostic::DuckDb;
 
 struct ResultState {
     columns: Vec<String>,
@@ -93,7 +91,10 @@ impl DuckParty {
             return Err(format!("Database file '{}' does not exist.", db_path));
         }
         Ok(Self {
-            db: DbState::Closed { path: db_path.to_string(), readonly },
+            db: DbState::Closed {
+                path: db_path.to_string(),
+                readonly,
+            },
             handles: HashMap::new(),
             next_handle_id: 1,
         })
@@ -125,20 +126,24 @@ impl DuckParty {
         let sql = match String::from_utf8(text) {
             Ok(s) => s,
             Err(_) => {
-                return error(ErrorKind::Syntax, IDENT_DUCK_ERROR, b"query is not UTF-8".to_vec())
+                return error(DuckDb::ProtocolText {
+                    message: "query is not UTF-8".to_string(),
+                })
             }
         };
 
         let started = Instant::now();
         let manager = match self.manager() {
             Ok(m) => m,
-            Err(e) => return error(ErrorKind::Connection, IDENT_DUCK_ERROR, e.into_bytes()),
+            Err(message) => return error(DuckDb::Connect { message }),
         };
         let mut executor = DuckDBExecutorImpl::new(manager);
         let result = match executor.execute_query(&sql) {
             Ok(r) => r,
             Err(e) => {
-                return error(ErrorKind::Syntax, IDENT_DUCK_ERROR, e.to_string().into_bytes())
+                return error(DuckDb::Engine {
+                    message: e.to_string(),
+                })
             }
         };
         let exec_ms = started.elapsed().as_millis() as u64;
@@ -146,7 +151,7 @@ impl DuckParty {
         // DML/DDL with no result columns: the spec-appendix relation.
         let (columns, rows) = match shape_result(result) {
             Ok(cr) => cr,
-            Err(msg) => return error(ErrorKind::Connection, IDENT_DUCK_ERROR, msg.into_bytes()),
+            Err(message) => return error(DuckDb::Engine { message }),
         };
 
         let handle_id = self.next_handle_id;
@@ -170,7 +175,11 @@ impl DuckParty {
 
         self.handles.insert(
             handle.clone(),
-            ResultState { columns, rows: cells, exec_ms },
+            ResultState {
+                columns,
+                rows: cells,
+                exec_ms,
+            },
         );
         ServerTerm::Header { handle, dimensions }
     }
@@ -183,11 +192,9 @@ impl DuckParty {
         orientation: Orientation,
     ) -> ServerTerm {
         if orientation != Orientation::Rows {
-            return error(
-                ErrorKind::Connection,
-                "delightql-error://target/duckdb/orientation",
-                b"orientation Columns not supported".to_vec(),
-            );
+            return error(DuckDb::Orientation {
+                message: "orientation Columns not supported".to_string(),
+            });
         }
         let state = match self.handles.get_mut(&handle) {
             Some(s) => s,
@@ -253,16 +260,14 @@ fn shape_result(result: QueryResult) -> Result<(Vec<String>, Vec<Vec<String>>), 
     }
 }
 
-fn error(kind: ErrorKind, identity: &str, message: impl Into<Vec<u8>>) -> ServerTerm {
-    ServerTerm::Error {
-        kind,
-        identity: identity.as_bytes().to_vec(),
-        message: message.into(),
-    }
+/// The one projection of an adapter diagnostic onto the wire: identity,
+/// class and prose all come from the typed leaf.
+fn error(diagnostic: DuckDb) -> ServerTerm {
+    ServerTerm::Error(WireError::of(&diagnostic.into()))
 }
 
 fn unknown_handle() -> ServerTerm {
-    error(ErrorKind::Connection, IDENT_DUCK_ERROR, b"unknown handle".to_vec())
+    error(DuckDb::UnknownHandle)
 }
 
 impl Handler for DuckParty {
@@ -281,11 +286,9 @@ impl Handler for DuckParty {
                     .filter(|o| supported.contains(o))
                     .collect();
                 if agreed.is_empty() {
-                    error(
-                        ErrorKind::Connection,
-                        "delightql-error://target/duckdb/orientation",
-                        b"no common orientation".to_vec(),
-                    )
+                    error(DuckDb::Orientation {
+                        message: "no common orientation".to_string(),
+                    })
                 } else {
                     ServerTerm::Version {
                         max_message_size,
@@ -303,12 +306,10 @@ impl Handler for DuckParty {
             ClientTerm::Stat { handle } => self.handle_stat(handle),
             ClientTerm::Close { handle } => self.handle_close(handle),
 
-            ClientTerm::Prepare { .. } | ClientTerm::Offer { .. } => error(
-                ErrorKind::Permission,
-                IDENT_UNIMPLEMENTED,
-                b"load path not implemented for the duckdb fatboy (Appender API is a later slice)"
-                    .to_vec(),
-            ),
+            ClientTerm::Prepare { .. } | ClientTerm::Offer { .. } => error(DuckDb::Unimplemented {
+                message: "load path not implemented for the duckdb fatboy (Appender API is a later slice)"
+                    .to_string(),
+            }),
         }
     }
 }
@@ -339,7 +340,8 @@ mod tests {
         {
             let mgr = DuckDBConnectionManager::new_file(path.to_str().unwrap()).unwrap();
             let mut ex = DuckDBExecutorImpl::new(&mgr);
-            ex.execute_query("CREATE TABLE t (id INTEGER, name TEXT)").ok();
+            ex.execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
+                .ok();
             ex.execute_query("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta')")
                 .ok();
         } // manager dropped: single-writer lock released
@@ -359,25 +361,26 @@ mod tests {
         };
         let rows_o = session.agreed_orientation(Orientation::Rows).unwrap();
 
-        let QueryResponse::Header { handle, dimensions } = session
-            .query(b("SELECT name FROM t ORDER BY id"))
-            .unwrap()
+        let QueryResponse::Header { handle, dimensions } =
+            session.query(b("SELECT name FROM t ORDER BY id")).unwrap()
         else {
             panic!("expected Header")
         };
         assert_eq!(dimensions[0].name, b("name"));
 
-        match session.fetch(&handle, Projection::All, 100, rows_o).unwrap() {
+        match session
+            .fetch(&handle, Projection::All, 100, rows_o)
+            .unwrap()
+        {
             FetchResponse::Data { cells } => {
-                assert_eq!(
-                    cells,
-                    vec![vec![Some(b("alpha"))], vec![Some(b("beta"))]]
-                );
+                assert_eq!(cells, vec![vec![Some(b("alpha"))], vec![Some(b("beta"))]]);
             }
             other => panic!("expected Data, got {:?}", other),
         }
         assert!(matches!(
-            session.fetch(&handle, Projection::All, 100, rows_o).unwrap(),
+            session
+                .fetch(&handle, Projection::All, 100, rows_o)
+                .unwrap(),
             FetchResponse::End
         ));
         session.close(handle).unwrap();
@@ -458,8 +461,8 @@ mod tests {
                 .iter()
                 .map(|d| String::from_utf8_lossy(&d.name).into_owned())
                 .collect()),
-            QueryResponse::Error { message, .. } => {
-                Err(String::from_utf8_lossy(&message).into_owned())
+            QueryResponse::Error(error) => {
+                Err(String::from_utf8_lossy(error.message()).into_owned())
             }
         }
     }
@@ -502,13 +505,16 @@ mod tests {
             else {
                 panic!("handshake should succeed")
             };
-            for sql in ["CREATE TABLE made (x INTEGER)", "INSERT INTO made VALUES (7)"] {
+            for sql in [
+                "CREATE TABLE made (x INTEGER)",
+                "INSERT INTO made VALUES (7)",
+            ] {
                 match session.query(b(sql)).unwrap() {
                     QueryResponse::Header { .. } => {}
-                    QueryResponse::Error { message, .. } => panic!(
+                    QueryResponse::Error(error) => panic!(
                         "{} must succeed (writable ruling), got: {}",
                         sql,
-                        String::from_utf8_lossy(&message)
+                        String::from_utf8_lossy(error.message())
                     ),
                 }
             }
@@ -545,8 +551,8 @@ mod tests {
     #[test]
     fn connect_does_not_take_the_file_lock() {
         let path = temp_db();
-        let idle_spare = DuckParty::connect(path.to_str().unwrap())
-            .expect("first connect (the idle spare)");
+        let idle_spare =
+            DuckParty::connect(path.to_str().unwrap()).expect("first connect (the idle spare)");
         let worker = DuckParty::connect(path.to_str().unwrap())
             .expect("second connect must succeed while the spare is alive");
         run_sql(worker, "INSERT INTO t VALUES (4, 'delta')")
@@ -568,8 +574,8 @@ mod tests {
             panic!("handshake should succeed")
         };
         match session.query(b("SELECT * FROM no_such_table")).unwrap() {
-            QueryResponse::Error { identity, .. } => {
-                assert_eq!(identity, b("delightql-error://target/duckdb/error"));
+            QueryResponse::Error(error) => {
+                assert_eq!(error.identity(), b("delightql-error://target/duckdb/error"));
             }
             QueryResponse::Header { .. } => panic!("expected Error"),
         }

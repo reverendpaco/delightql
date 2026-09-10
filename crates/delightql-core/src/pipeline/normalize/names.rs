@@ -14,6 +14,7 @@
 //! reassemble.
 
 use super::Normalizer;
+use crate::diagnostic::{Internal, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::metadata::NamespacePath;
 use crate::pipeline::asts::core::QualifiedName;
@@ -87,10 +88,23 @@ impl<'t> Normalizer<'t> {
         resolution: ResolutionMode,
     ) -> Result<Ref> {
         let name = self.require(node.name(), "a predicate identifier has a name")?;
+        self.written_reference(node.namespace(), name, mark, resolution)
+    }
+
+    /// A written reference from its two parts. The citation spells them
+    /// around its mark (`ns.:f`) rather than as one `predicate_identifier`,
+    /// and decodes through the same act.
+    pub(crate) fn written_reference(
+        &self,
+        namespace: Option<cst::NamespaceQual<'t>>,
+        name: cst::Identifier<'t>,
+        mark: Mark,
+        resolution: ResolutionMode,
+    ) -> Result<Ref> {
         let name = self.identifier(name);
         Ok(Ref::written(
             std::rc::Rc::clone(&self.registry),
-            self.namespace_of(node.namespace())?,
+            self.namespace_of(namespace)?,
             self.registry.intern(name.as_str(), name.is_stropped()),
             mark,
             resolution,
@@ -122,7 +136,8 @@ impl<'t> Normalizer<'t> {
                 ));
             }
         }
-        Err(DelightQLError::parse_error(
+        Err(Internal::invariant(
+            "normalize::names",
             "an effect identifier has a predicate identifier",
         ))
     }
@@ -191,7 +206,9 @@ impl<'t> Normalizer<'t> {
                         .collect(),
                 )
                 .map_err(|error| {
-                    DelightQLError::parse_error(format!("invalid namespace path: {error:?}"))
+                    crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+                        message: format!("invalid namespace path: {error:?}"),
+                    })
                 })?
             }
         };
@@ -215,7 +232,11 @@ impl<'t> Normalizer<'t> {
                 .map(|segment| segment.as_str().to_string())
                 .collect(),
         )
-        .map_err(|error| DelightQLError::parse_error(format!("invalid namespace path: {error:?}")))
+        .map_err(|error| {
+            crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+                message: format!("invalid namespace path: {error:?}"),
+            })
+        })
     }
 
     /// A qualifier in reference position. The deictic `_` names a RELATION —
@@ -226,45 +247,10 @@ impl<'t> Normalizer<'t> {
         match node {
             cst::Qualifier::QualifierName(name) => {
                 let inner = self.require(name.children().next(), "a qualifier names something")?;
-                Ok(Qualified::Named(
-                    self.supplied_qualifier(self.identifier(inner)),
-                ))
+                Ok(Qualified::Named(self.identifier(inner)))
             }
             cst::Qualifier::DeicticStage(_) => Ok(Qualified::DeicticStage),
         }
-    }
-
-    /// A qualifier naming a relation FORMAL names what the call site supplied.
-    /// `T(*)` and `T.id` address ONE relation, so the binding that swaps the
-    /// read's spelling swaps the reference's; substituting only the read
-    /// leaves the body qualifying a column by a name no longer in scope.
-    ///
-    /// The lookup is by BYTES. A formal `T` and an authored alias `t` are
-    /// different qualifiers, and identifier folding would rewrite the alias
-    /// into the supplied table.
-    fn supplied_qualifier(&self, written: SqlIdentifier) -> SqlIdentifier {
-        let Some(bindings) = self.bindings() else {
-            return written;
-        };
-        let formal = written.as_str();
-        // A compiler-owned carrier is addressed by IDENTITY and keeps the
-        // authored formal its plan read carries; it has no table spelling,
-        // and inventing one here would name nothing.
-        if bindings.table_scope_params.contains_key(formal) {
-            return written;
-        }
-        // An argumentative-by-name binding registers under both maps, and
-        // the arity-checked entry is the one that names the relation.
-        if let Some((_, supplied, _, _)) = bindings
-            .argumentative_table_refs
-            .iter()
-            .find(|(param, ..)| param == formal)
-        {
-            return supplied.clone();
-        }
-        // A relation EXPRESSION has no spelling to substitute, and an
-        // ordinary alias is not a formal at all: both keep what was written.
-        written
     }
 }
 
@@ -343,9 +329,10 @@ impl<'t> Normalizer<'t> {
             cst::CompileTimeInteger::Number(number) => {
                 let text = self.text(number);
                 text.parse::<i64>().map_err(|_| {
-                    DelightQLError::parse_error(format!(
-                        "{position} takes a whole number; '{text}' is not one"
-                    ))
+                    Internal::invariant(
+                        "normalize::names",
+                        format!("{position} takes a whole number; '{text}' is not one"),
+                    )
                 })
             }
             cst::CompileTimeInteger::ScalarParameterReference(parameter) => {
@@ -366,38 +353,34 @@ impl<'t> Normalizer<'t> {
         // parameters arrive is DEFERRED by the road that owns it, and this
         // refusal is what tells that road so.
         let Some(bindings) = self.features.ho_bindings.as_ref() else {
-            return Err(DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::LIMIT_VALUE,
-                format!(
+            return Err(DelightQLError::from(Semantic::LimitValue {
+                message: format!(
                     "{position} names '{name}', which is an identifier with no active \
                      higher-order scalar binding"
                 ),
-                "a scalar parameter is code: it is substituted before resolution",
-            ));
+            }));
         };
         match bindings.scalar_literals.get(name.as_str()) {
-            Some(LiteralValue::Number(number)) => number.replace('_', "").parse::<i64>().map_err(|_| {
-                DelightQLError::validation_error_categorized(
-                    crate::uri_registry::subcat::LIMIT_VALUE,
-                    format!("{position} takes a whole number; '{name}' is bound to {number}"),
-                    "a scalar parameter is code: it is substituted before resolution",
-                )
-            }),
-            Some(_) => Err(DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::LIMIT_VALUE,
-                format!(
+            Some(LiteralValue::Number(number)) => {
+                number.replace('_', "").parse::<i64>().map_err(|_| {
+                    DelightQLError::from(Semantic::LimitValue {
+                        message: format!(
+                            "{position} takes a whole number; '{name}' is bound to {number}"
+                        ),
+                    })
+                })
+            }
+            Some(_) => Err(DelightQLError::from(Semantic::LimitValue {
+                message: format!(
                     "{position} takes a whole number; '{name}' is bound to a non-numeric value"
                 ),
-                "a scalar parameter is code: it is substituted before resolution",
-            )),
-            None => Err(DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::LIMIT_VALUE,
-                format!(
+            })),
+            None => Err(DelightQLError::from(Semantic::LimitValue {
+                message: format!(
                     "{position} names '{name}', which is not a scalar parameter of this \
                      higher-order expansion"
                 ),
-                "a scalar parameter is code: it is substituted before resolution",
-            )),
+            })),
         }
     }
 }

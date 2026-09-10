@@ -10,8 +10,9 @@
 /// - No coupling to backend-specific types (no DynamicSqliteSchema dependency)
 /// - Works identically for SQLite, DuckDB, and future backends
 /// - Schema information arrives via mount!, not at open() time
+use crate::diagnostic::Runtime;
 use delightql_types::schema::{ColumnInfo, DatabaseSchema};
-use delightql_types::{DelightQLError, Result};
+use delightql_types::Result;
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
@@ -40,7 +41,7 @@ impl DatabaseSchema for BootstrapBackedSchema {
         table_name: &str,
     ) -> Result<Option<Vec<ColumnInfo>>> {
         let conn = self.bootstrap_conn.lock().map_err(|error| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap schema connection",
                 error.to_string(),
             )
@@ -69,7 +70,10 @@ impl DatabaseSchema for BootstrapBackedSchema {
         // via `DelightQLSystem::session_shadow_split` instead of this path.
         // Pinned by session_shadow_tests::bare_read_prefers_session_materialized_temp.
         let sql_by_namespace = r#"
-            SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type
+            SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type,
+                   EXISTS (SELECT 1 FROM interior_entity ie
+                            WHERE ie.parent_entity_id = ea.entity_id
+                              AND ie.column_name = ea.attribute_name) AS interior
             FROM entity_attribute ea
             WHERE ea.entity_id = (
                 SELECT e.id
@@ -107,7 +111,10 @@ impl DatabaseSchema for BootstrapBackedSchema {
         // heading that describes no relation, and every column in it loses
         // its name. Pick one; they are the same table.
         let sql_by_mount_qualification = r#"
-            SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type
+            SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type,
+                   EXISTS (SELECT 1 FROM interior_entity ie
+                            WHERE ie.parent_entity_id = ea.entity_id
+                              AND ie.column_name = ea.attribute_name) AS interior
             FROM entity_attribute ea
             WHERE ea.entity_id = (
                 SELECT e.id
@@ -142,7 +149,10 @@ impl DatabaseSchema for BootstrapBackedSchema {
         // participating in `mount` keeps that metadata from becoming a second
         // writable copy of mount qualification policy.
         let sql_by_non_mount_source_ns = r#"
-            SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type
+            SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type,
+                   EXISTS (SELECT 1 FROM interior_entity ie
+                            WHERE ie.parent_entity_id = ea.entity_id
+                              AND ie.column_name = ea.attribute_name) AS interior
             FROM entity_attribute ea
             JOIN entity e ON e.id = ea.entity_id
             JOIN activated_entity ae ON ae.entity_id = e.id
@@ -180,7 +190,7 @@ impl BootstrapBackedSchema {
         table_name: &str,
     ) -> Result<Option<Vec<ColumnInfo>>> {
         let mut stmt = conn.prepare(sql).map_err(|error| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 "Failed to prepare bootstrap schema query",
                 error.to_string(),
             )
@@ -191,23 +201,22 @@ impl BootstrapBackedSchema {
                 let position: i32 = row.get(1)?;
                 let is_nullable: Option<i32> = row.get(2)?;
                 let data_type: Option<String> = row.get(3)?;
+                let interior: i32 = row.get(4)?;
 
                 Ok(ColumnInfo {
                     name: name.into(),
                     nullable: is_nullable.unwrap_or(1) != 0,
                     position: (position + 1) as usize, // 0-based to 1-based
                     declared_type: data_type.filter(|t| !t.is_empty()),
+                    interior: interior != 0,
                 })
             })
             .map_err(|error| {
-                DelightQLError::database_error(
-                    "Failed to query bootstrap schema",
-                    error.to_string(),
-                )
+                Runtime::catalog("Failed to query bootstrap schema", error.to_string())
             })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| {
-                DelightQLError::database_error("Failed to read bootstrap schema", error.to_string())
+                Runtime::catalog("Failed to read bootstrap schema", error.to_string())
             })?;
 
         Ok(Some(columns))

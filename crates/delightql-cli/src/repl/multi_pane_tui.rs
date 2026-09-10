@@ -406,7 +406,12 @@ pub fn run_multi_pane_tui(
     terminal.show_cursor()?;
 
     if let Err(err) = res {
-        crate::client::incident::error("terminal", crate::client::incident::hierarchy::TERMINAL, format!("error in the multi-pane TUI: {err}"));
+        crate::client::incident::error(
+            "terminal",
+            delightql_types::diagnostic::Client::Terminal {
+                message: format!("error in the multi-pane TUI: {err}"),
+            },
+        );
     }
 
     // Return the final window position

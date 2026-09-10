@@ -20,6 +20,8 @@ use super::law::{law_of, FixedShape, HeadingEdit, InterfaceLaw};
 use super::minus::{ExactHeadingMap, ExactPair};
 use super::port::{Interface, PortId, RelationId};
 use super::set::{Contribution, ContributionMatrix, SetMode, SetOutput, Vec2};
+use super::support::SupportLaw;
+use crate::diagnostic::{Constraint, Internal, Resolution, ResolutionSetop, SetOperation};
 use crate::error::{DelightQLError, Result};
 use crate::names::{
     Addressing, ColId, CteLabel, CteRole, HoRole, Registry, ScopeId, ScratchRole, ValueFacts,
@@ -142,8 +144,10 @@ pub(crate) enum Boundary {
         kind: super::form::DefinitionKind,
         answers_to: Option<crate::names::Spelling>,
     },
-    /// A derived table addressed by its own written name.
-    Alias { answer: crate::names::Spelling },
+    /// An interior relation addressed by its own written name. The boundary
+    /// spends the body's correlation support outward: its level emits what
+    /// the body owed, and nothing over it owes it further.
+    Interior { answer: crate::names::Spelling },
 }
 
 /// The relation a wrapping ground form's own body publishes.
@@ -171,6 +175,16 @@ where
         GroundForm::Reference(Relation::Ground { .. } | Relation::FunctorCall { .. })
         | GroundForm::Literal(_) => None,
     }
+}
+
+/// WHETHER A CARRIED POSITION STILL HOLDS ITS SOURCE'S VALUE. Facts that
+/// belong to the value — the static interior a tree-valued position owns —
+/// travel only with the same value; a rewritten position starts without
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarriedValue {
+    Same,
+    Rewritten,
 }
 
 /// THE OCCURRENCE EFFECT of one carried position, stated by the act that
@@ -243,6 +257,271 @@ impl TotalPortMap {
     }
 }
 
+/// ONE REBUILD OF ONE OPERAND, performed by the authority.
+///
+/// Opened by [`SemanticBuilder::rebuilding`] over the occurrences the
+/// operand stands over, in the order the rebuild consumes them. Every join
+/// is derived HERE. What the rebuild admits from outside is one realization
+/// per stated occurrence — the occurrence itself, a recorded replacement of
+/// it, or a republication of it by the record — and the replacement this
+/// rebuild certifies, for a resolver-era intermediate or for the operand,
+/// names only the product it derived over those realizations. There is no
+/// entrance that pairs a finished relation with another as a candidate.
+pub(crate) struct Rebuild<'r> {
+    authority: SemanticBuilder<'r>,
+    operand: SemanticRelation,
+    occurrences: Vec<SemanticRelation>,
+    /// Each operand position's stated sources, when the operand stands over
+    /// exactly the stated occurrences. `None` says it does not, and this
+    /// rebuild then derives its product and certifies nothing.
+    operand_sources: Option<Vec<(PortId, Vec<PortId>)>>,
+    /// How many stated occurrences the product stands over so far.
+    consumed: usize,
+    /// The relation the product stands at, once the rebuild has begun.
+    product: Option<SemanticRelation>,
+}
+
+impl<'r> Rebuild<'r> {
+    /// THE REBUILD BEGINS WITH THE FIRST OCCURRENCE. The chain admitted here
+    /// is not derived by the rebuild: it is the occurrence itself, a
+    /// relation a rebuild recorded as replacing it, or a republication of
+    /// it by the record — never a relation that merely carries its
+    /// positions beside another operand.
+    pub(crate) fn begins_with<P>(
+        &mut self,
+        first: &crate::pipeline::asts::core::Chain<P>,
+    ) -> Result<()>
+    where
+        P: crate::pipeline::asts::core::Phase<Scope = SemanticRelation>,
+    {
+        if self.product.is_some() {
+            return Err(replacement_error("a rebuild begins once"));
+        }
+        let relation = first.semantic_relation();
+        if !self.authority.stands_for(&self.occurrences[0], &relation)? {
+            return Err(replacement_error(
+                "a rebuild begins with the first occurrence it stands over, or a relation recorded as standing in its place",
+            ));
+        }
+        self.product = Some(relation);
+        self.consumed = 1;
+        Ok(())
+    }
+
+    /// JOIN THE NEXT OCCURRENCE onto the product.
+    ///
+    /// The left operand is the product this rebuild derived; the right is
+    /// the next stated occurrence or a relation recorded as standing in its
+    /// place. A correspondence written against the operands the resolver
+    /// saw is translated onto the operands as they stand here, through the
+    /// records rebuilds wrote, so the join stands on positions its operands
+    /// publish. Anything else is refused: this is the one road by which a
+    /// rebuild's product comes to exist, and it consumes only what the
+    /// rebuild was opened over.
+    pub(crate) fn join<P>(
+        &mut self,
+        left: crate::pipeline::asts::core::Chain<P>,
+        rhs: crate::pipeline::asts::core::Chain<P>,
+        correlation: crate::pipeline::asts::core::MemberCorrelation<P>,
+        join_type: Option<crate::pipeline::asts::core::JoinType>,
+    ) -> Result<crate::pipeline::asts::core::Chain<P>>
+    where
+        P: crate::pipeline::asts::core::Phase<
+            Scope = SemanticRelation,
+            Output = PortId,
+            Binder = PortId,
+            Col = crate::pipeline::asts::core::ColumnOccurrence,
+            Correspondence = crate::pipeline::asts::core::Correspondence,
+            MemberCorr = crate::pipeline::asts::core::MemberCorrelation<P>,
+        >,
+    {
+        use crate::pipeline::asts::core::{JoinType, MemberCorrelation};
+        let Some(product) = self.product else {
+            return Err(replacement_error("a rebuild joins after it has begun"));
+        };
+        let left_relation = left.semantic_relation();
+        if left_relation != product {
+            return Err(replacement_error(
+                "a rebuild joins onto the product it derived, not onto a relation assembled elsewhere",
+            ));
+        }
+        let Some(next) = self.occurrences.get(self.consumed) else {
+            return Err(replacement_error(
+                "a rebuild joins no more occurrences than it was opened over",
+            ));
+        };
+        let right_relation = rhs.semantic_relation();
+        if !self.authority.stands_for(next, &right_relation)? {
+            return Err(replacement_error(
+                "a rebuild joins the next occurrence it stands over, or a relation recorded as standing in its place",
+            ));
+        }
+        let correlation = match correlation {
+            MemberCorrelation::Correspond(correspondence) => {
+                let pairs = correspondence
+                    .pairs
+                    .into_iter()
+                    .map(|pair| {
+                        Ok(MergedKey {
+                            left: self.authority.port_in(&left_relation, pair.left)?,
+                            right: self.authority.port_in(&right_relation, pair.right)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                MemberCorrelation::Correspond(crate::pipeline::asts::core::Correspondence::new(
+                    pairs,
+                ))
+            }
+            other => other,
+        };
+        // A CORRESPONDENCE MERGES POSITIONS, and the join it stands on is
+        // the one the resolver already derived. Rebuilding with an empty
+        // merge list would publish the right operand's shared columns a
+        // second time, so the rebuilt relation would not stand where the
+        // resolved one stood and every reference through it would move.
+        let merged = match &correlation {
+            MemberCorrelation::Correspond(correspondence) => correspondence.pairs.clone(),
+            MemberCorrelation::Condition(_) | MemberCorrelation::Cartesian(_) => Vec::new(),
+        };
+        let join_type = join_type.unwrap_or(JoinType::Inner);
+        let kind = match join_type {
+            JoinType::LeftOuter => JoinKind::LeftOuter,
+            JoinType::RightOuter => JoinKind::RightOuter,
+            JoinType::FullOuter => JoinKind::FullOuter,
+            JoinType::Inner => JoinKind::Inner,
+        };
+        let chain = self.authority.extend(
+            left,
+            StepOp::Join {
+                rhs,
+                correlation,
+                join_type: Some(join_type),
+                right: right_relation,
+                kind,
+                merged: &merged,
+            },
+        )?;
+        self.product = Some(chain.semantic_relation());
+        self.consumed += 1;
+        Ok(chain)
+    }
+
+    /// CERTIFY THAT THE PRODUCT SO FAR REPLACES A RESOLVER-ERA INTERMEDIATE.
+    ///
+    /// The intermediate must stand over exactly the occurrences consumed so
+    /// far, judged from the record; the product does, by construction. Its
+    /// positions pair with the product's by the stated sources each stands
+    /// over. An intermediate that stands over something else, or whose
+    /// positions do not pair one to one, is certified for nothing.
+    pub(crate) fn replaces<P>(
+        &self,
+        intermediate: SemanticRelation,
+        product: &crate::pipeline::asts::core::Chain<P>,
+    ) -> Result<()>
+    where
+        P: crate::pipeline::asts::core::Phase<Scope = SemanticRelation>,
+    {
+        check_mark(self.authority.mark, &intermediate)?;
+        let Some(derived) = self.product else {
+            return Err(replacement_error("a rebuild certifies after it has begun"));
+        };
+        if product.semantic_relation() != derived {
+            return Err(replacement_error(
+                "a rebuild certifies only the product it derived",
+            ));
+        }
+        if intermediate == derived {
+            return Ok(());
+        }
+        let stated = &self.occurrences[..self.consumed];
+        let Some(sources) = self.authority.standing_over(&intermediate, stated)? else {
+            return Ok(());
+        };
+        self.certify(intermediate, sources, stated)
+    }
+
+    /// CLOSE THE REBUILD, certifying that its product replaces the operand.
+    ///
+    /// Every stated occurrence must have been consumed, the chain must
+    /// publish the product this rebuild derived, and the operand must have
+    /// been judged at the opening to stand over exactly the stated
+    /// occurrences; otherwise the product is returned uncertified.
+    pub(crate) fn finish<P>(
+        self,
+        product: crate::pipeline::asts::core::Chain<P>,
+    ) -> Result<crate::pipeline::asts::core::Chain<P>>
+    where
+        P: crate::pipeline::asts::core::Phase<Scope = SemanticRelation>,
+    {
+        let now = product.semantic_relation();
+        if now == self.operand {
+            return Ok(product);
+        }
+        if self.product != Some(now) {
+            return Err(replacement_error(
+                "a rebuild certifies only the product it derived",
+            ));
+        }
+        if self.consumed != self.occurrences.len() {
+            return Err(replacement_error(
+                "a rebuild consumes every occurrence it was opened over before it closes",
+            ));
+        }
+        if let Some(sources) = self.operand_sources.clone() {
+            self.certify(self.operand, sources, &self.occurrences)?;
+        }
+        Ok(product)
+    }
+
+    /// Pair an old relation's positions with the product's by the stated
+    /// sources each stands over, and record the map. Every old position
+    /// must be met by exactly one product position; anything else is not a
+    /// replacement and nothing is recorded.
+    fn certify(
+        &self,
+        old: SemanticRelation,
+        old_sources: Vec<(PortId, Vec<PortId>)>,
+        stated: &[SemanticRelation],
+    ) -> Result<()> {
+        let Some(product) = self.product else {
+            return Ok(());
+        };
+        // THE PRODUCT IS JUDGED BY THE SAME STANDING AS THE OPERAND: every
+        // position over at least one stated occurrence and over nothing
+        // else. It is derived here over the stated occurrences, so this
+        // holds by construction; asking again is what makes the certificate
+        // account for every relationship it grants rather than for the
+        // slots it happens to pair.
+        let Some(product_sources) = self.authority.standing_over(&product, stated)? else {
+            return Ok(());
+        };
+        let standing: Vec<(Vec<PortId>, PortId)> = product_sources
+            .into_iter()
+            .map(|(port, from)| (from, port))
+            .collect();
+        let mut pairs = Vec::with_capacity(old_sources.len());
+        for (port, from) in old_sources {
+            let mut met = standing
+                .iter()
+                .filter(|(stands_for, _)| *stands_for == from);
+            let (Some((_, landed)), None) = (met.next(), met.next()) else {
+                return Ok(());
+            };
+            pairs.push((port, *landed));
+        }
+        self.authority.registry.relations().record_replacement(
+            old.relation(),
+            product.relation(),
+            TotalPortMap {
+                from: old.relation(),
+                to: product.relation(),
+                pairs,
+            },
+        );
+        Ok(())
+    }
+}
+
 /// WHAT A SHAPE-CHANGING REFINEMENT PRODUCED.
 ///
 /// One typed outcome, and the ONLY producer is
@@ -272,6 +551,39 @@ pub enum Refinement<P: crate::pipeline::asts::core::Phase> {
         chain: crate::pipeline::asts::core::Chain<P>,
         map: TotalPortMap,
     },
+}
+
+/// A REBUILD OF AN OPERAND THE AUTHORITY JUDGED: the chain now standing
+/// where the operand stood, and the operand it replaces, as ONE value.
+///
+/// Minted only by [`SemanticBuilder::rebuilt`], which ran the rewrite and
+/// judged its product against the construction record — the relation it was
+/// handed, or one derived from it carrying every position the operand
+/// published, recorded as that operand's replacement; a product built beside
+/// the operand refuses. Private fields: the chain and the operand it replaces
+/// are paired nowhere else, so a carrier handed one of these knows the
+/// replacement was judged FOR the operand it names, and can refuse one that
+/// names another.
+pub struct Replacement<P: crate::pipeline::asts::core::Phase> {
+    chain: crate::pipeline::asts::core::Chain<P>,
+    of: SemanticRelation,
+}
+
+impl<P: crate::pipeline::asts::core::Phase<Scope = SemanticRelation>> Replacement<P> {
+    /// The operand this replaces.
+    pub(crate) fn of(&self) -> SemanticRelation {
+        self.of
+    }
+
+    /// The relation the replacement publishes.
+    pub(crate) fn published(&self) -> SemanticRelation {
+        self.chain.semantic_relation()
+    }
+
+    /// The chain, for the position that stands it where the operand stood.
+    pub(crate) fn into_chain(self) -> crate::pipeline::asts::core::Chain<P> {
+        self.chain
+    }
 }
 
 /// The semantic epoch, closed.
@@ -353,10 +665,52 @@ impl Relations {
         Ok(self.registry.relations().inputs(relation.relation()))
     }
 
-    /// Exact input ports this operation consumes without publishing.
+    /// Exact input ports this operation consumes without publishing, in the
+    /// order its level emits them after its heading: a pattern's constrained
+    /// positions, then the correlation support it keeps readable — or, for
+    /// a join, its operands' runs left then right.
     pub(crate) fn dependencies(&self, relation: &SemanticRelation) -> Result<Vec<PortId>> {
         check_mark(self.mark, relation)?;
-        Ok(self.registry.relations().dependencies(relation.relation()))
+        Ok(self.registry.relations().support_run(relation.relation()))
+    }
+
+    /// The correlation support this relation's level emits beside its
+    /// heading. Owed by construction: a level that does not emit it has
+    /// dropped an obligation, which is a refusal and never a scaffold.
+    pub(crate) fn correlation_support(&self, relation: &SemanticRelation) -> Result<Vec<PortId>> {
+        check_mark(self.mark, relation)?;
+        Ok(self
+            .registry
+            .relations()
+            .support_emitted(relation.relation()))
+    }
+
+    /// Whether a position is emitted by no level of its own — carried
+    /// toward an interior boundary unread, or the boundary's own position
+    /// the enclosing join computes — so the level publishing it binds it
+    /// to no slot.
+    pub(crate) fn unemitted_here(&self, port: PortId) -> bool {
+        self.registry.relations().unemitted_here(port)
+    }
+
+    /// EVERY OCCURRENCE ONE POSITION CONTINUES, by the carry edges the acts
+    /// that minted it and its ancestors wrote — the same record
+    /// [`super::stands_where`] reads. For a support slot, which realizes a
+    /// position some level below minted: a reference to the occurrence that
+    /// position continues means this slot.
+    pub(crate) fn continued_occurrences(&self, port: PortId) -> Vec<PortId> {
+        let store = self.registry.relations();
+        let mut frontier = vec![port];
+        let mut seen: Vec<PortId> = Vec::new();
+        while let Some(here) = frontier.pop() {
+            for source in store.lineage(here) {
+                if !seen.contains(&source) {
+                    seen.push(source);
+                    frontier.push(source);
+                }
+            }
+        }
+        seen
     }
 
     /// The physical storage this exact semantic occurrence reads, if any.
@@ -612,20 +966,14 @@ fn published_position(
     position: super::pending::Position,
     output: Option<PortId>,
 ) -> crate::pipeline::asts::core::OutItem<crate::pipeline::asts::core::Resolved> {
-    use super::pending::Position;
     use crate::pipeline::asts::core::{OneOut, OutItem};
-    match (position, output) {
-        (Position::Authored { expr, naming }, Some(output))
-        | (Position::Expanded { expr, naming }, Some(output)) => {
+    match (position.into_stated(), output) {
+        (Some((expr, naming)), Some(output)) => {
             OutItem::one(OneOut::published(token, expr, naming, output))
         }
-        (Position::Whole, None) => OutItem::Whole,
-        (Position::Authored { .. } | Position::Expanded { .. }, None) => {
-            unreachable!("one stated value publishes one semantic port")
-        }
-        (Position::Whole, Some(_)) => {
-            unreachable!("a whole operand publishes through its expansion")
-        }
+        (None, None) => OutItem::Whole,
+        (Some(_), None) => unreachable!("one stated value publishes one semantic port"),
+        (None, Some(_)) => unreachable!("a whole operand publishes through its expansion"),
     }
 }
 
@@ -634,17 +982,86 @@ pub(super) fn check_epoch(registry: &Registry, relation: &SemanticRelation) -> R
 }
 
 fn replacement_error(what: &str) -> DelightQLError {
-    DelightQLError::transformation_error(what, "semantic rewrite")
+    Internal::invariant("semantic rewrite", what)
+}
+
+/// The refusal a form gives when it cannot keep a correlation's interior
+/// occurrence readable. `what` names the form, in the author's terms.
+fn unrealizable_support(what: &str) -> DelightQLError {
+    DelightQLError::from(crate::diagnostic::Interior::CorrelationSupport {
+        message: format!(
+            "a correlated interior cannot carry its correlation through {what}: the \
+             correlation is evaluated at the enclosing join, which must still read the \
+             interior column it names, and this operation cannot keep that column \
+             readable without changing what the interior means — group by the \
+             correlated column, keep it in the interior's heading, or state the \
+             correlation outside the interior"
+        ),
+    })
+}
+
+/// WHAT A FORM DOES WITH THE CORRELATION SUPPORT ITS OPERANDS OWE.
+///
+/// Total over the vocabulary, and fail-closed by construction: a form that
+/// republishes its operand's dimensions or adds beside them CARRIES, a
+/// grouping TRANSLATES through a key that stands on the occurrence, and
+/// every form that would change what an operand position means REFUSES
+/// while anything is owed. There is no arm that owes nothing by default.
+fn support_law_of(form: &RelForm<'_>) -> SupportLaw {
+    match form {
+        // No operand to owe for: the read is where a correlation's interior
+        // occurrences are born, and it publishes every one of them.
+        RelForm::Source(_) | RelForm::Anonymous(_) | RelForm::Opaque => SupportLaw::Carries,
+        // A join's row is the concatenation of its operands' rows, support
+        // columns included.
+        RelForm::Join(_) => SupportLaw::Concatenates,
+        // Each republishes the operand's own dimensions, or adds beside
+        // them, and its level can emit any operand position it does not
+        // publish.
+        RelForm::Access(_)
+        | RelForm::Project(_)
+        | RelForm::Embed(_)
+        | RelForm::Rename(_)
+        | RelForm::Reposition(_)
+        | RelForm::ProjectOut(_)
+        | RelForm::Cover(_)
+        | RelForm::Order(_) => SupportLaw::Carries,
+        RelForm::Export(spec) => match spec.why {
+            ExportWhy::Alias { .. }
+            | ExportWhy::Bound { .. }
+            | ExportWhy::Stage
+            | ExportWhy::EmissionAlias => SupportLaw::Carries,
+            // A binding is a complete statement: nothing inside it can be
+            // evaluated at a join outside it.
+            ExportWhy::Cte { .. } => SupportLaw::Refuses("a query-local binding"),
+        },
+        RelForm::Group(spec) => SupportLaw::Translates {
+            keys: spec.keys.len(),
+        },
+        RelForm::Set(_) => SupportLaw::Refuses("a set operation"),
+        RelForm::Minus(_) => SupportLaw::Refuses("a set difference"),
+        RelForm::Witness(_) => SupportLaw::Refuses("a witness"),
+        RelForm::SignedWitness(_) => SupportLaw::Refuses("a signed witness"),
+        RelForm::Meta(_) => SupportLaw::Refuses("a schema reflection"),
+        RelForm::Destructure(_) => SupportLaw::Refuses("a destructuring"),
+        RelForm::Drill(_) => SupportLaw::Refuses("a drill"),
+        RelForm::Narrow(_) => SupportLaw::Refuses("a narrowing"),
+        RelForm::Interior(_) => SupportLaw::Refuses("a nested interior"),
+        RelForm::ErBoundary(_) => SupportLaw::Refuses("an ER edge"),
+        RelForm::Instantiate(_) => SupportLaw::Refuses("a definition instance"),
+        RelForm::PlanRead(_) => SupportLaw::Refuses("a plan read"),
+        RelForm::Scratch(_) => SupportLaw::Refuses("a scratch"),
+    }
 }
 
 fn check_mark(mark: BuilderMark, relation: &SemanticRelation) -> Result<()> {
     if relation.origin() == mark {
         return Ok(());
     }
-    Err(DelightQLError::transformation_error(
+    Err(Internal::invariant(
+        "semantic relation",
         "a semantic relation built against another compilation's registry \
          cannot be read here: it names identities this epoch never issued",
-        "semantic relation",
     ))
 }
 
@@ -771,10 +1188,12 @@ impl<'r> SemanticBuilder<'r> {
             addressing,
             continuity,
             true,
+            CarriedValue::Same,
             |_| {},
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn carry_with(
         &self,
         owner: CarryOwner,
@@ -784,6 +1203,7 @@ impl<'r> SemanticBuilder<'r> {
         addressing: Addressing,
         continuity: Continuity,
         preserve_higher_order_support: bool,
+        value: CarriedValue,
         update: impl FnOnce(&mut ValueFacts),
     ) -> PortId {
         // THE ONE BOUNDARY ACT over a carried position: the arm proposed
@@ -805,6 +1225,9 @@ impl<'r> SemanticBuilder<'r> {
         self.registry
             .relations()
             .carry_residual_row_token(output, source);
+        self.registry
+            .relations()
+            .carry_frontier_actual(output, source);
         if preserve_higher_order_support {
             self.registry
                 .relations()
@@ -820,11 +1243,16 @@ impl<'r> SemanticBuilder<'r> {
                 Continuity::Republishes => super::store::Occurrence::Own,
             },
         );
-        if let Some(interior) = self.registry.relations().interior(source) {
-            self.registry.relations().record_interior(output, interior);
-        }
-        if self.registry.relations().interior_conflict(source) {
-            self.registry.relations().record_interior_conflict(output);
+        // THE CHILD TRAVELS WITH THE VALUE: a position that keeps its
+        // value keeps the exact interior it owned; a position a cover
+        // rewrote holds a different value, which owns no static child.
+        if matches!(value, CarriedValue::Same) {
+            if let Some(interior) = self.registry.relations().interior(source) {
+                self.registry.relations().record_interior(output, interior);
+            }
+            if self.registry.relations().interior_conflict(source) {
+                self.registry.relations().record_interior_conflict(output);
+            }
         }
         let owner = match owner {
             CarryOwner::Preserve => self
@@ -864,7 +1292,9 @@ impl<'r> SemanticBuilder<'r> {
     /// against before any call supplies a carrier. No carrier ever answers
     /// to it; a real carrier's landing is reserved by [`Self::bind_carrier`].
     pub fn reserve_proffer(&self) -> super::StructuralRelation {
-        self.registry.relations().reserve_structural(HoPart::Proffer)
+        self.registry
+            .relations()
+            .reserve_structural(HoPart::Proffer)
     }
 
     /// BIND A STRUCTURAL CARRIER, in one act and only for the carrier
@@ -893,7 +1323,9 @@ impl<'r> SemanticBuilder<'r> {
     /// ALLOCATE A SCRATCH ROW: derived from its spec, and the receipt of
     /// the allocation minted in the same act.
     pub fn scratch_row(&self, spec: super::form::ScratchSpec<'_>) -> Result<super::ScratchRow> {
-        Ok(super::ScratchRow::minted(self.derive(RelForm::Scratch(spec))?))
+        Ok(super::ScratchRow::minted(
+            self.derive(RelForm::Scratch(spec))?,
+        ))
     }
 
     /// The semantic owner recorded when this port was constructed.
@@ -1007,6 +1439,12 @@ impl<'r> SemanticBuilder<'r> {
         self.registry.relations().residual_capture_value(port)
     }
 
+    /// The caller actual this hygienic position carries through a
+    /// parameterized fixpoint, when it is such a support position.
+    pub(crate) fn frontier_actual(&self, port: PortId) -> Option<PortId> {
+        self.registry.relations().frontier_actual(port)
+    }
+
     /// This compilation's epoch, for the test that proves two compilations
     /// never share one.
     #[cfg(test)]
@@ -1044,12 +1482,37 @@ impl<'r> SemanticBuilder<'r> {
             self.registry
                 .relations()
                 .record_inputs(result.relation(), inputs.iter().copied());
+            // THE FORM SAYS WHETHER ITS ROWS ARE ITS OPERAND'S. Recorded
+            // here, by the act that knows the form, so that no later reader
+            // has to infer from carried positions whether a relation
+            // republishes its operand or combines it with something else.
+            if republishes(&form) {
+                self.registry
+                    .relations()
+                    .record_republication(result.relation());
+            }
+            if matches!(form, RelForm::Join(_)) {
+                self.registry.relations().record_join(result.relation());
+            }
         }
         let dependencies = self.dependencies_of(&form);
         if !dependencies.is_empty() {
             self.registry
                 .relations()
                 .record_dependencies(result.relation(), dependencies);
+        }
+        // CORRELATION SUPPORT IS JUDGED HERE, under the form's own law, from
+        // what its operands owe — and refused here when the form cannot keep
+        // an owed occurrence readable. A form that answers with one of its
+        // own operands changed nothing that relation owes.
+        if !inputs
+            .iter()
+            .any(|input| input.relation() == result.relation())
+        {
+            self.registry
+                .relations()
+                .record_support_law(result.relation(), support_law_of(&form));
+            self.judge_support(result)?;
         }
         if let Some(storage) = self.storage_of(&form) {
             self.registry
@@ -1120,7 +1583,8 @@ impl<'r> SemanticBuilder<'r> {
     /// Answers with the operator and the result as ONE value: there is no
     /// road that hands back a set result on its own for a caller to pair
     /// with whichever operator it happens to be holding.
-    /// WHAT A FORM OWES BESIDE ITS HEADING.
+    /// WHAT A FORM OWES BESIDE ITS HEADING for a predicate standing right
+    /// above it — a caller pattern's constrained positions.
     ///
     /// A support position an operand still owes crosses a BOUNDARY — an
     /// alias, a stage, an emission wrap, a reordering, a renaming — because
@@ -1129,9 +1593,12 @@ impl<'r> SemanticBuilder<'r> {
     /// its own debts: it is a complete statement, so the operation that reads
     /// a support position stands inside it.
     ///
+    /// This is NOT correlation support, which is owed until the interior
+    /// boundary and judged fail-closed by [`support_law_of`]: a form that
+    /// spends a constraint position here still carries a correlation's.
+    ///
     /// Total over the vocabulary. A form added without an answer here would
-    /// silently owe nothing, and the level above would emit no carrier for a
-    /// hoisted correlation to name.
+    /// silently owe nothing.
     fn dependencies_of(&self, form: &RelForm<'_>) -> Vec<PortId> {
         let carried =
             |input: &SemanticRelation| self.registry.relations().dependencies(input.relation());
@@ -1146,19 +1613,10 @@ impl<'r> SemanticBuilder<'r> {
             // A PROJECTION SPENDS WHAT STOOD UNDER IT. The heading it
             // publishes is the whole answer; a position its operand needed
             // for a predicate already applied is not this relation's to owe.
-            // What it declares here it owes itself.
-            RelForm::Project(spec) => spec.dependencies.to_vec(),
+            RelForm::Project(_) => Vec::new(),
             // AN EMBED KEEPS THE OPERAND WHOLE and adds. What the operand
-            // owed it still owes, beside anything it takes on here.
-            RelForm::Embed(spec) => {
-                let mut owed = carried(&spec.input);
-                for dependency in spec.dependencies {
-                    if !owed.contains(dependency) {
-                        owed.push(*dependency);
-                    }
-                }
-                owed
-            }
+            // owed it still owes.
+            RelForm::Embed(spec) => carried(&spec.input),
             RelForm::Export(ExportSpec {
                 why: ExportWhy::Cte { .. },
                 ..
@@ -1357,9 +1815,9 @@ impl<'r> SemanticBuilder<'r> {
             SetOperator::SmartUnionAll => SetAlignment::Smart,
             SetOperator::MinusCorresponding => {
                 let [left, right] = arms else {
-                    return Err(DelightQLError::transformation_error(
-                        "a minus has exactly two operands",
+                    return Err(Internal::invariant(
                         "set",
+                        "a minus has exactly two operands",
                     ));
                 };
                 let result = self.derive(RelForm::Minus(MinusSpec {
@@ -1498,9 +1956,9 @@ impl<'r> SemanticBuilder<'r> {
                     let was = std::mem::discriminant(standing.form());
                     let form = interior(standing.form().clone())?;
                     if std::mem::discriminant(&form) != was {
-                        return Err(DelightQLError::transformation_error(
-                            "an interior rewrite changed which continuation a step is",
+                        return Err(Internal::invariant(
                             "semantic relation",
+                            "an interior rewrite changed which continuation a step is",
                         ));
                     }
                     Some(form)
@@ -1594,35 +2052,6 @@ impl<'r> SemanticBuilder<'r> {
         chain.restate_head(&self.construction, Some(form), None);
     }
 
-    /// A HEAD THAT EXPORTS WHAT ITS OWN BODY PUBLISHES.
-    ///
-    /// An ER hop stands on the body it just resolved and republishes that
-    /// body's positions under its own answering name. The input is read
-    /// out of the payload, exactly as [`SemanticBuilder::wrapping`] reads
-    /// it — the caller states WHY the export happens and nothing else.
-    pub(crate) fn exporting_head<P>(
-        &self,
-        form: crate::pipeline::asts::core::GroundForm<P>,
-        why: ExportWhy,
-    ) -> Result<crate::pipeline::asts::core::Grelex<P>>
-    where
-        P: crate::pipeline::asts::core::Phase<Scope = SemanticRelation>,
-    {
-        let Some(body) = wrapped_body(&form) else {
-            return Err(DelightQLError::transformation_error(
-                "a head with no body of its own cannot export one",
-                "semantic relation",
-            ));
-        };
-        check_mark(self.mark, &body)?;
-        let result = self.derive(RelForm::Export(ExportSpec { input: body, why }))?;
-        Ok(crate::pipeline::asts::core::Grelex::derived(
-            &self.construction,
-            form,
-            result,
-        ))
-    }
-
     /// DERIVE, AND HAND EACH PUBLISHED PORT TO THE POSITION THAT PUBLISHES
     /// AT IT.
     ///
@@ -1645,9 +2074,9 @@ impl<'r> SemanticBuilder<'r> {
         let relation = self.derive(operation)?;
         let ports = self.interface(&relation)?.ports().to_vec();
         if ports.len() < positions.len() {
-            return Err(DelightQLError::transformation_error(
-                "a publication position stands where the derived interface has none",
+            return Err(Internal::invariant(
                 "publication",
+                "a publication position stands where the derived interface has none",
             ));
         }
         let built = positions
@@ -1741,6 +2170,28 @@ impl<'r> SemanticBuilder<'r> {
                 bound,
             } => {
                 let bounded = bound.is_some();
+                // A BOUNDED ORDERING OVER A CORRELATED RELATION is evaluated
+                // per correlation class, at the interior's top where the
+                // hoisting realization ranks the class: the occurrences its
+                // specs read are owed from here like the correlation's own,
+                // to the boundary. Stated on the operand, so the stage
+                // translates them as it does every position it republishes.
+                // The ranking witness that reads them is a refinement of the
+                // body the boundary was judged over, so the body's obligation
+                // is left as the boundary recorded it rather than spent.
+                if bounded
+                    && !self
+                        .registry
+                        .relations()
+                        .support_owed(input.relation())
+                        .is_empty()
+                {
+                    let read = super::support::ports_read(specs.iter().map(|spec| &spec.column));
+                    self.registry
+                        .relations()
+                        .mark_correlation(input.relation(), &read);
+                    self.judge_support(input)?;
+                }
                 let (step, output) = self.bound(
                     RelForm::Export(ExportSpec {
                         input,
@@ -1760,18 +2211,23 @@ impl<'r> SemanticBuilder<'r> {
                 RelForm::Order(input),
                 crate::pipeline::asts::core::Continuation::Access { access, named: () },
             ),
-            Pending::CarrierInjection {
-                replaces,
-                carriers,
-                items,
-                stored,
-            } => self.bind_carrier_injection(replaces, carriers, items, stored),
             Pending::CrossingCarrierInjection {
                 replaces,
                 carriers,
                 items,
                 stored,
             } => self.bind_crossing_carrier_injection(replaces, carriers, items, stored),
+            Pending::FrontierActualInjection {
+                replaces,
+                support,
+                items,
+                stored,
+            } => self.bind_frontier_actual_injection(
+                replaces,
+                support.carriers().to_vec(),
+                items,
+                stored,
+            ),
             Pending::WindowWitness {
                 input,
                 partition,
@@ -1822,6 +2278,10 @@ impl<'r> SemanticBuilder<'r> {
         // edit already carries and mints no slot of its own.
         let mut slots = Vec::with_capacity(positions.len());
         let mut publishing = Vec::with_capacity(positions.len());
+        // THE POSITIONS THE ENCLOSING JOIN COMPUTES, by stated position,
+        // each with the interior occurrences its value reads — what the
+        // relation owes until the boundary.
+        let mut deferring: Vec<(usize, Vec<PortId>)> = Vec::new();
         for (index, position) in positions.iter().enumerate() {
             let Some(value) = position.value() else {
                 continue;
@@ -1830,7 +2290,33 @@ impl<'r> SemanticBuilder<'r> {
             if publishes == Publishes::Edited && position.is_engine_expansion() {
                 continue;
             }
-            let slot = self.publication_slot(value, position.naming(), &input)?;
+            let slot = match position.evaluation() {
+                super::pending::Evaluation::Here => {
+                    self.publication_slot(value, position.naming(), &input)?
+                }
+                // A VALUE THAT READS THE ENCLOSING ROW is a new value of
+                // its own — never a carry of the enclosing occurrence into
+                // this heading. In place, the target evaluates it beside
+                // the operand's row; at a hoisted interior the enclosing
+                // join computes it, and the interior carries the position
+                // unread until then — a row past that join is one no join
+                // evaluating the interior can read.
+                super::pending::Evaluation::Enclosing {
+                    correlations,
+                    reach,
+                } => {
+                    let (slot, reads) = self.enclosing_slot(value, position.naming(), &input)?;
+                    if *correlations == crate::pipeline::resolver::Correlations::Hoisted {
+                        if *reach == super::pending::EnclosingReach::PastTheJoin {
+                            return Err(super::enclosing_position_refusal(
+                                "a value reading a row two interiors out",
+                            ));
+                        }
+                        deferring.push((index, reads));
+                    }
+                    slot
+                }
+            };
             let slot = match slot {
                 ProjectSlot::Carried {
                     source,
@@ -1848,15 +2334,14 @@ impl<'r> SemanticBuilder<'r> {
             slots.push(slot);
         }
         if slots.is_empty() {
-            return Err(DelightQLError::parse_error(
-                "Projection matched no columns - would create empty table",
-            ));
+            return Err(DelightQLError::from(Constraint::General {
+                message: "Projection matched no columns - would create empty table".to_string(),
+            }));
         }
         let spec = ProjectSpec {
             input,
             why,
             slots: &slots,
-            dependencies: &[],
         };
         let result = self.derive(match publishes {
             Publishes::Anew => RelForm::Project(spec),
@@ -1867,15 +2352,29 @@ impl<'r> SemanticBuilder<'r> {
         for (index, port) in publishing.into_iter().zip(ports) {
             outputs[index] = Some(port);
         }
+        if !deferring.is_empty() {
+            // THE DEFERRAL AND THE SUPPORT ARE THE PUBLICATION'S OWN RECORD,
+            // written in the act that minted the position: the position is
+            // computed at the boundary, and the interior occurrences its
+            // value reads stay readable there. Judged at once, as the
+            // correlation act judges its own marks.
+            let store = self.registry.relations();
+            for (index, reads) in &deferring {
+                let port = outputs[*index].expect("one stated value publishes one semantic port");
+                store.mark_deferred(result.relation(), port);
+                store.mark_correlation(result.relation(), reads);
+            }
+            self.judge_support(result)?;
+        }
         let items: Vec<OutItem<_>> = positions
             .into_iter()
             .zip(outputs)
             .map(|(position, output)| published_position(&self.construction, position, output))
             .collect();
         let Some(items) = crate::pipeline::asts::vocabulary::Vec1::try_from_vec(items) else {
-            return Err(DelightQLError::parse_error(
-                "Projection matched no columns - would create empty table",
-            ));
+            return Err(DelightQLError::from(Constraint::General {
+                message: "Projection matched no columns - would create empty table".to_string(),
+            }));
         };
         self.paired(
             Continuation::Pipe {
@@ -1971,10 +2470,9 @@ impl<'r> SemanticBuilder<'r> {
         }
         let Some(occurrences) = crate::pipeline::asts::vocabulary::Vec1::try_from_vec(occurrences)
         else {
-            return Err(DelightQLError::validation_error(
-                "A positional pattern bound no slots",
-                "Pattern resolution",
-            ));
+            return Err(DelightQLError::from(Constraint::General {
+                message: "A positional pattern bound no slots".to_string(),
+            }));
         };
         self.paired(
             Continuation::Access {
@@ -2112,21 +2610,23 @@ impl<'r> SemanticBuilder<'r> {
             let Reference::Named(NamedReference(ColumnOccurrence { column, .. })) =
                 &spell.reference
             else {
-                return Err(DelightQLError::parse_error(
-                    "Reposition only supports columns and ordinals",
-                ));
+                return Err(DelightQLError::from(Constraint::General {
+                    message: "Reposition only supports columns and ordinals".to_string(),
+                }));
             };
             let column = *column;
             let source = ports
                 .iter()
                 .position(|candidate| *candidate == column)
                 .ok_or_else(|| {
-                    DelightQLError::parse_error("Reposition column is not in the input")
+                    DelightQLError::from(Resolution::General {
+                        message: "Reposition column is not in the input".to_string(),
+                    })
                 })?;
             if moved.contains(&source) {
-                return Err(DelightQLError::parse_error(
-                    "A column appears multiple times in reposition",
-                ));
+                return Err(DelightQLError::from(Constraint::General {
+                    message: "A column appears multiple times in reposition".to_string(),
+                }));
             }
             let target = if spell.position < 0 {
                 count as i32 + spell.position
@@ -2134,16 +2634,18 @@ impl<'r> SemanticBuilder<'r> {
                 spell.position - 1
             };
             if target < 0 || target >= count as i32 {
-                return Err(DelightQLError::parse_error(format!(
-                    "Position {} is out of range for {} columns",
-                    spell.position, count
-                )));
+                return Err(DelightQLError::from(Constraint::General {
+                    message: format!(
+                        "Position {} is out of range for {} columns",
+                        spell.position, count
+                    ),
+                }));
             }
             let target = target as usize;
             if layout[target].is_some() {
-                return Err(DelightQLError::parse_error(
-                    "Multiple columns cannot target the same position",
-                ));
+                return Err(DelightQLError::from(Constraint::General {
+                    message: "Multiple columns cannot target the same position".to_string(),
+                }));
             }
             layout[target] = Some(column);
             moved.push(source);
@@ -2445,13 +2947,19 @@ impl<'r> SemanticBuilder<'r> {
                 None => item.naming.to_string(),
             };
             let carried = self.port_in(&input, item.covered).map_err(|_| {
-                DelightQLError::column_not_found_error(spelled.clone(), "as a transform target")
+                DelightQLError::from(Resolution::Column {
+                    column: spelled.clone().to_string(),
+                    context: "as a transform target".to_string(),
+                })
             })?;
             let position = input_ports
                 .iter()
                 .position(|candidate| *candidate == carried)
                 .ok_or_else(|| {
-                    DelightQLError::column_not_found_error(spelled, "as a transform target")
+                    DelightQLError::from(Resolution::Column {
+                        column: spelled.to_string(),
+                        context: "as a transform target".to_string(),
+                    })
                 })?;
             // A cover that hands the slot back its own column writes
             // nothing: it is the same value under the same name.
@@ -2517,8 +3025,8 @@ impl<'r> SemanticBuilder<'r> {
                 let mut semantic_keys = Vec::new();
                 let mut publishing = Vec::new();
                 for (position, item) in keys.iter().enumerate() {
-                    if let Some(value) = item.value() {
-                        semantic_keys.push(self.publication_slot(value, item.naming(), &input)?);
+                    if item.value().is_some() {
+                        semantic_keys.push(self.evaluated_slot(item, &input, "a grouping key")?);
                         publishing.push(position);
                     }
                 }
@@ -2556,8 +3064,8 @@ impl<'r> SemanticBuilder<'r> {
                 let mut semantic_keys = Vec::new();
                 let mut key_publishing = Vec::new();
                 for (position, item) in keys.iter().enumerate() {
-                    if let Some(value) = item.value() {
-                        semantic_keys.push(self.publication_slot(value, item.naming(), &input)?);
+                    if item.value().is_some() {
+                        semantic_keys.push(self.evaluated_slot(item, &input, "a grouping key")?);
                         key_publishing.push(position);
                     }
                 }
@@ -2578,10 +3086,7 @@ impl<'r> SemanticBuilder<'r> {
                             }
                         }
                         Reduction::Out(out) => {
-                            let value = out
-                                .value()
-                                .expect("one reduction item publishes one position");
-                            let slot = self.publication_slot(value, out.naming(), &input)?;
+                            let slot = self.evaluated_slot(out, &input, "a reduction")?;
                             let is_group = out.value().is_some_and(|expression| {
                                 matches!(
                                     expression,
@@ -2641,10 +3146,10 @@ impl<'r> SemanticBuilder<'r> {
                     .collect();
                 for (delegate_index, delegate) in delegates.iter().enumerate() {
                     for (item_index, item) in delegate.payload.iter().enumerate() {
-                        let Some(value) = item.value() else {
+                        if item.value().is_none() {
                             continue;
-                        };
-                        let slot = self.publication_slot(value, item.naming(), &input)?;
+                        }
+                        let slot = self.evaluated_slot(item, &input, "a delegate's payload")?;
                         if matches!(
                             slot,
                             ProjectSlot::Carried {
@@ -2702,41 +3207,43 @@ impl<'r> SemanticBuilder<'r> {
                     .zip(key_assignments)
                     .map(|(item, output)| published_position(&self.construction, item, output))
                     .collect();
-                let mut on: Vec<_> = reductions
-                    .drain(..)
-                    .zip(reduction_assignments)
-                    .map(|(item, output)| {
-                        Ok(match item {
-                            Reduction::Out(item) => {
-                                if let (Some(port), Some(expression)) =
-                                    (output, item.value().cloned())
-                                {
-                                    crate::pipeline::resolver::resolving::operators::attach_record_interior(
-                                        self,
-                                        port,
-                                        &expression,
-                                    )?;
+                let mut on: Vec<_> =
+                    reductions
+                        .drain(..)
+                        .zip(reduction_assignments)
+                        .map(|(item, output)| {
+                            Ok(match item {
+                                Reduction::Out(item) => {
+                                    if let (Some(port), Some(expression)) =
+                                        (output, item.value().cloned())
+                                    {
+                                        self.attach_record_interior(port, &expression)?;
+                                    }
+                                    crate::pipeline::asts::core::ReductionItem::Out(
+                                        published_position(&self.construction, item, output),
+                                    )
                                 }
-                                crate::pipeline::asts::core::ReductionItem::Out(
-                                    published_position(&self.construction, item, output),
-                                )
-                            }
-                            Reduction::Metadata { group, naming } => {
-                                crate::pipeline::asts::core::ReductionItem::Metadata(
-                                    crate::pipeline::asts::core::MetadataOut::published(
-                                        &self.construction,
-                                        group,
-                                        naming,
-                                        output.expect("metadata publishes one group port"),
-                                    ),
-                                )
-                            }
-                            Reduction::Pivot(pivot) => {
-                                crate::pipeline::asts::core::ReductionItem::Pivot(pivot)
-                            }
+                                Reduction::Metadata { group, naming } => {
+                                    let output = output.expect("metadata publishes one group port");
+                                    // A metadata group yields a record keyed by
+                                    // data: a nested payload whose heading is
+                                    // not static, so the fact alone travels.
+                                    self.registry.mark_nested_payload(output.column());
+                                    crate::pipeline::asts::core::ReductionItem::Metadata(
+                                        crate::pipeline::asts::core::MetadataOut::published(
+                                            &self.construction,
+                                            group,
+                                            naming,
+                                            output,
+                                        ),
+                                    )
+                                }
+                                Reduction::Pivot(pivot) => {
+                                    crate::pipeline::asts::core::ReductionItem::Pivot(pivot)
+                                }
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                        .collect::<Result<Vec<_>>>()?;
                 let plan =
                     crate::pipeline::resolver::resolving::tree_group_analysis::analyze_tree_groups_for_ctes(
                         &mut by, &mut on,
@@ -2777,60 +3284,44 @@ impl<'r> SemanticBuilder<'r> {
         }
     }
 
-    /// A projection rebuilt to carry correlation columns a hoisted
-    /// predicate still reads. The rebuild publishes the projection it
-    /// replaces, whole; the stored items follow the carry edges this act
-    /// writes, and the replacement is recorded in the same act.
-    fn bind_carrier_injection(
-        &self,
-        replaces: SemanticRelation,
-        carriers: Vec<PortId>,
-        mut items: Vec<crate::pipeline::asts::resolved::OutItem>,
-        stored: super::pending::Publishes,
-    ) -> Result<BoundStep> {
-        use crate::pipeline::asts::core::{Continuation, OutItem, PipeOp};
-        let result = self.derive(RelForm::Embed(ProjectSpec {
-            input: replaces,
-            why: super::form::ProjectWhy::Stage,
-            slots: &[],
-            dependencies: &carriers,
-        }))?;
-        // WHERE EACH POSITION WENT IS THE CARRY EDGE'S ANSWER. An embed
-        // ADDS positions, so counting them asks a different question from
-        // following them.
-        for item in items.iter_mut() {
-            let OutItem::One(one) = item else {
-                continue;
-            };
-            let landed = self.followed(&result, *one.output())?;
-            one.reland(&self.construction, landed);
-        }
-        self.record_replacement_of(replaces, &result)?;
-        let items = crate::pipeline::asts::vocabulary::Vec1::try_from_vec(items)
-            .expect("injection preserves a nonempty projection");
-        // THE OPERATOR IS THE ONE THAT WAS THERE. An embed keeps the
-        // operand whole and a projection states a heading; rebuilding one
-        // as the other would change what the step means.
-        self.paired(
-            Continuation::Pipe {
-                operator: match stored {
-                    super::pending::Publishes::Anew => PipeOp::Project(items),
-                    super::pending::Publishes::Edited => PipeOp::Embed(items),
-                },
-                named: (),
-            },
-            result,
-        )
-    }
-
     /// Rebuild a projection with hygienic positions that remain semantic
     /// until their closed-value lifecycle spends them.
     fn bind_crossing_carrier_injection(
         &self,
         replaces: SemanticRelation,
         carriers: Vec<PortId>,
+        items: Vec<crate::pipeline::asts::resolved::OutItem>,
+        stored: super::pending::Publishes,
+    ) -> Result<BoundStep> {
+        self.bind_hidden_carriers_beside(replaces, carriers, items, stored, |_, _| {})
+    }
+
+    /// THE FIXPOINT'S SUPPORT, PUBLISHED BESIDE A CLAUSE'S PROJECTION: each
+    /// hidden position carries one landed caller actual and is marked with
+    /// the exact actual it stands for, in the same act that mints it.
+    fn bind_frontier_actual_injection(
+        &self,
+        replaces: SemanticRelation,
+        carriers: Vec<(PortId, PortId)>,
+        items: Vec<crate::pipeline::asts::resolved::OutItem>,
+        stored: super::pending::Publishes,
+    ) -> Result<BoundStep> {
+        let actuals: Vec<PortId> = carriers.iter().map(|(_, actual)| *actual).collect();
+        let landed: Vec<PortId> = carriers.into_iter().map(|(landed, _)| landed).collect();
+        self.bind_hidden_carriers_beside(replaces, landed, items, stored, |index, output| {
+            self.registry
+                .relations()
+                .mark_frontier_actual(output, actuals[index]);
+        })
+    }
+
+    fn bind_hidden_carriers_beside(
+        &self,
+        replaces: SemanticRelation,
+        carriers: Vec<PortId>,
         mut items: Vec<crate::pipeline::asts::resolved::OutItem>,
         stored: super::pending::Publishes,
+        mark: impl Fn(usize, PortId),
     ) -> Result<BoundStep> {
         use crate::pipeline::asts::core::{
             ColumnOccurrence, Continuation, DomainExpression, NamedReference, OneOut, OutItem,
@@ -2848,7 +3339,6 @@ impl<'r> SemanticBuilder<'r> {
             input: replaces,
             why: super::form::ProjectWhy::Stage,
             slots: &slots,
-            dependencies: &[],
         }))?;
         for item in items.iter_mut() {
             let OutItem::One(one) = item else {
@@ -2859,7 +3349,10 @@ impl<'r> SemanticBuilder<'r> {
         }
         let outputs = self.interface(&result)?.ports().to_vec();
         let hidden = &outputs[outputs.len() - carriers.len()..];
-        for (source, output) in carriers.into_iter().zip(hidden.iter().copied()) {
+        for (index, (source, output)) in
+            carriers.into_iter().zip(hidden.iter().copied()).enumerate()
+        {
+            mark(index, output);
             items.push(OutItem::one(OneOut::published(
                 &self.construction,
                 DomainExpression::Reference(Reference::Named(NamedReference(
@@ -2904,7 +3397,6 @@ impl<'r> SemanticBuilder<'r> {
             input,
             why: super::form::ProjectWhy::Restate,
             slots: &slots,
-            dependencies: &[],
         }))?;
         let ports = self.interface(&result)?.ports().to_vec();
         let port = *ports
@@ -2985,6 +3477,8 @@ impl<'r> SemanticBuilder<'r> {
                 shape,
             };
         Ok(match value {
+            // A RESTATEMENT CARRIES: a position the enclosing join computes
+            // continues here unread, and the carry record says so.
             DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
                 column,
                 ..
@@ -2994,8 +3488,113 @@ impl<'r> SemanticBuilder<'r> {
             },
             DomainExpression::Reference(Reference::Ordinal(ordinal)) => match *ordinal {},
             DomainExpression::Reference(Reference::Physical(physical)) => match *physical {},
-            domain @ DomainExpression::Application(_) => computed(naming, self.value_shape(domain)),
+            // A COMPUTATION READS.
+            domain @ DomainExpression::Application(_) => {
+                self.refusing_deferred_reads(domain, "a value inside the interior")?;
+                computed(naming, self.value_shape(domain))
+            }
         })
+    }
+
+    /// THE SLOT OF A STATED POSITION IN A FORM THAT EVALUATES IT WHERE IT
+    /// STANDS — a grouping's key, a reduction, a delegate's payload. A value
+    /// evaluated here takes the publication's slot; one that reads the
+    /// enclosing row is, in place, the target's own correlated value, and
+    /// in a hoisted interior a value the form cannot compute inside the
+    /// boundary — the form refuses, naming itself.
+    fn evaluated_slot(
+        &self,
+        position: &super::pending::Position,
+        input: &SemanticRelation,
+        what: &str,
+    ) -> Result<ProjectSlot> {
+        let value = position
+            .value()
+            .expect("a slot is asked of a position that states a value");
+        match position.evaluation() {
+            super::pending::Evaluation::Here => {
+                self.publication_slot(value, position.naming(), input)
+            }
+            super::pending::Evaluation::Enclosing { correlations, .. } => {
+                if *correlations == crate::pipeline::resolver::Correlations::Hoisted {
+                    return Err(super::enclosing_position_refusal(what));
+                }
+                Ok(self.enclosing_slot(value, position.naming(), input)?.0)
+            }
+        }
+    }
+
+    /// A POSITION WHOSE VALUE READS THE ENCLOSING ROW: a new value, named
+    /// as the author asked or — for a bare reference — as the occurrence it
+    /// reads publishes, and the interior occurrences the value reads, as
+    /// positions of the operand. Nothing here carries the enclosing
+    /// occurrence: a carry edge from a row this heading does not stand on
+    /// would make the two occurrences interchangeable to every reader of
+    /// the record.
+    fn enclosing_slot<P>(
+        &self,
+        value: &crate::pipeline::asts::core::DomainExpression<P>,
+        naming: Option<&delightql_types::SqlIdentifier>,
+        input: &SemanticRelation,
+    ) -> Result<(ProjectSlot, Vec<PortId>)>
+    where
+        P: crate::pipeline::asts::core::Phase<
+            Col = crate::pipeline::asts::core::ColumnOccurrence,
+            ColumnOrdinal = crate::pipeline::asts::vocabulary::Never,
+            PhysicalColumn = crate::pipeline::asts::vocabulary::Never,
+            Entity = crate::names::CallableId,
+        >,
+    {
+        use crate::pipeline::asts::core::{
+            ColumnOccurrence, DomainExpression, NamedReference, Reference,
+        };
+        self.refusing_deferred_reads(value, "a value inside the interior")?;
+        let naming = match (naming, value) {
+            (Some(name), _) => {
+                Naming::Authored(self.registry.intern(name.as_str(), name.is_stropped()))
+            }
+            (
+                None,
+                DomainExpression::Reference(Reference::Named(NamedReference(ColumnOccurrence {
+                    column,
+                    ..
+                }))),
+            ) => self
+                .inheritable_publication(*column)
+                .map_or(Naming::Anonymous, Naming::Authored),
+            (None, _) => Naming::Anonymous,
+        };
+        let reads: Vec<PortId> = super::support::ports_read_deep(value)
+            .into_iter()
+            .filter_map(|port| self.port_in(input, port).ok())
+            .collect();
+        Ok((
+            ProjectSlot::Computed {
+                naming,
+                shape: self.value_shape(value),
+            },
+            reads,
+        ))
+    }
+
+    /// A VALUE MAY NOT READ A POSITION THE ENCLOSING JOIN COMPUTES: the
+    /// position has no value until the boundary is crossed.
+    fn refusing_deferred_reads<P>(
+        &self,
+        value: &crate::pipeline::asts::core::DomainExpression<P>,
+        what: &str,
+    ) -> Result<()>
+    where
+        P: crate::pipeline::asts::core::Phase<Col = crate::pipeline::asts::core::ColumnOccurrence>,
+    {
+        let store = self.registry.relations();
+        if super::support::ports_read_deep(value)
+            .into_iter()
+            .any(|port| store.is_deferred_port(port))
+        {
+            return Err(super::enclosing_position_refusal(what));
+        }
+        Ok(())
     }
 
     /// THE SHAPE A COMPUTED VALUE HAS, where the computation says so.
@@ -3066,9 +3665,9 @@ impl<'r> SemanticBuilder<'r> {
         P: crate::pipeline::asts::core::Phase<Scope = SemanticRelation>,
     {
         let Some(template) = wrapped_body(&form) else {
-            return Err(DelightQLError::transformation_error(
-                "a head with no body of its own cannot read plan storage through it",
+            return Err(Internal::invariant(
                 "semantic relation",
+                "a head with no body of its own cannot read plan storage through it",
             ));
         };
         check_mark(self.mark, &template)?;
@@ -3105,9 +3704,9 @@ impl<'r> SemanticBuilder<'r> {
         P: crate::pipeline::asts::core::Phase<Scope = SemanticRelation>,
     {
         let Some(body) = wrapped_body(&form) else {
-            return Err(DelightQLError::transformation_error(
-                "a head with no body of its own wraps nothing",
+            return Err(Internal::invariant(
                 "semantic relation",
+                "a head with no body of its own wraps nothing",
             ));
         };
         check_mark(self.mark, &body)?;
@@ -3134,12 +3733,13 @@ impl<'r> SemanticBuilder<'r> {
         P: crate::pipeline::asts::core::Phase<Scope = SemanticRelation>,
     {
         let Some(body) = wrapped_body(&form) else {
-            return Err(DelightQLError::transformation_error(
-                "a head with no body of its own has no boundary to publish",
+            return Err(Internal::invariant(
                 "semantic relation",
+                "a head with no body of its own has no boundary to publish",
             ));
         };
         check_mark(self.mark, &body)?;
+        let interior = matches!(boundary, Boundary::Interior { .. });
         let boundary = self.derive(match boundary {
             Boundary::Instance { kind, answers_to } => {
                 RelForm::Instantiate(super::form::InstanceSpec {
@@ -3148,11 +3748,23 @@ impl<'r> SemanticBuilder<'r> {
                     answers_to,
                 })
             }
-            Boundary::Alias { answer } => RelForm::Export(super::form::ExportSpec {
+            Boundary::Interior { answer } => RelForm::Export(super::form::ExportSpec {
                 input: body,
                 why: super::form::ExportWhy::Alias { answer },
             }),
         })?;
+        // THE INTERIOR BOUNDARY IS WHERE A HOISTED CORRELATION IS SPENT. The
+        // enclosing join evaluates the correlation, so the boundary's level
+        // still emits every interior occurrence the body owed — and nothing
+        // standing over the boundary owes it any further.
+        if interior {
+            let store = self.registry.relations();
+            store.spend_support_outward(boundary.relation());
+            // AND WHERE A DEFERRED POSITION IS COMPUTED: the boundary hands
+            // the enclosing join every position the body carried toward it,
+            // and nothing over the boundary defers them.
+            store.spend_deferral_outward(boundary.relation());
+        }
         Ok(crate::pipeline::asts::core::Grelex::derived(
             &self.construction,
             form,
@@ -3232,11 +3844,18 @@ impl<'r> SemanticBuilder<'r> {
             // relation whose operand is gone. Anything else that publishes
             // its own heading still refuses: it saw rows the replacement
             // never showed it.
-            let stands_on = self.registry.relations().inputs(step.result().relation());
-            let republishes = stands_on.as_slice() == [replaced];
+            let store = self.registry.relations();
+            let stands_on = store.inputs(step.result().relation());
+            // THE STEP MUST HAVE REPUBLISHED ITS OPERAND, by the record of
+            // the act that derived its result — not merely stood on it. A
+            // grouping stands on one input too, and re-deriving it as a
+            // stage export would record a distinct bag as its operand
+            // republished.
+            let republishes = stands_on.as_slice() == [replaced]
+                && store.is_republication(step.result().relation());
             if !republishes {
                 return Err(replacement_error(
-                    "a step re-appended over a replaced relation did not stand on it",
+                    "a step re-appended over a replaced relation did not republish it",
                 ));
             }
             let old_stage = *step.result();
@@ -3364,7 +3983,251 @@ impl<'r> SemanticBuilder<'r> {
                 "a step was landed on an operand its relation was not derived over",
             ));
         }
-        Ok(chain.landed(&self.construction, step))
+        // A CORRELATED RESTRICTION LANDS ONLY WHERE IT WAS MINTED. Its
+        // payload carries the relation the act recorded the obligation on;
+        // descent is not enough, because the step would then claim a
+        // relation the rows under it are not, and the step's own result is
+        // not consulted, because the payload is what cannot be re-paired.
+        if let crate::pipeline::asts::core::Continuation::Correlated(correlated) = step.form() {
+            if P::correlated(correlated).standing() != operand {
+                return Err(replacement_error(
+                    "a correlated restriction was landed on a relation other than the one its \
+                     correlation act recorded the obligation on",
+                ));
+            }
+        }
+        // THE STEP RE-JUDGES WHAT IT OWES from the operand it now stands on,
+        // under the law its own derivation stated: a correlation placed
+        // under an already-derived run reaches the run's relations here.
+        self.judge_support(*step.result())?;
+        chain.landed(&self.construction, step)
+    }
+
+    /// THE ONE CORRELATION ACT. A restriction that reads the enclosing row
+    /// stands on the chain's relation; that relation now OWES the interior
+    /// occurrences the restriction reads, because the hoisting realization
+    /// evaluates the restriction at the enclosing join and every operation
+    /// up to the interior boundary must keep them readable.
+    ///
+    /// The act takes the restriction's two operands and DERIVES everything
+    /// else: which of the condition's occurrences the relation publishes
+    /// (the interior ones, owed) and which it does not (the enclosing
+    /// row's). There is no argument for the support, so no caller can pair
+    /// a condition with occurrences somebody else read, and the obligation,
+    /// the sealed [`super::Correlated`] value and the step are written in
+    /// the same breath — a chain cannot carry the step without the record.
+    /// The lexical proof says only that a lookup judged the condition a
+    /// correlation; the act refuses one that reads no interior occurrence
+    /// (it constrains nothing about the relation it stands on) or no
+    /// enclosing one (it is not a correlation at all).
+    pub(crate) fn correlate(
+        &self,
+        chain: crate::pipeline::asts::resolved::Chain,
+        condition: crate::pipeline::asts::resolved::TruthExpression,
+        _judged: crate::pipeline::resolver::Terminal,
+    ) -> Result<crate::pipeline::asts::resolved::Chain> {
+        let standing = chain.semantic_relation();
+        check_mark(self.mark, &standing)?;
+        self.registry.relations().check_open()?;
+        let published = self.interface(&standing)?.ports().to_vec();
+        // READ AT ANY DEPTH: a witness's body or a scalar subquery inside
+        // the condition is evaluated where the condition is, at the
+        // enclosing join, so an interior occurrence it reads is one the
+        // hoisted condition reads. The nested relation's own positions come
+        // along and fall to `outer`, which only the invariant below reads.
+        let read = super::support::ports_read_by_deep(&condition);
+        if read
+            .iter()
+            .any(|port| self.registry.relations().is_deferred_port(*port))
+        {
+            return Err(super::enclosing_position_refusal(
+                "a restriction inside the interior",
+            ));
+        }
+        let (inner, outer): (Vec<PortId>, Vec<PortId>) =
+            read.into_iter().partition(|port| published.contains(port));
+        if inner.is_empty() {
+            return Err(DelightQLError::from(
+                crate::diagnostic::Resolution::CorrelationUncorrelatedPredicate {
+                    message: "every name in this condition was answered by the enclosing \
+                              relation, so it constrains nothing about the relation it is \
+                              attached to — an interior relation reads the heading its \
+                              source PUBLISHES, and a name absent from that heading reaches \
+                              outward"
+                        .to_string(),
+                },
+            ));
+        }
+        if outer.is_empty() {
+            return Err(Internal::invariant(
+                "correlation",
+                "a restriction reading no enclosing occurrence was presented as a correlation",
+            ));
+        }
+        self.registry
+            .relations()
+            .mark_correlation(standing.relation(), &inner);
+        self.judge_support(standing)?;
+        chain.correlated(
+            &self.construction,
+            super::Correlated::recorded(condition, inner, standing),
+        )
+    }
+
+    /// THE SUPPORT ONE RELATION OWES AND EMITS, judged from what its
+    /// operands owe under the law its own derivation stated.
+    ///
+    /// Total and fail-closed. An owed occurrence CONTINUES in the one
+    /// published position standing on it; where none does, it RIDES beside
+    /// the heading under its own identity if the form can emit an operand
+    /// position, and REFUSES if it cannot. Nothing here drops an occurrence,
+    /// and nothing downstream is asked to find one again: the positions this
+    /// level emits are recorded for lowering, and what its consumers owe is
+    /// recorded for their own judgment.
+    fn judge_support(&self, relation: SemanticRelation) -> Result<()> {
+        let store = self.registry.relations();
+        let Some(law) = store.support_law(relation.relation()) else {
+            return Ok(());
+        };
+        let ports = self.interface(&relation)?.ports().to_vec();
+        // JUDGED FIRST: A POSITION THE ENCLOSING JOIN COMPUTES travels the
+        // other way under the same law — a form that reads one refuses for
+        // that before the question of what it keeps readable is asked: it CONTINUES, unread, in every published position
+        // standing on it — a level that republishes carries it, a join's
+        // row concatenates it — or it is dropped; a grouping keyed on it, or
+        // a form that would change what the position means, refuses. And a
+        // boundary that SPENT such a position outward is consumed by the
+        // join that computes it and by nothing else: a level between them
+        // would emit a value nobody has yet.
+        let mut defers: Vec<PortId> = Vec::new();
+        for input in store.inputs(relation.relation()) {
+            if !matches!(law, SupportLaw::Concatenates)
+                && self
+                    .interface(&input)?
+                    .ports()
+                    .iter()
+                    .any(|port| store.is_realized_port(*port))
+            {
+                return Err(super::enclosing_position_refusal(
+                    "a step between the interior and the join that computes its positions",
+                ));
+            }
+            for deferred in store.deferred(input.relation()) {
+                let standing: Vec<PortId> = ports
+                    .iter()
+                    .copied()
+                    .filter(|published| {
+                        *published == deferred || store.lineage(*published).contains(&deferred)
+                    })
+                    .collect();
+                match law {
+                    SupportLaw::Carries | SupportLaw::Concatenates => {
+                        for continued in standing {
+                            if !defers.contains(&continued) {
+                                defers.push(continued);
+                            }
+                        }
+                    }
+                    SupportLaw::Translates { keys } => {
+                        let keys = ports.get(..keys).unwrap_or(&ports);
+                        if standing.iter().any(|key| keys.contains(key)) {
+                            return Err(super::enclosing_position_refusal(
+                                "a grouping that groups by it",
+                            ));
+                        }
+                    }
+                    SupportLaw::Refuses(what) => {
+                        if !standing.is_empty() {
+                            return Err(super::enclosing_position_refusal(what));
+                        }
+                    }
+                }
+            }
+        }
+        for mark in store.deferred_marks(relation.relation()) {
+            if !defers.contains(&mark) {
+                defers.push(mark);
+            }
+        }
+        store.record_deferral(relation.relation(), defers);
+        let mut owed: Vec<PortId> = Vec::new();
+        for input in store.inputs(relation.relation()) {
+            for port in store.support_owed(input.relation()) {
+                if !owed.contains(&port) {
+                    owed.push(port);
+                }
+            }
+        }
+        let mut owes: Vec<PortId> = Vec::new();
+        for port in owed {
+            let standing: Vec<PortId> = ports
+                .iter()
+                .copied()
+                .filter(|published| *published == port || store.lineage(*published).contains(&port))
+                .collect();
+            let carried = match law {
+                SupportLaw::Carries | SupportLaw::Concatenates => match standing.as_slice() {
+                    [continued] => *continued,
+                    // Several positions continuing one occurrence are one
+                    // value each; the occurrence keeps its own identity
+                    // rather than having one of them chosen for it.
+                    _ => port,
+                },
+                SupportLaw::Translates { keys } => {
+                    let keys = ports.get(..keys).unwrap_or(&ports);
+                    // Two keys standing on one occurrence group by one value
+                    // twice; the first in the authored key order stands for
+                    // it, and either would filter the same groups.
+                    match standing.iter().copied().find(|key| keys.contains(key)) {
+                        Some(key) => key,
+                        None => {
+                            return Err(unrealizable_support(
+                                "a grouping that does not group by it",
+                            ))
+                        }
+                    }
+                }
+                SupportLaw::Refuses(what) => return Err(unrealizable_support(what)),
+            };
+            if !owes.contains(&carried) {
+                owes.push(carried);
+            }
+        }
+        for mark in store.support_marks(relation.relation()) {
+            if !owes.contains(&mark) {
+                owes.push(mark);
+            }
+        }
+        let emits: Vec<PortId> = owes
+            .iter()
+            .copied()
+            .filter(|port| !ports.contains(port))
+            .collect();
+        // THE RUN THE LEVEL EMITS AFTER ITS HEADING, in emission order. A
+        // join's row re-emits its operands' runs whole, left then right;
+        // every other level emits its own constraint dependencies and then
+        // the correlation support it owes. Only the latter — what THIS level
+        // owes and does not publish — is what binding refuses to leave
+        // unbound: a level over a join may drop the run the join already
+        // spent.
+        let run = match law {
+            SupportLaw::Concatenates => store
+                .inputs(relation.relation())
+                .into_iter()
+                .flat_map(|input| store.support_run(input.relation()))
+                .collect(),
+            SupportLaw::Carries | SupportLaw::Translates { .. } | SupportLaw::Refuses(_) => {
+                let mut run = store.dependencies(relation.relation());
+                for port in &emits {
+                    if !run.contains(port) {
+                        run.push(*port);
+                    }
+                }
+                run
+            }
+        };
+        store.record_support(relation.relation(), owes, emits, run);
+        Ok(())
     }
 
     /// Land a whole suffix back, innermost first. See
@@ -3478,9 +4341,9 @@ impl<'r> SemanticBuilder<'r> {
                         .map(crate::pipeline::asts::core::OutItem::one)
                         .collect(),
                 ) else {
-                    return Err(DelightQLError::transformation_error(
-                        "a republishing projection carries no position",
+                    return Err(Internal::invariant(
                         "publication",
+                        "a republishing projection carries no position",
                     ));
                 };
                 crate::pipeline::asts::core::Step::derived(
@@ -3545,6 +4408,34 @@ impl<'r> SemanticBuilder<'r> {
                 "a refinement published a relation its operand did not build",
             )),
         }
+    }
+
+    /// REBUILD AN OPERAND IN PLACE, JUDGED.
+    ///
+    /// The one road that lets a rewrite stand a DIFFERENT relation where an
+    /// operand stood while the node above keeps its identity: the product
+    /// is the operand itself, or a relation derived from it that carries
+    /// every position the operand published — recorded here as the
+    /// operand's replacement, so the boundary standing over it translates
+    /// through the record rather than through a resemblance — and anything
+    /// else refuses. The answer names the operand it replaces, so the
+    /// carrier that admits it can refuse a replacement judged for some
+    /// other operand.
+    pub(crate) fn rebuilt<P>(
+        &self,
+        operand: crate::pipeline::asts::core::Chain<P>,
+        rebuild: impl FnOnce(
+            crate::pipeline::asts::core::Chain<P>,
+        ) -> Result<crate::pipeline::asts::core::Chain<P>>,
+    ) -> Result<Replacement<P>>
+    where
+        P: crate::pipeline::asts::core::Phase<Scope = SemanticRelation>,
+    {
+        let of = operand.semantic_relation();
+        let chain = match self.refine_relation(operand, rebuild)? {
+            Refinement::Preserved(chain) | Refinement::Rebuilt { chain, .. } => chain,
+        };
+        Ok(Replacement { chain, of })
     }
 
     /// REFINE A CHAIN WHOSE SHAPE THE REFINER MAY REPLACE WHOLE.
@@ -3636,9 +4527,9 @@ impl<'r> SemanticBuilder<'r> {
     /// sits at its old ordinal.
     fn followed(&self, result: &SemanticRelation, source: PortId) -> Result<PortId> {
         self.landed_port(result, source)?.ok_or_else(|| {
-            DelightQLError::transformation_error(
-                "a rebuilt operation does not carry a position the one it replaces published",
+            Internal::invariant(
                 "publication",
+                "a rebuilt operation does not carry a position the one it replaces published",
             )
         })
     }
@@ -3695,16 +4586,24 @@ impl<'r> SemanticBuilder<'r> {
         Ok(None)
     }
 
-    /// WHICH STATED SOURCE POSITIONS AN OUTPUT CARRIES.
+    /// WHICH STATED SOURCE POSITIONS A POSITION STANDS OVER.
     ///
-    /// The walk descends the carry edges construction wrote and stops the
-    /// moment it reaches a position of the stated set, so what it concludes
-    /// over is that set and the record between — never everything a lineage
-    /// happens to touch. A merged key carries SEVERAL, and the several are
-    /// the answer rather than an ambiguity: which sources a position stands
-    /// for is exactly what tells it from its siblings. The answer is
-    /// ordered by the stated set so two of them compare.
-    fn carried_out_of(&self, port: PortId, out_of: &[PortId]) -> Vec<PortId> {
+    /// The walk descends every carry the record wrote into a position and
+    /// stops the moment it reaches a position of the stated set, so what it
+    /// concludes over is that set and the record between — never everything
+    /// a lineage happens to touch. A merged key carries SEVERAL, and the
+    /// several are the answer rather than an ambiguity: which sources a
+    /// position stands for is exactly what tells it from its siblings. The
+    /// answer is ordered by the stated set so two of them compare.
+    ///
+    /// A READ IS WHERE AN OCCURRENCE BEGINS, AND THE WALK ENDS THERE. A read
+    /// of a definition may itself be a stated source, reached above; behind
+    /// it lies the definition, which every read of it shares, and two reads
+    /// meeting there would pair positions of one row stream with another's.
+    ///
+    /// This pairs POSITIONS. It is not the judgment of what an operation is
+    /// made of — that is [`Self::operation_over`], read from operands.
+    fn reach(&self, port: PortId, out_of: &[PortId]) -> Vec<PortId> {
         let store = self.registry.relations();
         let mut reached: Vec<PortId> = Vec::new();
         let mut seen = vec![port];
@@ -3716,13 +4615,34 @@ impl<'r> SemanticBuilder<'r> {
                 }
                 continue;
             }
-            let mut back = store.lineage(next);
-            // A SOURCE MAY ITSELF HAVE BEEN REBUILT. An inner segment states
-            // what it replaced while it builds, so the position a rebuilt
-            // table publishes reaches the position the operand stood on
-            // through that record — the same construction evidence the carry
-            // edges are, one relation down.
+            if store.is_read_boundary(next) {
+                continue;
+            }
+            // EVERY CARRY THE RECORD WROTE INTO THIS POSITION, not lineage
+            // alone: a merged key is carried from its left half and the
+            // join's translation act records its right half.
+            let mut back = store.carried_from(next);
+            // A SET POSITION STANDS OVER EVERY ARM. Its carry edge names the
+            // opening arm alone; the contribution table the set was built
+            // from names what each arm puts through it.
             if let Some(owner) = store.relation_of(next) {
+                if let Some(matrix) = store.contributions(owner) {
+                    for output in matrix.outputs() {
+                        if output.result() != next {
+                            continue;
+                        }
+                        for cell in output.by_arm().iter() {
+                            if let Contribution::Port(port) = cell {
+                                back.push(*port);
+                            }
+                        }
+                    }
+                }
+                // A SOURCE MAY ITSELF HAVE BEEN REBUILT. An inner segment
+                // states what it replaced while it builds, so the position a
+                // rebuilt table publishes reaches the position the operand
+                // stood on through that record — the same construction
+                // evidence the carry edges are, one relation down.
                 for map in store.replacements_into(owner) {
                     for (was, now) in map.pairs() {
                         if *now == next {
@@ -3747,72 +4667,232 @@ impl<'r> SemanticBuilder<'r> {
         answer
     }
 
-    /// A REBUILD SAYS WHAT IT REPLACED AND WHAT IT STOOD OVER.
+    /// WHETHER AN OPERATION IS MADE OF EXACTLY THE STATED OCCURRENCES, by
+    /// the operands each deriving act recorded.
     ///
-    /// The FAR cycle flattens a segment into the tables it is made of and
-    /// builds over THOSE, so what it publishes is the operand's sibling
-    /// rather than its descendant and no carry edge runs between them.
-    /// What relates them is the SOURCES, and the rebuild is the only thing
-    /// that knows which they were: it flattened them out of the operand and
-    /// emitted them again. So it states them here, while it still holds
-    /// them, and the map is that statement joined to the record — not a
-    /// resemblance between two relations that came out looking alike.
+    /// The walk descends the recorded operands. A node that stands for a
+    /// stated occurrence — the occurrence itself, a recorded replacement of
+    /// it, or a republication of it — is a leaf and marks that occurrence
+    /// reached. A join descends into both operands and a republication into
+    /// its one; every other operation — a set, a minus, a group, a read, a
+    /// destructure — is a participant the rebuild does not reproduce, and
+    /// the answer is no. Nothing here reads positions: an operand whose
+    /// column a projection dropped still determines the rows.
+    fn operation_over(
+        &self,
+        node: SemanticRelation,
+        stated: &[SemanticRelation],
+        reached: &mut Vec<usize>,
+        seen: &mut Vec<RelationId>,
+    ) -> Result<bool> {
+        for (index, occurrence) in stated.iter().enumerate() {
+            if self.stands_for(occurrence, &node)? {
+                if !reached.contains(&index) {
+                    reached.push(index);
+                }
+                return Ok(true);
+            }
+        }
+        if seen.contains(&node.relation()) {
+            return Ok(false);
+        }
+        seen.push(node.relation());
+        let store = self.registry.relations();
+        let inputs = store.inputs(node.relation());
+        if store.is_join(node.relation()) {
+            let [left, right] = inputs.as_slice() else {
+                return Ok(false);
+            };
+            return Ok(self.operation_over(*left, stated, reached, seen)?
+                && self.operation_over(*right, stated, reached, seen)?);
+        }
+        if store.is_republication(node.relation()) {
+            let [input] = inputs.as_slice() else {
+                return Ok(false);
+            };
+            return self.operation_over(*input, stated, reached, seen);
+        }
+        Ok(false)
+    }
+
+    /// WHETHER A RELATION STANDS OVER EXACTLY THE STATED OCCURRENCES.
     ///
-    /// Every position of the operand must reach exactly one stated source
-    /// and be met there by exactly one position of the rebuild. Anything
-    /// else is not a replacement and nothing is recorded.
-    pub(crate) fn replacing<P>(
+    /// The judgment is the operation's: its recorded operand tree is made of
+    /// joins and republications whose leaves stand for the stated
+    /// occurrences, and every stated occurrence is a leaf. Only then are the
+    /// relation's positions paired with what they stand over — the stated
+    /// positions each one's recorded carries reach — for the map a rebuild
+    /// writes. `Some` carries that pairing; `None` says these occurrences
+    /// are not what the relation stands over, so nothing about them may be
+    /// certified. A position that reaches no stated position cannot be
+    /// paired, and the answer is likewise `None`.
+    fn standing_over(
+        &self,
+        relation: &SemanticRelation,
+        occurrences: &[SemanticRelation],
+    ) -> Result<Option<Vec<(PortId, Vec<PortId>)>>> {
+        let mut reached = Vec::new();
+        if !self.operation_over(*relation, occurrences, &mut reached, &mut Vec::new())?
+            || reached.len() != occurrences.len()
+        {
+            return Ok(None);
+        }
+        let mut sources = Vec::new();
+        for occurrence in occurrences {
+            sources.extend_from_slice(self.interface(occurrence)?.ports());
+        }
+        let mut standing = Vec::new();
+        for port in self.interface(relation)?.ports().iter().copied() {
+            let from = self.reach(port, &sources);
+            if from.is_empty() {
+                return Ok(None);
+            }
+            standing.push((port, from));
+        }
+        Ok(Some(standing))
+    }
+
+    /// WHETHER ONE RELATION IS A REPUBLICATION OF ANOTHER, by the record:
+    /// the relation itself, or a row-preserving single-operand derivation
+    /// whose operand is (recursively) a republication of it. Read from what
+    /// each deriving act recorded about its form and its operand — never
+    /// from the positions carried, which a set's first arm or a join's left
+    /// side carry just as well without republishing anything.
+    fn republication_of(&self, original: &SemanticRelation, relation: &SemanticRelation) -> bool {
+        let store = self.registry.relations();
+        let mut current = *relation;
+        let mut seen: Vec<RelationId> = Vec::new();
+        loop {
+            if current == *original {
+                return true;
+            }
+            if seen.contains(&current.relation()) || !store.is_republication(current.relation()) {
+                return false;
+            }
+            seen.push(current.relation());
+            let inputs = store.inputs(current.relation());
+            let [input] = inputs.as_slice() else {
+                return false;
+            };
+            current = *input;
+        }
+    }
+
+    /// Whether a relation IS a stated occurrence or stands in its place by
+    /// record: the occurrence itself, a relation a rebuild recorded as
+    /// replacing it, or a republication of it. Never a resemblance, never a
+    /// sibling, never a relation that merely carries the occurrence's
+    /// positions beside something else.
+    fn stands_for(
+        &self,
+        occurrence: &SemanticRelation,
+        relation: &SemanticRelation,
+    ) -> Result<bool> {
+        if occurrence == relation {
+            return Ok(true);
+        }
+        if self
+            .registry
+            .relations()
+            .replacement(occurrence.relation(), relation.relation())
+            .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(self.republication_of(occurrence, relation))
+    }
+
+    /// TWO ZERO-WIDTH NARROWINGS OF ONE GRID ARE ONE OPERAND. A rebuild
+    /// re-derives the resolver's all-consumed narrowing of an anonymous read
+    /// over the same grid; neither publishes a position, so the replacement
+    /// carries no map and grants no alias — it says only that the later
+    /// narrowing stands where the earlier one stood. Anything wider, or
+    /// narrowed from anything else, is refused.
+    pub(crate) fn narrowed_again(
         &self,
         was: SemanticRelation,
-        over: &[SemanticRelation],
-        produced: crate::pipeline::asts::core::Chain<P>,
-    ) -> Result<crate::pipeline::asts::core::Chain<P>>
-    where
-        P: crate::pipeline::asts::core::Phase<Scope = SemanticRelation>,
-    {
-        let now = produced.semantic_relation();
-        if now == was {
-            return Ok(produced);
-        }
+        now: &SemanticRelation,
+    ) -> Result<()> {
         check_mark(self.mark, &was)?;
-        check_mark(self.mark, &now)?;
-        let mut sources = Vec::new();
-        for source in over {
-            sources.extend_from_slice(self.interface(source)?.ports());
+        check_mark(self.mark, now)?;
+        if !self.interface(&was)?.ports().is_empty() || !self.interface(now)?.ports().is_empty() {
+            return Err(replacement_error(
+                "a re-derived narrowing replaces a narrowing only when both publish nothing",
+            ));
         }
-        let after = self.interface(&now)?;
-        let standing: Vec<(Vec<PortId>, PortId)> = after
-            .ports()
-            .iter()
-            .copied()
-            .map(|port| (self.carried_out_of(port, &sources), port))
-            .filter(|(from, _)| !from.is_empty())
-            .collect();
-        let before = self.interface(&was)?;
-        let mut pairs = Vec::with_capacity(before.width());
-        for port in before.ports().iter().copied() {
-            let from = self.carried_out_of(port, &sources);
-            if from.is_empty() {
-                return Ok(produced);
+        let store = self.registry.relations();
+        // A NARROWING IS A REPUBLICATION OF ITS GRID, and the record says
+        // which derivations were. Publishing nothing is not the act: a
+        // grouping to no columns publishes nothing too, and one row of it
+        // stands for many rows of the grid.
+        if !store.is_republication(was.relation()) || !store.is_republication(now.relation()) {
+            return Err(replacement_error(
+                "a re-derived narrowing replaces a narrowing only when both republish the grid",
+            ));
+        }
+        let (before, after) = (store.inputs(was.relation()), store.inputs(now.relation()));
+        match (before.as_slice(), after.as_slice()) {
+            ([grid], [again]) if grid == again => {}
+            _ => {
+                return Err(replacement_error(
+                    "a re-derived narrowing replaces a narrowing of the same one grid",
+                ))
             }
-            let mut met = standing
-                .iter()
-                .filter(|(stands_for, _)| *stands_for == from);
-            let (Some((_, landed)), None) = (met.next(), met.next()) else {
-                return Ok(produced);
-            };
-            pairs.push((port, *landed));
         }
-        self.registry.relations().record_replacement(
+        store.record_replacement(
             was.relation(),
             now.relation(),
             TotalPortMap {
                 from: was.relation(),
                 to: now.relation(),
-                pairs,
+                pairs: Vec::new(),
             },
         );
-        Ok(produced)
+        Ok(())
+    }
+
+    /// OPEN A REBUILD of one operand over the occurrences it stands over.
+    ///
+    /// The FAR cycle flattens a segment into the tables it is made of and
+    /// builds over THOSE, so what it publishes is the operand's sibling
+    /// rather than its descendant, and no carry edge runs between them. What
+    /// relates them is the occurrences both stand over, and the rebuild is
+    /// the act that consumes them again — so the rebuild is performed HERE,
+    /// as one operation of the authority, and the replacement it certifies
+    /// is evidence that operation produced: the operand was judged to stand
+    /// over exactly these occurrences, the product is derived by this
+    /// operation over exactly these occurrences in this order, and nothing
+    /// assembled elsewhere can be handed in as the product. Independently
+    /// valid ingredients — a finished relation, a source list, a chain —
+    /// cannot be paired into a replacement from outside.
+    ///
+    /// An operand that does not stand over exactly the stated occurrences
+    /// opens a rebuild that certifies nothing: the product is still
+    /// derived, and a reference the refiner cannot translate onto it then
+    /// refuses where it is written.
+    pub(crate) fn rebuilding(
+        self,
+        operand: SemanticRelation,
+        occurrences: &[SemanticRelation],
+    ) -> Result<Rebuild<'r>> {
+        check_mark(self.mark, &operand)?;
+        for occurrence in occurrences {
+            check_mark(self.mark, occurrence)?;
+        }
+        if occurrences.is_empty() {
+            return Err(replacement_error(
+                "a rebuild stands over at least one occurrence",
+            ));
+        }
+        let operand_sources = self.standing_over(&operand, occurrences)?;
+        Ok(Rebuild {
+            authority: self,
+            operand,
+            occurrences: occurrences.to_vec(),
+            operand_sources,
+            consumed: 0,
+            product: None,
+        })
     }
 
     /// The total old-to-new map a rebuild WROTE DOWN while it built.
@@ -3828,6 +4908,24 @@ impl<'r> SemanticBuilder<'r> {
         new: SemanticRelation,
     ) -> Result<Option<TotalPortMap>> {
         check_mark(self.mark, &new)?;
+        // A REBUILD THAT ALREADY SAID WHAT IT REPLACED is the record itself:
+        // the map the operation wrote, not one reconstructed from carries.
+        if let Some(map) = self
+            .registry
+            .relations()
+            .replacement(old.relation(), new.relation())
+        {
+            return Ok(Some(map));
+        }
+        // CARRYING EVERY POSITION IS NOT DESCENDING. A set carries its first
+        // arm's positions and a join its left side's; neither republishes
+        // its operand. Short of a recorded replacement, the record of each
+        // deriving act must say the road from the new relation down to the
+        // old one is republication all the way; only then is there a map to
+        // write.
+        if !self.republication_of(&old, &new) {
+            return Ok(None);
+        }
         let before = self.interface(&old)?;
         let mut pairs = Vec::with_capacity(before.width());
         for port in before.ports().iter().copied() {
@@ -3905,9 +5003,9 @@ impl<'r> SemanticBuilder<'r> {
             .into_iter()
             .find_map(|(source, output)| (source == referenced).then_some(output))
             .ok_or_else(|| {
-                DelightQLError::transformation_error(
-                    "a resolved reference is not carried by its input relation",
+                Internal::invariant(
                     "semantic relation",
+                    "a resolved reference is not carried by its input relation",
                 )
             })
     }
@@ -3918,9 +5016,24 @@ impl<'r> SemanticBuilder<'r> {
         if self.interface(relation)?.ports().contains(&referenced) {
             return Ok(true);
         }
-        Ok(translated_ports_for(self.registry, relation)?
+        if translated_ports_for(self.registry, relation)?
             .into_iter()
-            .any(|(source, _)| source == referenced))
+            .any(|(source, _)| source == referenced)
+        {
+            return Ok(true);
+        }
+        // THE SUPPORT IT EMITS IS CARRIED TOO. A hoisted correlation names
+        // an interior occurrence the boundary keeps readable beside its
+        // heading — under that occurrence's own identity, or under a
+        // position that continues it.
+        Ok(self
+            .registry
+            .relations()
+            .support_emitted(relation.relation())
+            .into_iter()
+            .any(|emitted| {
+                emitted == referenced || super::stands_where(self.registry, emitted, referenced)
+            }))
     }
 
     /// Every exact ancestor port construction carried into one output.
@@ -4066,6 +5179,7 @@ impl<'r> SemanticBuilder<'r> {
                             addressing,
                             ValueFacts {
                                 declared_type: slot.declared_type.clone(),
+                                tree_valued: slot.interior,
                                 ..ValueFacts::default()
                             },
                         )
@@ -4074,83 +5188,90 @@ impl<'r> SemanticBuilder<'r> {
                 (scope, ports)
             }
             RelForm::Anonymous(spec) => {
-                let scope = self.registry.anonymous_scope(spec.answers_to);
-                let ports = spec
-                    .slots
-                    .iter()
-                    .map(|slot| {
-                        let (_position, named, addressing, declared_type, shape) = match slot {
-                            AnonymousSlot::Binder {
-                                position,
-                                named,
-                                declared_type,
-                                shape,
-                            } => (
-                                *position,
-                                Some(*named),
-                                // The binder is the caller's own bare lvar;
-                                // under an alias its complete name is
-                                // qualified. Which name is the lexical
-                                // frontier's fact.
-                                if spec.answers_to.is_some() {
-                                    Addressing::BareUnder
-                                } else {
-                                    Addressing::Bare
-                                },
-                                declared_type.clone(),
-                                *shape,
-                            ),
-                            AnonymousSlot::Literal {
-                                position,
-                                declared_type,
-                                shape,
-                            }
-                            | AnonymousSlot::Inferred {
-                                position,
-                                declared_type,
-                                shape,
-                            } => (
-                                *position,
-                                None,
-                                Addressing::Published,
-                                declared_type.clone(),
-                                *shape,
-                            ),
-                            AnonymousSlot::Constraint {
-                                position,
-                                declared_type,
-                                shape,
-                            } => (
-                                *position,
-                                None,
-                                Addressing::Hygienic,
-                                declared_type.clone(),
-                                *shape,
-                            ),
-                            AnonymousSlot::Declared { position, named } => (
-                                *position,
-                                *named,
-                                if named.is_some() {
-                                    Addressing::Published
-                                } else {
-                                    Addressing::Latent
-                                },
-                                None,
-                                crate::names::ValueShape::Unknown,
-                            ),
-                        };
-                        self.mint(
-                            scope,
+                let scope = self.registry.anonymous_scope(spec.answers_to());
+                let mut ports = Vec::with_capacity(spec.slots().len());
+                for (index, slot) in spec.slots().iter().enumerate() {
+                    let (_position, named, addressing, declared_type, shape) = match slot {
+                        AnonymousSlot::Binder {
+                            position,
                             named,
-                            addressing,
-                            ValueFacts {
-                                declared_type,
-                                shape,
-                                ..ValueFacts::default()
+                            declared_type,
+                            shape,
+                        } => (
+                            *position,
+                            Some(*named),
+                            // The binder is the caller's own bare lvar;
+                            // under an alias its complete name is
+                            // qualified. Which name is the lexical
+                            // frontier's fact.
+                            if spec.answers_to().is_some() {
+                                Addressing::BareUnder
+                            } else {
+                                Addressing::Bare
                             },
-                        )
-                    })
-                    .collect();
+                            declared_type.clone(),
+                            *shape,
+                        ),
+                        AnonymousSlot::Literal {
+                            position,
+                            declared_type,
+                            shape,
+                        }
+                        | AnonymousSlot::Inferred {
+                            position,
+                            declared_type,
+                            shape,
+                        } => (
+                            *position,
+                            None,
+                            Addressing::Published,
+                            declared_type.clone(),
+                            *shape,
+                        ),
+                        AnonymousSlot::Constraint {
+                            position,
+                            declared_type,
+                            shape,
+                        } => (
+                            *position,
+                            None,
+                            Addressing::Hygienic,
+                            declared_type.clone(),
+                            *shape,
+                        ),
+                        AnonymousSlot::Declared { position, named } => (
+                            *position,
+                            *named,
+                            if named.is_some() {
+                                Addressing::Published
+                            } else {
+                                Addressing::Latent
+                            },
+                            None,
+                            crate::names::ValueShape::Unknown,
+                        ),
+                    };
+                    let port = self.mint(
+                        scope,
+                        named,
+                        addressing,
+                        ValueFacts {
+                            declared_type,
+                            shape,
+                            ..ValueFacts::default()
+                        },
+                    );
+                    // THE MINT ACT WRITES THE REUSE EDGE, as the caller
+                    // pattern's bind act does: the lexical authority decided
+                    // the live port this position reuses and the spec carries
+                    // that decision beside the slot it was judged for; the
+                    // record pairs it with the port minted here, and the join
+                    // that owns the reused port consumes the record.
+                    if let Some(reused) = spec.reuse_at(index) {
+                        self.registry.relations().record_reuse(port, reused)?;
+                    }
+                    ports.push(port);
+                }
                 (scope, ports)
             }
             _ => unreachable!("only a source or an anonymous relation takes the New law"),
@@ -4359,6 +5480,11 @@ impl<'r> SemanticBuilder<'r> {
                             Continuity::Continues
                         },
                         !written,
+                        if written {
+                            CarriedValue::Rewritten
+                        } else {
+                            CarriedValue::Same
+                        },
                         |facts| {
                             // A COVER KEEPS THE SLOT'S IDENTITY and writes
                             // a different value into it, so downstream
@@ -4461,11 +5587,29 @@ impl<'r> SemanticBuilder<'r> {
         merged: &[MergedKey],
     ) -> Result<SemanticRelation> {
         let scope = self.registry.join_scope();
+        let left_heading = self.operand_heading(left);
+        let right_heading = self.operand_heading(right);
+        // A MERGED KEY NAMES ONE POSITION OF EACH OPERAND. A pair written
+        // against operands a rebuild has since replaced is translated onto
+        // the rebuilt operands before it arrives here. Accepting a position
+        // neither operand publishes would silently drop the pair from the
+        // record and publish a join that merged nothing.
+        for key in merged {
+            if !left_heading.contains(&key.left.0) || !right_heading.contains(&key.right.0) {
+                return Err(Internal::invariant(
+                    "join",
+                    format!(
+                        "a merged key {:?} names a position its operands do not publish",
+                        key
+                    ),
+                ));
+            }
+        }
         // A JOIN CONSUMES NOTHING. Its arms are still the statement's FROM
         // entries, so the columns it publishes still belong to the
         // relations they came from.
         let mut ports = Vec::new();
-        for column in self.operand_heading(left) {
+        for column in left_heading {
             let published = self.registry.published(column);
             let addressing = self.registry.addressing(column);
             ports.push(self.carry(
@@ -4477,7 +5621,7 @@ impl<'r> SemanticBuilder<'r> {
                 Continuity::Continues,
             ));
         }
-        for column in self.operand_heading(right) {
+        for column in right_heading {
             // A merged key publishes ONE position standing for a port of
             // each operand, so the right side's half does not publish
             // again.
@@ -4530,9 +5674,9 @@ impl<'r> SemanticBuilder<'r> {
     /// relation that has half the rows.
     fn merge(&self, alignment: SetAlignment, arms: &[SetArm]) -> Result<SemanticRelation> {
         let Some(first) = arms.first() else {
-            return Err(DelightQLError::transformation_error(
-                "a set operation has two or more arms",
+            return Err(Internal::invariant(
                 "set",
+                "a set operation has two or more arms",
             ));
         };
         let mode = match alignment {
@@ -4560,9 +5704,9 @@ impl<'r> SemanticBuilder<'r> {
                 .collect::<Vec<_>>(),
         )
         .ok_or_else(|| {
-            DelightQLError::transformation_error(
-                "a set operation has two or more arms; one arm is not a set",
+            Internal::invariant(
                 "set",
+                "a set operation has two or more arms; one arm is not a set",
             )
         })?;
 
@@ -4609,28 +5753,17 @@ impl<'r> SemanticBuilder<'r> {
                 addressing,
                 continuity,
             );
-            // The slot's interior evidence: the opening column's rides the
-            // carry; every other contribution reconciles against it.
-            for cell in &slot.cells {
-                if let Contribution::Port(port) = cell {
-                    if port.0 != slot.source {
-                        self.reconcile_interior(result, *port)?;
-                    }
-                }
-            }
+            self.judge_set_child(result, &slot.cells)?;
             ports.push(result);
             let cells = Vec2::try_from_vec(slot.cells).ok_or_else(|| {
-                DelightQLError::transformation_error(
-                    "a set output has one contribution per arm",
-                    "set",
-                )
+                Internal::invariant("set", "a set output has one contribution per arm")
             })?;
             outputs.push(SetOutput::of(result, cells));
         }
         let matrix = ContributionMatrix::build(mode, arm_relations, outputs).map_err(|error| {
-            DelightQLError::transformation_error(
-                format!("a set operation's contribution matrix is malformed: {error:?}"),
+            Internal::invariant(
                 "set",
+                format!("a set operation's contribution matrix is malformed: {error:?}"),
             )
         })?;
         let relation = self.store(scope, Interface::of(ports))?;
@@ -4742,18 +5875,39 @@ impl<'r> SemanticBuilder<'r> {
         Ok(slots)
     }
 
-    /// Merge one contribution's exact interior evidence into a set slot.
-    /// The relation store owns both links, so no scope heading or copied
-    /// value fact participates in the comparison.
-    fn reconcile_interior(&self, slot: PortId, contributed: PortId) -> Result<()> {
-        let different = match (
-            self.registry.relations().interior(slot),
-            self.registry.relations().interior(contributed),
-        ) {
-            (Some(left), Some(right)) => !self.same_interior_shape(&left, &right)?,
-            _ => false,
-        };
-        if different || self.registry.relations().interior_conflict(contributed) {
+    /// THE CHILD A SET SLOT OWNS, decided from EVERY arm's evidence at once:
+    /// every arm establishes a child of one shape, or every arm establishes
+    /// none, or the slot records a conflict — one arm with a child beside
+    /// one without is a conflict, never the first arm's silent default. The
+    /// carry that minted the slot copied the opening column's child; this
+    /// judgment keeps it only when all arms agree, and a padded arm
+    /// establishes no child. The relation store owns every link read here,
+    /// so no scope heading or copied value fact participates.
+    fn judge_set_child(&self, slot: PortId, cells: &[Contribution]) -> Result<()> {
+        let mut children = Vec::with_capacity(cells.len());
+        for cell in cells {
+            match cell {
+                Contribution::Port(port) => {
+                    if self.registry.relations().interior_conflict(*port) {
+                        self.registry.relations().record_interior_conflict(slot);
+                        return Ok(());
+                    }
+                    children.push(self.registry.relations().interior(*port));
+                }
+                Contribution::Padding(_) => children.push(None),
+            }
+        }
+        let mut agreed = true;
+        if let Some((first, rest)) = children.split_first() {
+            for other in rest {
+                agreed &= match (first, other) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => self.same_interior_shape(left, right)?,
+                    (Some(_), None) | (None, Some(_)) => false,
+                };
+            }
+        }
+        if !agreed {
             self.registry.relations().record_interior_conflict(slot);
         }
         Ok(())
@@ -4819,9 +5973,8 @@ impl<'r> SemanticBuilder<'r> {
             pairs,
         )
         .map_err(|error| {
-            DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::RESOLUTION_SETOP_MINUS_HEADING,
-                match error {
+            DelightQLError::from(ResolutionSetop::MinusHeading {
+                message: match error {
                     super::minus::ExactHeadingError::DegreeMismatch { .. } => {
                         "a minus requires the two operands to publish the same \
                          dimensions; they do not agree in width"
@@ -4833,10 +5986,9 @@ impl<'r> SemanticBuilder<'r> {
                     super::minus::ExactHeadingError::OpaqueHeading => {
                         "a minus requires an enumerable heading on both sides"
                     }
-                },
-                "declare the dimensions at the mention so both operands publish \
-                 the same exact heading",
-            )
+                }
+                .to_string(),
+            })
         })?;
 
         // ONLY THE LEFT IS EXPORTED. The right ports occur in the pairs the
@@ -4908,6 +6060,15 @@ impl<'r> SemanticBuilder<'r> {
                         .relations()
                         .residual_row_token(PortId(*column))
                         .is_some()
+                    // A fixpoint's support crosses every read of it: the
+                    // recursive clause reads the caller's actual from the
+                    // frontier row, and the expansion boundary is the one
+                    // place it is dropped.
+                    || self
+                        .registry
+                        .relations()
+                        .frontier_actual(PortId(*column))
+                        .is_some()
             })
             .map(|port| {
                 let published = self.registry.published(port);
@@ -4919,14 +6080,20 @@ impl<'r> SemanticBuilder<'r> {
                     }
                     addressing => addressing,
                 };
-                self.carry(
+                let output = self.carry(
                     CarryOwner::New,
                     scope,
                     port,
                     published,
                     addressing,
                     Continuity::Continues,
-                )
+                );
+                // THE READ IS WHERE THIS OCCURRENCE BEGINS. What stands
+                // behind the position is the definition every read of it
+                // shares; a rebuild judged over that would find two reads of
+                // one definition standing over the same thing.
+                self.registry.relations().record_read_boundary(output);
+                output
             })
             .collect();
         let result = self.store(scope, Interface::of(ports))?;
@@ -5228,6 +6395,7 @@ impl<'r> SemanticBuilder<'r> {
                             Continuity::Republishes
                         },
                         matches!(naming, Naming::Inherited | Naming::Hygienic),
+                        CarriedValue::Same,
                         |_| {},
                     )
                 }
@@ -5280,7 +6448,7 @@ fn scope_of_form(registry: &Registry, form: &RelForm<'_>) -> ScopeId {
                 registry.anonymous_scope(spec.answers_to)
             }
         },
-        RelForm::Anonymous(spec) => registry.anonymous_scope(spec.answers_to),
+        RelForm::Anonymous(spec) => registry.anonymous_scope(spec.answers_to()),
         RelForm::Opaque => registry.opaque_scope(),
         // A transparent step creates no occurrence at all, so asking for
         // one is asking the wrong question; the anonymous birth is what an
@@ -5390,6 +6558,45 @@ fn inputs_of<'a>(form: &'a RelForm<'a>) -> Vec<&'a SemanticRelation> {
     }
 }
 
+/// Whether a form REPUBLISHES its one operand: the same rows, under this
+/// relation's own positions — a projection, export, access, rename,
+/// reposition, cover, ordering or ER boundary. Everything that combines
+/// operands, changes the bag, begins a new occurrence or has no operand
+/// answers no. A witness answers no: an existence witness collapses its
+/// operand to one verdict row, and a signed witness totalizes an empty
+/// operand into a proxy row. Exhaustive: a new form says which it is.
+fn republishes(form: &RelForm<'_>) -> bool {
+    match form {
+        RelForm::Export(_)
+        | RelForm::Access(_)
+        | RelForm::Project(_)
+        | RelForm::Embed(_)
+        | RelForm::ErBoundary(_)
+        | RelForm::Rename(_)
+        | RelForm::Reposition(_)
+        | RelForm::ProjectOut(_)
+        | RelForm::Cover(_)
+        | RelForm::Order(_) => true,
+        RelForm::Witness(_)
+        | RelForm::SignedWitness(_)
+        | RelForm::Source(_)
+        | RelForm::Anonymous(_)
+        | RelForm::Opaque
+        | RelForm::Group(_)
+        | RelForm::Join(_)
+        | RelForm::Set(_)
+        | RelForm::Minus(_)
+        | RelForm::Instantiate(_)
+        | RelForm::PlanRead(_)
+        | RelForm::Destructure(_)
+        | RelForm::Drill(_)
+        | RelForm::Narrow(_)
+        | RelForm::Interior(_)
+        | RelForm::Meta(_)
+        | RelForm::Scratch(_) => false,
+    }
+}
+
 /// The lexical scope an export reason determines. Exhaustive: a new road
 /// has no scope until it states one.
 fn scope_of_export(registry: &Registry, input: ScopeId, why: ExportWhy) -> ScopeId {
@@ -5400,7 +6607,6 @@ fn scope_of_export(registry: &Registry, input: ScopeId, why: ExportWhy) -> Scope
         ExportWhy::Cte { role, label } => {
             registry.cte_scope(input, cte_role(role), cte_label(label))
         }
-        ExportWhy::ErHop { hop } => registry.er_hop_scope(input, hop, "hop"),
         ExportWhy::EmissionAlias => registry.emission_alias_scope(input),
     }
 }
@@ -5409,11 +6615,7 @@ fn scope_of_export(registry: &Registry, input: ScopeId, why: ExportWhy) -> Scope
 /// the road; it has no spelling for what the road does to owners.
 fn boundary_of_export(why: ExportWhy) -> CarryOwner {
     match why {
-        // AN ER HOP CONSUMES NOTHING, for the same reason a join does not:
-        // the hop's heading IS its endpoints' columns, and the path's
-        // composition asks each column which endpoint it belongs to. A hop
-        // that took ownership would leave every column belonging to the hop.
-        ExportWhy::EmissionAlias | ExportWhy::ErHop { .. } => CarryOwner::Preserve,
+        ExportWhy::EmissionAlias => CarryOwner::Preserve,
         ExportWhy::Alias { .. } | ExportWhy::Bound { .. } => CarryOwner::New,
         ExportWhy::Stage | ExportWhy::Cte { .. } => CarryOwner::New,
     }
@@ -5533,7 +6735,6 @@ fn output_boundary(form: &RelForm<'_>) -> OutputBoundary {
             super::form::ExportWhy::Alias { .. }
             | super::form::ExportWhy::Bound { .. }
             | super::form::ExportWhy::Cte { .. }
-            | super::form::ExportWhy::ErHop { .. }
             | super::form::ExportWhy::EmissionAlias => OutputBoundary::Publishing,
         },
         RelForm::Source(_)
@@ -5634,12 +6835,11 @@ fn padding(slot: usize, arm: usize, arms: usize) -> super::port::PaddingId {
 /// every name the result does has no column for a slot, and there is no
 /// typed null for this operator to put there.
 fn smart_name_error() -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "set_operation/column_name_mismatch",
-        "smart union (|;|) requires every operand to publish the same names, \
-         and one operand does not publish every name the result has",
-        "rename the operands to agree, or use `;` which pads by name",
-    )
+    DelightQLError::from(SetOperation::ColumnNameMismatch {
+        message: "smart union (|;|) requires every operand to publish the same names, \
+         and one operand does not publish every name the result has"
+            .to_string(),
+    })
 }
 
 /// A width disagreement under an exact alignment.
@@ -5648,12 +6848,10 @@ fn smart_name_error() -> DelightQLError {
 /// and category are the set operator's own, because the operator is what
 /// the author wrote and what a report has to name.
 fn exact_width_error(left: usize, right: usize) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "set_operation/column_count_mismatch",
-        format!(
+    DelightQLError::from(SetOperation::ColumnCountMismatch {
+        message: format!(
             "Set operation requires both sides to have the same number of columns, \
              but left has {left} and right has {right}"
         ),
-        "Positional union column count mismatch",
-    )
+    })
 }

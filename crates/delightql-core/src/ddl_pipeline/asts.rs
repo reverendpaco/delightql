@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::diagnostic::{DelightQLError, Manifest};
 use crate::pipeline::asts::core::expressions::domain::DomainExpression;
 use crate::pipeline::asts::core::expressions::truth::TruthExpression;
 use crate::pipeline::asts::core::{Resolved, Unresolved};
@@ -32,15 +33,13 @@ impl GeneratedKind {
         match raw.to_ascii_lowercase().as_str() {
             "virtual" => Ok(Self::Virtual),
             "stored" => Ok(Self::Stored),
-            _ => Err(crate::DelightQLError::validation_error_categorized(
-                "imprint/manifest/generated_kind",
-                format!(
+            _ => Err(DelightQLError::from(Manifest::GeneratedKind {
+                message: format!(
                     "generated column kind '{}' is not recognized; valid values are \
                      \"virtual\" or \"stored\"",
                     raw
                 ),
-                "use \"virtual\" or \"stored\" in the generated column of defaults()",
-            )),
+            })),
         }
     }
 }

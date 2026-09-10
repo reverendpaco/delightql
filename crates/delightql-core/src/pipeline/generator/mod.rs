@@ -595,6 +595,24 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         }
     }
 
+    /// The spelling a user callee takes on this dialect: bare where the
+    /// target accepts the word as a function name, delimited where its
+    /// parser would refuse the call (`identifiers::callee_needs_quoting`).
+    fn callee_spelling(&self, name: &str) -> Result<String, GeneratorError> {
+        let mut spelled = String::new();
+        if identifiers::callee_needs_quoting(name, self.config.dialect) {
+            identifiers::write_delimited(
+                &mut spelled,
+                name,
+                self.config.dialect,
+                &self.config.dialect_pack,
+            )?;
+        } else {
+            spelled.push_str(name);
+        }
+        Ok(spelled)
+    }
+
     /// Emit a `name(args)` call with the canonical shape (parens, DISTINCT,
     /// comma-joined args).
     fn write_fn_call(
@@ -1526,13 +1544,22 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                             };
                             self.generate_domain_expression(sql, arg, at)?;
                         } else {
-                            self.write_fn_call(
-                                sql,
-                                canonical_name.expect("a callable function has a spelling"),
-                                args,
-                                *distinct,
-                                at,
-                            )?;
+                            // A USER callee is an admitted name and owes the
+                            // target a lawful call: delimited exactly where
+                            // this dialect refuses the bare word as a call.
+                            // An intrinsic's canonical spelling is target
+                            // syntax and is written as it is.
+                            let spelled = match name {
+                                crate::pipeline::sql_ast::FunctionName::User(user) => {
+                                    self.callee_spelling(user)?
+                                }
+                                crate::pipeline::sql_ast::FunctionName::Intrinsic(_) => {
+                                    canonical_name
+                                        .expect("a callable function has a spelling")
+                                        .to_string()
+                                }
+                            };
+                            self.write_fn_call(sql, &spelled, args, *distinct, at)?;
                         }
                     }
                 }
@@ -1545,8 +1572,10 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                 order_by,
                 frame,
             } => {
-                // Function call
-                sql.push_str(name);
+                // Function call — a window callee is an admitted name like
+                // any other and takes the same per-dialect callee law.
+                let spelled = self.callee_spelling(name)?;
+                sql.push_str(&spelled);
                 sql.push('(');
                 if *distinct {
                     sql.push_str("DISTINCT ");

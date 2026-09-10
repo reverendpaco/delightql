@@ -2,6 +2,7 @@
 // Copyright 2026 Daniel Eklund
 //! The durable resolver core and its catalog readers.
 
+use crate::diagnostic::{Internal, Operational, Runtime};
 use crate::error::DelightQLError;
 use crate::pipeline::ast_resolved::NamespacePath;
 use crate::pipeline::resolver::DatabaseSchema;
@@ -79,15 +80,13 @@ impl<'a> ResolverCore<'a> {
             1 => Ok(self.connection_ids.iter().next().copied()),
             _ => {
                 let ids: Vec<_> = self.connection_ids.iter().collect();
-                Err(DelightQLError::validation_error_categorized(
-                    "operational/federation-prohibited",
-                    format!(
+                Err(DelightQLError::from(Operational::FederationProhibited {
+                    message: format!(
                         "Query references tables from multiple database connections ({:?}). \
                          Cross-connection joins are not supported.",
                         ids
                     ),
-                    "Cross-connection join detected",
-                ))
+                }))
             }
         }
     }
@@ -130,6 +129,7 @@ impl<'a> DatabaseRegistry<'a> {
                         .intern(col.name.as_str(), col.name.is_stropped()),
                 ),
                 declared_type: col.declared_type.clone(),
+                interior: col.interior,
             })
             .collect();
         self.identities
@@ -302,6 +302,7 @@ impl<'a> DatabaseRegistry<'a> {
                 nullable: attribute.is_nullable,
                 position: (attribute.position + 1) as usize,
                 declared_type: (!attribute.data_type.is_empty()).then_some(attribute.data_type),
+                interior: false,
             })
             .collect();
         let scope = self.catalog_heading(
@@ -477,15 +478,12 @@ impl<'a> DatabaseRegistry<'a> {
                         table_name
                     );
                     let system = self.system.ok_or_else(|| {
-                        crate::error::DelightQLError::validation_error(
-                            "No system available",
-                            "Cannot introspect bootstrap connection without system reference",
-                        )
+                        Internal::invariant("resolution::registry", "No system available")
                     })?;
 
                     let bootstrap_conn = system.get_bootstrap_connection();
                     let conn = bootstrap_conn.lock().map_err(|e| {
-                        crate::error::DelightQLError::connection_poison_error(
+                        Runtime::poisoned(
                             "Failed to acquire bootstrap connection lock",
                             format!("Connection was poisoned: {}", e),
                         )
@@ -494,7 +492,7 @@ impl<'a> DatabaseRegistry<'a> {
                     // Use PRAGMA table_xinfo to get column information (includes generated columns)
                     let query = format!("PRAGMA table_xinfo('{}')", table_name);
                     let mut stmt = conn.prepare(&query).map_err(|e| {
-                        crate::error::DelightQLError::database_error(
+                        Runtime::catalog(
                             format!("Failed to prepare PRAGMA query: {}", e),
                             e.to_string(),
                         )
@@ -512,10 +510,11 @@ impl<'a> DatabaseRegistry<'a> {
                                 nullable: notnull == 0,
                                 position: (cid + 1) as usize,
                                 declared_type: (!decltype.is_empty()).then_some(decltype),
+                                interior: false,
                             })
                         })
                         .map_err(|e| {
-                            crate::error::DelightQLError::database_error(
+                            Runtime::catalog(
                                 format!("Failed to query table_info: {}", e),
                                 e.to_string(),
                             )
@@ -523,7 +522,7 @@ impl<'a> DatabaseRegistry<'a> {
                         .collect();
 
                     let cols = cols.map_err(|e| {
-                        crate::error::DelightQLError::database_error(
+                        Runtime::catalog(
                             format!("Failed to fetch column info: {}", e),
                             e.to_string(),
                         )
@@ -803,9 +802,7 @@ impl<'s> ConsultRegistry<'s> {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to probe for declared modes", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to probe for declared modes", e.to_string()))?;
         let answer = exists != 0;
         self.any_mode.set(Some(answer));
         Ok(answer)
@@ -876,16 +873,17 @@ impl<'s> ConsultRegistry<'s> {
         entity_id: i32,
     ) -> rusqlite::Result<Vec<HoParamInfo>> {
         let mut stmt = conn.prepare(
-            "SELECT id, param_name, kind FROM ho_param
+            "SELECT id, param_name, kind, stropped FROM ho_param
              WHERE entity_id = ?1
              ORDER BY position",
         )?;
-        let rows: Vec<(i32, String, String)> = stmt
+        let rows: Vec<(i32, String, String, bool)> = stmt
             .query_map(rusqlite::params![entity_id], |row| {
                 Ok((
                     row.get::<_, i32>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             })?
             .filter_map(|r| r.ok())
@@ -893,8 +891,14 @@ impl<'s> ConsultRegistry<'s> {
 
         use crate::pipeline::asts::core::definitions::{HeadItem, HeadItems};
         let mut params = Vec::new();
-        for (hp_id, name, kind_str) in rows {
-            let identifier = delightql_types::SqlIdentifier::new(name.clone());
+        for (hp_id, name, kind_str, stropped) in rows {
+            // THE DECLARED IDENTIFIER IS REBUILT AS WRITTEN: a stropped name
+            // compares verbatim, an unstropped one folds.
+            let identifier = if stropped {
+                delightql_types::SqlIdentifier::stropped(name.clone())
+            } else {
+                delightql_types::SqlIdentifier::new(name.clone())
+            };
             params.push(match kind_str.as_str() {
                 "glob" => HoParamInfo::Relation {
                     name: identifier,
@@ -903,14 +907,22 @@ impl<'s> ConsultRegistry<'s> {
                 "argumentative" => {
                     // Read column names for this argumentative param
                     let mut col_stmt = conn.prepare(
-                        "SELECT column_name FROM ho_param_column
+                        "SELECT column_name, stropped FROM ho_param_column
                          WHERE ho_param_id = ?1
                          ORDER BY column_position",
                     )?;
                     let columns: Vec<HeadItem> = col_stmt
-                        .query_map(rusqlite::params![hp_id], |row| row.get::<_, String>(0))?
+                        .query_map(rusqlite::params![hp_id], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                        })?
                         .filter_map(|r| r.ok())
-                        .map(HeadItem::plumb)
+                        .map(|(column, stropped)| {
+                            HeadItem::plumb(if stropped {
+                                delightql_types::SqlIdentifier::stropped(column)
+                            } else {
+                                delightql_types::SqlIdentifier::new(column)
+                            })
+                        })
                         .collect();
                     HoParamInfo::Relation {
                         name: identifier,
@@ -958,7 +970,7 @@ impl<'s> ConsultRegistry<'s> {
                  WHERE entity_id = ?1 ORDER BY role, position",
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     "Failed to prepare functional dependency read",
                     e.to_string(),
                 )
@@ -972,19 +984,14 @@ impl<'s> ConsultRegistry<'s> {
                     row.get::<_, i64>(3)?,
                 ))
             })
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to read functional dependency",
-                    e.to_string(),
-                )
-            })?
+            .map_err(|e| Runtime::catalog("Failed to read functional dependency", e.to_string()))?
             // A declaration is read whole or not at all. An unreadable row
             // silently omitted would narrow a mode nobody narrowed.
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "corrupt catalog: a functional dependency row could not be read",
-                    e.to_string(),
+                Internal::invariant(
+                    "resolution::registry",
+                    format!("corrupt catalog: a functional dependency row could not be read: {e}"),
                 )
             })?;
         let mut inputs = Vec::new();
@@ -994,10 +1001,12 @@ impl<'s> ConsultRegistry<'s> {
                 0 => delightql_types::SqlIdentifier::new(name),
                 1 => delightql_types::SqlIdentifier::stropped(name),
                 other => {
-                    return Err(DelightQLError::database_error(
-                        "corrupt catalog: a functional dependency's stropping is neither \
-                         stropped nor unstropped",
-                        other.to_string(),
+                    return Err(Internal::invariant(
+                        "resolution::registry",
+                        format!(
+                            "corrupt catalog: a functional dependency's stropping is neither \
+                         stropped nor unstropped: {other}"
+                        ),
                     ))
                 }
             };
@@ -1005,27 +1014,24 @@ impl<'s> ConsultRegistry<'s> {
                 match role.as_str() {
                     "input" => &mut inputs,
                     "output" => &mut outputs,
-                    other => return Err(DelightQLError::database_error(
-                        "corrupt catalog: a functional dependency role is neither input nor output",
-                        other.to_string(),
-                    )),
+                    other => return Err(Internal::invariant("resolution::registry", format!("corrupt catalog: a functional dependency role '{other}' is neither input nor output"))),
                 };
             // The read is ordered by position, so each row's position must be
             // the next one. A gap or a repeat means the stored order is not
             // the declared order, and the selected POSITION is chosen by it.
             if position != side.len() as i64 {
-                return Err(DelightQLError::database_error(
+                return Err(Internal::invariant(
+                    "resolution::registry",
                     "corrupt catalog: a functional dependency's positions are not the \
                      declared order",
-                    format!("{role} at position {position}"),
                 ));
             }
             side.push(identifier);
         }
         if inputs.is_empty() || outputs.is_empty() {
-            return Err(DelightQLError::database_error(
+            return Err(Internal::invariant(
+                "resolution::registry",
                 "corrupt catalog: a declared mode has no inputs or no outputs",
-                format!("{} input(s), {} output(s)", inputs.len(), outputs.len()),
             ));
         }
         Ok(DeclaredMode { inputs, outputs })

@@ -247,7 +247,28 @@ module.exports = grammar({
       choice(/[a-zA-Z_][a-zA-Z0-9_]*/, seq('`', /[^`\n]*/, '`')),
     )),
 
-    identifier: $ => choice($._classic_ident, $.stropped_form),
+    // WORDS ARE NOT RESERVED. Every keyword token is an identifier where the
+    // grammar reaches one; a keyword's own production is preferred only where
+    // both readings survive the whole parse (`null` alone is the literal,
+    // `null:()` a call, `null.x` a qualified reference; `as` after a relation
+    // is the alias operator, `as(*)` a relation). The negative dynamic
+    // precedence is that tie-break, never a lexical classification.
+    identifier: $ => choice($._classic_ident, $.stropped_form, $._keyword_as_identifier),
+
+    _keyword_as_identifier: $ => prec.dynamic(-1, choice(
+      $.as_keyword,
+      $.and_keyword,
+      $.or_keyword,
+      $.not_keyword,
+      $.in_keyword,
+      $.of_keyword,
+      $.null,
+      $.boolean,
+      'has',
+      'rows',
+      'range',
+      'groups',
+    )),
 
     _classic_ident: $ => /[a-zA-Z_][a-zA-Z0-9_]*/,
 
@@ -1110,7 +1131,9 @@ module.exports = grammar({
       field('body', $.sigma_body),
     ),
 
-    sigma_body: $ => $.truth_expression,
+    // A TRUTH-ONLY POSITION: the comma spells conjunction here (the
+    // `_enclosed_truth` note in the truth section).
+    sigma_body: $ => $._enclosed_truth,
 
     // A relational clause body is a complete `relex`: its optional let block
     // holds clause-local CTEs and CFEs. A definition does not narrow its body
@@ -1179,10 +1202,13 @@ module.exports = grammar({
     ),
     scalar_param: $ => $.identifier,
 
+    // THE PARAMETER LIST MAY BE EMPTY: `pi:() :- 3.14159` and the paren-less
+    // `pi :- 3.14159` define one zero-argument value function (FN.28), and
+    // `:pi` / `pi:()` invoke either.
     function_rule: $ => seq(
       field('name', $.predicate_identifier),
       ':(',
-      commaSep1($, $.function_param),
+      optional(commaSep1($, $.function_param)),
       ')',
       $.definition_neck,
       optional($.doc_slot),
@@ -1781,8 +1807,14 @@ module.exports = grammar({
     ),
 
     // The nullary consumer — normalizes to the zero-argument application and
-    // is never ground.
-    citation: $ => seq(':', field('callee', $.callee)),
+    // is never ground. THE MARK BELONGS TO THE LEAF: a qualified citation is
+    // `ns::math.:pi`, the namespace where the application form puts it
+    // (`ns::math.pi:()`); `:ns::math.pi` is not a spelling of anything.
+    citation: $ => seq(
+      optional(field('namespace', $.namespace_qual)),
+      ':',
+      field('name', $.identifier),
+    ),
 
     // `<~` is one glyph, two carriers: the group delegate and this window
     // context. Related by lowering, never merged in meaning.
@@ -1943,15 +1975,15 @@ module.exports = grammar({
       optional(seq(';', $.default_arm)),
     ),
 
-    // `,` as `and` is scoped here: FN.30 admits the comma spelling of
-    // conjunction in case-arm conditions only.
     searched_arm: $ => seq(
       field('condition', $.arm_condition),
       $.arrow,
       field('result', $.domain_expression),
     ),
 
-    arm_condition: $ => commaSep1($, $.truth_expression),
+    // A TRUTH-ONLY POSITION: the arrow closes it, so the comma spells
+    // conjunction here as it does in a sigma body (`_enclosed_truth`).
+    arm_condition: $ => $._enclosed_truth,
 
     default_arm: $ => seq($.disregarded, $.arrow, field('result', $.domain_expression)),
 
@@ -2163,9 +2195,16 @@ module.exports = grammar({
     // Truth position
     // =====================================================================
 
-    // TWO STRATA, ONE SUPERTYPE. The strata are hidden so the supertype keeps
-    // all its members; the crossing admits them at different value tiers.
-    truth_expression: $ => choice($._infix_truth, $._non_infix_truth),
+    // A TRUTH IS A CONNECTIVE OPERAND OR A CONNECTIVE RUN. The operand rule is
+    // hidden, so the supertype keeps every concrete member; the two strata
+    // below are the CROSSING's admission tiers over the same members, and
+    // are hidden for the same reason.
+    truth_expression: $ => choice(
+      $._connective_operand,
+      $.conjunction_expression,
+      $.disjunction_expression,
+      $.mixed_connective_run,
+    ),
 
     // The forms open on at least one side. Not operands: they cross into
     // value position only as a whole value, and re-enter operand position
@@ -2175,6 +2214,7 @@ module.exports = grammar({
       $.heading_correlation,
       $.conjunction_expression,
       $.disjunction_expression,
+      $.mixed_connective_run,
       $.membership,
       $.relational_membership,
     ),
@@ -2215,15 +2255,84 @@ module.exports = grammar({
       token.immediate('|'),
     ),
 
-    // n-ary Vec carriers — associativity makes nesting meaningless.
-    conjunction_expression: $ => prec.left(seq(
-      $.truth_expression,
-      repeat1(seq($.and_keyword, $.truth_expression)),
-    )),
+    // NO PEMDAS AT THE CONNECTIVE TIER. A connective composes operands that
+    // are themselves connective-free: a comparison, a membership, a
+    // correlation, or a form closed by its own token. Two different
+    // connectives therefore never meet in one conjunction or disjunction —
+    // `a or b and c` has no reading, exactly as `a + b * c` has none — and
+    // the reading is stated with parentheses. One connective repeats freely: the carrier is
+    // n-ary because associativity makes that nesting meaningless. Equal
+    // precedence between the two rules is not a substitute: it would still
+    // choose a reading, silently. The rule is hidden and reached from
+    // `truth_expression` by ONE reduction, so a comparison forks only where
+    // the crossing already forks it — a wider fork here drives the runtime's
+    // end-of-input recovery past its version cap.
+    _connective_operand: $ => choice(
+      $.comparison,
+      $.heading_correlation,
+      $.membership,
+      $.relational_membership,
+      $._non_infix_truth,
+    ),
+
+    conjunction_expression: $ => seq(
+      $._connective_operand,
+      repeat1(seq($.and_keyword, $._connective_operand)),
+    ),
 
     disjunction_expression: $ => choice(
-      prec.left(seq($.truth_expression, repeat1(seq($.or_keyword, $.truth_expression)))),
+      seq($._connective_operand, repeat1(seq($.or_keyword, $._connective_operand))),
       seq('(', $.truth_expression, repeat1(seq($.corresponding_union_sigil, $.truth_expression)), ')'),
+    ),
+
+    // THE MIXTURE IS RECOGNIZED TO BE REFUSED. `a and b or c` has no reading,
+    // and the refusal must name the two connectives the author wrote wherever
+    // the run stands — a query predicate, a consulted clause, a clause beside
+    // a lawful sibling — so the run is a witness node like `renamed_slot`:
+    // recognized so the teaching is exact and owned by the truth it stands
+    // in, never normalized. A run of one connective is never this node; the
+    // first connective that differs from the run's first is what makes one,
+    // in either order, and the run then continues under either word.
+    mixed_connective_run: $ => choice(
+      seq(
+        $._connective_operand,
+        repeat1(seq($.and_keyword, $._connective_operand)),
+        $.or_keyword,
+        $._connective_operand,
+        repeat(seq(choice($.and_keyword, $.or_keyword), $._connective_operand)),
+      ),
+      seq(
+        $._connective_operand,
+        repeat1(seq($.or_keyword, $._connective_operand)),
+        $.and_keyword,
+        $._connective_operand,
+        repeat(seq(choice($.and_keyword, $.or_keyword), $._connective_operand)),
+      ),
+    ),
+
+    // A TRUTH-ONLY POSITION. Nothing but a truth stands here — no relational
+    // member to join, no argument row or parameter list to separate — so the
+    // comma has one meaning left, conjunction, and spells it beside `and`.
+    // The run is ONE `conjunction_expression` node whichever separator each
+    // gap uses; the separator children keep the authored spelling. The
+    // keyword-only run stays `truth_expression`'s own conjunction, so this
+    // production is the one with a comma in it and no run derives twice.
+    // A comma joining a relational member (`comma_continuation`) is not this
+    // position, and the mixture of a comma with `or` has no derivation here
+    // for the same reason `and` with `or` has none.
+    _enclosed_truth: $ => choice(
+      $.truth_expression,
+      alias($._comma_conjunction, $.conjunction_expression),
+    ),
+
+    // At least one comma, wherever it falls: an `and`-joined prefix, the
+    // first comma, then the run under either separator.
+    _comma_conjunction: $ => seq(
+      repeat(seq($._connective_operand, $.and_keyword)),
+      $._connective_operand,
+      $.comma_sigil,
+      $._connective_operand,
+      repeat(seq(choice($.comma_sigil, $.and_keyword), $._connective_operand)),
     ),
 
     // The parens are part of the form.

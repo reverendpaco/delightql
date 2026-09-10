@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::diagnostic::{Constraint, Internal, Join, Parse};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::refined::{self, JoinType};
 use crate::pipeline::asts::resolved;
@@ -21,7 +22,10 @@ pub(super) fn rebuild_join_segment(
 ) -> Result<refined::Chain> {
     // Start with the first table
     if analyzed.tables.is_empty() {
-        return Err(DelightQLError::parse_error("No tables in segment"));
+        return Err(Internal::invariant(
+            "refiner::join_builder",
+            "No tables in segment",
+        ));
     }
 
     // Validate outer join markers before processing (only at top level)
@@ -46,6 +50,20 @@ pub(super) fn rebuild_join_segment(
     )?;
     let mut table_idx = 1;
 
+    // THE REBUILD IS THE AUTHORITY'S OPERATION. It stood over the tables it
+    // flattened out of the operand and emits them again; the authority is
+    // opened over those occurrences, derives every join over the next of
+    // them, and certifies — for each resolver-era intermediate and for the
+    // operand — only the product it derived itself. Nothing here states a
+    // relationship for a later reader to trust.
+    let over: Vec<_> = analyzed
+        .tables
+        .iter()
+        .map(|table| table.stood_over())
+        .collect();
+    let mut rebuild = identities.authority().rebuilding(analyzed.operand, &over)?;
+    rebuild.begins_with(&result)?;
+
     // Process operators left to right (CPR-ltr semantics)
     for (op_idx, op) in analyzed.operators.iter().enumerate() {
         let flattener::FlatOperatorKind::Join { correlation } = &op.kind;
@@ -59,7 +77,13 @@ pub(super) fn rebuild_join_segment(
             &mut op_predicates,
             danger_gates,
             identities,
+            &mut rebuild,
         )?;
+        // EACH INTERMEDIATE REBUILD SAYS WHAT IT REPLACED TOO. The next
+        // operator's correspondence was written against the resolver's
+        // intermediate result, and this record is what translates it onto
+        // the rebuilt operand.
+        rebuild.replaces(op.result, &new_result)?;
         result = new_result;
         table_idx = new_table_idx;
     }
@@ -67,18 +91,7 @@ pub(super) fn rebuild_join_segment(
     // Apply any top-level filters
     result = apply_top_level_filters(result, &mut op_predicates, identities)?;
 
-    // THE REBUILD SAYS WHAT IT REPLACED. It stood over the tables it
-    // flattened out of the operand and emitted them again, so it is the one
-    // thing that knows which sources relate the two — and it states them
-    // here rather than leaving a later reader to notice a resemblance.
-    let over: Vec<_> = analyzed
-        .tables
-        .iter()
-        .map(|table| table.stood_over())
-        .collect();
-    identities
-        .authority()
-        .replacing(analyzed.operand, &over, result)
+    rebuild.finish(result)
 }
 
 /// Process a single join operator
@@ -91,10 +104,14 @@ pub(super) fn process_single_join(
     op_predicates: &mut HashMap<OperatorRef, Vec<AnalyzedPredicate>>,
     danger_gates: &crate::pipeline::danger_gates::DangerGateMap,
     identities: &crate::relation::Planning,
+    rebuild: &mut crate::relation::builder::Rebuild<'_>,
 ) -> Result<(refined::Chain, usize)> {
     // Get the right table for this join
     if table_idx >= analyzed.tables.len() {
-        return Err(DelightQLError::parse_error("Not enough tables for join"));
+        return Err(Internal::invariant(
+            "refiner::join_builder",
+            "Not enough tables for join",
+        ));
     }
 
     let right_table = table_to_refined(
@@ -117,24 +134,16 @@ pub(super) fn process_single_join(
     let join_type = determine_join_type(analyzed, table_idx);
 
     if !leftover_conditions.is_empty() && join_type != JoinType::Inner {
-        return Err(crate::error::DelightQLError::validation_error_categorized(
-            "join/using/extra_condition",
-            "a USING-style join with an additional multi-relation condition \
+        return Err(DelightQLError::from(Join::UsingExtraCondition {
+            message: "a USING-style join with an additional multi-relation condition \
 is not expressible for an outer join: USING has no ON clause to carry it, \
-and WHERE placement would change which rows match",
-            "write the join fully explicitly: replace .(cols) with equality \
-predicates alongside the extra condition",
-        ));
+and WHERE placement would change which rows match"
+                .to_string(),
+        }));
     }
 
-    // Build the join with proper schema
-    let join_expr = create_join(
-        result,
-        right_table,
-        correlation,
-        Some(join_type),
-        identities,
-    )?;
+    // THE JOIN IS THE REBUILD'S OWN DERIVATION over the next occurrence.
+    let join_expr = rebuild.join(result, right_table, correlation, Some(join_type))?;
 
     // Inner join: the leftovers filter the joined rows — WHERE placement
     // is exactly equivalent to ON for an inner join.
@@ -221,46 +230,6 @@ pub(super) fn build_correlation(
     })
 }
 
-pub(super) fn create_join(
-    left: refined::Chain,
-    right: refined::Chain,
-    correlation: refined::MemberCorrelation,
-    join_type: Option<JoinType>,
-    identities: &crate::relation::Planning,
-) -> Result<refined::Chain> {
-    let jt = join_type.unwrap_or(JoinType::Inner);
-    // A CORRESPONDENCE MERGES POSITIONS, and the join it stands on is the
-    // one the resolver already derived. Rebuilding with an empty merge list
-    // and an inner kind would publish the right operand's shared columns a
-    // second time, so the rebuilt relation would not stand where the
-    // resolved one stood and every reference through it would move.
-    let merged = match &correlation {
-        refined::MemberCorrelation::Correspond(correspondence) => correspondence.pairs.clone(),
-        refined::MemberCorrelation::Condition(_) | refined::MemberCorrelation::Cartesian(_) => {
-            Vec::new()
-        }
-    };
-    let right_relation = right.semantic_relation();
-    // ONE DESCRIPTION: the variant says both what the step is and the law
-    // its result comes from, and the left operand is the chain's own.
-    identities.authority().extend(
-        left,
-        crate::relation::builder::StepOp::Join {
-            rhs: right,
-            correlation,
-            join_type: Some(jt.clone()),
-            right: right_relation,
-            kind: match jt {
-                JoinType::LeftOuter => crate::relation::form::JoinKind::LeftOuter,
-                JoinType::RightOuter => crate::relation::form::JoinKind::RightOuter,
-                JoinType::FullOuter => crate::relation::form::JoinKind::FullOuter,
-                JoinType::Inner => crate::relation::form::JoinKind::Inner,
-            },
-            merged: &merged,
-        },
-    )
-}
-
 pub(super) fn determine_join_type(analyzed: &AnalyzedSegment, table_idx: usize) -> JoinType {
     // Markedness, not comma position, determines join role: the unmarked
     // tables form the required core; each ?-marked table LEFT-joins onto
@@ -316,13 +285,13 @@ fn validate_outer_join_markers(
             "ERROR: Standalone relation with outer marker: {:?}",
             analyzed.tables[0].relation
         );
-        return Err(DelightQLError::parse_error(
-            "Outer join marker on standalone relation\n\n\
+        return Err(DelightQLError::from(Constraint::Join {
+            message: "Outer join marker on standalone relation\n\n\
             The table has an outer join marker (?, <, or >) but there are no other tables\n\
             to join it to. Outer join markers require at least one join operation.\n\n\
             Remove the marker from the relation."
                 .to_string(),
-        ));
+        }));
     }
 
     // Rule 2: FULL OUTER — the all-marked case — requires a join
@@ -356,9 +325,8 @@ fn validate_outer_join_markers(
                 .unwrap_or(false);
 
         if !has_correlation {
-            return Err(DelightQLError::parse_error_categorized(
-                "general",
-                format!(
+            return Err(DelightQLError::from(Parse::General {
+                message: format!(
                     "FULL OUTER JOIN requires an explicit join condition\n\n\
                 Every relation in this chain is marked optional (?), which makes\n\
                 the join FULL OUTER — but a pair of adjacent relations has no\n\
@@ -370,7 +338,7 @@ fn validate_outer_join_markers(
                 Affected relation identities: {:?} and {:?}",
                     left_table.relation, right_table.relation,
                 ),
-            ));
+            }));
         }
     }
 

@@ -5,6 +5,7 @@
 /// Provides a unified interface for SQLite, siso, and fatboy connections
 use anyhow::Result;
 use delightql_backends::SqliteConnectionManager;
+use delightql_types::diagnostic::{Client, DelightQLError, Mount};
 use delightql_types::DatabaseConnection;
 use std::sync::{Arc, Mutex};
 
@@ -59,18 +60,27 @@ pub enum Route {
 
 /// Classify a `--db` / mount input. `via` is the mechanism override
 /// (`--via`); it applies to postgres resources (fatboy | siso).
-pub fn classify(input: &str, via: Option<&str>) -> Result<Route> {
+/// A locator this session cannot open, as the typed mount refusal.
+fn locator(message: String) -> DelightQLError {
+    Mount::Locator { message }.into()
+}
+
+pub fn classify(input: &str, via: Option<&str>) -> delightql_types::Result<Route> {
     if let Some(v) = via {
         if !matches!(v, "fatboy" | "siso") {
-            anyhow::bail!("unknown --via '{v}' (known mechanisms: fatboy, siso)");
+            return Err(Client::Argument {
+                message: format!("unknown --via '{v}' (known mechanisms: fatboy, siso)"),
+            }
+            .into());
         }
     }
 
     if let Some(rest) = input.strip_prefix("delightql-siso://") {
         if rest.is_empty() {
-            anyhow::bail!(
+            return Err(locator(
                 "delightql-siso:// needs a profile: delightql-siso://<profile>[/<target>]"
-            );
+                    .to_string(),
+            ));
         }
         return Ok(Route::Siso {
             rest: rest.to_string(),
@@ -83,13 +93,13 @@ pub fn classify(input: &str, via: Option<&str>) -> Result<Route> {
         return match scheme.as_str() {
             "postgres" | "postgresql" => {
                 let url = url::Url::parse(input)
-                    .map_err(|e| anyhow::anyhow!("'{input}': not a valid postgres URL: {e}"))?;
+                    .map_err(|e| locator(format!("'{input}': not a valid postgres URL: {e}")))?;
                 if url.password().is_some() {
-                    anyhow::bail!(
+                    return Err(locator(format!(
                         "'{input}': passwords are never accepted in connection URLs \
                          (they would persist into session metadata). Set PGPASSWORD \
                          in the environment instead."
-                    );
+                    )));
                 }
                 let display_db = url.path().trim_start_matches('/').to_string();
                 match via {
@@ -110,20 +120,22 @@ pub fn classify(input: &str, via: Option<&str>) -> Result<Route> {
             "file" => {
                 // RFC 8089: file:///path (empty authority) or file://localhost/path.
                 let url = url::Url::parse(input)
-                    .map_err(|e| anyhow::anyhow!("'{input}': not a valid file URL: {e}"))?;
+                    .map_err(|e| locator(format!("'{input}': not a valid file URL: {e}")))?;
                 match url.host_str() {
                     None | Some("") | Some("localhost") => {}
-                    Some(h) => anyhow::bail!(
-                        "'{input}': file URLs with a remote host ('{h}') are not \
-                         supported — file:///absolute/path only."
-                    ),
+                    Some(h) => {
+                        return Err(locator(format!(
+                            "'{input}': file URLs with a remote host ('{h}') are not \
+                             supported — file:///absolute/path only."
+                        )))
+                    }
                 }
                 classify_file_path(url.path(), via)
             }
-            other => anyhow::bail!(
+            other => Err(locator(format!(
                 "'{input}': unsupported URI scheme '{other}://'. Known: \
                  postgres://, file://, delightql-siso://, or a plain file path."
-            ),
+            ))),
         };
     }
 
@@ -131,12 +143,15 @@ pub fn classify(input: &str, via: Option<&str>) -> Result<Route> {
 }
 
 /// Classify a filesystem path by magic bytes / extension.
-fn classify_file_path(path: &str, via: Option<&str>) -> Result<Route> {
+fn classify_file_path(path: &str, via: Option<&str>) -> delightql_types::Result<Route> {
     use std::io::Read;
 
     if let Some(v) = via {
         if v != "fatboy" {
-            anyhow::bail!("--via {v} does not apply to file-backed databases");
+            return Err(Client::Argument {
+                message: format!("--via {v} does not apply to file-backed databases"),
+            }
+            .into());
         }
     }
 
@@ -176,45 +191,43 @@ pub enum ConnectionManager {
 
 impl ConnectionManager {
     /// Open a classified route (see [`classify`]).
-    pub fn open_route(route: Route) -> Result<Self> {
+    pub fn open_route(route: Route) -> delightql_types::Result<Self> {
         match route {
             Route::Sqlite(path) => Ok(ConnectionManager::SQLite(
                 SqliteConnectionManager::new_file(&path)?,
             )),
             Route::DuckdbFatboy(path) => {
-                let mgr = crate::fatboy_exec::FatboyManager::connect("duckdb", &path)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let mgr = crate::fatboy_exec::FatboyManager::connect("duckdb", &path)?;
                 Ok(ConnectionManager::Fatboy(Arc::new(mgr)))
             }
             Route::PostgresFatboy { url, display_db } => {
                 let mgr =
-                    crate::fatboy_exec::FatboyManager::connect_postgres_url(&url, &display_db)
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    crate::fatboy_exec::FatboyManager::connect_postgres_url(&url, &display_db)?;
                 Ok(ConnectionManager::Fatboy(Arc::new(mgr)))
             }
             Route::Siso { rest } => {
                 let mgr = delightql_cli_siso::PipeConnectionManager::from_uri(&format!(
                     "delightql-siso://{rest}"
                 ))
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                .map_err(|e| delightql_cli_siso::error::diagnostic("delightql-siso://", e))?;
                 Ok(ConnectionManager::Pipe(Arc::new(mgr)))
             }
         }
     }
 
     /// Open from a `--db` / mount input string with a mechanism override.
-    pub fn open(input: &str, via: Option<&str>) -> Result<Self> {
+    pub fn open(input: &str, via: Option<&str>) -> delightql_types::Result<Self> {
         Self::open_route(classify(input, via)?)
     }
 
     /// Create a new connection from a resource string (path or worldly
     /// URI), default mechanisms. Kept as the factory-facing entry point.
-    pub fn new_file(path: &str) -> Result<Self> {
+    pub fn new_file(path: &str) -> delightql_types::Result<Self> {
         Self::open(path, None)
     }
 
     /// Create a new in-memory connection (defaults to SQLite)
-    pub fn new_memory() -> Result<Self> {
+    pub fn new_memory() -> delightql_types::Result<Self> {
         Ok(ConnectionManager::SQLite(
             SqliteConnectionManager::new_memory()?,
         ))
@@ -222,11 +235,13 @@ impl ConnectionManager {
 
     /// Test the connection
     #[allow(dead_code)]
-    pub fn test_connection(&self) -> Result<()> {
+    pub fn test_connection(&self) -> delightql_types::Result<()> {
         match self {
             ConnectionManager::SQLite(conn) => Ok(conn.test_connection()?),
             ConnectionManager::Pipe(mgr) => {
-                let _conn = mgr.connect().map_err(|e| anyhow::anyhow!("{}", e))?;
+                let _conn = mgr
+                    .connect()
+                    .map_err(|e| delightql_cli_siso::error::diagnostic("pipe connect", e))?;
                 Ok(())
             }
             // Fatboy children connect lazily (fatboy_exec FatboyManager::relay);
@@ -348,19 +363,12 @@ impl ConnectionManager {
     /// Execute a SQL query against the underlying database connection.
     ///
     /// Dispatches to the appropriate backend (SQLite, Pipe, or Fatboy).
-    /// The `db_label` is used for error messages in SQLite; Pipe ignores it.
-    pub fn execute_query(
-        &self,
-        sql: &str,
-        db_label: &str,
-    ) -> Result<delightql_backends::QueryResults> {
+    pub fn execute_query(&self, sql: &str) -> Result<delightql_backends::QueryResults> {
         match self {
-            ConnectionManager::SQLite(conn) => delightql_backends::execute_sql_with_connection(
-                sql.to_string(),
-                conn,
-                std::path::Path::new(db_label),
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e)),
+            ConnectionManager::SQLite(conn) => {
+                delightql_backends::execute_sql_with_connection(sql.to_string(), conn)
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+            }
             ConnectionManager::Pipe(mgr) => crate::pipe_exec::execute_sql_with_pipe(sql, mgr)
                 .map_err(|e| anyhow::anyhow!("{}", e)),
             ConnectionManager::Fatboy(mgr) => crate::fatboy_exec::execute_sql_with_fatboy(sql, mgr)
@@ -380,14 +388,15 @@ impl ConnectionManager {
     pub fn create_system_components(
         &self,
         mounted_schema: Option<String>,
-    ) -> Result<delightql_types::ConnectionComponents> {
+    ) -> delightql_types::Result<delightql_types::ConnectionComponents> {
         match self {
             ConnectionManager::SQLite(sqlite_conn) => {
                 if mounted_schema.is_some() {
-                    anyhow::bail!(
+                    return Err(locator(
                         "SQLite has no schemas; a #schema fragment is only meaningful \
                          on a Postgres or DuckDB target (use mount! without a fragment)"
-                    );
+                            .to_string(),
+                    ));
                 }
                 let raw_conn_arc = sqlite_conn.get_connection_arc();
                 let schema = Box::new(delightql_backends::DynamicSqliteSchema::new(
@@ -427,7 +436,104 @@ impl ConnectionManager {
     }
 }
 
-/// Open a DqlHandle using the factory-only API.
+/// THE SESSION PROFILE: the complete capability decision for one handle,
+/// chosen once by the command that opens it. The profile owns which
+/// types-level mount factory the handle receives, which namespaces are
+/// published into it automatically, and which inert byte bindings it
+/// carries; nothing below it rediscovers any of that from process state,
+/// and a handle is constructed only through `SessionProfile::open`.
+pub enum SessionProfile {
+    /// The prompt, the one-shot query, and every other subcommand: the
+    /// CLI's own surfaces are published — `repl::*` over the named client
+    /// database, and `cli::surface` — beside the inert bindings. `None` is
+    /// the road when the in-memory engine refused a client database:
+    /// `repl::*` is unavailable and said so, and the handle is otherwise
+    /// the same.
+    Client(Option<std::sync::Arc<crate::client::database::ClientDatabase>>),
+    /// `dql server`: the canonical Core image, explicit user/data mounts,
+    /// and the inert `book`/`man`/`editor` bindings. The handle receives no
+    /// client mount factory, so no query it serves can mount the process's
+    /// client database, and it publishes neither `repl::*` nor
+    /// `cli::surface` — before or after any protocol Reset, which restores
+    /// only this profile. The process's client database still records the
+    /// server's session and incidents on the host side.
+    Server,
+}
+
+impl SessionProfile {
+    /// The client profile over the process's own client database — the
+    /// one every client-road command opens. The database is an ingredient
+    /// the caller names; the profile is the caller's choice.
+    pub fn client() -> Self {
+        SessionProfile::Client(crate::client::context::process_database())
+    }
+
+    /// THE ONE HANDLE CONSTRUCTION. Every handle the CLI opens comes
+    /// through here, and the profile decides everything in one exhaustive
+    /// judgment: the mount factory at open, the inert bindings, and the
+    /// automatic namespaces. Answers the handle and whether `repl::*` was
+    /// installed on it (a failed install is degraded client diagnostics,
+    /// said once, never a reason to refuse the handle).
+    pub fn open(self) -> Result<(Box<dyn delightql_core::api::DqlHandle>, bool)> {
+        let factory = Box::new(crate::connection_factory::CliConnectionFactory);
+        // The types-level factory powers mount!/import! of URI-scheme
+        // databases (postgres://, delightql-siso://, …). The client
+        // profile's factory ALSO answers the private session locator with
+        // the live client connection; the server's factory knows no such
+        // locator, so the capability does not exist on that road.
+        let mount_factory: Box<dyn delightql_types::ConnectionFactory> = match &self {
+            SessionProfile::Client(Some(db)) => {
+                Box::new(crate::client::mount::ReplMountFactory::over(db))
+            }
+            SessionProfile::Client(None) | SessionProfile::Server => {
+                Box::new(crate::connection_factory::CliConnectionFactory)
+            }
+        };
+        let mut handle = delightql_core::api::open(factory, Some(mount_factory))
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        // The CLI's embedded database images are BOUND on every profile. A
+        // binding is a name→bytes map entry, not a mount: no attachment, no
+        // I/O, no cost until a session actually runs
+        // `mount!("delightql-bytes://book", ...)`. Binding on every handle
+        // is what makes the locators typeable from any session.
+        for (name, bytes) in [
+            ("book", crate::embedded_db::BOOK_BYTES),
+            ("man", crate::embedded_db::MAN_BYTES),
+            ("editor", crate::embedded_db::EDITOR_BYTES),
+        ] {
+            handle
+                .bind_static_bytes(name, bytes)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+        }
+        match self {
+            SessionProfile::Server => Ok((handle, false)),
+            SessionProfile::Client(db) => {
+                let installed = match db {
+                    None => false,
+                    Some(_) => match crate::client::mount::install_repl_namespace(&mut *handle) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            crate::client::incident::warning(
+                                "namespace",
+                                delightql_types::diagnostic::Client::NamespaceInstall {
+                                    message: format!(
+                                        "the repl::* namespace could not be installed ({e}); \
+                                         repl::* will be unavailable until the next session reset"
+                                    ),
+                                },
+                            );
+                            false
+                        }
+                    },
+                };
+                let handle = crate::cli_surface::attach(handle)?;
+                Ok((handle, installed))
+            }
+        }
+    }
+}
+
+/// Open a DqlHandle under `profile`.
 ///
 /// Returns `Box<dyn DqlHandle>` — the compiler-enforced API boundary.
 /// The handle starts with an empty "main" namespace. The CLI must send
@@ -439,81 +545,226 @@ impl ConnectionManager {
 /// `mount!` first-query, not by any pre-opened `ConnectionManager`. Keeping
 /// it self-less makes that separation explicit: a `&self` method that
 /// ignores `self` reads as if a manager fed the handle.
-pub fn open_handle() -> Result<Box<dyn delightql_core::api::DqlHandle>> {
-    open_handle_with_namespace().map(|(handle, _)| handle)
-}
-
-/// The same, reporting whether `repl::*` is installed on the handle. The
-/// client database is mounted in EVERY mode; a failed install is degraded
-/// client diagnostics, said once, never a reason to refuse the handle.
-pub fn open_handle_with_namespace() -> Result<(Box<dyn delightql_core::api::DqlHandle>, bool)> {
-    open_handle_over(crate::client::context::process_database())
-}
-
-/// The same over a NAMED client database (`None`: no client database at
-/// all). The one road every handle takes; the process form above and the
-/// interactive state both come through here.
-pub fn open_handle_over(
-    client: Option<std::sync::Arc<crate::client::database::ClientDatabase>>,
-) -> Result<(Box<dyn delightql_core::api::DqlHandle>, bool)> {
-    let Some(client) = client else {
-        return open_bare_handle().map(|handle| (handle, false));
-    };
-    let mut handle = crate::client::mount::open_client_handle(&client)?;
-    let installed = match crate::client::mount::install_repl_namespace(&mut *handle) {
-        Ok(()) => true,
-        Err(e) => {
-            crate::client::incident::warning(
-                "namespace",
-                crate::client::incident::hierarchy::NAMESPACE_INSTALL,
-                format!(
-                    "the repl::* namespace could not be installed ({e}); \
-                     repl::* will be unavailable until the next session reset"
-                ),
-            );
-            false
-        }
-    };
-    Ok((handle, installed))
-}
-
-/// A handle with no client database behind it: the road when the in-memory
-/// engine refused to open one.
-fn open_bare_handle() -> Result<Box<dyn delightql_core::api::DqlHandle>> {
-    let factory = Box::new(crate::connection_factory::CliConnectionFactory);
-    // Second factory (types-level) powers mount!/import! of URI-scheme
-    // databases (postgres://, delightql-siso://, …). Same unit struct, both
-    // trait impls.
-    let mount_factory = Box::new(crate::connection_factory::CliConnectionFactory);
-    let mut handle = delightql_core::api::open(factory, Some(mount_factory))
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    // Bind the CLI's embedded database images.
-    // A binding is a name→bytes map entry, not a mount: no attachment, no
-    // I/O, no cost until a session actually runs
-    // `mount!("delightql-bytes://book", ...)`. Binding on every handle is
-    // what makes the locators typeable from any session, REPL included.
-    handle
-        .bind_static_bytes("book", crate::embedded_db::BOOK_BYTES)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    handle
-        .bind_static_bytes("man", crate::embedded_db::MAN_BYTES)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    handle
-        .bind_static_bytes("editor", crate::embedded_db::EDITOR_BYTES)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    crate::cli_surface::attach(handle)
+pub fn open_handle(profile: SessionProfile) -> Result<Box<dyn delightql_core::api::DqlHandle>> {
+    profile.open().map(|(handle, _)| handle)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A private client database on the `Other` road, never the process's.
+    fn private_db() -> std::sync::Arc<crate::client::database::ClientDatabase> {
+        std::sync::Arc::new(
+            crate::client::database::ClientDatabase::open_on(crate::client::context::Mode::Other)
+                .expect("client database"),
+        )
+    }
+
+    fn run(
+        session: &mut dyn delightql_core::api::DqlSession,
+        dql: &str,
+    ) -> std::result::Result<usize, String> {
+        crate::exec_ng::run_dql_query(dql, session)
+            .map(|r| r.rows.len())
+            .map_err(|e| e.to_string())
+    }
+
+    /// What the server profile must refuse, and what it must still serve,
+    /// in one world — asserted before and after a Reset, since a Reset
+    /// restores only the profile.
+    fn assert_server_world(handle: &mut dyn delightql_core::api::DqlHandle) {
+        let mut session = handle.session().expect("session");
+        let repl = run(&mut *session, "repl::context.session(*)");
+        assert!(
+            repl.is_err(),
+            "repl::* is published on the server road: {repl:?}"
+        );
+        let surface = run(&mut *session, "cli::surface.command(*)");
+        assert!(
+            surface.is_err(),
+            "cli::surface is published on the server road: {surface:?}"
+        );
+        let leak = run(
+            &mut *session,
+            "mount!(\"delightql-repl://session\", \"leak\")(*)",
+        );
+        assert!(
+            leak.is_err(),
+            "the server road can mount the process's client database: {leak:?}"
+        );
+        assert!(
+            !leak.as_ref().unwrap_err().contains("leak.session"),
+            "the refusal must be the locator's, before any relation: {leak:?}"
+        );
+        // The inert documentation bindings stay typeable and mountable.
+        run(
+            &mut *session,
+            "mount!(\"delightql-bytes://book\", \"cli::book\")(*)",
+        )
+        .expect("the book binding mounts on the server road");
+    }
+
+    /// SERVER PROFILE: no `repl::*`, no `cli::surface`, no capability to
+    /// mount the private session locator — before and after a Reset —
+    /// while the inert `book`/`man`/`editor` bindings remain usable.
+    #[test]
+    fn a_server_profile_has_no_client_surface_before_or_after_reset() {
+        let (mut handle, installed) = SessionProfile::Server.open().expect("server handle");
+        assert!(!installed);
+        assert_server_world(&mut *handle);
+        handle.recover_session().expect("reset");
+        assert_server_world(&mut *handle);
+        let mut session = handle.session().expect("session");
+        run(
+            &mut *session,
+            "mount!(\"delightql-bytes://man\", \"cli::man\")(*)",
+        )
+        .expect("the man binding mounts after a reset");
+        run(
+            &mut *session,
+            "mount!(\"delightql-bytes://editor\", \"cli::editor\")(*)",
+        )
+        .expect("the editor binding mounts after a reset");
+    }
+
+    /// CLIENT PROFILE over a database: `repl::*` is installed and answers,
+    /// `cli::surface` is attached, and the session locator is the
+    /// factory's to answer.
+    #[test]
+    fn a_client_profile_publishes_its_surfaces() {
+        let db = private_db();
+        let (mut handle, installed) = SessionProfile::Client(Some(db.clone()))
+            .open()
+            .expect("client handle");
+        assert!(installed, "repl::* was not installed on the client road");
+        let mut session = handle.session().expect("session");
+        assert_eq!(run(&mut *session, "repl::context.session(*)").unwrap(), 1);
+        assert!(run(&mut *session, "cli::surface.command(*)").unwrap() > 0);
+        run(
+            &mut *session,
+            "mount!(\"delightql-repl://session\", \"again\")(*)",
+        )
+        .expect("the client road's factory answers the session locator");
+    }
+
+    /// CLIENT PROFILE without a database (the engine refused one): the
+    /// surface still attaches; `repl::*` is absent and the locator is
+    /// unknown, because there is no client database to reach.
+    #[test]
+    fn a_client_profile_without_a_database_keeps_the_surface_only() {
+        let (mut handle, installed) = SessionProfile::Client(None).open().expect("client handle");
+        assert!(!installed);
+        let mut session = handle.session().expect("session");
+        assert!(run(&mut *session, "cli::surface.command(*)").unwrap() > 0);
+        assert!(run(&mut *session, "repl::context.session(*)").is_err());
+        assert!(run(
+            &mut *session,
+            "mount!(\"delightql-repl://session\", \"leak\")(*)"
+        )
+        .is_err());
+    }
+
+    /// HOST-SIDE INCIDENTS: a server's incident lands in the process's
+    /// client database, and that database is not query-reachable from a
+    /// server world.
+    #[test]
+    fn server_incidents_land_in_the_client_database_without_being_query_reachable() {
+        use crate::client::incident::{Incident, IncidentKind};
+        let db = private_db();
+        let diagnostic: delightql_core::error::DelightQLError =
+            delightql_types::diagnostic::Client::NamespaceInstall {
+                message: "probe: a server-side incident".to_string(),
+            }
+            .into();
+        db.record_incident(Incident::of(IncidentKind::Warning, "server", &diagnostic));
+        let recorded: i64 = db
+            .connection_arc()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM incident WHERE message LIKE '%server-side incident%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1, "the incident was not recorded host-side");
+        let (mut handle, _) = SessionProfile::Server.open().expect("server handle");
+        let mut session = handle.session().expect("session");
+        assert!(run(&mut *session, "repl::errors.incident(*)").is_err());
+        assert!(run(
+            &mut *session,
+            "mount!(\"delightql-repl://session\", \"leak\")(*)"
+        )
+        .is_err());
+    }
+
+    /// PROFILE CENSUS over the crate's shipped source: the one handle
+    /// construction, the one server-profile site (the listener), and no
+    /// surviving ambient server-policy road.
+    #[test]
+    fn the_profile_owns_the_only_handle_construction() {
+        fn shipped(path: &std::path::Path, found: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let p = entry.path();
+                if p.is_dir() {
+                    shipped(&p, found);
+                } else if p.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&p).unwrap();
+                    let text = text.split("#[cfg(test)]").next().unwrap_or("").to_string();
+                    found.push((p.display().to_string(), text));
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        shipped(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        let occurrences = |needle: &str| -> Vec<String> {
+            sources
+                .iter()
+                .filter(|(_, text)| text.contains(needle))
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+        for retired in [
+            "is_server_process",
+            "attach_unless_server",
+            "reinstall_client_namespace",
+            "open_client_handle",
+            "open_handle_over",
+            "open_bare_handle",
+        ] {
+            assert!(
+                occurrences(retired).is_empty(),
+                "retired road `{retired}` survives in {:?}",
+                occurrences(retired)
+            );
+        }
+        let opens = occurrences("delightql_core::api::open(");
+        assert_eq!(
+            opens.len(),
+            1,
+            "handles are constructed outside the profile: {opens:?}"
+        );
+        assert!(opens[0].ends_with("connection.rs"));
+        let server = occurrences("SessionProfile::Server");
+        assert_eq!(
+            server.len(),
+            2,
+            "the server profile is chosen somewhere other than the listener: {server:?}"
+        );
+        assert!(server.iter().any(|p| p.ends_with("server/listener.rs")));
+    }
+
     /// Bindings are immutable for the life of a handle — rebinding
     /// refuses, even to the same bytes, so a locator's referent can never
     /// change underneath a mounted namespace.
     #[test]
     fn byte_bindings_are_immutable() {
-        let mut handle = open_handle().unwrap();
+        let mut handle = open_handle(SessionProfile::client()).unwrap();
         let err = handle
             .bind_static_bytes("book", crate::embedded_db::BOOK_BYTES)
             .expect_err("rebinding 'book' must refuse");
@@ -534,7 +785,7 @@ mod tests {
     /// behind: the target namespace stays cleanly mountable.
     #[test]
     fn failed_mount_leaves_nothing_behind() {
-        let mut handle = open_handle().unwrap();
+        let mut handle = open_handle(SessionProfile::client()).unwrap();
 
         // Raw garbage: refused by the header check.
         let err = handle
@@ -589,7 +840,7 @@ mod tests {
                 .unwrap();
             conn.serialize("main").unwrap().to_vec()
         };
-        let mut handle = open_handle().unwrap();
+        let mut handle = open_handle(SessionProfile::client()).unwrap();
         handle.bind_owned_bytes("emptyimg", image).unwrap();
         let mut session = handle.session().unwrap();
         session
@@ -600,7 +851,7 @@ mod tests {
             .err()
             .expect("refresh of a bytes image must refuse");
         assert!(
-            err.contains("immutable"),
+            err.message.contains("immutable"),
             "empty bytes image must reach the immutable refusal, got: {err}"
         );
     }
@@ -619,7 +870,7 @@ mod tests {
             .unwrap();
         let db_s = db.to_string_lossy().to_string();
 
-        let mut handle = open_handle().unwrap();
+        let mut handle = open_handle(SessionProfile::client()).unwrap();
         let mut session = handle.session().unwrap();
         session
             .query(&format!("mount!(\"{db_s}\", \"a\")(*)"))
@@ -678,7 +929,7 @@ mod tests {
         .unwrap();
         let lib_path = lib.to_string_lossy().to_string();
 
-        let mut handle = open_handle().unwrap();
+        let mut handle = open_handle(SessionProfile::client()).unwrap();
         handle.bind_owned_bytes("imprintimg", image).unwrap();
         let mut session = handle.session().unwrap();
         session
@@ -701,6 +952,129 @@ mod tests {
             .query("ib.t(*)")
             .err()
             .expect("ib's image must be untouched");
+    }
+
+    /// Rows of an in-process query, decoded as text.
+    fn rows_of(session: &mut dyn delightql_core::api::DqlSession, text: &str) -> Vec<Vec<String>> {
+        let result = session
+            .query(text)
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        let fetched = session.fetch(&result.handle, 1_000).expect("fetch");
+        session.close(result.handle).expect("close");
+        fetched
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|cell| {
+                        cell.map(|b| String::from_utf8_lossy(&b).into_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Blueprint inertness — the CATALOG half. A refused re-imprint of the
+    /// archive must leave the session's catalog exactly as the lawful imprint
+    /// left it: the archive still at `main::_0_blueprint`, still visible
+    /// through the catalog functor, no blueprint minted under the
+    /// fresh target, and nothing resolvable there. The data half (the files)
+    /// is pinned by tests/blueprint_inertness.rs; the ball runner cannot
+    /// observe either, because a sequence ends at its first error.
+    ///
+    /// RED-BEFORE: the archive materialized into `second` and was moved to
+    /// `second::_0_blueprint`, vacating `main::_0_blueprint`.
+    #[test]
+    fn refused_reimprint_leaves_the_catalog_as_the_lawful_imprint_left_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("items.dql");
+        std::fs::write(
+            &lib,
+            "items(*) :- _(x @ 1;2;3)\n\
+             (~~ddl:\"_internal\"\n\
+             imprinting(*) :- _(entity,materialization,extent @ \"items\",\"table\",\"permanent\")\n\
+             ~~)\n",
+        )
+        .unwrap();
+        let lib_path = lib.to_string_lossy().to_string();
+        let main_db = dir.path().join("main.sqlite").to_string_lossy().to_string();
+        let second_db = dir
+            .path()
+            .join("second.sqlite")
+            .to_string_lossy()
+            .to_string();
+
+        let mut handle = open_handle(SessionProfile::client()).unwrap();
+        let mut session = handle.session().unwrap();
+        session
+            .query(&format!("mount_new!(\"{main_db}\", \"main\")(*)"))
+            .expect("main");
+        session
+            .query(&format!("consult!(\"{lib_path}\", \"blue\")(*)"))
+            .expect("consult");
+        session
+            .query("imprint!(\"blue\", \"main\")(*)")
+            .expect("lawful imprint");
+        session
+            .query(&format!("mount_new!(\"{second_db}\", \"second\")(*)"))
+            .expect("fresh target");
+
+        let census = |session: &mut dyn delightql_core::api::DqlSession| -> Vec<Vec<String>> {
+            let mut rows: Vec<Vec<String>> =
+                rows_of(session, "sys::ns.namespace(*) |> (fq_name, kind)")
+                    .into_iter()
+                    .filter(|row| row[0].contains("blueprint"))
+                    .collect();
+            rows.sort();
+            rows
+        };
+        let before = census(&mut *session);
+        assert_eq!(
+            before,
+            vec![
+                vec!["main::_0_blueprint".to_string(), "blueprint".to_string()],
+                vec![
+                    "main::_0_blueprint::_internal".to_string(),
+                    "scratch".to_string()
+                ],
+            ],
+            "the lawful imprint archives the source under main"
+        );
+
+        let err = session
+            .query("imprint!(\"main::_0_blueprint\", \"second\")(*)")
+            .err()
+            .expect("re-imprinting the archive must refuse");
+        assert_eq!(
+            err.identity.as_deref(),
+            Some("delightql-error://imprint/blueprint/inert"),
+            "the refusal carries the inertness badge: {err}"
+        );
+
+        assert_eq!(
+            census(&mut *session),
+            before,
+            "the catalog is unchanged by the refusal"
+        );
+        assert_eq!(
+            rows_of(&mut *session, "main::_0_blueprint::(*) |> (name)"),
+            vec![vec!["main::_0_blueprint".to_string()]],
+            "the archive is still visible at its path through the catalog functor"
+        );
+        session
+            .query("second.items(*)")
+            .err()
+            .expect("nothing resolves in the fresh target");
+        assert_eq!(
+            rows_of(&mut *session, "main.items(*)"),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ],
+            "the lawful materialization still answers"
+        );
     }
 
     #[test]

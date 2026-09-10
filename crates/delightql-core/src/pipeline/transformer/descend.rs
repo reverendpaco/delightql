@@ -69,9 +69,9 @@ pub(super) fn descend(
     let form = last.into_form();
     let lowered = match form {
         // Restriction: lower the operand, then add WHERE.
-        ast_refined::Continuation::Restrict { condition, origin } => {
+        ast_refined::Continuation::Restrict { condition, .. } => {
             let child = descend(expr, names, ctx)?;
-            relational::r_lower_filter(child, condition, origin, result, ctx)
+            relational::r_lower_filter(child, condition, result, ctx)
         }
 
         ast_refined::Continuation::Bound { bound, .. } => {
@@ -104,6 +104,13 @@ pub(super) fn descend(
                 (rhs, expr, Some(ast_refined::JoinType::LeftOuter))
             } else {
                 (expr, rhs, join_type)
+            };
+            // THE POSITIONS THIS JOIN COMPUTES for an interior boundary
+            // standing as either member: read off the boundary's own
+            // classification, where they were taken off the interior.
+            let deferred = relational::DeferredSides {
+                left: deferred_of(&left),
+                right: deferred_of(&right),
             };
             let left_builder = descend(left, names, ctx)?;
             // A zero-width anonymous table rides this road too: its one
@@ -150,6 +157,7 @@ pub(super) fn descend(
                     join_type,
                     result,
                     emitted_swapped,
+                    deferred,
                     ctx,
                 )
             }
@@ -332,4 +340,16 @@ pub(super) fn descend_as_final(
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     descend_as_query(expr, names, ctx)
+}
+
+/// The positions the enclosing join computes for a member that is an
+/// interior boundary: the deferred items its classification holds.
+fn deferred_of(member: &ast_refined::Chain) -> Vec<ast_refined::DeferredItem> {
+    match member.head().form() {
+        ast_refined::GroundForm::Reference(ast_refined::Relation::InnerRelation {
+            pattern,
+            ..
+        }) => pattern.deferred().to_vec(),
+        _ => Vec::new(),
+    }
 }

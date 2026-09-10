@@ -5,7 +5,7 @@
 //! Provides POSIX BRE-compatible pattern matching for column selection,
 //! converting simple BRE patterns to Rust regex patterns.
 
-use crate::error::{DelightQLError, Result};
+use crate::error::Result;
 
 /// Convert a POSIX BRE-style pattern to Rust regex pattern
 ///
@@ -48,8 +48,10 @@ pub fn bre_to_rust_regex(pattern: &str) -> Result<String> {
                     }
                 }
                 if !found_close {
-                    return Err(DelightQLError::parse_error(
-                        "Unclosed character class in pattern",
+                    return Err(crate::diagnostic::DelightQLError::from(
+                        crate::diagnostic::Parse::General {
+                            message: "Unclosed character class in pattern".to_string(),
+                        },
                     ));
                 }
             }
@@ -76,7 +78,11 @@ pub fn bre_to_rust_regex(pattern: &str) -> Result<String> {
                     }
                 } else {
                     // Trailing backslash
-                    return Err(DelightQLError::parse_error("Trailing backslash in pattern"));
+                    return Err(crate::diagnostic::DelightQLError::from(
+                        crate::diagnostic::Parse::General {
+                            message: "Trailing backslash in pattern".to_string(),
+                        },
+                    ));
                 }
             }
 

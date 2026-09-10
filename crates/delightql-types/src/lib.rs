@@ -19,25 +19,29 @@
 //! - delightql-core can then use backends for execution
 
 pub mod db_traits;
+pub mod diagnostic;
 pub mod error;
 pub mod factory;
 pub mod identifier;
 pub mod introspect;
 pub mod namespace;
 pub mod schema;
+pub mod taxon;
 
 // Test utilities (mock implementations for testing without real databases)
 pub mod test_utils;
 
 // Re-export commonly used types
-pub use db_traits::{DatabaseConnection, DatabaseConnectionExt, DbValue, FromDbValue, Row, ToDbValue};
-pub use error::{DelightQLError, KnownLimitationType, Result};
+pub use db_traits::{
+    DatabaseConnection, DatabaseConnectionExt, DbValue, FromDbValue, Row, ToDbValue,
+};
+pub use error::{DelightQLError, Result};
+pub use factory::{ConnectionComponents, ConnectionFactory};
 pub use identifier::SqlIdentifier;
 pub use introspect::{
     DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity, DiscoveredRelation,
 };
 pub use namespace::{NamespaceItem, NamespacePath};
-pub use factory::{ConnectionComponents, ConnectionFactory};
 pub use schema::{ColumnInfo, DatabaseSchema};
 
 /// Backend runtime messages with a known DQL-side remedy get the

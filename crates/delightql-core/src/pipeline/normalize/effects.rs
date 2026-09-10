@@ -19,6 +19,7 @@
 //! mutation source exists solely to be fed to its terminal.
 
 use super::Normalizer;
+use crate::diagnostic::{Effect, EffectCte, Internal};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::definitions::Head;
 use crate::pipeline::asts::core::operators::HoArgument;
@@ -65,16 +66,14 @@ fn judge_authored_arguments(
         {
             continue;
         }
-        return Err(DelightQLError::validation_error_categorized(
-            "effect/arguments/not_a_table",
-            format!(
+        return Err(DelightQLError::from(Effect::ArgumentsNotATable {
+            message: format!(
                 "the first parentheses of {bare}! are its ARGUMENTS, never a table: \
                  '{}' takes a value, and a relation — including the one a `;`-row \
                  spelling builds — cannot be one",
                 declared.name
             ),
-            format!("supply the arguments as values: `{bare}!(arg, …)(*)`; pipe the relation in"),
-        ));
+        }));
     }
     Ok(())
 }
@@ -108,14 +107,12 @@ fn judge_landing(
         return Ok(());
     }
     let bare = name.strip_suffix('!').unwrap_or(&name);
-    Err(DelightQLError::validation_error_categorized(
-        "effect/landing/nowhere",
-        format!(
+    Err(DelightQLError::from(Effect::LandingNowhere {
+        message: format!(
             "'{bare}!' declares no parameters, so its one slot is the piped relation's \
              — the written argument fills it and the pipe has nowhere to land"
         ),
-        format!("pipe into it with the slot free: `… |> {bare}!(*)`"),
-    ))
+    }))
 }
 
 /// What rides an effect chain after its call: pure material, or an
@@ -129,8 +126,7 @@ enum EffectToken<'t> {
 impl<'t> Normalizer<'t> {
     pub(crate) fn effrelex_query(&mut self, node: cst::Effrelex<'t>) -> Result<Query<Unresolved>> {
         let chain = self.require(node.chain(), "an effect relex has a chain")?;
-        let chain = self.effect_chain(chain)?;
-        self.wrap_let_block(node.let_block(), chain)
+        self.wrap_let_block(node.let_block(), |me| me.effect_chain(chain))
     }
 
     #[stacksafe::stacksafe]
@@ -525,15 +521,13 @@ impl<'t> Normalizer<'t> {
             }
         };
         if !crate::pipeline::asts::effects::expression_demands_directive(&expression) {
-            return Err(DelightQLError::validation_error_categorized(
-                "effect/cte/pure_mark",
-                format!(
+            return Err(DelightQLError::from(EffectCte::PureMark {
+                message: format!(
                     "the binding '{name}' is marked '!' but its body demands no directive. \
                      The mark asserts that the body is effectful; it cannot make it so. \
                      Drop the mark, or give the body the directive it claims to have."
                 ),
-                "effect mark on a pure binding",
-            ));
+            }));
         }
         self.binding(
             expression,
@@ -574,15 +568,13 @@ impl<'t> Normalizer<'t> {
             cst::EffectHoCteBody::EffectChain(chain) => self.effect_chain(chain)?,
         };
         if !crate::pipeline::asts::effects::expression_demands_directive(&expression) {
-            return Err(DelightQLError::validation_error_categorized(
-                "effect/cte/pure_mark",
-                format!(
+            return Err(DelightQLError::from(EffectCte::PureMark {
+                message: format!(
                     "the binding '{name}' is marked '!' but its body demands no directive. \
                      The mark asserts that the body is effectful; it cannot make it so. \
                      Drop the mark, or give the body the directive it claims to have."
                 ),
-                "effect mark on a pure binding",
-            ));
+            }));
         }
         // THE SUBJECT CARRIES THE MARK, as a consulted effect rule's does:
         // the demand that opens it names `p!`.
@@ -612,7 +604,8 @@ impl<'t> Normalizer<'t> {
                 return Ok(self.identifier(name));
             }
         }
-        Err(DelightQLError::parse_error(
+        Err(Internal::invariant(
+            "normalize::effects",
             "an effect identifier has a predicate identifier",
         ))
     }

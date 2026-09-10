@@ -18,6 +18,7 @@ path = "src/bin/dql_fatboy_duckdb.rs"
 [dependencies]
 delightql-buildinfo = { path = "../delightql-buildinfo" }
 delightql-protocol = { path = "../delightql-protocol" }
+delightql-types = { path = "../delightql-types" }
 delightql-backends = { path = "../delightql-backends", default-features = false, features = ["duckdb"] }
 clap.workspace = true
 libc = "0.2"

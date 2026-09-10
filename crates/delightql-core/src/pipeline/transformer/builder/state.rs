@@ -7,6 +7,7 @@
 //! carries the same [`SqlLayout`], so what a state advertises and what its
 //! statement emits are one value, not two that have to be kept in step.
 
+use crate::diagnostic::Internal;
 use crate::error::Result;
 use crate::pipeline::sql_ast::{
     DomainExpression, OrderTerm, QueryExpression, SelectBuilder, SelectItem, TableExpression,
@@ -340,12 +341,14 @@ fn rename_target(
         .map(|(_, target)| *target);
     match (exact.next(), exact.next()) {
         (Some(target), None) => Ok(target),
-        (Some(_), Some(_)) => Err(crate::error::DelightQLError::parse_error(format!(
-            "subquery output {output:?} is paired more than once by the alias wrapping it"
-        ))),
-        (None, _) => Err(crate::error::DelightQLError::parse_error(format!(
-            "subquery output {output:?} has no exact target in the alias wrapping it"
-        ))),
+        (Some(_), Some(_)) => Err(Internal::invariant(
+            "transformer::builder",
+            format!("subquery output {output:?} is paired more than once by the alias wrapping it"),
+        )),
+        (None, _) => Err(Internal::invariant(
+            "transformer::builder",
+            format!("subquery output {output:?} has no exact target in the alias wrapping it"),
+        )),
     }
 }
 
@@ -377,7 +380,7 @@ pub(in crate::pipeline) fn rewrite_output_aliases(
                 .republish(alias, |output| {
                     rename_target(output, aliases).map_err(|error| error.to_string())
                 })
-                .map_err(crate::error::DelightQLError::parse_error)?;
+                .map_err(|e| Internal::invariant("transformer::builder", e))?;
         }
         QueryExpression::SetOperation { left, right, .. } => {
             rewrite_output_aliases(left, alias, aliases, _identities)?;

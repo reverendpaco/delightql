@@ -16,7 +16,7 @@ use clap::Parser;
 use delightql_postgres::PgParty;
 use delightql_protocol::socket::{read_client_message, write_server_message};
 use delightql_protocol::{
-    ClientMessage, ControlResult, ErrorKind, Handler, ServerMessage, ServerTerm,
+    ClientMessage, ControlResult, Handler, ServerMessage, ServerTerm, WireError,
 };
 
 #[derive(Parser)]
@@ -110,11 +110,12 @@ fn serve_stdio(conninfo: &str) {
             if read_client_message(&mut reader, &mut buf).is_ok() {
                 let _ = write_server_message(
                     &mut writer,
-                    &ServerMessage::Data(ServerTerm::Error {
-                        kind: ErrorKind::Connection,
-                        identity: b"delightql-error://target/postgres/connect".to_vec(),
-                        message: format!("cannot reach postgres: {e}").into_bytes(),
-                    }),
+                    &ServerMessage::Data(ServerTerm::Error(WireError::of(
+                        &delightql_types::diagnostic::Postgres::Connect {
+                            message: format!("cannot reach postgres: {e}"),
+                        }
+                        .into(),
+                    ))),
                 );
             }
             return;
@@ -139,9 +140,12 @@ fn serve_stdio(conninfo: &str) {
                         party = fresh;
                         ServerMessage::Control(ControlResult::Ok)
                     }
-                    Err(e) => ServerMessage::Control(ControlResult::Error {
-                        message: format!("reset failed: cannot reach postgres: {e}"),
-                    }),
+                    Err(e) => ServerMessage::Control(ControlResult::Error(WireError::of(
+                        &delightql_types::diagnostic::Postgres::Connect {
+                            message: format!("reset failed: cannot reach postgres: {e}"),
+                        }
+                        .into(),
+                    ))),
                 }
             }
             ClientMessage::Control(delightql_protocol::ControlOp::Shutdown) => {
@@ -150,9 +154,12 @@ fn serve_stdio(conninfo: &str) {
                 return;
             }
             ClientMessage::Control(delightql_protocol::ControlOp::Cwd(_)) => {
-                ServerMessage::Control(ControlResult::Error {
-                    message: "cwd is not applicable to the postgres fatboy".into(),
-                })
+                ServerMessage::Control(ControlResult::Error(WireError::of(
+                    &delightql_types::diagnostic::Postgres::Unimplemented {
+                        message: "cwd is not applicable to the postgres fatboy".into(),
+                    }
+                    .into(),
+                )))
             }
         };
         if write_server_message(&mut writer, &response).is_err() {

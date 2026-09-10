@@ -109,15 +109,6 @@ a(*), b(*), a.id = b.id
 $ dql format query.dql
 $ dql format --fail-if-not-formatted query.dql || echo needs formatting
 .EE
-.SH BUGS
-Formatter coverage is incomplete: pipes
-.RB ( |> ),
-group-pipes
-.RB ( ~> ),
-and anonymous tables
-.RB ( _(1,2;3,4) )
-currently pass through (loudly \(em see PASS-THROUGH) instead of
-being formatted.
 .SH SEE ALSO
 .BR dql (1),
 .BR dql-query (1)

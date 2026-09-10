@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::diagnostic::Internal;
 use crate::pipeline::generator::{GeneratorError, SqlGenerator};
 
 use super::sql_ast::{SqlColumnDef, SqlCreateTable, SqlDefaultClause, SqlTableConstraint};
@@ -55,7 +56,10 @@ pub fn generate(
     let bundle =
         crate::names::Bundle::gather(vec![collector.finish()]).reserve_authored(identities);
     let baptised = crate::names::baptise(identities, &bundle).map_err(|error| {
-        crate::error::DelightQLError::parse_error(format!("DDL naming failed: {error:?}"))
+        Internal::invariant(
+            "ddl_pipeline::generator",
+            format!("DDL naming failed: {error:?}"),
+        )
     })?;
     let gen = SqlGenerator::new(&baptised).with_bin_registry(bin_registry);
     let mut sql = String::new();

@@ -13,13 +13,13 @@ users(^)
 
 This returns one row per column in `users`:
 
-| colname | colposition | coltype |
-|---------|-------------|---------|
-| id      | 1           | INTEGER |
-| first_name | 2        | TEXT    |
-| last_name | 3         | TEXT    |
-| age     | 4           | INTEGER |
-| email   | 5           | TEXT    |
+| scope  | column_name   | ordinal  |
+| ------ | ------------- | -------- |
+| users  | id            | 1        |
+| users  | first_name    | 2        |
+| users  | last_name     | 3        |
+| users  | email         | 4        |
+| users | age           | 5        |
 
 : Output of `users(^)`
 
@@ -65,7 +65,7 @@ operators:
 
 ```delightql
 -- text columns only
-users(^), coltype = "TEXT" |> (colname)
+users(^), coltype = "TEXT" |> (column_name)
 ```
 
 ```delightql

@@ -12,6 +12,9 @@
 //! together only in this module's transitions, each of which derives them
 //! from one bound carrier's own parts.
 
+use crate::diagnostic::{
+    Cfe, Choe, Constraint, Internal, Recursion, Resolution, Runtime, Semantic,
+};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::ddl::HoParam;
 use crate::pipeline::asts::unresolved as ast_unresolved;
@@ -71,7 +74,7 @@ impl<'p> BodyPositionFacts<'p> {
     /// A QUERY-SCOPED body's position: the body is the caller's own
     /// authored text, so the caller's judgments stay in force — nothing
     /// here is a replay.
-    fn authored_of(caller: &ResolverFold<'_, '_>) -> Self {
+    pub(in crate::defuse) fn authored_of(caller: &ResolverFold<'_, '_>) -> Self {
         BodyPositionFacts {
             config: caller.config.clone(),
             grade: caller.position_grade,
@@ -113,7 +116,7 @@ fn body_env(
 
 /// A body fold over an opened world — the admitted operations' shared
 /// private seam; nothing outside them reaches it.
-fn body_fold_in<'a, 'db>(
+pub(in crate::defuse) fn body_fold_in<'a, 'db>(
     core: &'a mut ResolverCore<'db>,
     env: &'a mut Environment,
     facts: BodyPositionFacts<'a>,
@@ -128,7 +131,15 @@ fn body_fold_in<'a, 'db>(
     // reads that row: then the body's position is enclosed by the
     // caller's, through a borrow, exactly as an interior expression is.
     let mut fold = match enclosing_row {
-        Some(row) => ResolverFold::enclosed(core, env, config, row.0),
+        // A body opened over its caller's row is evaluated IN PLACE beside
+        // that row: it is the caller's own statement, not a join member.
+        Some(row) => ResolverFold::enclosed(
+            core,
+            env,
+            config,
+            row.0,
+            crate::pipeline::resolver::Correlations::InPlace,
+        ),
         None => ResolverFold::new(core, env, config),
     };
     fold.position_grade = grade;
@@ -176,7 +187,11 @@ fn resolve_truth_in<A: ActualPayload>(
     formals: super::environment::FormalBindings,
     truth: ast_unresolved::TruthExpression,
 ) -> Result<crate::pipeline::asts::resolved::TruthExpression> {
-    let mut env = world_of(bound, &crate::defuse::carriers::CarrierRecord::default(), formals);
+    let mut env = world_of(
+        bound,
+        &crate::defuse::carriers::CarrierRecord::default(),
+        formals,
+    );
     let mut fold = body_fold_in(core, &mut env, facts);
     fold.transform_boolean(truth)
 }
@@ -194,7 +209,11 @@ fn resolve_value_in<A: ActualPayload>(
     Result<crate::pipeline::asts::resolved::DomainExpression>,
     Option<crate::pipeline::resolver::resolver_fold::WindowObligation>,
 ) {
-    let mut env = world_of(bound, &crate::defuse::carriers::CarrierRecord::default(), formals);
+    let mut env = world_of(
+        bound,
+        &crate::defuse::carriers::CarrierRecord::default(),
+        formals,
+    );
     let mut fold = body_fold_in(core, &mut env, facts);
     let outcome = fold.transform_domain(body);
     let obligation = fold.window_obligation.take();
@@ -204,8 +223,19 @@ fn resolve_value_in<A: ActualPayload>(
 /// A consumed position's held world: the OWNED admission (alive until the
 /// arm finishes resolving) or a scoped binding's held instance.
 enum Held<'s, A: ActualPayload> {
-    Bound(BoundUse<'s, A>),
-    Scoped(super::instance::InstanceFrame),
+    /// A consulted definition: the admission that owns its world, and the
+    /// shaped body that opens in it.
+    Bound {
+        bound: BoundUse<'s, A>,
+        body: crate::pipeline::ast_unresolved::DomainExpression,
+    },
+    /// A query-scoped twin: its held instance and the SELECTED DEFINITION
+    /// whole. The definition governs its own lexical position; nothing here
+    /// holds a position apart from it.
+    Scoped {
+        _frame: super::instance::InstanceFrame,
+        definition: super::environment::ScopedCfe,
+    },
 }
 
 impl<A: ActualPayload + Default> BoundUse<'_, A> {
@@ -252,138 +282,145 @@ impl<'s> AdmittedErChain<'s> {
             .expect("a chain is linked from its first edge");
         let next = super::er::use_er_edge(fold, &last.context, last.right.clone(), right)?;
         if next.bound.family.namespace() != last.bound.family.namespace() {
-            return Err(DelightQLError::validation_error_categorized(
-                "er/chain/declaration",
-                format!(
+            return Err(DelightQLError::from(Semantic::ErChainDeclaration {
+                message: format!(
                     "an ER chain's edges must share one declaring namespace; \
                      found '{}' and '{}'",
                     last.bound.family.namespace(),
                     next.bound.family.namespace(),
                 ),
-                "ER chain declaration identity",
-            ));
+            }));
         }
         self.members.push(next);
         Ok(self)
     }
 
-    /// Compose and resolve in the chain's ONE proven declaration world.
-    /// The composition is the authority's chain-merge law over the members
-    /// themselves — each body beside the pair that selected it, the shared
-    /// endpoint being the member's own left term — and EVERY member's
-    /// admission is alive through the resolution.
-    pub(in crate::defuse) fn resolve(
+    /// COMPOSE: ONE READ PER TERM, ONE CONJUNCTION. Each term's own read
+    /// resolves once, in the world of an edge that reads it; each member's
+    /// body resolves ALONE in its own edge's world — its two reads, its
+    /// conditions, its own names — and its resolved conditions are
+    /// re-attached over the chain's scans, each body read standing in
+    /// position for position for the chain's read of the same term. The
+    /// conditions are simple, so the substitution is total. Every member's
+    /// admission is alive until the last condition is attached. Nothing is
+    /// paired by name, nothing is merged as text, nothing is materialized.
+    pub(in crate::defuse) fn compose(
         self,
         caller: &mut ResolverFold<'_, '_>,
-    ) -> Result<crate::pipeline::resolver::ResolvedQuery> {
+    ) -> Result<(
+        crate::pipeline::resolver::ResolvedRelation,
+        Vec<super::er::ErTerm>,
+    )> {
         let AdmittedErChain { members } = self;
         let context = members
             .first()
             .expect("a chain is linked from its first edge")
             .context
             .clone();
-        // THE SPEND: each member's opened body flows into the composition
-        // here, at the one consuming act, beside the terms that selected
-        // it; every member's ADMISSION stays alive (in `bounds`) until the
-        // composed body has resolved.
         let mut bounds = Vec::with_capacity(members.len());
-        let mut links = Vec::with_capacity(members.len());
+        let mut bodies = Vec::with_capacity(members.len());
+        let mut terms: Vec<super::er::ErTerm> = Vec::with_capacity(members.len() + 1);
         for ErEdgeUse {
             bound,
             query,
             context: _,
             left,
             right,
+            left_at,
         } in members
         {
             bounds.push(bound);
-            links.push(super::er::ErLink {
-                body: query,
-                left,
-                right,
-            });
+            bodies.push((query, left_at));
+            if terms.is_empty() {
+                terms.push(left);
+            }
+            terms.push(right);
         }
-        let combined = super::er::compose_chain(links, &context)?;
-        let facts = BodyPositionFacts::of(caller);
-        let outcome = resolve_query_in(
-            &mut *caller.core,
-            facts,
-            bounds
-                .first()
-                .expect("construction proved at least one edge"),
-            &crate::defuse::carriers::CarrierRecord::default(),
-            super::environment::FormalBindings::default(),
-            combined,
-        );
+        let identities = caller.core.identities;
+        let last_edge = bounds.len() - 1;
+
+        // THE CHAIN'S SCANS: each term read once, self-aliased so its
+        // columns answer to the term's name at the boundary.
+        let mut scans = Vec::with_capacity(terms.len());
+        for (index, term) in terms.iter().enumerate() {
+            let facts = BodyPositionFacts::of(caller);
+            let scan = resolve_query_in(
+                &mut *caller.core,
+                facts,
+                &bounds[index.min(last_edge)],
+                &crate::defuse::carriers::CarrierRecord::default(),
+                super::environment::FormalBindings::default(),
+                super::er::add_self_aliases_to_query(ast_unresolved::Query::relational(
+                    term.read().clone(),
+                )),
+            )?
+            .into_relational_body()
+            .map_err(|_| {
+                Internal::invariant(
+                    "er composition",
+                    "a term's read is one relation and carries no bindings",
+                )
+            })?;
+            scans.push(scan);
+        }
+
+        // EACH BODY ALONE: its conditions, resolved and judged in its own
+        // scope, rebound onto the chain's scans of its two terms.
+        let mut attachments: Vec<Vec<crate::pipeline::ast_resolved::TruthExpression>> =
+            Vec::with_capacity(bodies.len());
+        for (index, (query, left_at)) in bodies.into_iter().enumerate() {
+            let (left, right) = (&terms[index], &terms[index + 1]);
+            let pair = format!(
+                "{} & {} in '::{context}'",
+                left.spelling(),
+                right.spelling()
+            );
+            let facts = BodyPositionFacts::of(caller);
+            let resolved = resolve_query_in(
+                &mut *caller.core,
+                facts,
+                &bounds[index],
+                &crate::defuse::carriers::CarrierRecord::default(),
+                super::environment::FormalBindings::default(),
+                super::er::add_self_aliases_to_query(query),
+            )?
+            .into_relational_body()
+            .map_err(|_| {
+                Internal::invariant(
+                    "er composition",
+                    "a simple edge body resolves to one relation and carries no bindings",
+                )
+            })?;
+            let body = resolved.semantic_relation();
+            let chain = resolved.into_body();
+            let left_scan =
+                crate::relation::published_ports(identities, &scans[index].semantic_relation())?;
+            let right_scan = crate::relation::published_ports(
+                identities,
+                &scans[index + 1].semantic_relation(),
+            )?;
+            attachments.push(
+                super::er::body::ResolvedBody::of(&chain, &body, left_at, &pair, identities)?
+                    .rebound_onto(&left_scan, &right_scan)?,
+            );
+        }
+
+        // THE ASSEMBLY: the scans joined in chain order, each edge's
+        // conditions attached once its two scans stand.
+        let mut scans = scans.into_iter();
+        let mut acc = scans.next().expect("a chain has a first term");
+        for (index, scan) in scans.enumerate() {
+            acc = crate::pipeline::resolver::ResolvedRelation::joining(acc, scan)
+                .joined(None, identities)?;
+            for condition in std::mem::take(&mut attachments[index]) {
+                acc = acc.transparently(crate::pipeline::ast_resolved::Transparent::Restrict {
+                    condition,
+                    origin: crate::pipeline::asts::core::FilterOrigin::UserWritten,
+                });
+            }
+        }
         drop(bounds);
-        outcome
-    }
-}
-
-/// A SCOPED definition's admitted body: its formal frame and its syntax,
-/// ONE value — born where the binding's actuals resolved, consumed whole
-/// by its own resolving operations below. The frame goes into the world
-/// under a lease and comes out again when the resolution ends; the pair
-/// can never be re-assembled from loose pieces at a use site, and no
-/// caller holds a pushed frame open.
-pub(crate) struct ScopedBody {
-    formals: super::environment::FormalBindings,
-    body: crate::pipeline::ast_unresolved::DomainExpression,
-}
-
-impl ScopedBody {
-    fn of(
-        formals: super::environment::FormalBindings,
-        body: crate::pipeline::ast_unresolved::DomainExpression,
-    ) -> Self {
-        ScopedBody { formals, body }
-    }
-
-    /// RESOLVE the admitted scoped body in the world it was born in: its
-    /// frame stands on that world for exactly this resolution's extent,
-    /// answered through a child fold, and the lease's drop restores the
-    /// world on every path.
-    pub(crate) fn resolve(
-        self,
-        fold: &mut ResolverFold<'_, '_>,
-    ) -> Result<crate::pipeline::ast_resolved::DomainExpression> {
-        use crate::pipeline::ast_transform::AstTransform;
-        let ScopedBody { formals, body } = self;
-        let config = fold.config.clone();
-        let grade = fold.position_grade;
-        let mut lease = fold.env.instantiated(formals);
-        let mut child = ResolverFold::new(&mut *fold.core, lease.world(), config);
-        child.position_grade = grade;
-        child.transform_domain(body)
-    }
-
-    /// The SCALAR twin of [`Self::resolve`]: the enclosing row a `..` body
-    /// declared and the window obligation ride in beside the admitted
-    /// value, and the obligation rides back out.
-    pub(crate) fn resolve_scalar(
-        self,
-        core: &mut ResolverCore<'_>,
-        env: &mut Environment,
-        config: crate::pipeline::resolver::ResolutionConfig,
-        grade: CallableGrade,
-        row: Option<EnclosingRow<'_>>,
-        obligation: Option<crate::pipeline::resolver::resolver_fold::WindowObligation>,
-    ) -> (
-        Result<Option<crate::pipeline::ast_resolved::DomainExpression>>,
-        Option<crate::pipeline::resolver::resolver_fold::WindowObligation>,
-    ) {
-        use crate::pipeline::ast_transform::AstTransform;
-        let ScopedBody { formals, body } = self;
-        let mut lease = env.instantiated(formals);
-        let mut child = match row {
-            Some(row) => ResolverFold::enclosed(&mut *core, lease.world(), config, row.0),
-            None => ResolverFold::new(&mut *core, lease.world(), config),
-        };
-        child.position_grade = grade;
-        child.window_obligation = obligation;
-        let out = child.transform_domain(body).map(Some);
-        let obligation = child.window_obligation.take();
-        (out, obligation)
+        Ok((acc, terms))
     }
 }
 
@@ -400,16 +437,20 @@ impl super::bound_use::BoundUse<'_, ValueActuals> {
     ) -> Result<crate::pipeline::asts::resolved::TruthExpression> {
         use crate::pipeline::asts::ddl::DefKind;
         let group = self.reconstruct_group().map_err(|e| {
-            DelightQLError::parse_error(format!(
-                "No definitions found for sigma predicate '{functor}': {e}"
-            ))
+            Internal::invariant(
+                "defuse::admitted",
+                format!("No definitions found for sigma predicate '{functor}': {e}"),
+            )
         })?;
         if group.kind() != DefKind::Sigma {
-            return Err(DelightQLError::parse_error(format!(
-                "Expected sigma predicate definition for '{}', got {:?}",
-                functor,
-                group.kind()
-            )));
+            return Err(Internal::invariant(
+                "defuse::admitted",
+                format!(
+                    "Expected sigma predicate definition for '{}', got {:?}",
+                    functor,
+                    group.kind()
+                ),
+            ));
         }
         let ValueActuals(resolved_args) = &self.actuals;
 
@@ -417,15 +458,14 @@ impl super::bound_use::BoundUse<'_, ValueActuals> {
         for clause in group.clauses() {
             let params = clause.params();
             if params.len() != resolved_args.len() {
-                return Err(DelightQLError::validation_error(
-                    format!(
+                return Err(DelightQLError::from(Semantic::Arity {
+                    message: format!(
                         "Sigma predicate '{}' expects {} arguments, got {}",
                         functor,
                         params.len(),
                         resolved_args.len()
                     ),
-                    "Arity mismatch",
-                ));
+                }));
             }
             // A sigma rule's body is a TRUTH, and the parse-level
             // category says so: `p(x) :- users` never becomes one of
@@ -433,10 +473,14 @@ impl super::bound_use::BoundUse<'_, ValueActuals> {
             let truth = clause
                 .as_truth_expr()
                 .ok_or_else(|| {
-                    DelightQLError::parse_error(format!(
-                        "Sigma predicate '{}' clause has no truth body",
-                        functor
-                    ))
+                    crate::diagnostic::DelightQLError::from(
+                        crate::diagnostic::Constraint::General {
+                            message: format!(
+                                "Sigma predicate '{}' clause has no truth body",
+                                functor
+                            ),
+                        },
+                    )
                 })?
                 .clone();
             let mut inventory = FormalInventory::declared(
@@ -472,9 +516,19 @@ impl super::bound_use::BoundUse<'_, ValueActuals> {
 /// shares — scalar call, cover cell, pattern slot — derived from the
 /// carrier's own parts.
 struct OpenedCallable<'s, A: ActualPayload> {
-    cfe: crate::pipeline::asts::unresolved::CfeDefinition,
+    shape: CallableShape,
     actuals: A,
     held: Held<'s, A>,
+}
+
+/// A CALLABLE'S DECLARATION — everything left of the body: the name, the
+/// context mode and the two formal runs the binding prologue reads. Both
+/// roads build one, and NEITHER carries a body: a consulted body travels
+/// on its admission, a query-scoped one never leaves its carrier.
+struct CallableShape {
+    context_mode: crate::pipeline::asts::core::ContextMode,
+    callable_formals: Vec<crate::pipeline::asts::core::CfeFormal>,
+    scalar_formals: Vec<crate::pipeline::asts::core::CfeFormal>,
 }
 
 impl<'s, A: ActualPayload + Default> CallableUse<'s, A> {
@@ -483,38 +537,60 @@ impl<'s, A: ActualPayload + Default> CallableUse<'s, A> {
             CallableUse::Bound(mut bound) => {
                 let cfe = shape_callable(&bound)?;
                 let actuals = bound.spend_actuals();
+                let (callable_formals, scalar_formals) = cfe.split_formals();
+                let shape = CallableShape {
+                    context_mode: cfe.context_mode.clone(),
+                    callable_formals: callable_formals.to_vec(),
+                    scalar_formals: scalar_formals.to_vec(),
+                };
                 OpenedCallable {
-                    cfe,
+                    shape,
                     actuals,
-                    held: Held::Bound(bound),
+                    held: Held::Bound {
+                        bound,
+                        body: cfe.body,
+                    },
                 }
             }
             CallableUse::Scoped(ScopedBoundUse {
-                cfe,
+                definition,
                 actuals,
                 _frame,
-            }) => OpenedCallable {
-                cfe,
-                actuals,
-                held: Held::Scoped(_frame),
-            },
+            }) => {
+                let shape = CallableShape {
+                    context_mode: definition.context_mode().clone(),
+                    callable_formals: definition.callable_formals().to_vec(),
+                    scalar_formals: definition.scalar_formals().to_vec(),
+                };
+                OpenedCallable {
+                    shape,
+                    actuals,
+                    held: Held::Scoped { _frame, definition },
+                }
+            }
         })
     }
 }
 
 /// The categorized cardinality refusal of a callable's formal binding,
 /// spelled with the callable's name.
-fn named_binding_refusal(name: &str, error: DelightQLError) -> DelightQLError {
+pub(in crate::defuse) fn named_binding_refusal(
+    name: &str,
+    error: DelightQLError,
+) -> DelightQLError {
+    // The refusal keeps its own identity; the callable's name is carried in
+    // the message where the leaf is the general cardinality refusal.
     match error {
-        DelightQLError::ValidationError {
-            message,
-            context,
-            subcategory,
-        } => DelightQLError::ValidationError {
+        DelightQLError::Semantic(Semantic::Arity { message }) => Semantic::Arity {
             message: format!("'{name}': {message}"),
-            context,
-            subcategory,
-        },
+        }
+        .into(),
+        DelightQLError::Semantic(Semantic::Constraint(Constraint::General { message })) => {
+            Constraint::General {
+                message: format!("'{name}': {message}"),
+            }
+            .into()
+        }
         other => other,
     }
 }
@@ -535,7 +611,11 @@ impl CallableUse<'_, ScalarActuals> {
         supplied_members: usize,
     ) -> Result<Option<crate::pipeline::asts::resolved::DomainExpression>> {
         use crate::pipeline::asts::core::ContextMode;
-        let OpenedCallable { cfe, actuals, held } = self.open()?;
+        let OpenedCallable {
+            shape,
+            actuals,
+            held,
+        } = self.open()?;
         let ScalarActuals {
             context: context_call,
             code: held_code,
@@ -543,24 +623,32 @@ impl CallableUse<'_, ScalarActuals> {
         } = actuals;
 
         // The context and arity laws, judged on the ADMITTED, opened shape.
-        match (&cfe.context_mode, context_call) {
+        match (&shape.context_mode, context_call) {
             (ContextMode::None, true) => {
-                return Err(DelightQLError::parse_error(format!(
+                return Err(DelightQLError::from(Constraint::General {
+                    message: format!(
                     "'{name}' is not context-aware: it declares no `..`; supply values positionally"
-                )));
+                ),
+                }));
             }
             (ContextMode::Implicit, false) => {
-                return Err(DelightQLError::parse_error(format!(
+                return Err(DelightQLError::from(Constraint::General {
+    message: format!(
                     "CFE '{name}' uses implicit context and cannot be called positionally — use {name}:(.., args)"
-                )));
+                ),
+}));
             }
             _ => {}
         }
-        let (callable_formals, scalar_formals) = cfe.split_formals();
+        let CallableShape {
+            callable_formals,
+            scalar_formals,
+            ..
+        } = &shape;
         let curried_count = callable_formals.len();
         // Explicit captures called positionally are leading positionals; a
         // context call binds them by name instead, so they are not counted.
-        let positional_captures = match (&cfe.context_mode, context_call) {
+        let positional_captures = match (&shape.context_mode, context_call) {
             (ContextMode::Explicit(captures), false) => captures.len(),
             _ => 0,
         };
@@ -570,21 +658,21 @@ impl CallableUse<'_, ScalarActuals> {
             // capture that cannot bind is what refuses, below, by name.
             if !context_call {
                 if positional_captures > 0 {
-                    return Err(DelightQLError::parse_error(format!(
+                    return Err(DelightQLError::from(Cfe::Arity {
+    message: format!(
                         "'{name}' expects {declared} positional argument{} (captures first), got {}",
                         if declared == 1 { "" } else { "s" },
                         supplied_members
-                    )));
+                    ),
+}));
                 }
-                return Err(DelightQLError::validation_error_categorized(
-                    "cfe/arity",
-                    format!(
+                return Err(DelightQLError::from(Cfe::Arity {
+                    message: format!(
                         "'{name}' expects {declared} argument{}, got {}",
                         if declared == 1 { "" } else { "s" },
                         supplied_members
                     ),
-                    "supply one argument per declared parameter, code first",
-                ));
+                }));
             }
         }
 
@@ -599,7 +687,7 @@ impl CallableUse<'_, ScalarActuals> {
                 .iter()
                 .map(|formal| (formal.name.clone(), FormalRole::Callable))
                 .collect();
-            if let ContextMode::Explicit(captures) = &cfe.context_mode {
+            if let ContextMode::Explicit(captures) = &shape.context_mode {
                 declared.extend(
                     captures
                         .iter()
@@ -621,7 +709,7 @@ impl CallableUse<'_, ScalarActuals> {
             .bind_callables_positional(held_code)
             .map_err(|error| named_binding_refusal(name, error))?;
         let mut resolved_values = held_values.into_iter();
-        if let ContextMode::Explicit(captures) = &cfe.context_mode {
+        if let ContextMode::Explicit(captures) = &shape.context_mode {
             if context_call {
                 // `..` binds each declared capture BY NAME, resolved at
                 // the call site, THROUGH the issued inventory — a name the
@@ -659,15 +747,13 @@ impl CallableUse<'_, ScalarActuals> {
         // captures, reach the call site's row. Implicit context is the one
         // deliberate unsealing: `..` DECLARES that free names capture from
         // the caller's ROW — the row, never the caller's bindings.
-        let implicit = matches!(cfe.context_mode, ContextMode::Implicit);
-        let horizon = cfe.horizon();
+        let implicit = matches!(shape.context_mode, ContextMode::Implicit);
         let enclosing_row = implicit.then(|| EnclosingRow(&fold.lexical));
-        let body = cfe.body;
         // A windowed use's obligation flows into the body's resolution and
         // back out: the position's grade is a contract, not lexical state.
         let obligation = fold.window_obligation.take();
         let (outcome, obligation) = match held {
-            Held::Bound(bound) => {
+            Held::Bound { bound, body } => {
                 let facts = BodyPositionFacts::of(fold)
                     .with_enclosing_row(enclosing_row)
                     .with_window_obligation(obligation);
@@ -675,25 +761,22 @@ impl CallableUse<'_, ScalarActuals> {
                     resolve_value_in(&mut *fold.core, facts, &bound, frame, body);
                 (outcome.map(Some), obligation)
             }
-            Held::Scoped(_frame) => {
-                // The scoped twin resolves in the SAME world it was born
-                // in: its admitted frame-and-body value resolves itself,
-                // sealed against the caller's row unless `..` declared
-                // otherwise.
-                fold.env.push_horizon(horizon);
+            // The scoped twin resolves in the SAME world it was born in,
+            // at the site its DECLARATION stands in, however deep the
+            // mention that spends it — and it resolves ITSELF: the body
+            // never leaves the carrier to be opened by this road.
+            Held::Scoped { definition, .. } => {
                 let config = fold.config.clone();
                 let grade = fold.position_grade;
-                let resolved = ScopedBody::of(frame, body).resolve_scalar(
+                definition.resolve_scalar(
+                    frame,
                     &mut *fold.core,
                     &mut *fold.env,
                     config,
                     grade,
                     implicit.then_some(()).and(enclosing_row),
                     obligation,
-                );
-                fold.env.pop_horizon();
-                let (outcome, obligation) = resolved;
-                (outcome, obligation)
+                )
             }
         };
         fold.window_obligation = obligation;
@@ -717,30 +800,32 @@ impl CallableUse<'_, ValueActuals> {
         name: &str,
     ) -> Result<Option<crate::pipeline::asts::resolved::DomainExpression>> {
         use crate::pipeline::asts::core::ContextMode;
-        let OpenedCallable { cfe, actuals, held } = self.open()?;
+        let OpenedCallable {
+            shape,
+            actuals,
+            held,
+        } = self.open()?;
         let ValueActuals(values) = actuals;
-        if cfe.context_mode != ContextMode::None || !cfe.callable_formals().is_empty() {
+        if shape.context_mode != ContextMode::None || !shape.callable_formals.is_empty() {
             return Ok(None);
         }
-        let formals = cfe.scalar_formals();
+        let formals = &shape.scalar_formals;
         if formals.is_empty() {
-            return Err(DelightQLError::validation_error_categorized(
-                "cfe/cover_arity",
-                format!("'{name}' takes no parameters, so a cover cannot land the cell in one"),
-                "the covered callable's final parameter receives each cell",
-            ));
+            return Err(DelightQLError::from(Cfe::CoverArity {
+                message: format!(
+                    "'{name}' takes no parameters, so a cover cannot land the cell in one"
+                ),
+            }));
         }
         if values.len() != formals.len() {
-            return Err(DelightQLError::validation_error_categorized(
-                "cfe/cover_arity",
-                format!(
+            return Err(DelightQLError::from(Cfe::CoverArity {
+                message: format!(
                     "'{name}' has {} parameter{} before the cell; the mention supplies {}",
                     formals.len() - 1,
                     if formals.len() == 2 { "" } else { "s" },
                     values.len() - 1
                 ),
-                "the cell lands last; supply one value per preceding parameter",
-            ));
+            }));
         }
         let mut inventory = FormalInventory::declared(
             formals
@@ -751,19 +836,12 @@ impl CallableUse<'_, ValueActuals> {
             .bind_positional(FormalRole::Value, values)
             .map_err(|error| named_binding_refusal(name, error))?;
         let frame = inventory.sealed();
-        let horizon = cfe.horizon();
-        let body = cfe.body;
         let outcome = match held {
-            Held::Bound(bound) => {
+            Held::Bound { bound, body } => {
                 let facts = BodyPositionFacts::of(fold);
                 resolve_value_in(&mut *fold.core, facts, &bound, frame, body).0
             }
-            Held::Scoped(_frame) => {
-                fold.env.push_horizon(horizon);
-                let resolved = ScopedBody::of(frame, body).resolve(fold);
-                fold.env.pop_horizon();
-                resolved
-            }
+            Held::Scoped { definition, .. } => definition.resolve_cover(frame, fold),
         };
         Ok(Some(outcome?))
     }
@@ -779,25 +857,27 @@ impl CallableUse<'_, ValueActuals> {
         instantiation: crate::pipeline::resolver::SlotInstantiation<'_, '_>,
         name: &str,
     ) -> Result<Option<crate::pipeline::asts::resolved::DomainExpression>> {
-        let OpenedCallable { cfe, actuals, held } = self.open()?;
+        let OpenedCallable {
+            shape,
+            actuals,
+            held,
+        } = self.open()?;
         let ValueActuals(values) = actuals;
-        if !cfe.callable_formals().is_empty()
-            || cfe.context_mode != crate::pipeline::asts::core::ContextMode::None
+        if !shape.callable_formals.is_empty()
+            || shape.context_mode != crate::pipeline::asts::core::ContextMode::None
         {
             return Ok(None);
         }
-        let scalar_formals = cfe.scalar_formals();
+        let scalar_formals = &shape.scalar_formals;
         if values.len() != scalar_formals.len() {
-            return Err(DelightQLError::validation_error_categorized(
-                "cfe/arity",
-                format!(
+            return Err(DelightQLError::from(Cfe::Arity {
+                message: format!(
                     "'{name}' expects {} argument{}, got {}",
                     scalar_formals.len(),
                     if scalar_formals.len() == 1 { "" } else { "s" },
                     values.len()
                 ),
-                "supply one value per declared parameter",
-            ));
+            }));
         }
         let mut inventory = FormalInventory::declared(
             scalar_formals
@@ -814,662 +894,64 @@ impl CallableUse<'_, ValueActuals> {
         // frame-and-body value is consumed whole against the caller's own
         // allowance. Either way the world and the body cross as ONE closed
         // value, and the converter consumes the variant it is handed.
-        let world = match held {
-            Held::Bound(ref bound) => SealedSlotWorld::Opened(world_of(bound, &crate::defuse::carriers::CarrierRecord::default(), frame)),
-            Held::Scoped(_) => SealedSlotWorld::Scoped(frame, cfe.horizon()),
+        let slot = match held {
+            Held::Bound {
+                ref bound,
+                ref body,
+            } => SealedSlot::Opened {
+                env: world_of(
+                    bound,
+                    &crate::defuse::carriers::CarrierRecord::default(),
+                    frame,
+                ),
+                body: body.clone(),
+            },
+            // The scoped road's world holds the body too: the carrier mints
+            // all three together, so nothing here pairs a body with a world.
+            Held::Scoped { ref definition, .. } => SealedSlot::Scoped(definition.spending(frame)),
         };
-        let outcome = SealedSlot {
-            world,
-            body: cfe.body,
-        }
-        .convert(converter.registry(), instantiation);
+        let outcome = slot.convert(converter.registry(), instantiation);
         drop(held);
         outcome
     }
 }
 
-/// THE SEALED SLOT: the world (or the scoped frame) and the body as ONE
-/// value, private to this file — constructed from the consumed use's own
-/// parts and spent only by its own converting operation. No signature
-/// anywhere accepts the world and the body independently.
-struct SealedSlot {
-    world: SealedSlotWorld,
-    body: crate::pipeline::asts::core::DomainExpression<crate::pipeline::asts::core::Unresolved>,
-}
-
-/// The world a sealed slot body resolves in — a closed sum: an OPENED
-/// consulted world, or a scoped binding's frame standing on the caller's
-/// own world. There is no third state and no combination of the two.
-enum SealedSlotWorld {
-    Opened(Environment),
-    Scoped(
-        super::environment::FormalBindings,
-        crate::pipeline::asts::core::LexicalHorizon,
-    ),
+/// THE SEALED SLOT — a closed sum, private to this file: an OPENED
+/// consulted world with the body that opens in it, or a query-scoped
+/// definition's own slot world, which the carrier minted with its body,
+/// its frame and its declaration site together. There is no third state,
+/// no combination of the two, and no signature that accepts a world and a
+/// body independently.
+enum SealedSlot {
+    Opened {
+        env: Environment,
+        body:
+            crate::pipeline::asts::core::DomainExpression<crate::pipeline::asts::core::Unresolved>,
+    },
+    Scoped(super::environment::ScopedSlotWorld),
 }
 
 impl SealedSlot {
     /// THE CONSUMING OPERATION: convert the body in the world it was sealed
-    /// with. The allowance stands in that world — an opened world on its
-    /// own, a scoped frame on the caller's — and the strict converter
-    /// realizes the body under it. The variant is consumed here; nothing
-    /// receives the world beside the body.
+    /// with. A consulted body converts under its opened world here; a
+    /// scoped one converts through its own world's operation, which is the
+    /// only road to that body.
     fn convert(
         self,
         registry: &crate::names::Registry,
         allowance: crate::pipeline::resolver::SlotInstantiation<'_, '_>,
     ) -> Result<Option<crate::pipeline::asts::resolved::DomainExpression>> {
+        use crate::pipeline::ast_transform::AstTransform;
         use crate::pipeline::resolver::StrictPhaseConverter;
-        let SealedSlot { world, body } = self;
-        let nested = match &world {
-            SealedSlotWorld::Opened(env) => allowance.in_opened(env),
-            SealedSlotWorld::Scoped(frame, horizon) => allowance.in_scoped(frame, *horizon),
-        };
-        let mut converter = StrictPhaseConverter::sealed(registry, nested);
-        converter.transform_domain(body).map(Some)
-    }
-}
-
-/// WHAT AN EFFECT DEMAND SELECTED: the query's own effect-mirror CHOE, or a
-/// consulted effect rule. Both invoke through one entrance.
-pub(crate) enum EffectSelection<'s> {
-    Consulted(EffectUse<'s>),
-    Scoped(ScopedEffectUse),
-}
-
-impl EffectSelection<'_> {
-    /// The rule's name, `!` included.
-    pub(crate) fn rule_name(&self) -> delightql_types::SqlIdentifier {
         match self {
-            EffectSelection::Consulted(consulted) => consulted.rule_name().clone(),
-            EffectSelection::Scoped(scoped) => scoped.rule_name(),
-        }
-    }
-
-    /// The exact declared row, reconstructed from the same selected family
-    /// for consulted effects and read directly from a scoped definition.
-    pub(crate) fn declared_params(&self) -> Result<Vec<HoParam>> {
-        match self {
-            EffectSelection::Consulted(consulted) => Ok(crate::ddl::reconstruct::group(
-                consulted.family.definition(),
-            )?
-            .params()
-            .to_vec()),
-            EffectSelection::Scoped(scoped) => Ok(scoped.definition.group().params().to_vec()),
-        }
-    }
-
-    pub(crate) fn invoke(
-        self,
-        instances: &InstanceTable,
-        resolved_arguments: Vec<crate::pipeline::asts::resolved::DomainExpression>,
-        rule_arguments: std::collections::HashMap<
-            delightql_types::SqlIdentifier,
-            super::ho::RuleValueId,
-        >,
-        builder: &mut crate::pipeline::effect_transformer::PlanBuilder<'_>,
-        piped: Option<crate::relation::ScratchRow>,
-        ctx: &crate::pipeline::effect_transformer::WalkCtx<'_>,
-        root: bool,
-    ) -> Result<crate::pipeline::ast_unresolved::Chain> {
-        match self {
-            EffectSelection::Consulted(consulted) => consulted.invoke(
-                instances,
-                resolved_arguments,
-                rule_arguments,
-                builder,
-                piped,
-                ctx,
-                root,
-            ),
-            EffectSelection::Scoped(scoped) => scoped.invoke(
-                instances,
-                resolved_arguments,
-                rule_arguments,
-                builder,
-                piped,
-                ctx,
-            ),
-        }
-    }
-}
-
-/// The query's own EFFECT-MIRROR CHOE, selected by a demand and not yet
-/// invoked. Its body is the query's own text: it compiles IN THE DEMAND
-/// SITE'S WORLD, through a body frame holding the parameter frame and the
-/// definition's lexical horizon, exactly as a pure CHOE resolves — the
-/// piped input binds its relation formal as a consulted rule's does.
-pub(crate) struct ScopedEffectUse {
-    definition: crate::pipeline::asts::core::HoDefinition,
-}
-
-impl ScopedEffectUse {
-    pub(crate) fn of(definition: crate::pipeline::asts::core::HoDefinition) -> Self {
-        ScopedEffectUse { definition }
-    }
-
-    pub(crate) fn rule_name(&self) -> delightql_types::SqlIdentifier {
-        delightql_types::SqlIdentifier::new(format!("{}!", self.definition.name().as_str()))
-    }
-
-    pub(crate) fn scalar_param_count(&self) -> usize {
-        self.definition
-            .group()
-            .params()
-            .iter()
-            .filter(|param| matches!(param, crate::pipeline::asts::ddl::HoParam::Scalar { .. }))
-            .count()
-    }
-
-    fn invoke(
-        self,
-        instances: &InstanceTable,
-        resolved_arguments: Vec<crate::pipeline::asts::resolved::DomainExpression>,
-        rule_arguments: std::collections::HashMap<
-            delightql_types::SqlIdentifier,
-            super::ho::RuleValueId,
-        >,
-        builder: &mut crate::pipeline::effect_transformer::PlanBuilder<'_>,
-        piped: Option<crate::relation::ScratchRow>,
-        ctx: &crate::pipeline::effect_transformer::WalkCtx<'_>,
-    ) -> Result<crate::pipeline::ast_unresolved::Chain> {
-        let display_name = self.rule_name().to_string();
-        let declared = self.scalar_param_count();
-        if resolved_arguments.len() != declared {
-            return Err(DelightQLError::validation_error_categorized(
-                "effect/rule/arity",
-                format!(
-                    "effect rule '{display_name}' declares {declared} scalar parameter(s) and is \
-                     invoked with {} argument(s)",
-                    resolved_arguments.len()
-                ),
-                "scalar argument count does not match the rule's parameters",
-            ));
-        }
-        let actuals = EffectActuals::of(resolved_arguments, rule_arguments);
-        let frame = match instances.admit_scoped(self.definition.name(), actuals.scoped_key()) {
-            super::instance::ScopedAdmission::Fresh(frame) => frame,
-            super::instance::ScopedAdmission::Reenter
-            | super::instance::ScopedAdmission::Cycle { .. }
-            | super::instance::ScopedAdmission::Widening { .. } => {
-                return Err(choe_recursion_refusal(&display_name));
+            SealedSlot::Opened { env, body } => {
+                let nested = allowance.in_opened(&env);
+                let mut converter = StrictPhaseConverter::sealed(registry, nested);
+                converter.transform_domain(body).map(Some)
             }
-        };
-        let mut rule = crate::pipeline::asts::effects::EffectRule::from_definition_group(
-            self.definition.group(),
-        )?;
-        rule.strip_bound_param_heads();
-        let formals = {
-            let EffectActuals { values, rules } = actuals;
-            let mut inventory =
-                FormalInventory::declared(self.definition.group().params().iter().filter_map(
-                    |param| match param {
-                        HoParam::Scalar { name, .. } => Some((name.clone(), FormalRole::Value)),
-                        HoParam::Rule { name, .. } => Some((name.clone(), FormalRole::Rule)),
-                        HoParam::Relation { .. } | HoParam::Ground { .. } => None,
-                    },
-                ));
-            inventory
-                .bind_positional(FormalRole::Value, values)
-                .map_err(|error| named_binding_refusal(&display_name, error))?;
-            for (name, value) in rules {
-                inventory.bind_rule_named(&name, value)?;
-            }
-            inventory.sealed()
-        };
-        // THE DEMAND SITE'S OWN WORLD, entered through a body frame for
-        // exactly this invocation's extent.
-        let lease = super::environment::SharedInstantiated::body(
-            ctx.world_cell(),
-            formals,
-            self.definition.horizon().clone(),
-        );
-        let invoked = InvokedRule {
-            rule,
-            world: InvokedWorld::Caller {
-                _lease: lease,
-                horizon: self.definition.horizon().clone(),
-            },
-            _held: HeldInvocation::Scoped { _frame: frame },
-        };
-        builder.compile_invoked(&invoked, piped, ctx)
-    }
-}
-
-/// One selected effect rule, NOT yet opened: invocation is the use, and
-/// [`Self::invoke`] is its one entrance — the complete bound-use
-/// transition (resolved actuals -> semantic key -> admission -> a fresh
-/// body world with the parameter frame) with restoration owned
-/// STRUCTURALLY by the entrance, never by a consumer convention.
-pub(crate) struct EffectUse<'s> {
-    family: LinkedFamily<'s>,
-}
-
-impl<'s> EffectUse<'s> {
-    /// The rule's name, `!` included — a family fact for receipts and
-    /// diagnostics.
-    pub(crate) fn rule_name(&self) -> &delightql_types::SqlIdentifier {
-        self.family.name()
-    }
-
-    /// INVOKE the rule AS ONE CLOSED OPERATION: the caller-RESOLVED
-    /// actuals bind the use — semantic key, admission (re-encountering the
-    /// rule while invoked is the R6 refusal), body opening and shaping —
-    /// then plan compilation runs INSIDE this operation, under a world
-    /// this operation OWNS for exactly its extent; the resolved effect
-    /// artifact is what returns. The plan builder compiles the rule's
-    /// statements through the world's own named resolving operations: it
-    /// never receives the environment, cannot retain the world past this
-    /// call, and has no stack of its own to place it on.
-    pub(crate) fn invoke(
-        self,
-        instances: &InstanceTable,
-        resolved_arguments: Vec<crate::pipeline::asts::resolved::DomainExpression>,
-        rule_arguments: std::collections::HashMap<
-            delightql_types::SqlIdentifier,
-            super::ho::RuleValueId,
-        >,
-        builder: &mut crate::pipeline::effect_transformer::PlanBuilder<'_>,
-        piped: Option<crate::relation::ScratchRow>,
-        ctx: &crate::pipeline::effect_transformer::WalkCtx<'_>,
-        root: bool,
-    ) -> Result<crate::pipeline::ast_unresolved::Chain> {
-        let EffectUse { family } = self;
-        let display_name = family.name().to_string();
-        let declared = family
-            .params()
-            .iter()
-            .filter(|param| matches!(param, crate::pipeline::asts::ddl::HoParam::Scalar { .. }))
-            .count();
-        if resolved_arguments.len() != declared {
-            return Err(DelightQLError::validation_error_categorized(
-                "effect/rule/arity",
-                format!(
-                    "effect rule '{display_name}' declares {declared} scalar parameter(s) and is \
-                     invoked with {} argument(s)",
-                    resolved_arguments.len()
-                ),
-                "scalar argument count does not match the rule's parameters",
-            ));
-        }
-        let bound = require_fresh(
-            bind_definition_use(
-                instances,
-                family,
-                EffectActuals::of(resolved_arguments, rule_arguments),
-            )?,
-            || {
-                DelightQLError::validation_error_categorized(
-                    "effect/transform/unsupported",
-                    format!("effect rule '{display_name}' recursed during plan expansion (R6)"),
-                    "unsupported in the v0.1 effect transformer",
-                )
-            },
-        )?;
-        let group = bound.reconstruct_group()?;
-        let mut rule = crate::pipeline::asts::effects::EffectRule::from_definition_group(&group)?;
-        // A parameterized rule's HEADS drop their scalar formals for the
-        // landing decisions (the bound parameters leave the head; what a
-        // rule still declares is what it still wants) — the BODIES keep
-        // their parameter references, bound below through the frame.
-        rule.strip_bound_param_heads();
-        // THE PARAMETER FRAME: the caller-resolved values bind the
-        // declared parameters by name, through the same formal-frame
-        // mechanism every value definition uses — never textual
-        // substitution of unresolved caller expressions into callee text.
-        let formals = {
-            let EffectActuals { values, rules } = &bound.actuals;
-            let mut inventory =
-                FormalInventory::declared(group.params().iter().filter_map(|param| match param {
-                    HoParam::Scalar { name, .. } => Some((name.clone(), FormalRole::Value)),
-                    HoParam::Rule { name, .. } => Some((name.clone(), FormalRole::Rule)),
-                    HoParam::Relation { .. } | HoParam::Ground { .. } => None,
-                }));
-            inventory
-                .bind_positional(FormalRole::Value, values.iter().cloned())
-                .map_err(|error| named_binding_refusal(&display_name, error))?;
-            for (name, value) in rules {
-                inventory.bind_rule_named(name, *value)?;
-            }
-            inventory.sealed()
-        };
-        // THE INVOKED WORLD, owned HERE for exactly the compilation's
-        // extent: a demanded PROGRAM (root) is the plan's own use world,
-        // rooted at its namespace — its statements are the plan and read
-        // the plan's creations. A rule invoked FROM a body opens a
-        // consulted body world: only its formals cross. The builder
-        // compiles the rule's statements through the world's named
-        // operations and cannot reach the enclosing world while it stands.
-        // THE PROGRAM WORLD READS UNDER THE FAMILY'S OWN READ: the registry
-        // it captures the session reach through is built from the read
-        // that selected the rule, never supplied beside it.
-        let program_registry = ConsultRegistry::new_with_system(bound.family.catalog().system());
-        let world = EffectWorld::of(if root {
-            Environment::Use(super::environment::UseEnvironment::session_with_formals(
-                &program_registry,
-                bound.declaration.namespace(),
-                formals,
-            )?)
-        } else {
-            // An invoked rule's world is its own declaration's.
-            body_env(bound.declaration.clone(), &crate::defuse::carriers::CarrierRecord::default(), formals)
-        });
-        // THE INVOKED ATOM: the shaped rule, the world it resolves in, and
-        // the held admission are ONE value the builder compiles through —
-        // it reads the rule's syntax and obtains walk contexts standing in
-        // the world, and can pair neither with anything else.
-        let invoked = InvokedRule {
-            rule,
-            world: InvokedWorld::Owned(world),
-            _held: HeldInvocation::Bound { _bound: bound },
-        };
-        builder.compile_invoked(&invoked, piped, ctx)
-    }
-}
-
-/// THE WORLD AN INVOKED RULE COMPILES IN: a consulted rule's own, owned
-/// by the invocation; or — for the query's effect-mirror CHOE — the demand
-/// site's world itself, entered through a body frame the invocation holds
-/// open for its extent.
-enum InvokedWorld<'w> {
-    Owned(EffectWorld),
-    Caller {
-        _lease: super::environment::SharedInstantiated<'w>,
-        horizon: crate::pipeline::asts::core::LexicalHorizon,
-    },
-}
-
-/// The admission an invocation holds while its clauses compile — held for
-/// its extent, read by nothing.
-enum HeldInvocation<'s> {
-    Bound {
-        _bound: BoundUse<'s, EffectActuals>,
-    },
-    Scoped {
-        _frame: super::instance::InstanceFrame,
-    },
-}
-
-/// ONE INVOKED EFFECT RULE — the shaped rule, the world its statements
-/// resolve in, and the admission held while they compile, as one value
-/// with private fields. The plan builder compiles it through the
-/// operations below: it may read the rule's syntax, and it may obtain a
-/// walk context whose facts it supplies standing in THIS rule's world;
-/// the world itself never leaves, so no planner entrance can accept a rule
-/// beside a world, and nothing can pair this world with another rule.
-pub(crate) struct InvokedRule<'s, 'w> {
-    rule: crate::pipeline::asts::effects::EffectRule,
-    world: InvokedWorld<'w>,
-    _held: HeldInvocation<'s>,
-}
-
-impl InvokedRule<'_, '_> {
-    /// The shaped rule's syntax.
-    pub(crate) fn rule(&self) -> &crate::pipeline::asts::effects::EffectRule {
-        &self.rule
-    }
-
-    /// The given walk facts standing in this invocation's world — the one
-    /// road the world reaches a walk, inside a context for this rule's own
-    /// clauses. A consulted rule's clauses stand in its own world with its
-    /// clause's own block; a CHOE's stand in the demand site's world, in a
-    /// block where the clause's own bindings stand FIRST and the site's
-    /// follow.
-    ///
-    /// That order is the nesting, spelled in the one carrier a flat ledger
-    /// has: the clause's text is the nearer scope, so all of it is visible
-    /// and a spelling it declares SHADOWS the site's — which leaves the
-    /// site's block entirely, claim and binding together. The site's
-    /// remaining declarations follow, and the definition's horizon — read
-    /// at the distance those claims moved — still cuts them exactly where
-    /// the definition was written, so a site name declared after the
-    /// definition remains a refusal rather than becoming a local miss.
-    pub(crate) fn context_for<'a, 'f: 'a>(
-        &'a self,
-        clause: &crate::pipeline::asts::effects::EffectClause,
-        facts: crate::pipeline::effect_transformer::WalkCtx<'f>,
-    ) -> Result<crate::pipeline::effect_transformer::WalkCtx<'a>> {
-        match &self.world {
-            InvokedWorld::Owned(world) => Ok(facts
-                .with_locals(clause.body.locals.clone())
-                .standing_in(world)),
-            InvokedWorld::Caller { horizon, .. } => {
-                let nearer = clause.body.locals.clone();
-                let mut block = crate::pipeline::asts::core::QueryLocalBlock::default();
-                let site = facts.locals().visible_at(*horizon).shadowed_by(&nearer);
-                block.absorb(nearer)?;
-                let moved = block.absorb(site)?;
-                Ok(facts
-                    .with_locals(block.seal()?)
-                    .at_horizon(horizon.shifted(moved))
-                    .standing_in_caller())
-            }
+            SealedSlot::Scoped(world) => world.convert(registry, allowance),
         }
     }
-}
-
-/// THE WORLD AN EFFECT PLAN RESOLVES IN — owned by the invocation that
-/// built it (or by the plan's own root compilation for the session world)
-/// and reachable by the plan builder only through the named operations
-/// below. The environment inside never leaves: nothing outside this
-/// authority can retain it, stack it, or pair it with another plan.
-pub(crate) struct EffectWorld {
-    world: std::cell::RefCell<Environment>,
-}
-
-impl EffectWorld {
-    fn of(world: Environment) -> Self {
-        EffectWorld {
-            world: std::cell::RefCell::new(world),
-        }
-    }
-
-    /// The world's cell, for a body frame lease over it — reachable only
-    /// through a walk context, whose world this is.
-    pub(crate) fn cell(&self) -> &std::cell::RefCell<Environment> {
-        &self.world
-    }
-
-    /// The plan's OWN session world — the scope of statements standing
-    /// outside every rule body, rooted at the plan's namespace (`home` for
-    /// an ad-hoc statement).
-    pub(crate) fn program(consult: &ConsultRegistry, root_fq: &str) -> Result<Self> {
-        Ok(Self::of(Environment::Use(
-            super::environment::UseEnvironment::session(consult, root_fq)?,
-        )))
-    }
-
-    /// Register a relation an earlier statement of the plan created. A
-    /// PROGRAM world reads it as its own state; a consulted body world
-    /// reads a plan creation only through an explicit actual, never
-    /// ambiently, so the registration lands nowhere there.
-    pub(crate) fn register_materialized(
-        &self,
-        name: delightql_types::SqlIdentifier,
-        relation: crate::relation::SemanticRelation,
-    ) {
-        if let Environment::Use(world) = &mut *self.world.borrow_mut() {
-            world.register_materialized(name, relation);
-        }
-    }
-
-    /// Resolve one of the plan's statements in this world.
-    pub(crate) fn resolve_query(
-        &self,
-        core: &mut ResolverCore<'_>,
-        config: crate::pipeline::resolver::ResolutionConfig,
-        query: ast_unresolved::Query,
-    ) -> Result<crate::pipeline::resolver::ResolvedQuery> {
-        let mut world = self.world.borrow_mut();
-        let mut fold = ResolverFold::new(core, &mut world, config);
-        crate::pipeline::resolver::resolve_query_with(&mut fold, query)
-    }
-
-    /// Resolve a compiler-built application of one already-closed rule value.
-    /// The opaque id enters through the same formal inventory and residual
-    /// spending road as an authored higher-order body; callers provide only
-    /// the synthetic formal spelling used by their compiler-built query.
-    pub(crate) fn resolve_query_with_rule_value(
-        &self,
-        core: &mut ResolverCore<'_>,
-        config: crate::pipeline::resolver::ResolutionConfig,
-        query: ast_unresolved::Query,
-        formal: delightql_types::SqlIdentifier,
-        value: super::ho::RuleValueId,
-    ) -> Result<crate::pipeline::resolver::ResolvedQuery> {
-        let mut inventory =
-            FormalInventory::declared(std::iter::once((formal.clone(), FormalRole::Rule)));
-        inventory.bind_rule_named(&formal, value)?;
-        let mut world = self.world.borrow_mut();
-        let mut lease = world.instantiated(inventory.sealed());
-        let mut fold = ResolverFold::new(core, lease.world(), config);
-        crate::pipeline::resolver::resolve_query_with(&mut fold, query)
-    }
-
-    /// Resolve a demand site's row-free argument values in this world —
-    /// the CALLER's actuals, resolved before the callee is admitted.
-    pub(crate) fn resolve_values(
-        &self,
-        core: &mut ResolverCore<'_>,
-        config: crate::pipeline::resolver::ResolutionConfig,
-        values: Vec<ast_unresolved::DomainExpression>,
-    ) -> Result<Vec<crate::pipeline::asts::resolved::DomainExpression>> {
-        let mut world = self.world.borrow_mut();
-        let mut fold = ResolverFold::new(core, &mut world, config);
-        values
-            .into_iter()
-            .map(|value| fold.transform_domain(value))
-            .collect()
-    }
-
-    /// Construct a pure closed residual at an effect demand site through the
-    /// ordinary higher-order constructor. The caller world and resolver core
-    /// meet only inside this owned operation.
-    pub(crate) fn close_rule_value(
-        &self,
-        core: &mut ResolverCore<'_>,
-        config: crate::pipeline::resolver::ResolutionConfig,
-        designator: &ast_unresolved::Chain,
-        expected: &crate::pipeline::asts::core::definitions::ResidualSignature,
-        evaluation_relation: Option<crate::relation::ScratchRow>,
-    ) -> Result<super::ho::RuleValueId> {
-        let mut world = self.world.borrow_mut();
-        let mut fold = ResolverFold::new(core, &mut world, config);
-        super::carriers::construct_effect_residual(
-            designator,
-            expected,
-            &mut fold,
-            evaluation_relation,
-            Vec::new(),
-        )
-    }
-
-    /// Close a rule value at a built-in demand that stands inside an authored
-    /// query-local block. The block enters through the same name and
-    /// manifestation registration used by ordinary query resolution, so a
-    /// query-scoped designator and any configured local relation capture keep
-    /// their lexical identities.
-    pub(crate) fn close_rule_value_in_locals(
-        &self,
-        core: &mut ResolverCore<'_>,
-        config: crate::pipeline::resolver::ResolutionConfig,
-        locals: crate::pipeline::asts::core::QueryLocals<crate::pipeline::asts::core::Unresolved>,
-        designator: &ast_unresolved::Chain,
-        expected: &crate::pipeline::asts::core::definitions::ResidualSignature,
-        evaluation_relation: Option<crate::relation::ScratchRow>,
-    ) -> Result<super::ho::RuleValueId> {
-        let mut world = self.world.borrow_mut();
-        let (names, cfes, hos, ctes) = locals.spend();
-        world.push_query_names(names);
-        let result = (|| {
-            for cfe in cfes {
-                world.register_query_local(super::environment::QueryLocalRegistration::Value(cfe));
-            }
-            for ho in hos {
-                world.register_query_local(
-                    super::environment::QueryLocalRegistration::HigherOrder(ho),
-                );
-            }
-            let mut fold = ResolverFold::new(core, &mut world, config);
-            let leading_ctes = if ctes.is_empty() {
-                Vec::new()
-            } else {
-                crate::pipeline::bindings::resolve_cte_bindings(ctes, &mut fold)?
-            };
-            super::carriers::construct_effect_residual(
-                designator,
-                expected,
-                &mut fold,
-                evaluation_relation,
-                leading_ctes,
-            )
-        })();
-        world.pop_query_names();
-        result
-    }
-
-    /// Select one effect family from this world's captured reach. Qualified
-    /// and enlisted demands share the catalog's exhaustive selection and
-    /// kind judgment; the returned use carries the exact selected family.
-    pub(crate) fn select_effect_rule<'s>(
-        &self,
-        system: &'s crate::system::DelightQLSystem,
-        namespace: Option<&str>,
-        name: &str,
-        stropped: bool,
-    ) -> Result<Option<EffectUse<'s>>> {
-        let consult = ConsultRegistry::new_with_system(system);
-        let world = self.world.borrow();
-        let selected = match namespace {
-            Some(namespace) => consult
-                .select_entity(name, stropped, namespace, world.reach())?
-                .unique_or_refuse(name)?,
-            None => match super::select::judge_position(
-                name,
-                consult.select_enlisted(name, stropped, world.reach())?,
-                |kind| kind == crate::enums::EntityType::DqlEffectRule,
-            )? {
-                super::select::PositionOutcome::Selected(selected) => Some(selected),
-                _ => None,
-            },
-        };
-        match selected {
-            Some(super::select::Selected::Authored(family))
-                if family.kind() == crate::enums::EntityType::DqlEffectRule =>
-            {
-                Ok(Some(EffectUse { family }))
-            }
-            _ => Ok(None),
-        }
-    }
-}
-
-/// Use a name in EFFECT-RULE position: select the family in the demanded
-/// namespace and judge the kind. The body does NOT open here — invocation
-/// is the use, and [`EffectUse::invoke`] is its one entrance.
-/// `None` is a position miss (no such rule in the namespace).
-pub(crate) fn use_effect_rule<'s>(
-    system: &'s crate::system::DelightQLSystem,
-    namespace: &str,
-    rule_name: &str,
-) -> Result<Option<EffectUse<'s>>> {
-    let consult = crate::resolution::registry::ConsultRegistry::new_with_system(system);
-    // The demanded namespace's own reach, captured for this selection.
-    let reach = super::environment::reach::capture(
-        super::CatalogRead::of(system),
-        namespace,
-        super::environment::reach::World::Session,
-    )?;
-    let Some(super::select::Selected::Authored(family)) = consult
-        .select_entity(rule_name, false, namespace, &reach)?
-        .unique_or_refuse(rule_name)?
-    else {
-        return Ok(None);
-    };
-    if family.kind() != crate::enums::EntityType::DqlEffectRule {
-        return Ok(None);
-    }
-    Ok(Some(EffectUse { family }))
 }
 
 /// The declaring namespace of a selected family, FOR DIAGNOSTICS ONLY —
@@ -1535,7 +1017,13 @@ impl RelationUse<'_> {
             query,
             bound,
         } = self;
-        let resolved = resolve_relation_body(caller, &name, query, &bound, &crate::defuse::carriers::CarrierRecord::default())?;
+        let resolved = resolve_relation_body(
+            caller,
+            &name,
+            query,
+            &bound,
+            &crate::defuse::carriers::CarrierRecord::default(),
+        )?;
         drop(bound);
         Ok((name, definition_kind, resolved))
     }
@@ -1602,13 +1090,13 @@ fn dress_view_error(
     resolved: Result<crate::pipeline::resolver::ResolvedQuery>,
 ) -> Result<crate::pipeline::resolver::ResolvedQuery> {
     resolved.map_err(|e| {
-        if matches!(e, DelightQLError::ValidationError { .. }) {
+        if matches!(e, DelightQLError::Semantic(_)) {
             return e;
         }
-        DelightQLError::database_error(
-            format!("Error while resolving borrowed view '{}': {}", view_name, e),
-            e.to_string(),
-        )
+        DelightQLError::from(Runtime::General {
+            message: format!("Error while resolving borrowed view '{}': {}", view_name, e),
+            details: e.to_string(),
+        })
     })
 }
 
@@ -1639,15 +1127,18 @@ fn resolve_synthesized_in(
 /// body opened to a query, and the CONTEXT and PAIR that selected it
 /// retained — an edge never stands apart from the terms it was selected
 /// for. The body may be COMPOSED (the ER position's own law: self-aliases,
-/// endpoint marks, chain merges), but RESOLUTION happens here, in the
-/// rule's own world, while the admitted instance holds. The world decision
-/// never leaves.
+/// the peer's outer mark), but RESOLUTION happens here, in the rule's own
+/// world, while the admitted instance holds, and the resolved body is
+/// judged before it stands. The world decision never leaves.
 pub(crate) struct ErEdgeUse<'s> {
     bound: BoundUse<'s, NoActuals>,
     query: ast_unresolved::Query,
     context: String,
     left: super::er::ErTerm,
     right: super::er::ErTerm,
+    /// Where the left term's read stands in the body: the stored text
+    /// re-judged at use, as an invariant of what declaration admitted.
+    left_at: super::er::shape::LeftAt,
 }
 
 impl ErEdgeUse<'_> {
@@ -1667,26 +1158,34 @@ impl ErEdgeUse<'_> {
     /// replacement of the opened body.
     pub(crate) fn compose_standard(self, outer_endpoint: Option<&str>) -> Result<Self> {
         self.compose(|query| {
-            let mut query = crate::pipeline::resolver::add_self_aliases_to_query(query);
+            let mut query = super::er::add_self_aliases_to_query(query);
             if let Some(endpoint) = outer_endpoint {
-                query.body =
-                    crate::pipeline::resolver::mark_er_endpoint_outer(query.body, endpoint)?;
+                query.body = super::er::mark_endpoint_outer(query.body, endpoint)?;
             }
             Ok(query)
         })
     }
 
     /// Resolve the (possibly composed) body in the declaration's own
-    /// world. The admitted instance holds for the resolution's extent.
+    /// world. The admitted instance holds for the resolution's extent, and
+    /// the resolved body is judged on its endpoint roles — simple as
+    /// resolved, connected — as every edge consumer judges it.
     pub(crate) fn resolve(
         self,
         fold: &mut ResolverFold<'_, '_>,
         wrap: impl FnOnce(DelightQLError) -> DelightQLError,
-    ) -> Result<crate::pipeline::resolver::ResolvedQuery> {
+    ) -> Result<crate::pipeline::resolver::ResolvedRelation> {
         // THE SINGLE-EDGE OPERATION: this edge's own admitted body
         // resolves in its own declaration world — no chain, no
         // composition choice, nothing discarded.
-        let ErEdgeUse { bound, query, .. } = self;
+        let ErEdgeUse {
+            bound,
+            query,
+            context,
+            left,
+            right,
+            left_at,
+        } = self;
         let facts = BodyPositionFacts::of(fold);
         let outcome = resolve_query_in(
             &mut *fold.core,
@@ -1698,7 +1197,23 @@ impl ErEdgeUse<'_> {
         )
         .map_err(wrap);
         drop(bound);
-        outcome
+        let relation = outcome?.into_relational_body().map_err(|_| {
+            Internal::invariant(
+                "er composition",
+                "a simple edge body resolves to one relation and carries no bindings",
+            )
+        })?;
+        let pair = format!(
+            "{} & {} in '::{context}'",
+            left.spelling(),
+            right.spelling()
+        );
+        let identities = fold.core.identities;
+        let body = relation.semantic_relation();
+        relation.republished(|chain| {
+            super::er::body::ResolvedBody::of(&chain, &body, left_at, &pair, identities)?;
+            Ok(chain)
+        })
     }
 }
 
@@ -1712,42 +1227,24 @@ pub(in crate::defuse) fn er_edge<'s>(
     right: super::er::ErTerm,
 ) -> Result<ErEdgeUse<'s>> {
     let opened = super::bound_use::use_er_rule(bound)?;
+    let pair = format!(
+        "{} & {} in '::{context}'",
+        left.spelling(),
+        right.spelling()
+    );
+    // THE STORED SHAPE, RE-JUDGED: declaration admitted this body, and a
+    // use never widens what it admitted. The reads are spelled from the
+    // stored bytes, as they were at declaration.
+    let reads = crate::term_spec::edge_body_reads(opened.bound.family.definition())?;
+    let left_at = super::er::shape::judge(&opened.query, &reads, &left, &right, &pair)?;
     Ok(ErEdgeUse {
         bound: opened.bound,
         query: opened.query,
         context: context.to_string(),
         left,
         right,
+        left_at,
     })
-}
-
-/// A CODE actual's scoped closing: the frame of formal holes and the body
-/// derive from ONE definition value; a truth body refuses before anything
-/// resolves.
-pub(in crate::defuse) fn scoped_curried(
-    cfe: &crate::pipeline::asts::core::CfeDefinition,
-) -> Result<(usize, ScopedBody)> {
-    let formals = cfe.scalar_formals();
-    let arity = formals.len();
-    let mut inventory = FormalInventory::declared(
-        formals
-            .iter()
-            .map(|formal| (formal.name.clone(), FormalRole::Value)),
-    );
-    inventory
-        .bind_positional(FormalRole::Value, (0..arity as u32).map(curried_hole))
-        .map_err(|error| named_binding_refusal(cfe.name.as_str(), error))?;
-    let frame = inventory.sealed();
-    let body = cfe.body.clone();
-    Ok((arity, ScopedBody::of(frame, body)))
-}
-
-fn curried_hole(index: u32) -> crate::pipeline::asts::resolved::DomainExpression {
-    crate::pipeline::asts::resolved::DomainExpression::Application(
-        crate::pipeline::asts::resolved::FunctionApplication::Open(
-            crate::pipeline::asts::core::FormalHole(index),
-        ),
-    )
 }
 
 impl super::bound_use::HoUse {
@@ -1788,12 +1285,55 @@ impl super::bound_use::HoUse {
         // A multi-clause (or badged) parameterized definition establishes a
         // fixpoint: mint THIS instance's frontier so a same-key
         // self-reference re-enters it by identity, exactly as the
-        // unparameterized road does.
-        let frontier = (self.group.clauses().len() > 1 || self.group.fixpoint().is_badged())
-            .then(|| self.frame.frontier(&self.group));
+        // unparameterized road does. THE FRONTIER CARRIES THE CALLER: the
+        // caller-resolved actual ports the fixpoint's rows must carry are
+        // minted into it here, beside the instance — a caller row admitted
+        // at the anchor reaches every recursive clause through this and
+        // nothing else.
+        let requires_frontier = self.group.clauses().len() > 1 || self.group.fixpoint().is_badged();
+        let callers = {
+            let consult = &caller.core.consult;
+            let reach = self.declaration.reach();
+            self.group
+                .clauses()
+                .iter()
+                .map(|clause| {
+                    clause_caller(
+                        clause,
+                        self.declaration.namespace(),
+                        &self.frame,
+                        requires_frontier,
+                        |name, stropped, namespace_fq| {
+                            consult.select_entity(name, stropped, namespace_fq, reach)
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        // Only a definition some clause of which reads the frontier carries
+        // the caller through it; a multi-clause definition no clause of
+        // which mentions its subject accumulates its clauses once, each
+        // admitting the caller row, and publishes the authored heading.
+        let recursive = callers
+            .iter()
+            .any(|caller| *caller == super::ClauseCaller::Carried);
+        let (carried, carried_formals) = if join_input_scope.is_some() && recursive {
+            actual_occurrences(&self.actuals.values)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let frontier = requires_frontier.then(|| self.frame.frontier(&self.group, carried));
         let mut block = crate::pipeline::asts::core::QueryLocalBlock::default();
-        for clause_query in self.shaped_clause_queries(join_input_scope)? {
-            super::ho::extract_clause_ctes(clause_query, function, frontier.as_ref(), &mut block)?;
+        for (clause_query, caller) in
+            self.shaped_clause_queries(join_input_scope, &callers, &carried_formals)?
+        {
+            super::ho::extract_clause_ctes(
+                clause_query,
+                function,
+                frontier.as_ref(),
+                caller,
+                &mut block,
+            )?;
         }
         // Main query: function(*) referencing the clause CTEs.
         let main_query = ast_unresolved::Chain::read(
@@ -1825,7 +1365,7 @@ impl super::bound_use::HoUse {
                 position
                     .column_name
                     .as_ref()
-                    .map(|name| (delightql_types::SqlIdentifier::new(name), FormalRole::Value))
+                    .map(|name| (name.clone(), FormalRole::Value))
             })
             .chain(self.group.params().iter().filter_map(|param| match param {
                 HoParam::Rule { name, .. } => Some((name.clone(), FormalRole::Rule)),
@@ -1871,32 +1411,134 @@ impl super::bound_use::HoUse {
 
     /// The parameterized body, one shaped query per clause, each bound
     /// and injected with THIS use's actuals — module-private: only the
-    /// consuming operation above pairs them with a world.
+    /// consuming operation above pairs them with a world. Under a fixpoint
+    /// each clause states how it reaches the caller: a clause that mentions
+    /// its own subject reads the caller through the frontier, every other
+    /// clause admits the caller row.
     fn shaped_clause_queries(
         &self,
         join_input_scope: Option<crate::relation::StructuralRelation>,
-    ) -> Result<Vec<ast_unresolved::Query>> {
+        callers: &[super::ClauseCaller],
+        carried_formals: &[delightql_types::SqlIdentifier],
+    ) -> Result<Vec<(ast_unresolved::Query, super::ClauseCaller)>> {
         let actuals = &self.actuals;
         let bindings = &actuals.bindings;
         let defs = self.group.clauses();
         let mut shaped = Vec::with_capacity(defs.len());
-        for def in defs {
+        for (def, caller) in defs.iter().zip(callers.iter().copied()) {
             let q = if defs.len() == 1 {
                 // Single clause: the whole stored definition is the clause.
                 crate::ddl::reconstruct::bound_body(&self.definition, bindings.clone())?
             } else {
                 crate::ddl::reconstruct::bound_body(&def.full_source, bindings.clone())?
             };
-            shaped.push(shape_bound_clause(
-                q,
-                def,
-                &self.positions,
-                actuals,
-                join_input_scope,
+            shaped.push((
+                shape_bound_clause(
+                    q,
+                    def.params().to_vec(),
+                    def.head_items(),
+                    &self.positions,
+                    actuals,
+                    join_input_scope,
+                    caller,
+                    carried_formals,
+                ),
+                caller,
             ));
         }
         Ok(shaped)
     }
+}
+
+/// HOW ONE CLAUSE OF A DEFINITION REACHES ITS CALLER, judged BY IDENTITY
+/// before the clause is shaped: every name the clause mentions (the census
+/// enumeration, under the clause's own declarations) is SELECTED through
+/// the definition-use authority under the declaration's reach — the same
+/// selection resolution performs — and a selection that answers the family
+/// this frame opens is a self-reference. Under a fixpoint such a clause
+/// reads the caller through the frontier; every other clause admits the
+/// caller row. No spelling is compared: an alias, a qualified path, or a
+/// bare name reaches the same family through the same selector. A mention
+/// the selector cannot answer uniquely refuses here as it would at
+/// resolution.
+pub(in crate::defuse) fn clause_caller<'s>(
+    clause: &crate::pipeline::asts::ddl::Clause,
+    declaring_namespace: &str,
+    frame: &super::instance::InstanceFrame,
+    fixpoint: bool,
+    mut select: impl FnMut(&str, bool, &str) -> Result<super::select::Selection<'s>>,
+) -> Result<super::ClauseCaller> {
+    if !fixpoint {
+        return Ok(super::ClauseCaller::Admitted);
+    }
+    for mention in crate::ddl::analyzer::clause_mentions(clause)? {
+        let namespace_fq = mention.namespace.as_deref().unwrap_or(declaring_namespace);
+        let selected = select(
+            mention.name.as_str(),
+            mention.name.is_stropped(),
+            namespace_fq,
+        )?
+        .unique_or_refuse(mention.name.as_str())?;
+        if let Some(super::select::Selected::Authored(family)) = selected {
+            if frame.opens(&family) {
+                return Ok(super::ClauseCaller::Carried);
+            }
+        }
+    }
+    Ok(super::ClauseCaller::Admitted)
+}
+
+/// The exact caller-resolved ports the scalar actuals reference, in
+/// declaration-name order — what a fixpoint over these actuals carries —
+/// and the formals whose actuals reference any, which every clause of the
+/// fixpoint carries through its own stages.
+fn actual_occurrences(
+    values: &std::collections::HashMap<
+        delightql_types::SqlIdentifier,
+        crate::pipeline::asts::resolved::DomainExpression,
+    >,
+) -> (
+    Vec<crate::relation::PortId>,
+    Vec<delightql_types::SqlIdentifier>,
+) {
+    use crate::pipeline::ast_visit::{walk_visit_domain, AstVisit, Descent};
+    use crate::pipeline::asts::core::{ColumnOccurrence, NamedReference, Reference, Resolved};
+    struct Occurrences(Vec<crate::relation::PortId>);
+    impl AstVisit<Resolved> for Occurrences {
+        fn enter_domain(
+            &mut self,
+            expression: &crate::pipeline::asts::resolved::DomainExpression,
+        ) -> Result<Descent> {
+            if let crate::pipeline::asts::resolved::DomainExpression::Reference(Reference::Named(
+                NamedReference(ColumnOccurrence { column, .. }),
+            )) = expression
+            {
+                if !self.0.contains(column) {
+                    self.0.push(*column);
+                }
+            }
+            Ok(Descent::Continue)
+        }
+    }
+    let mut names: Vec<_> = values.keys().collect();
+    names.sort();
+    let mut occurrences = Occurrences(Vec::new());
+    let mut formals = Vec::new();
+    for name in names {
+        let mut own = Occurrences(Vec::new());
+        walk_visit_domain(&mut own, &values[name])
+            .expect("collecting column occurrences is infallible");
+        if own.0.is_empty() {
+            continue;
+        }
+        formals.push(name.clone());
+        for port in own.0 {
+            if !occurrences.0.contains(&port) {
+                occurrences.0.push(port);
+            }
+        }
+    }
+    (occurrences.0, formals)
 }
 
 /// ONE BOUND CLAUSE, SHAPED: the caller input injected (before the scalar
@@ -1905,25 +1547,38 @@ impl super::bound_use::HoUse {
 /// where the melt strategy handles it), then the scalar positions bound
 /// and the head projected. The same act for a consulted clause and a
 /// CHOE's; only how the bound query was obtained differs.
-fn shape_bound_clause(
+pub(in crate::defuse) fn shape_bound_clause(
     q: ast_unresolved::Query,
-    def: &crate::pipeline::asts::ddl::Clause,
+    clause_params: Vec<crate::pipeline::asts::ddl::HoParam>,
+    output_head: Option<&[crate::pipeline::asts::core::definitions::HeadItem]>,
     positions: &[crate::pipeline::asts::ddl::HoPositionInfo],
     actuals: &HoActuals,
     join_input_scope: Option<crate::relation::StructuralRelation>,
+    caller: super::ClauseCaller,
+    carried_formals: &[delightql_types::SqlIdentifier],
 ) -> ast_unresolved::Query {
-    let clause_params = def.params().to_vec();
-    let output_head = def.head_items();
-    let q = if let Some(input_scope) = join_input_scope {
-        // Every clause participates in row-by-row dispatch. A ground-only
-        // clause still needs the caller row so its discriminator can be
-        // compared without joining the carrier a second time above the
-        // union.
-        let condition =
-            super::ho::ground_scalar_correlation_condition(&clause_params, positions, actuals);
-        super::ho::inject_input_table_into_query(q, input_scope, condition)
-    } else {
-        q
+    let q = super::ho::carry_formals_through_stages(q, carried_formals);
+    let q = match (join_input_scope, caller) {
+        // A clause that ADMITS the caller participates in row-by-row
+        // dispatch: the caller row is joined in once. A ground-only clause
+        // still needs it so its discriminator can be compared without
+        // joining the carrier a second time above the union.
+        (Some(input_scope), super::ClauseCaller::Admitted) => {
+            let condition =
+                super::ho::ground_scalar_correlation_condition(&clause_params, positions, actuals);
+            super::ho::inject_input_table_into_query(q, input_scope, condition)
+        }
+        // A clause that reads the caller THROUGH ITS FRONTIER joins no
+        // carrier: its formals land on the actuals the frontier row
+        // carries, and a ground head discriminates over that row.
+        (Some(_), super::ClauseCaller::Carried) => {
+            match super::ho::ground_scalar_correlation_condition(&clause_params, positions, actuals)
+            {
+                Some(condition) => super::ho::restrict_before_barrier(q, condition),
+                None => q,
+            }
+        }
+        (None, _) => q,
     };
     super::ho::inject_scalar_columns(
         q,
@@ -1938,15 +1593,12 @@ fn shape_bound_clause(
 /// The refusal of a common higher-order expression whose body reaches
 /// itself: a query-scoped parameterized rule has no fixpoint to re-enter.
 pub(in crate::defuse) fn choe_recursion_refusal(name: &str) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        crate::uri_registry::subcat::RESOLUTION_CHOE_RECURSION,
-        format!(
+    DelightQLError::from(Choe::Recursion {
+        message: format!(
             "the common higher-order expression '{name}' reaches itself: a query-scoped \
              parameterized rule has no fixpoint to re-enter"
         ),
-        "write the recursion as a consulted rule, or bind the recursive relation \
-         with a `%`-badged common table expression",
-    )
+    })
 }
 
 /// ONE ADMITTED COMMON HIGHER-ORDER EXPRESSION USE — the CHOE twin of
@@ -1954,7 +1606,10 @@ pub(in crate::defuse) fn choe_recursion_refusal(name: &str) -> DelightQLError {
 /// actuals, the analyzed positions, and the held query-local instance,
 /// paired by construction and spent whole by [`Self::resolve_squished`].
 pub(in crate::defuse) struct ScopedHoUse {
-    definition: crate::pipeline::asts::core::HoDefinition,
+    /// THE SELECTED DEFINITION, WHOLE — its clauses and the site its
+    /// registration stamped, never separated. The body opens at that site
+    /// because it arrives on the definition, not beside it.
+    definition: super::environment::ScopedHo,
     actuals: HoActuals,
     positions: Vec<crate::pipeline::asts::ddl::HoPositionInfo>,
     _frame: super::instance::InstanceFrame,
@@ -1966,16 +1621,16 @@ pub(in crate::defuse) struct ScopedHoUse {
 /// there is no fixpoint to re-enter and no parameter to widen.
 pub(in crate::defuse) fn use_scoped_ho(
     instances: &InstanceTable,
-    definition: crate::pipeline::asts::core::HoDefinition,
+    scoped: super::environment::ScopedHo,
     call_spelling: &str,
     actuals: HoActuals,
 ) -> Result<ScopedHoUse> {
     let key = actuals.scoped_key();
-    match instances.admit_scoped(definition.name(), key) {
+    match instances.admit_scoped(scoped.name(), key) {
         super::instance::ScopedAdmission::Fresh(frame) => {
-            let positions = super::ho::scoped_positions(&definition);
+            let positions = scoped.positions();
             Ok(ScopedHoUse {
-                definition,
+                definition: scoped,
                 actuals,
                 positions,
                 _frame: frame,
@@ -2012,43 +1667,18 @@ impl ScopedHoUse {
         caller: &mut ResolverFold<'_, '_>,
     ) -> Result<SquishedExpansion> {
         super::ho::refuse_provable_ground_miss(function, scalar_spec, &self.positions)?;
-        let join_input_scope = self.actuals.carriers.join_input();
-        let group = self.definition.group();
-        // A multi-clause CHOE binds its clauses under one frontier so they
-        // accumulate as one definition; a self-reference never reaches the
-        // frontier — admission refused it before the body opened.
-        let frontier = (group.clauses().len() > 1).then(|| self._frame.frontier(group));
-        let mut block = crate::pipeline::asts::core::QueryLocalBlock::default();
-        for def in group.clauses() {
-            let crate::pipeline::asts::ddl::DdlBody::Deferred { source } = &def.body else {
-                return Err(DelightQLError::transformation_error(
-                    "a common higher-order expression holds its body as authored text; \
-                     a clause built any other way cannot be bound",
-                    "choe",
-                ));
-            };
-            let q = crate::ddl::reconstruct::bound_relex(source, self.actuals.bindings.clone())?;
-            let q = shape_bound_clause(q, def, &self.positions, &self.actuals, join_input_scope);
-            super::ho::extract_clause_ctes(q, function, frontier.as_ref(), &mut block)?;
-        }
-        let main_query = ast_unresolved::Chain::read(
-            ast_unresolved::Relation::Ground {
-                mention: ast_unresolved::GroundMention::Named {
-                    identifier: ast_unresolved::QualifiedName {
-                        namespace_path: ast_unresolved::NamespacePath::empty(),
-                        name: function.into(),
-                    },
-                    alias: None,
-                    mutation_target: false,
-                    passthrough: false,
-                },
-                outer: false,
-            },
-            ast_unresolved::Access::All,
-        );
-        let squished = ast_unresolved::Query::binding(block.seal()?, main_query);
-        let declared: Vec<(delightql_types::SqlIdentifier, FormalRole)> = self
-            .positions
+        let ScopedHoUse {
+            definition,
+            mut actuals,
+            positions,
+            _frame,
+        } = self;
+        let join_input_scope = actuals.carriers.join_input();
+
+        // THE FRAME THIS USE SPENDS, from the declaration alone: the
+        // analyzed positions and the definition's declared parameters.
+        // Nothing here reads the body.
+        let declared: Vec<(delightql_types::SqlIdentifier, FormalRole)> = positions
             .iter()
             .filter(|position| {
                 position.column_kind == crate::pipeline::asts::ddl::HoColumnKind::Scalar
@@ -2057,26 +1687,13 @@ impl ScopedHoUse {
                 position
                     .column_name
                     .as_ref()
-                    .map(|name| (delightql_types::SqlIdentifier::new(name), FormalRole::Value))
+                    .map(|name| (name.clone(), FormalRole::Value))
             })
-            .chain(
-                self.definition
-                    .group()
-                    .params()
-                    .iter()
-                    .filter_map(|param| match param {
-                        HoParam::Rule { name, .. } => Some((name.clone(), FormalRole::Rule)),
-                        HoParam::Relation { .. }
-                        | HoParam::Scalar { .. }
-                        | HoParam::Ground { .. } => None,
-                    }),
-            )
+            .chain(definition.params().iter().filter_map(|param| match param {
+                HoParam::Rule { name, .. } => Some((name.clone(), FormalRole::Rule)),
+                HoParam::Relation { .. } | HoParam::Scalar { .. } | HoParam::Ground { .. } => None,
+            }))
             .collect();
-        let ScopedHoUse {
-            definition,
-            mut actuals,
-            ..
-        } = self;
         let carriers = std::mem::take(&mut actuals.carriers);
         let leading_ctes: Vec<_> = carriers.leading_ctes().cloned().collect();
         let mut inventory = FormalInventory::declared(declared);
@@ -2088,26 +1705,26 @@ impl ScopedHoUse {
         }
         let formals = inventory.sealed();
         let spent = std::mem::take(&mut actuals.values);
-        let facts = BodyPositionFacts::authored_of(caller);
-        let resolved = match scoped_world {
-            Some(world) => {
-                let mut world = world.open();
-                let mut lease =
-                    world.opened_body(formals, &carriers, definition.horizon().clone());
-                let mut fold = body_fold_in(&mut *caller.core, lease.world(), facts);
-                fold.crossing_carriers = crossing_carriers.to_vec();
-                crate::pipeline::resolver::resolve_query_with(&mut fold, squished)?
-            }
-            None => {
-                let mut lease =
-                    caller
-                        .env
-                        .opened_body(formals, &carriers, definition.horizon().clone());
-                let mut fold = body_fold_in(&mut *caller.core, lease.world(), facts);
-                fold.crossing_carriers = crossing_carriers.to_vec();
-                crate::pipeline::resolver::resolve_query_with(&mut fold, squished)?
-            }
-        };
+
+        // THE BODY IS SPENT BY ITS OWN CARRIER. This use supplies actuals
+        // and analyzed metadata; the definition's authority opens the
+        // declaration, reconstructs and shapes the clauses inside that
+        // opening, and resolves them there. No clause, group or body ever
+        // becomes a value here, so this road cannot pair one with a world.
+        let resolved = definition.expand(
+            super::environment::ChoeSpending {
+                function,
+                positions: &positions,
+                actuals: &actuals,
+                join_input_scope,
+                frame: &_frame,
+                crossing_carriers,
+            },
+            formals,
+            &carriers,
+            scoped_world,
+            caller,
+        )?;
         Ok(SquishedExpansion {
             resolved: resolved.with_leading_ctes(leading_ctes),
             actuals: spent,
@@ -2157,6 +1774,11 @@ pub(in crate::defuse) struct ClosedHoFamily {
 }
 
 impl ClosedHoFamily {
+    /// Whether this family is being expanded: the use is a self-reference.
+    pub(in crate::defuse) fn is_open(&self, instances: &InstanceTable) -> bool {
+        instances.is_open(&self.identity)
+    }
+
     pub(in crate::defuse) fn close(family: LinkedFamily<'_>) -> Result<Self> {
         let identity = super::instance::ClosedFamilyIdentity::of(&family);
         let name = family.name().clone();
@@ -2214,12 +1836,9 @@ fn closed_ho_signature(
             .find(|param| accepts(param))
     };
     let missing = |position: usize| {
-        DelightQLError::database_error(
-            format!(
+        Internal::invariant("defuse::admitted", format!(
                 "the reconstructed higher-order family has no source parameter for analyzed position {position}"
-            ),
-            "catalog definition and position analysis disagree",
-        )
+            ))
     };
 
     positions
@@ -2228,7 +1847,7 @@ fn closed_ho_signature(
             let name = position
                 .column_name
                 .as_ref()
-                .map(|name| delightql_types::SqlIdentifier::new(name))
+                .cloned()
                 .ok_or_else(|| missing(position.position))?;
             match (&position.column_kind, &position.ground_pattern) {
                 (HoColumnKind::TableGlob, _) => Ok(HoParam::Relation {
@@ -2302,13 +1921,11 @@ pub(in crate::defuse) fn use_closed_ho(
         super::instance::Admitted::Fresh(frame) => frame,
         super::instance::Admitted::Reenter { frontier } => {
             if absorbs_input {
-                return Err(DelightQLError::validation_error_categorized(
-                    crate::uri_registry::subcat::RECURSION_CONSULTED_CLAUSE_ORDER,
-                    format!(
+                return Err(DelightQLError::from(Recursion::ConsultedClauseOrder {
+    message: format!(
                         "the self-reference of '{call_spelling}' re-enters its own fixpoint and cannot also absorb an input"
                     ),
-                    "recursive frontier read",
-                ));
+}));
             }
             return Ok(super::bound_use::HoUseOutcome::Reenter { frontier });
         }
@@ -2319,15 +1936,13 @@ pub(in crate::defuse) fn use_closed_ho(
             building,
             requested,
         } => {
-            return Err(DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::RECURSION_PARAMETER_WIDENING,
-                format!(
+            return Err(DelightQLError::from(Recursion::ParameterWidening {
+    message: format!(
                     "'{call_spelling}' is recursive and changes a parameter actual (building [{}], requested [{}])",
                     building.join(", "),
                     requested.join(", ")
                 ),
-                "recursive parameters never widen",
-            ))
+}))
         }
     };
     Ok(super::bound_use::HoUseOutcome::Open(HoUse {
@@ -2368,10 +1983,9 @@ pub(in crate::defuse) fn shape_callable<A: ActualPayload>(
 
     let family = &bound.family;
     let group = bound.reconstruct_group().map_err(|e| {
-        DelightQLError::parse_error(format!(
-            "No definition found for function '{}': {e}",
-            family.name()
-        ))
+        DelightQLError::from(Resolution::General {
+            message: format!("No definition found for function '{}': {e}", family.name()),
+        })
     })?;
 
     let formals: CfeFormals = if group.kind() == DefKind::Function {
@@ -2402,10 +2016,12 @@ pub(in crate::defuse) fn shape_callable<A: ActualPayload>(
     let body = if clauses.len() == 1 {
         let clause = clauses.pop().expect("length checked above");
         clause.into_scalar_body().ok_or_else(|| {
-            DelightQLError::parse_error(format!(
-                "Expected scalar body for function '{}', got relational",
-                family.name()
-            ))
+            DelightQLError::from(Constraint::General {
+                message: format!(
+                    "Expected scalar body for function '{}', got relational",
+                    family.name()
+                ),
+            })
         })?
     } else {
         // Multi-clause: synthesize CASE expression with parameter Lvars
@@ -2465,20 +2081,150 @@ impl ValueActuals {
     }
 }
 
-/// An effect invocation's caller-resolved scalar values and closed pure rule
-/// values. One payload keys admission and later builds the formal frame, so
-/// neither half can be substituted after the effect family is selected.
+/// THE RELATION AN EFFECT INVOCATION BINDS: the formal the admission paired
+/// it with, the plan scratch it was staged into at the demand site, and WHERE
+/// IT CAME FROM — the provenance the admission recorded on that pair. It is
+/// minted by the invocation that spent the admitted pair, and the body reads
+/// it under that formal's name; no later act chooses the formal.
+///
+/// Binding a relation formal and standing at a configured designator's
+/// position are two facts, and only the second is the construction row a
+/// configured rule actual of the same call may close over: the relation a
+/// pipe landed stands there; an authored sibling argument binds its formal
+/// and supplies no caller row, however early or late in the row it was
+/// written. The provenance is private, so that entitlement is answered by
+/// [`Self::construction_row`] alone.
+#[derive(Clone)]
+pub(in crate::defuse) struct EffectInput {
+    formal: delightql_types::SqlIdentifier,
+    row: crate::relation::ScratchRow,
+    provenance: crate::pipeline::asts::core::operators::RelationProvenance,
+}
+
+impl EffectInput {
+    /// The one mint: the admitted pair's formal and provenance, and the
+    /// scratch the demand site staged the relation into.
+    pub(in crate::defuse) fn staged(
+        formal: delightql_types::SqlIdentifier,
+        row: crate::relation::ScratchRow,
+        provenance: crate::pipeline::asts::core::operators::RelationProvenance,
+    ) -> Self {
+        EffectInput {
+            formal,
+            row,
+            provenance,
+        }
+    }
+
+    /// The formal this relation binds.
+    pub(in crate::defuse) fn formal(&self) -> &delightql_types::SqlIdentifier {
+        &self.formal
+    }
+
+    /// The staged relation, read by the body under the formal's name.
+    pub(in crate::defuse) fn row(&self) -> crate::relation::ScratchRow {
+        self.row
+    }
+
+    /// THE CONSTRUCTION ROW a configured rule actual of the same call closes
+    /// over: the relation already standing at the designator's position —
+    /// the one a pipe landed — and nothing else. An authored relation
+    /// argument answers none, so a sibling argument cannot supply a
+    /// configured value's caller data.
+    pub(in crate::defuse) fn construction_row(&self) -> Option<crate::relation::ScratchRow> {
+        use crate::pipeline::asts::core::operators::RelationProvenance;
+        match self.provenance {
+            RelationProvenance::Landed => Some(self.row),
+            RelationProvenance::Authored => None,
+        }
+    }
+}
+
+/// An effect invocation's caller-resolved scalar values, closed pure rule
+/// values, and the staged relation with the formal it stands at. One payload
+/// keys admission and later builds the formal frame, so no part can be
+/// substituted after the effect family is selected.
 pub(in crate::defuse) struct EffectActuals {
     values: Vec<crate::pipeline::asts::resolved::DomainExpression>,
     rules: std::collections::HashMap<delightql_types::SqlIdentifier, super::ho::RuleValueId>,
+    input: Option<EffectInput>,
 }
 
 impl EffectActuals {
-    fn of(
+    pub(in crate::defuse) fn of(
         values: Vec<crate::pipeline::asts::resolved::DomainExpression>,
         rules: std::collections::HashMap<delightql_types::SqlIdentifier, super::ho::RuleValueId>,
+        input: Option<EffectInput>,
     ) -> Self {
-        EffectActuals { values, rules }
+        EffectActuals {
+            values,
+            rules,
+            input,
+        }
+    }
+
+    /// The staged relation and the formal it binds, as admitted.
+    pub(in crate::defuse) fn input(&self) -> Option<&EffectInput> {
+        self.input.as_ref()
+    }
+
+    /// THE PARAMETER FRAME: the caller-resolved values bind the declared
+    /// parameters by name, through the same formal-frame mechanism every
+    /// value definition uses — never textual substitution of unresolved
+    /// caller expressions into callee text. The frame is derived from
+    /// these actuals and the declared row; no half is projected out.
+    pub(in crate::defuse) fn formals(
+        &self,
+        params: &[HoParam],
+        display_name: &str,
+    ) -> Result<super::environment::FormalBindings> {
+        let mut inventory =
+            FormalInventory::declared(params.iter().filter_map(|param| match param {
+                HoParam::Scalar { name, .. } => Some((name.clone(), FormalRole::Value)),
+                HoParam::Rule { name, .. } => Some((name.clone(), FormalRole::Rule)),
+                HoParam::Relation { .. } | HoParam::Ground { .. } => None,
+            }));
+        inventory
+            .bind_positional(FormalRole::Value, self.values.iter().cloned())
+            .map_err(|error| named_binding_refusal(display_name, error))?;
+        for (name, value) in &self.rules {
+            inventory.bind_rule_named(name, *value)?;
+        }
+        Ok(inventory.sealed())
+    }
+}
+
+impl<'s> BoundUse<'s, EffectActuals> {
+    /// THE INVOKED RULE'S WORLD, derived from this admission's own
+    /// declaration and its own actuals — owned by the invocation for
+    /// exactly the compilation's extent. A demanded PROGRAM (`root`) is the
+    /// plan's own use world, rooted at the rule's namespace — its
+    /// statements are the plan and read the plan's creations. A rule
+    /// invoked FROM a body opens a consulted body world: only its formals
+    /// cross. THE PROGRAM WORLD READS UNDER THE FAMILY'S OWN READ: the
+    /// registry it captures the session reach through is built from the
+    /// read that selected the rule, never supplied beside it.
+    pub(in crate::defuse) fn effect_world(
+        &self,
+        group: &crate::pipeline::asts::ddl::DefinitionGroup,
+        display_name: &str,
+        root: bool,
+    ) -> Result<Environment> {
+        let formals = self.actuals.formals(group.params(), display_name)?;
+        Ok(if root {
+            let program_registry = ConsultRegistry::new_with_system(self.family.catalog().system());
+            Environment::Use(super::environment::UseEnvironment::session_with_formals(
+                &program_registry,
+                self.declaration.namespace(),
+                formals,
+            )?)
+        } else {
+            body_env(
+                self.declaration.clone(),
+                &crate::defuse::carriers::CarrierRecord::default(),
+                formals,
+            )
+        })
     }
 }
 
@@ -2554,15 +2300,10 @@ impl HoActuals {
                 if let Some(rule) = self.rules.get(name) {
                     return format!("rule:{}", rule.0);
                 }
+                if let Some(bound) = self.bindings.formals.get(name) {
+                    return bound.instance_key();
+                }
                 let spelling = name.as_str();
-                if let Some(scope) = self.bindings.table_scope_params.get(spelling) {
-                    return format!("relation:{scope:?}");
-                }
-                if let Some((carrier, scope)) = &self.bindings.pipe_carrier {
-                    if carrier == spelling {
-                        return format!("relation:{scope:?}");
-                    }
-                }
                 if let Some(ground) = self.bindings.scalar_literals.get(spelling) {
                     return format!("ground:{}", ground.to_lispy());
                 }
@@ -2613,6 +2354,9 @@ impl ActualPayload for EffectActuals {
                 .into_iter()
                 .map(|(name, value)| format!("rule:{name}:{}", value.0)),
         );
+        if let Some(input) = &self.input {
+            key.push(format!("relation:{}", input.formal()));
+        }
         key
     }
 }
@@ -2651,15 +2395,10 @@ impl ActualPayload for HoActuals {
                 if let Some(rule) = self.rules.get(&name) {
                     return format!("rule:{}", rule.0);
                 }
+                if let Some(bound) = self.bindings.formals.get(&name) {
+                    return bound.instance_key();
+                }
                 let name = name.as_str();
-                if let Some(scope) = self.bindings.table_scope_params.get(name) {
-                    return format!("relation:{scope:?}");
-                }
-                if let Some((carrier, scope)) = &self.bindings.pipe_carrier {
-                    if carrier == name {
-                        return format!("relation:{scope:?}");
-                    }
-                }
                 if let Some(ground) = self.bindings.scalar_literals.get(name) {
                     return format!("ground:{}", ground.to_lispy());
                 }
@@ -2787,22 +2526,51 @@ impl<'s> OpenedRelationDefinition<'s> {
     fn into_relation_body(self) -> Result<OpenedRelationBody<'s>> {
         let OpenedRelationDefinition { bound, group } = self;
         let fixpoint = group.fixpoint();
-        let frontier = (group.clauses().len() > 1 || fixpoint.is_badged())
-            .then(|| bound._frame.frontier(&group));
+        let requires_frontier = group.clauses().len() > 1 || fixpoint.is_badged();
+        // An unparameterized fixpoint carries no caller; each clause still
+        // states whether it reads the frontier, and the recursion authority
+        // verifies that statement where the self-reference binds.
+        let callers = {
+            let catalog = bound.family.catalog();
+            let reach = bound.declaration.reach();
+            group
+                .clauses()
+                .iter()
+                .map(|clause| {
+                    clause_caller(
+                        clause,
+                        bound.family.namespace(),
+                        &bound._frame,
+                        requires_frontier,
+                        |name, stropped, namespace_fq| {
+                            super::select::select_qualified_in_reach(
+                                catalog,
+                                name,
+                                stropped,
+                                namespace_fq,
+                                reach,
+                            )
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let frontier = requires_frontier.then(|| bound._frame.frontier(&group, Vec::new()));
         let mut clauses = group.spend_heads()?;
 
         if clauses.len() <= 1 && !fixpoint.is_badged() {
             let clause = clauses.pop().ok_or_else(|| {
-                DelightQLError::parse_error(format!(
-                    "No definition found for view '{}'",
-                    bound.family.name()
-                ))
+                DelightQLError::from(Resolution::General {
+                    message: format!("No definition found for view '{}'", bound.family.name()),
+                })
             })?;
             let query = clause.into_query().ok_or_else(|| {
-                DelightQLError::parse_error(format!(
-                    "Expected relational body for view '{}', got scalar",
-                    bound.family.name()
-                ))
+                DelightQLError::from(Constraint::General {
+                    message: format!(
+                        "Expected relational body for view '{}', got scalar",
+                        bound.family.name()
+                    ),
+                })
             })?;
             return Ok(OpenedRelationBody { bound, query });
         }
@@ -2814,18 +2582,19 @@ impl<'s> OpenedRelationDefinition<'s> {
         let frontier = frontier.expect("multi-clause or badged relation has frontier");
         let view_name = frontier.name().as_str().to_string();
         let mut block = crate::pipeline::asts::core::QueryLocalBlock::default();
-        for clause in clauses {
+        for (clause, caller) in clauses.into_iter().zip(callers) {
             let query = clause.into_query().ok_or_else(|| {
-                DelightQLError::parse_error(
-                    "Expected relational body for disjunctive view clause, got scalar",
-                )
+                DelightQLError::from(Constraint::General {
+                    message: "Expected relational body for disjunctive view clause, got scalar"
+                        .to_string(),
+                })
             })?;
             if !query.cfes().is_empty() || !query.hos().is_empty() {
-                return Err(DelightQLError::parse_error(
-                    "Unsupported query form in disjunctive view clause: a query-scoped \
+                return Err(DelightQLError::from(Constraint::Unsupported {
+                    message: "Unsupported query form in disjunctive view clause: a query-scoped \
                      function definition"
                         .to_string(),
-                ));
+                }));
             }
             let ast_unresolved::Query { locals, body } = query;
             // The clause's own block is ABSORBED, never rebuilt: a clause
@@ -2844,6 +2613,7 @@ impl<'s> OpenedRelationDefinition<'s> {
                             crate::pipeline::asts::core::provenance::CteOrigin::CompilerGenerated,
                         fixpoint,
                     },
+                    caller,
                 ),
             ))?;
         }
@@ -2876,7 +2646,10 @@ impl<'s> OpenedRelationDefinition<'s> {
 /// publication; it resolves in the world it was born in). The same
 /// no-projection law holds.
 pub(in crate::defuse) struct ScopedBoundUse<A: ActualPayload> {
-    pub(in crate::defuse) cfe: crate::pipeline::asts::unresolved::CfeDefinition,
+    /// THE SELECTED DEFINITION, WHOLE — its clauses and the position its
+    /// registration stamped, carried from the selection that produced it
+    /// and never taken apart.
+    pub(in crate::defuse) definition: super::environment::ScopedCfe,
     pub(in crate::defuse) actuals: A,
     pub(in crate::defuse) _frame: super::instance::InstanceFrame,
 }
@@ -2896,14 +2669,14 @@ pub(in crate::defuse) enum ScopedBoundAdmission<A: ActualPayload> {
 pub(in crate::defuse) fn bind_scoped_use<A: ActualPayload>(
     instances: &InstanceTable,
     name: &delightql_types::SqlIdentifier,
-    cfe: crate::pipeline::asts::unresolved::CfeDefinition,
+    scoped: super::environment::ScopedCfe,
     actuals: A,
 ) -> ScopedBoundAdmission<A> {
     let key = actuals.scoped_key();
     match instances.admit_scoped(name, key) {
         super::instance::ScopedAdmission::Fresh(frame) => {
             ScopedBoundAdmission::Fresh(ScopedBoundUse {
-                cfe,
+                definition: scoped,
                 actuals,
                 _frame: frame,
             })
@@ -2930,18 +2703,22 @@ mod sealed {
 /// The stored bytes normalize EXACTLY ONCE into a typed query.
 fn open_relation_body(bound: BoundUse<NoActuals>) -> Result<OpenedRelationBody> {
     let name = bound.family.name().clone();
-    let opened = bound.open_relation().map_err(|e| {
-        DelightQLError::database_error(
-            format!("Error while parsing borrowed view '{}': {}", name, e),
-            e.to_string(),
-        )
+    // A stored body's own refusal keeps its identity; a re-parse failure
+    // of stored text is the broad runtime failure it has always been.
+    let opened = bound.open_relation().map_err(|e| match e {
+        DelightQLError::Semantic(_) => e,
+        e => DelightQLError::from(Runtime::General {
+            message: format!("Error while parsing borrowed view '{}': {}", name, e),
+            details: e.to_string(),
+        }),
     })?;
     if opened.requires_frontier() {
-        opened.into_relation_body().map_err(|e| {
-            DelightQLError::database_error(
-                format!("Error while expanding disjunctive view '{}': {}", name, e),
-                e.to_string(),
-            )
+        opened.into_relation_body().map_err(|e| match e {
+            DelightQLError::Semantic(_) => e,
+            e => DelightQLError::from(Runtime::General {
+                message: format!("Error while expanding disjunctive view '{}': {}", name, e),
+                details: e.to_string(),
+            }),
         })
     } else {
         opened.into_relation_body()

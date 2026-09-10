@@ -6,6 +6,7 @@
 //! It doesn't use rusqlite and instead relies on the JavaScript bridge for database access.
 
 use crate::bin_cartridge::registry::BinCartridgeRegistry;
+use crate::diagnostic::{Runtime, SessionHealth};
 use crate::error::{DelightQLError, Result};
 use delightql_types::{ColumnInfo, DatabaseConnection, DatabaseSchema, NamespacePath};
 use std::sync::{Arc, Mutex};
@@ -76,10 +77,9 @@ impl PreparedLoad {
     }
 
     pub(crate) fn expose(&mut self, _system: &DelightQLSystem, _child_fq: &str) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "expose!() not supported in WASM",
-            "Namespace exposure is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "expose!() not supported in WASM".to_string(),
+        }))
     }
 }
 
@@ -136,7 +136,7 @@ impl DatabaseSchema for ConnectionBackedSchema {
             None => format!("PRAGMA table_info({})", table_name),
         };
         let conn = self.connection.lock().map_err(|error| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire WASM schema connection",
                 error.to_string(),
             )
@@ -148,16 +148,16 @@ impl DatabaseSchema for ConnectionBackedSchema {
 
         // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
         let name_idx = columns.iter().position(|c| c == "name").ok_or_else(|| {
-            DelightQLError::database_error(
-                "WASM schema metadata is malformed",
-                "missing required column 'name'",
-            )
+            DelightQLError::from(Runtime::General {
+                message: "WASM schema metadata is malformed".to_string(),
+                details: "missing required column 'name'".to_string(),
+            })
         })?;
         let notnull_idx = columns.iter().position(|c| c == "notnull").ok_or_else(|| {
-            DelightQLError::database_error(
-                "WASM schema metadata is malformed",
-                "missing required column 'notnull'",
-            )
+            DelightQLError::from(Runtime::General {
+                message: "WASM schema metadata is malformed".to_string(),
+                details: "missing required column 'notnull'".to_string(),
+            })
         })?;
 
         let cols: Vec<ColumnInfo> = rows
@@ -180,6 +180,7 @@ impl DatabaseSchema for ConnectionBackedSchema {
                     // PRAGMA table_info exposes decltype in the `type`
                     // column; the WASM bridge path doesn't thread it yet.
                     declared_type: None,
+                    interior: false,
                 }
             })
             .collect();
@@ -199,7 +200,7 @@ impl DatabaseSchema for ConnectionBackedSchema {
             ),
         };
         let conn = self.connection.lock().map_err(|error| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire WASM schema connection",
                 error.to_string(),
             )
@@ -232,6 +233,12 @@ pub(crate) struct DelightQLSystem {
     /// incident retained for the typed host report.
     session_incident: Option<(String, String)>,
 }
+
+/// The system a host is given. On native this is the reset-capable owner of
+/// the pristine image; the wasm system owns no bootstrap catalog and no
+/// image, so the host is given the system itself and `reinit_bootstrap`
+/// refuses. No image abstraction is pretended here.
+pub(crate) type ReadySystem = DelightQLSystem;
 
 impl DelightQLSystem {
     /// Create a new WASM DelightQL system
@@ -280,10 +287,11 @@ impl DelightQLSystem {
         self.schema
             .as_ref()
             .ok_or_else(|| {
-                DelightQLError::validation_error(
-                    "No database schema configured",
-                    "Use DelightQLSystem::new_with_schema() to inject a schema",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: "No database schema configured".to_string(),
+                    details: "Use DelightQLSystem::new_with_schema() to inject a schema"
+                        .to_string(),
+                })
             })
             .map(|boxed| boxed.as_ref())
     }
@@ -308,68 +316,60 @@ impl DelightQLSystem {
 
     /// Mount a database - not supported in WASM
     pub fn mount_database(&mut self, _db_path: &str, _namespace: &str) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "mount!() not supported in WASM",
-            "Database mounting is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "mount!() not supported in WASM".to_string(),
+        }))
     }
 
     /// Byte bindings (`delightql-bytes://`, documentation/archived/2026-08-05/BYTES-SCHEME-DESIGN.md) — not
     /// supported in WASM: it cannot attach deserialized native SQLite
     /// schemas. The documented refusal, actually implemented.
     pub fn bind_static_bytes(&mut self, _name: &str, _bytes: &'static [u8]) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "bind_static_bytes not supported in WASM",
-            "delightql-bytes:// mounts are only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "bind_static_bytes not supported in WASM".to_string(),
+        }))
     }
 
     /// Owned-buffer sibling — same WASM refusal.
     pub fn bind_owned_bytes(&mut self, _name: &str, _bytes: Vec<u8>) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "bind_owned_bytes not supported in WASM",
-            "delightql-bytes:// mounts are only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "bind_owned_bytes not supported in WASM".to_string(),
+        }))
     }
 
     /// Enlist namespace - not supported in WASM
     pub fn enlist_namespace(&mut self, _namespace: &str) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "enlist!() not supported in WASM",
-            "Namespace enlistment is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "enlist!() not supported in WASM".to_string(),
+        }))
     }
 
     /// Delist namespace - not supported in WASM
     pub fn delist_namespace(&mut self, _namespace: &str) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "delist!() not supported in WASM",
-            "Namespace delisting is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "delist!() not supported in WASM".to_string(),
+        }))
     }
 
     /// Unmount database - not supported in WASM
     pub fn unmount_database(&mut self, _namespace: &str) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "unmount!() not supported in WASM",
-            "Database unmounting is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "unmount!() not supported in WASM".to_string(),
+        }))
     }
 
     /// Unconsult namespace - not supported in WASM
     pub fn unconsult_namespace(&mut self, _namespace: &str) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "unconsult!() not supported in WASM",
-            "Namespace unconsulting is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "unconsult!() not supported in WASM".to_string(),
+        }))
     }
 
     /// Refresh namespace - not supported in WASM
     pub fn refresh_namespace(&mut self, _namespace: &str) -> Result<usize> {
-        Err(DelightQLError::validation_error(
-            "refresh!() not supported in WASM",
-            "Namespace refresh is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "refresh!() not supported in WASM".to_string(),
+        }))
     }
 
     /// Reconsult namespace - not supported in WASM
@@ -378,28 +378,25 @@ impl DelightQLSystem {
         _namespace: &str,
         _new_file: Option<&str>,
     ) -> Result<usize> {
-        Err(DelightQLError::validation_error(
-            "reconsult!() not supported in WASM",
-            "Namespace reconsulting is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "reconsult!() not supported in WASM".to_string(),
+        }))
     }
 
     /// Register namespace alias - not supported in WASM
     pub fn register_namespace_alias(&mut self, _alias: &str, _namespace: &str) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "Namespace aliases not supported in WASM",
-            "Namespace alias registration is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "Namespace aliases not supported in WASM".to_string(),
+        }))
     }
 
     /// Load publication is not supported in WASM. The signature mirrors the
     /// native `publish`: a stub whose arity drifts from it is a
     /// compile error waiting on the next WASM build, not on this one.
     pub(crate) fn publish(&mut self, _load: PreparedLoad) -> Result<PublishedLoad> {
-        Err(DelightQLError::validation_error(
-            "consult!() not supported in WASM",
-            "File consultation is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "consult!() not supported in WASM".to_string(),
+        }))
     }
 
     /// Liminal-program machinery (native atomic boundary): WASM has
@@ -422,11 +419,11 @@ impl DelightQLSystem {
         if self.session_incident.is_none() {
             Ok(())
         } else {
-            Err(DelightQLError::database_error_categorized(
-                "session_health/external_effect",
-                "the session is quarantined; reset or reconnect before issuing another query",
-                "external effect recovery is uncertain",
-            ))
+            Err(DelightQLError::from(SessionHealth::ExternalEffect {
+                message:
+                    "the session is quarantined; reset or reconnect before issuing another query"
+                        .to_string(),
+            }))
         }
     }
 
@@ -455,7 +452,7 @@ impl DelightQLSystem {
         &self,
         _target_fq: &str,
         _verb: &str,
-        _badge: &'static str,
+        _refuse: fn(String) -> DelightQLError,
     ) -> Result<()> {
         Ok(())
     }
@@ -487,10 +484,9 @@ impl DelightQLSystem {
 
     /// Entity documentation - not supported in WASM
     pub fn set_entity_doc(&mut self, _target: &str, _doc: &str) -> Result<(String, String)> {
-        Err(DelightQLError::validation_error(
-            "doc!() not supported in WASM",
-            "Entity documentation is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "doc!() not supported in WASM".to_string(),
+        }))
     }
 
     /// Imprint namespace - not supported in WASM
@@ -500,10 +496,9 @@ impl DelightQLSystem {
         _target_ns: &str,
         _replace: bool,
     ) -> Result<Vec<(String, String, String)>> {
-        Err(DelightQLError::validation_error(
-            "imprint!() not supported in WASM",
-            "Table materialization is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "imprint!() not supported in WASM".to_string(),
+        }))
     }
 
     /// Resolve namespace path - WASM returns None (no namespace support)
@@ -536,10 +531,9 @@ impl DelightQLSystem {
 
     /// Reinit bootstrap - not supported in WASM (no bootstrap database)
     pub fn reinit_bootstrap(&mut self) -> Result<()> {
-        Err(DelightQLError::validation_error(
-            "reinit_bootstrap not supported in WASM",
-            "Bootstrap database is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "reinit_bootstrap not supported in WASM".to_string(),
+        }))
     }
 
     /// Get canonical entity name - WASM returns None (no bootstrap)
@@ -629,10 +623,9 @@ impl DelightQLSystem {
         _lib_ns: &str,
         _new_ns_name: &str,
     ) -> Result<usize> {
-        Err(DelightQLError::validation_error(
-            "ground_namespace not supported in WASM",
-            "Namespace grounding is only available in native builds",
-        ))
+        Err(DelightQLError::from(Runtime::Unsupported {
+            message: "ground_namespace not supported in WASM".to_string(),
+        }))
     }
 
     /// Get bootstrap connection - not available in WASM

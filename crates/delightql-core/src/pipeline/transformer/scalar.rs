@@ -26,6 +26,7 @@
 
 use super::builder::Qualify;
 use super::TransformCtx;
+use crate::diagnostic::{Constraint, Internal, Mode, Semantic, Transform};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::expressions::{Enclyph, Record, RecordMember};
 use crate::pipeline::asts::core::literals::LiteralValue;
@@ -74,7 +75,8 @@ pub(super) fn s_lower_expression(
                     match matches.as_slice() {
                         [column] => *column,
                         [] => return Err(local_error),
-                        _ => return Err(DelightQLError::parse_error(
+                        _ => return Err(Internal::invariant(
+                            "transformer::scalar",
                             "a correlated semantic port is bound by more than one outer SQL site",
                         )),
                     }
@@ -100,27 +102,25 @@ pub(super) fn s_lower_expression(
         // this, so what stands here is an open body outside any position
         // that applies it.
         ast_refined::DomainExpression::Application(ast_refined::FunctionApplication::Open(_)) => {
-            Err(DelightQLError::ParseError {
-                message: "s_lower_expression: a composition input stands outside any \
+            Err(Internal::invariant(
+                "transformer::scalar",
+                "s_lower_expression: a composition input stands outside any \
                           callable applying it"
                     .to_string(),
-                source: None,
-                subcategory: None,
-            })
+            ))
         }
 
         ast_refined::DomainExpression::Application(func_expr) => {
             s_lower_function(func_expr, qualify, ctx)
         }
 
-        other => Err(DelightQLError::ParseError {
-            message: format!(
+        other => Err(Internal::invariant(
+            "transformer::scalar",
+            format!(
                 "s_lower_expression: unimplemented DomainExpression variant: {:?}",
                 std::mem::discriminant(&other)
             ),
-            source: None,
-            subcategory: None,
-        }),
+        )),
     }
 }
 
@@ -285,22 +285,18 @@ fn s_lower_truth(
             let output_columns = inner_builder.scope_columns();
             let mut query = inner_builder.to_sql()?;
             let cols = membership_output_columns(&query).ok_or_else(|| {
-                DelightQLError::validation_error_categorized(
-                    "transform/membership/columns",
-                    "membership subquery has no addressable output columns".to_string(),
-                    "project named columns on the right of `in`",
-                )
+                DelightQLError::from(Transform::MembershipColumns {
+                    message: "membership subquery has no addressable output columns".to_string(),
+                })
             })?;
             if cols.len() != probes.len() {
-                return Err(DelightQLError::validation_error_categorized(
-                    "membership/arity",
-                    format!(
+                return Err(DelightQLError::from(Semantic::MembershipArity {
+                    message: format!(
                         "membership probe has {} value(s) but the relation produces {} column(s)",
                         probes.len(),
                         cols.len()
                     ),
-                    "the left side of `in` must match the relation's width",
-                ));
+                }));
             }
             let wrap_scope = crate::pipeline::asts::core::ColumnMetadata::common_identity_scope(
                 &output_columns,
@@ -345,7 +341,7 @@ fn s_lower_truth(
                 .from_subquery(query, wrap_scope)
                 .where_clause(where_expr))
             .standing_at(at)
-            .map_err(crate::error::DelightQLError::parse_error)?;
+            .map_err(|e| Internal::invariant("transformer::scalar", e))?;
             let exists_query = sql_ast::QueryExpression::Select(Box::new(select));
             Ok(SqlPredicate::new(if negated {
                 SqlDomainExpr::not_exists(exists_query)
@@ -374,14 +370,12 @@ fn s_lower_truth(
                 // stopping at the shorter side, which would silently narrow
                 // the test rather than name the error.
                 let pairs = probes.clone().zip_exact(member.0).ok_or_else(|| {
-                    DelightQLError::validation_error_categorized(
-                        "membership/arity",
-                        format!(
+                    DelightQLError::from(Semantic::MembershipArity {
+                        message: format!(
                             "membership candidate has {} value(s) but the probe has {}",
                             row_width, probe_width
                         ),
-                        "every candidate must match the probe's width",
-                    )
+                    })
                 })?;
                 let (first, rest) = pairs
                     .try_map(|(probe, value)| -> Result<_> {
@@ -469,7 +463,10 @@ fn s_lower_sigma_application(
         ctx.identities
             .write_function_name(call.callee, &mut crate::names::sink::Teaching(&mut name))
             .map_err(|error| {
-                DelightQLError::parse_error(format!("sigma callee has no spelling: {error:?}"))
+                Internal::invariant(
+                    "transformer::scalar",
+                    format!("sigma callee has no spelling: {error:?}"),
+                )
             })?;
         name
     };
@@ -491,11 +488,9 @@ fn s_lower_sigma_application(
         crate::pipeline::asts::core::operators::CallArguments::Scalar(members) => members,
         crate::pipeline::asts::core::operators::CallArguments::None => Vec::new(),
         crate::pipeline::asts::core::operators::CallArguments::HigherOrder(_) => {
-            return Err(DelightQLError::ParseError {
+            return Err(DelightQLError::from(Constraint::Unsupported {
                 message: "a sigma call cannot lower a relational argument".to_string(),
-                source: None,
-                subcategory: None,
-            })
+            }))
         }
     };
     let args = members
@@ -511,11 +506,10 @@ fn s_lower_sigma_application(
             ast_refined::ScalarArgument::Spread(spread) => spread.expanded(),
             // A callable's slot is the callee's to supply; the substitution
             // that supplies it runs before this lowering.
-            ast_refined::ScalarArgument::Callable(_) => Err(DelightQLError::ParseError {
-                message: "a callable argument reached lowering unspent".to_string(),
-                source: None,
-                subcategory: None,
-            }),
+            ast_refined::ScalarArgument::Callable(_) => Err(Internal::invariant(
+                "transformer::scalar",
+                "a callable argument reached lowering unspent".to_string(),
+            )),
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(SqlPredicate::rewrite_call(name, namespace, args, false))
@@ -723,14 +717,13 @@ fn s_lower_function(
             )
         }
 
-        other => Err(DelightQLError::ParseError {
-            message: format!(
+        other => Err(Internal::invariant(
+            "transformer::scalar",
+            format!(
                 "s_lower_function: unimplemented FunctionApplication variant: {:?}",
                 std::mem::discriminant(&other)
             ),
-            source: None,
-            subcategory: None,
-        }),
+        )),
     }
 }
 
@@ -830,10 +823,10 @@ fn s_lower_field_select(
         match argument {
             ScalarArg::Value { value, .. } => supplied.push(value),
             ScalarArg::Star => {
-                return Err(DelightQLError::transformation_error(
-                    "a mode-compressed call supplies values for its declared inputs",
-                    "mode/argument",
-                ))
+                return Err(DelightQLError::from(Mode::Degree {
+                    message: "a mode-compressed call supplies values for its declared inputs"
+                        .to_string(),
+                }))
             }
         }
     }
@@ -1134,7 +1127,10 @@ pub(super) fn functor_name(
             &mut crate::names::sink::Teaching(&mut name),
         )
         .map_err(|error| {
-            DelightQLError::parse_error(format!("call has no renderable spelling: {error:?}"))
+            Internal::invariant(
+                "transformer::scalar",
+                format!("call has no renderable spelling: {error:?}"),
+            )
         })?;
     Ok(name.into())
 }
@@ -1162,11 +1158,9 @@ pub(super) fn scalar_call_arguments(call: ast_refined::FunctorCall) -> Result<Ve
         crate::pipeline::asts::core::operators::CallArguments::Scalar(members) => members,
         crate::pipeline::asts::core::operators::CallArguments::None => Vec::new(),
         crate::pipeline::asts::core::operators::CallArguments::HigherOrder(_) => {
-            return Err(DelightQLError::ParseError {
+            return Err(DelightQLError::from(Constraint::Unsupported {
                 message: "a scalar call cannot contain a relational argument".to_string(),
-                source: None,
-                subcategory: None,
-            })
+            }))
         }
     };
     members
@@ -1196,11 +1190,9 @@ pub(super) fn scalar_call_arguments(call: ast_refined::FunctorCall) -> Result<Ve
             // writes a template there.
             ast_refined::ScalarArgument::Callable(
                 ast_refined::Callable::Functor(_) | ast_refined::Callable::String(_),
-            ) => Err(DelightQLError::ParseError {
+            ) => Err(DelightQLError::from(Constraint::General {
                 message: "only a lambda is written as a callable argument".to_string(),
-                source: None,
-                subcategory: None,
-            }),
+            })),
         })
         .collect()
 }
@@ -1228,21 +1220,18 @@ fn s_lower_named_function(
         let (Some(Some(value)), Some(Some(type_arg)), None) =
             (args.next(), args.next(), args.next())
         else {
-            return Err(DelightQLError::ParseError {
-                message: "cast: expects exactly 2 arguments: cast:(expr, type)".into(),
-                source: None,
-                subcategory: None,
-            });
+            return Err(DelightQLError::from(Semantic::Cast {
+                message: "cast: expects exactly 2 arguments: cast:(expr, type)".to_string(),
+            }));
         };
         let ast_refined::DomainExpression::Application(ast_refined::FunctionApplication::Ground(
             LiteralValue::String(type_name),
         )) = type_arg
         else {
-            return Err(DelightQLError::ParseError {
-                message: "cast: type argument did not survive resolution as a type atom".into(),
-                source: None,
-                subcategory: None,
-            });
+            return Err(Internal::invariant(
+                "transformer::scalar",
+                "cast: type argument did not survive resolution as a type atom",
+            ));
         };
         let lowered = s_lower_expression(value, qualify, ctx)?;
         return Ok(SqlDomainExpr::cast(lowered, type_name));
@@ -1411,11 +1400,9 @@ fn s_lower_unary(
     qualify: &dyn Qualify,
     ctx: &TransformCtx,
 ) -> Result<SqlDomainExpr> {
-    Err(DelightQLError::ParseError {
+    Err(DelightQLError::from(Constraint::Unsupported {
         message: format!("s_lower_unary({}) not yet implemented", op),
-        source: None,
-        subcategory: None,
-    })
+    }))
 }
 
 /// Lower window function decoration (OVER clause).
@@ -1593,32 +1580,27 @@ pub(super) fn s_lower_record_scalar(
                     lowered
                 });
             }
-            // OUTWARD-ACTING: a metadata group summarizes the group of
-            // rows its record stands for. A record lowered per row stands
-            // for one row, and a single row is not a group.
+            // A metadata group partitions a group's rows by its key; a
+            // record lowered per row has no group to partition.
             RecordMember::Metadata { key, .. } => {
-                return Err(DelightQLError::validation_error_categorized(
-                    "constraint/metadata_per_row",
-                    format!(
-                        "`~> {{` makes one record PER ROW, and the metadata group \
-                         '{key}' inside it has no group of rows to summarize"
+                return Err(DelightQLError::from(Constraint::MetadataPerRow {
+                    message: format!(
+                        "the metadata group '{key}' stands in a record built per row, \
+                         which has no group of rows to partition; write it under \
+                         grouping keys: `%(keys ~> {{ …, \"{key}\": col:~> {{…}} }})`"
                     ),
-                    "write the grouping keys, so the record stands for a group: \
-                     `%(keys ~> {{ … }})`",
-                ));
+                }));
             }
             RecordMember::Induced { key, .. } => {
                 // An induced level is lowered by the CTE road in
                 // `r_lower_group`, which owns its own group. Reaching it here
                 // means a scalar position was handed a reduction.
-                return Err(DelightQLError::ParseError {
+                return Err(DelightQLError::from(Constraint::General {
                     message: format!(
                         "s_lower_record_scalar: nested reduction '{}' in scalar context",
                         key
                     ),
-                    source: None,
-                    subcategory: None,
-                });
+                }));
             }
             RecordMember::Spread(spread) => spread.expanded(),
         }
@@ -1713,21 +1695,24 @@ mod distinct_transport_tests {
         // A FIXTURE THAT EMITS NOTHING says so, exactly as an anonymous
         // row does. There is no site under it to answer from.
         fn rebind_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId> {
-            Err(crate::error::DelightQLError::parse_error(format!(
-                "the fixture scope emits no column for {port:?}"
-            )))
+            Err(Internal::invariant(
+                "transformer::scalar",
+                format!("the fixture scope emits no column for {port:?}"),
+            ))
         }
 
         fn slot_of_port(&self, port: crate::relation::PortId) -> Result<usize> {
-            Err(crate::error::DelightQLError::parse_error(format!(
-                "the fixture scope lays out no position for {port:?}"
-            )))
+            Err(Internal::invariant(
+                "transformer::scalar",
+                format!("the fixture scope lays out no position for {port:?}"),
+            ))
         }
 
         fn slot_of_physical(&self, column: crate::names::ColId) -> Result<usize> {
-            Err(crate::error::DelightQLError::parse_error(format!(
-                "the fixture scope lays out no position for {column:?}"
-            )))
+            Err(Internal::invariant(
+                "transformer::scalar",
+                format!("the fixture scope lays out no position for {column:?}"),
+            ))
         }
     }
 

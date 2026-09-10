@@ -6,9 +6,10 @@
 //! the user database connection and the internal _bootstrap metadata store.
 
 use crate::bootstrap::SourceType;
-use crate::bootstrap::{
-    setup_assertions_table_on_bootstrap, setup_danger_table_on_bootstrap,
-    setup_finding_table_on_bootstrap,
+use crate::ddl::lifecycle::{refuse_if_blueprint, Catalog, ImprintSource, LiveNamespace};
+use crate::diagnostic::{
+    Constraint, Ddl, DdlHead, Directive, EffectCte, EffectDdl, EffectMain, Ground, Namespace,
+    NamespaceName, Runtime,
 };
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
@@ -27,6 +28,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+/// The pristine world: constructed once, frozen, instantiated per reset.
+/// A child so it may lay fields into `DelightQLSystem`.
+mod world;
+pub(crate) use world::ReadySystem;
 
 /// The user-selected target connection. Imported and bootstrap connections
 /// receive distinct identities; an absent route also defaults here.
@@ -234,9 +240,7 @@ impl PreparedLoad {
                 [&namespace],
                 |row| row.get(0),
             )
-            .map_err(|e| {
-                DelightQLError::database_error("namespace lookup for declared graph", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("namespace lookup for declared graph", e.to_string()))?;
         record_declared_edges_on(conn, namespace_id, &namespace, edges)?;
         Ok(PublishedLoad {
             namespace_id,
@@ -264,16 +268,16 @@ fn record_declared_edges_on(
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(|e| DelightQLError::database_error("selected target lookup", e.to_string()))?
+        .map_err(|e| Runtime::catalog("selected target lookup", e.to_string()))?
         .ok_or_else(|| {
-            DelightQLError::database_error(
-                format!(
+            DelightQLError::from(Runtime::General {
+                message: format!(
                     "'{namespace}' declares {edge} of a namespace its own load no longer \
                      holds — the target the directive selected was destroyed before \
                      publication"
                 ),
-                "declared target destroyed",
-            )
+                details: "declared target destroyed".to_string(),
+            })
         })
     };
     for DeclaredEdge(act) in edges {
@@ -285,9 +289,7 @@ fn record_declared_edges_on(
                      (namespace_id, enlisted_namespace_id) VALUES (?1, ?2)",
                     rusqlite::params![namespace_id, target],
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("record namespace_local_enlist", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("record namespace_local_enlist", e.to_string()))?;
             }
             LexicalAct::Alias { shorthand, target } => {
                 standing(target, "an alias")?;
@@ -296,20 +298,18 @@ fn record_declared_edges_on(
                      (namespace_id, alias, target_namespace_id) VALUES (?1, ?2, ?3)",
                     rusqlite::params![namespace_id, shorthand, target],
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("record namespace_local_alias", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("record namespace_local_alias", e.to_string()))?;
             }
             LexicalAct::Expose { target } => {
                 let target_fq = standing(target, "an exposure")?;
                 if !target_fq.starts_with(&format!("{namespace}::")) {
-                    return Err(DelightQLError::database_error(
-                        format!(
+                    return Err(DelightQLError::from(Runtime::General {
+                        message: format!(
                             "Cannot expose '{target_fq}' through '{namespace}': not a child \
                              namespace"
                         ),
-                        "Invalid expose target",
-                    ));
+                        details: "Invalid expose target".to_string(),
+                    }));
                 }
                 conn.execute(
                     "INSERT OR IGNORE INTO exposed_namespace \
@@ -317,7 +317,7 @@ fn record_declared_edges_on(
                     rusqlite::params![namespace_id, target],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!("Failed to expose namespace '{target_fq}': {e}"),
                         e.to_string(),
                     )
@@ -451,7 +451,17 @@ impl LiminalRow {
 ///
 /// The _bootstrap database is NOT attached to the user database - it's a completely
 /// separate SQLite connection used internally by the engine for metadata storage.
-pub(crate) struct DelightQLSystem {
+///
+/// THE HOST IS UNSIZED. Its last field is a zero-length slice, so a
+/// `DelightQLSystem` is never a value: safe code cannot move one, replace
+/// one, or swap two — `std::mem::swap`, `replace` and `take` all require
+/// `Sized`. A `&mut DelightQLSystem` can only OPERATE on the host where it
+/// stands, under the carrier that owns it beside its image
+/// (`world::ReadySystem`, and the construction carriers before it), and
+/// nothing can pair that host with another image. The sized twin exists
+/// only for the one instant of construction in `system::world`, where it
+/// is boxed and unsized in the same expression.
+pub(crate) struct DelightQLSystem<Standing: ?Sized = InPlace> {
     /// User database connection (target backend)
     pub connection: Arc<Mutex<dyn DatabaseConnection>>,
 
@@ -502,8 +512,8 @@ pub(crate) struct DelightQLSystem {
     /// Lazily initialized on first access to catalog features.
     catalog_cartridge_id: Cell<Option<i32>>,
 
-    /// Database type string ("sqlite", "duckdb", "postgres").
-    /// Stored for reinit_bootstrap() to re-register the user connection.
+    /// Database type string ("sqlite", "duckdb", "postgres"); selects the
+    /// primary connection's dialect.
     db_type: String,
 
     /// Monotonic count of Effect-Executor effects (pseudo-predicates /
@@ -536,7 +546,18 @@ pub(crate) struct DelightQLSystem {
     /// narrowly scoped migration capability exists at all; nothing on any
     /// query road reaches it.
     bootstrap_guard: crate::bootstrap::guard::BootstrapGuard,
+
+    /// The unsizing tail: `[()]` in every type position the crate names.
+    /// Last, so the struct's other fields are laid out before it and the
+    /// sized twin coerces to it. Never read — it is a fact of the type,
+    /// not a datum.
+    #[allow(dead_code)]
+    standing: Standing,
 }
+
+/// The standing of a published host: the zero-length slice type that makes
+/// `DelightQLSystem` unsized, and so unmovable, everywhere it is named.
+pub(crate) type InPlace = [()];
 
 /// What kind of liminal program owns the current atomic boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -609,7 +630,7 @@ impl PublishedLoad {
 impl<'a> CatalogSavepoint<'a> {
     fn begin(conn: &'a Connection, name: &'static str, context: &str) -> Result<Self> {
         conn.execute_batch(&format!("SAVEPOINT {name}"))
-            .map_err(|e| DelightQLError::database_error(context, e.to_string()))?;
+            .map_err(|e| Runtime::catalog(context, e.to_string()))?;
         Ok(Self {
             conn,
             name,
@@ -620,7 +641,7 @@ impl<'a> CatalogSavepoint<'a> {
     fn commit(mut self, context: &str) -> Result<()> {
         self.conn
             .execute_batch(&format!("RELEASE SAVEPOINT {}", self.name))
-            .map_err(|e| DelightQLError::database_error(context, e.to_string()))?;
+            .map_err(|e| Runtime::catalog(context, e.to_string()))?;
         self.active = false;
         Ok(())
     }
@@ -657,10 +678,7 @@ fn register_sys_diagnostics_table(
             rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to create sys::diagnostics cartridge: {}", e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to create sys::diagnostics cartridge: {}", e), e.to_string())
         })?;
     let cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
     let ns_id: i32 = bootstrap_conn
@@ -670,7 +688,7 @@ fn register_sys_diagnostics_table(
             |row| row.get(0),
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to query sys::diagnostics namespace: {}", e),
                 e.to_string(),
             )
@@ -681,7 +699,7 @@ fn register_sys_diagnostics_table(
             rusqlite::params![cartridge_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to insert sys::diagnostics.finding entity: {}", e),
                 e.to_string(),
             )
@@ -694,7 +712,7 @@ fn register_sys_diagnostics_table(
             rusqlite::params![entity_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to insert sys::diagnostics.finding clause: {}", e),
                 e.to_string(),
             )
@@ -717,7 +735,7 @@ fn register_sys_diagnostics_table(
                 rusqlite::params![entity_id, name, data_type, position, nullable],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("Failed to insert sys::diagnostics.finding column '{name}': {e}"),
                     e.to_string(),
                 )
@@ -729,10 +747,7 @@ fn register_sys_diagnostics_table(
             rusqlite::params![entity_id, ns_id, cartridge_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to activate sys::diagnostics.finding: {}", e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to activate sys::diagnostics.finding: {}", e), e.to_string())
         })?;
     Ok(())
 }
@@ -755,10 +770,7 @@ fn register_sys_identifier_table(
             rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to create sys::identifiers cartridge: {}", e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to create sys::identifiers cartridge: {}", e), e.to_string())
         })?;
     let identifiers_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
 
@@ -769,7 +781,7 @@ fn register_sys_identifier_table(
             |row| row.get(0),
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to query sys::identifiers namespace: {}", e),
                 e.to_string(),
             )
@@ -784,6 +796,7 @@ fn register_sys_identifier_table(
             ("hierarchy", "TEXT", false),
             ("summary", "TEXT", false),
             ("explanation", "TEXT", false),
+            ("role", "TEXT", false),
         ],
     )];
 
@@ -794,7 +807,7 @@ fn register_sys_identifier_table(
                 rusqlite::params![table, identifiers_cartridge_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("Failed to insert sys::identifiers.{} entity: {}", table, e),
                     e.to_string(),
                 )
@@ -808,7 +821,7 @@ fn register_sys_identifier_table(
                 rusqlite::params![entity_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("Failed to insert sys::identifiers.{} clause: {}", table, e),
                     e.to_string(),
                 )
@@ -829,7 +842,7 @@ fn register_sys_identifier_table(
                     ],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!(
                             "Failed to insert sys::identifiers.{} column '{}': {}",
                             table, col_name, e
@@ -845,10 +858,7 @@ fn register_sys_identifier_table(
                 rusqlite::params![entity_id, identifiers_ns_id, identifiers_cartridge_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to activate sys::identifiers.{}: {}", table, e),
-                    e.to_string(),
-                )
+                Runtime::catalog(format!("Failed to activate sys::identifiers.{}: {}", table, e), e.to_string())
             })?;
     }
 
@@ -868,10 +878,7 @@ fn register_sys_format_table(bootstrap_conn: &Connection, bootstrap_conn_id: i64
             rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to create sys::format cartridge: {}", e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to create sys::format cartridge: {}", e), e.to_string())
         })?;
     let format_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
 
@@ -882,7 +889,7 @@ fn register_sys_format_table(bootstrap_conn: &Connection, bootstrap_conn_id: i64
             |row| row.get(0),
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to query sys::format namespace: {}", e),
                 e.to_string(),
             )
@@ -894,7 +901,7 @@ fn register_sys_format_table(bootstrap_conn: &Connection, bootstrap_conn_id: i64
             rusqlite::params![format_cartridge_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to insert sys::format.bundle entity: {}", e),
                 e.to_string(),
             )
@@ -908,7 +915,7 @@ fn register_sys_format_table(bootstrap_conn: &Connection, bootstrap_conn_id: i64
             rusqlite::params![entity_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to insert sys::format.bundle clause: {}", e),
                 e.to_string(),
             )
@@ -957,7 +964,7 @@ fn register_sys_format_table(bootstrap_conn: &Connection, bootstrap_conn_id: i64
                 ],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!(
                         "Failed to insert sys::format.bundle column '{}': {}",
                         col_name, e
@@ -973,10 +980,7 @@ fn register_sys_format_table(bootstrap_conn: &Connection, bootstrap_conn_id: i64
             rusqlite::params![entity_id, format_ns_id, format_cartridge_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to activate sys::format.bundle: {}", e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to activate sys::format.bundle: {}", e), e.to_string())
         })?;
 
     Ok(())
@@ -1013,10 +1017,7 @@ fn register_sys_connection_table(
             rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to create sys::connections cartridge: {}", e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to create sys::connections cartridge: {}", e), e.to_string())
         })?;
     let conn_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
 
@@ -1027,7 +1028,7 @@ fn register_sys_connection_table(
             |row| row.get(0),
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to query sys::connections namespace: {}", e),
                 e.to_string(),
             )
@@ -1039,7 +1040,7 @@ fn register_sys_connection_table(
             rusqlite::params![conn_cartridge_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to insert sys::connections.connection entity: {}", e),
                 e.to_string(),
             )
@@ -1053,7 +1054,7 @@ fn register_sys_connection_table(
             rusqlite::params![entity_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to insert sys::connections.connection clause: {}", e),
                 e.to_string(),
             )
@@ -1079,7 +1080,7 @@ fn register_sys_connection_table(
                 rusqlite::params![entity_id, col_name, data_type, position, nullable],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!(
                         "Failed to insert sys::connections.connection column '{}': {}",
                         col_name, e
@@ -1095,10 +1096,7 @@ fn register_sys_connection_table(
             rusqlite::params![entity_id, conn_ns_id, conn_cartridge_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to activate sys::connections.connection: {}", e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to activate sys::connections.connection: {}", e), e.to_string())
         })?;
 
     Ok(())
@@ -1128,7 +1126,7 @@ fn register_curated_sys_ns_table(
         )
         .optional()
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to query sys::ns cartridge for '{table_name}': {e}"),
                 e.to_string(),
             )
@@ -1143,10 +1141,7 @@ fn register_curated_sys_ns_table(
                     rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!("Failed to create sys::ns cartridge for '{table_name}': {e}"),
-                        e.to_string(),
-                    )
+                    Runtime::catalog(format!("Failed to create sys::ns cartridge for '{table_name}': {e}"), e.to_string())
                 })?;
             bootstrap_conn.last_insert_rowid() as i32
         }
@@ -1159,7 +1154,7 @@ fn register_curated_sys_ns_table(
             |row| row.get(0),
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to query sys::ns namespace: {}", e),
                 e.to_string(),
             )
@@ -1171,7 +1166,7 @@ fn register_curated_sys_ns_table(
             rusqlite::params![table_name, ns_cartridge_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to insert sys::ns.{table_name} entity: {e}"),
                 e.to_string(),
             )
@@ -1185,7 +1180,7 @@ fn register_curated_sys_ns_table(
             rusqlite::params![entity_id, clause_comment],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to insert sys::ns.{table_name} clause: {e}"),
                 e.to_string(),
             )
@@ -1200,7 +1195,7 @@ fn register_curated_sys_ns_table(
                 rusqlite::params![entity_id, col_name, data_type, position, nullable],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("Failed to insert sys::ns.{table_name} column '{col_name}': {e}"),
                     e.to_string(),
                 )
@@ -1213,10 +1208,7 @@ fn register_curated_sys_ns_table(
             rusqlite::params![entity_id, ns_ns_id, ns_cartridge_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to activate sys::ns.{table_name}: {e}"),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to activate sys::ns.{table_name}: {e}"), e.to_string())
         })?;
 
     Ok(())
@@ -1299,7 +1291,7 @@ fn register_catalog_wrapper(
             |row| row.get(0),
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to check catalog wrapper '{}': {}", entity_name, e),
                 e.to_string(),
             )
@@ -1316,7 +1308,7 @@ fn register_catalog_wrapper(
         rusqlite::params![&entity_name, 4, cartridge_id], // type 4 = DqlTemporaryViewExpression
     )
     .map_err(|e| {
-        DelightQLError::database_error(
+        Runtime::catalog(
             format!(
                 "Failed to insert catalog wrapper entity '{}': {}",
                 entity_name, e
@@ -1331,7 +1323,7 @@ fn register_catalog_wrapper(
         rusqlite::params![entity_id, &definition],
     )
     .map_err(|e| {
-        DelightQLError::database_error(
+        Runtime::catalog(
             format!(
                 "Failed to insert catalog wrapper clause for '{}': {}",
                 entity_name, e
@@ -1345,7 +1337,7 @@ fn register_catalog_wrapper(
         rusqlite::params![entity_id, sys_meta_ns_id, cartridge_id],
     )
     .map_err(|e| {
-        DelightQLError::database_error(
+        Runtime::catalog(
             format!(
                 "Failed to activate catalog wrapper '{}': {}",
                 entity_name, e
@@ -1517,12 +1509,12 @@ impl DetachOnDrop<'_> {
                 .execute(&format!("DETACH DATABASE '{}'", self.alias), &[])
                 .map(|_| ())
                 .map_err(|error| {
-                    DelightQLError::database_error(
-                        format!("Failed to detach mounted alias '{}'", self.alias),
-                        error.to_string(),
-                    )
+                    DelightQLError::from(Runtime::General {
+                        message: format!("Failed to detach mounted alias '{}'", self.alias),
+                        details: error.to_string(),
+                    })
                 }),
-            Err(error) => Err(DelightQLError::connection_poison_error(
+            Err(error) => Err(Runtime::poisoned(
                 format!(
                     "Failed to acquire connection lock to detach '{}'",
                     self.alias
@@ -1571,9 +1563,7 @@ struct BootstrapTxn<'a> {
 impl<'a> BootstrapTxn<'a> {
     fn begin(conn: &'a Connection, name: &'static str) -> Result<Self> {
         conn.execute_batch(&format!("SAVEPOINT {}", name))
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to open bootstrap savepoint", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to open bootstrap savepoint", e.to_string()))?;
         Ok(Self {
             conn,
             name,
@@ -1589,10 +1579,7 @@ impl<'a> BootstrapTxn<'a> {
         self.conn
             .execute_batch(&format!("RELEASE {}", self.name))
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to release bootstrap savepoint",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to release bootstrap savepoint", e.to_string())
             })?;
         self.armed = false;
         Ok(())
@@ -1639,16 +1626,16 @@ fn valid_byte_binding_name(name: &str) -> bool {
 /// future mount.
 fn validate_sqlite_image(name: &str, bytes: &[u8]) -> Result<()> {
     if bytes.len() < 100 || !bytes.starts_with(b"SQLite format 3\0") {
-        return Err(DelightQLError::validation_error(
-            format!(
+        return Err(DelightQLError::from(Runtime::General {
+            message: format!(
                 "byte binding '{}' is not a valid SQLite database image",
                 name
             ),
-            "delightql-bytes:// bindings must be complete SQLite images",
-        ));
+            details: "delightql-bytes:// bindings must be complete SQLite images".to_string(),
+        }));
     }
     let mut scratch = Connection::open_in_memory().map_err(|e| {
-        DelightQLError::database_error(
+        Runtime::catalog(
             "Failed to open scratch connection for image validation",
             e.to_string(),
         )
@@ -1661,13 +1648,13 @@ fn validate_sqlite_image(name: &str, bytes: &[u8]) -> Result<()> {
             })
         })
         .map_err(|e| {
-            DelightQLError::validation_error(
-                format!(
+            DelightQLError::from(Runtime::General {
+                message: format!(
                     "byte binding '{}' is not a valid SQLite database image: {}",
                     name, e
                 ),
-                "delightql-bytes:// bindings must be complete SQLite images",
-            )
+                details: "delightql-bytes:// bindings must be complete SQLite images".to_string(),
+            })
         })?;
     Ok(())
 }
@@ -1680,7 +1667,7 @@ fn create_mounted_namespace_path(
 ) -> Result<(i32, Vec<String>)> {
     let mut specs =
         crate::import::namespace::parse_namespace_path(conn, namespace).map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to construct namespace path '{}': {}", namespace, e),
                 e.to_string(),
             )
@@ -1705,7 +1692,7 @@ fn create_mounted_namespace_path(
     }
 
     crate::import::namespace::create_namespace_hierarchy(conn, &specs).map_err(|e| {
-        DelightQLError::database_error(
+        Runtime::catalog(
             format!("Failed to create namespace path '{}': {}", namespace, e),
             e.to_string(),
         )
@@ -1720,7 +1707,7 @@ fn create_mounted_namespace_path(
             |row| row.get(0),
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to find namespace '{}': {}", namespace, e),
                 e.to_string(),
             )
@@ -1783,16 +1770,13 @@ impl Drop for TargetTxnGuard<'_> {
 fn next_blueprint_version(conn: &Connection, target_ns_id: i32) -> Result<i64> {
     let mut stmt = conn
         .prepare("SELECT name FROM namespace WHERE pid = ?1 AND name GLOB '_[0-9]*_blueprint'")
-        .map_err(|e| {
-            DelightQLError::database_error("prepare blueprint version scan", e.to_string())
-        })?;
+        .map_err(|e| Runtime::catalog("prepare blueprint version scan", e.to_string()))?;
     let rows = stmt
         .query_map([target_ns_id], |r| r.get::<_, String>(0))
-        .map_err(|e| DelightQLError::database_error("scan blueprint versions", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("scan blueprint versions", e.to_string()))?;
     let mut max_n: Option<i64> = None;
     for name in rows {
-        let name =
-            name.map_err(|e| DelightQLError::database_error("read blueprint name", e.to_string()))?;
+        let name = name.map_err(|e| Runtime::catalog("read blueprint name", e.to_string()))?;
         // `name` is `_<N>_blueprint`; take the N between the leading `_` and the
         // `_blueprint` suffix. Anything that doesn't parse is ignored.
         if let Some(inner) = name
@@ -1818,16 +1802,21 @@ fn next_blueprint_version(conn: &Connection, target_ns_id: i32) -> Result<i64> {
 /// (delete-and-reuse) — and creates the archive. The archive is visible
 /// (a catalog wrapper is registered for it) but inert (`kind='blueprint'`,
 /// enlistment removed). Returns the blueprint fq_name.
-#[allow(clippy::too_many_arguments)]
+///
+/// The source arrives as an [`ImprintSource`] and the catalog written is the
+/// one it was judged in: only a judged live library can be consumed, so an
+/// archive can never be re-archived under a new target by an entrance that
+/// skipped the judgment or judged it elsewhere.
 fn consume_source_to_blueprint(
-    conn: &Connection,
-    source_ns: &str,
-    source_ns_id: i32,
+    source: &ImprintSource<'_>,
     target_ns: &str,
     target_ns_id: i32,
     sys_meta_ns_id: i32,
     catalog_id: i32,
 ) -> Result<String> {
+    let conn: &Connection = source.catalog();
+    let source_ns = source.fq();
+    let source_ns_id = source.id();
     // Version N = MAX(existing N)+1 over `_N_blueprint` children (loud on
     // query failure). See `next_blueprint_version` for why not COUNT.
     let n = next_blueprint_version(conn, target_ns_id)?;
@@ -1851,12 +1840,12 @@ fn consume_source_to_blueprint(
         let prefix = format!("{}::", source_ns);
         let mut stmt = conn
             .prepare("SELECT id, fq_name FROM namespace")
-            .map_err(|e| DelightQLError::database_error("prepare descendants", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("prepare descendants", e.to_string()))?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))
-            .map_err(|e| DelightQLError::database_error("query descendants", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("query descendants", e.to_string()))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| DelightQLError::database_error("read descendants", e.to_string()))?
+            .map_err(|e| Runtime::catalog("read descendants", e.to_string()))?
             .into_iter()
             .filter(|(_, fq)| fq.starts_with(&prefix))
             .collect()
@@ -1874,15 +1863,15 @@ fn consume_source_to_blueprint(
             [wrapper_name],
         )
         .map_err(|e| {
-            DelightQLError::database_error("drop wrapper activated_entity", e.to_string())
+            Runtime::catalog("drop wrapper activated_entity", e.to_string())
         })?;
         conn.execute(
             "DELETE FROM entity_clause WHERE entity_id IN (SELECT id FROM entity WHERE name = ?1)",
             [wrapper_name],
         )
-        .map_err(|e| DelightQLError::database_error("drop wrapper entity_clause", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("drop wrapper entity_clause", e.to_string()))?;
         conn.execute("DELETE FROM entity WHERE name = ?1", [wrapper_name])
-            .map_err(|e| DelightQLError::database_error("drop wrapper entity", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("drop wrapper entity", e.to_string()))?;
         Ok(())
     };
 
@@ -1891,25 +1880,25 @@ fn consume_source_to_blueprint(
         // it and re-root under the blueprint fq. `strip_prefix` (not byte
         // slicing) so a catalog inconsistency surfaces loudly, never panics.
         let suffix = old_fq.strip_prefix(source_ns).ok_or_else(|| {
-            DelightQLError::database_error(
-                "rename descendant ns",
-                format!(
+            DelightQLError::from(Runtime::General {
+                message: "rename descendant ns".to_string(),
+                details: format!(
                     "descendant '{}' is not under source '{}'",
                     old_fq, source_ns
                 ),
-            )
+            })
         })?;
         let new_fq = format!("{}{}", bp_fq, suffix);
         conn.execute(
             "UPDATE namespace SET fq_name = ?1 WHERE id = ?2",
             rusqlite::params![new_fq, id],
         )
-        .map_err(|e| DelightQLError::database_error("rename descendant ns", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("rename descendant ns", e.to_string()))?;
         conn.execute(
             "UPDATE cartridge SET source_ns = ?1 WHERE source_ns = ?2",
             rusqlite::params![new_fq, old_fq],
         )
-        .map_err(|e| DelightQLError::database_error("move descendant cartridge", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("move descendant cartridge", e.to_string()))?;
         drop_wrapper(&format!("{}::", old_fq))?;
     }
 
@@ -1918,12 +1907,12 @@ fn consume_source_to_blueprint(
         "UPDATE namespace SET name = ?1, fq_name = ?2, pid = ?3, kind = 'blueprint' WHERE id = ?4",
         rusqlite::params![bp_name, bp_fq, target_ns_id, source_ns_id],
     )
-    .map_err(|e| DelightQLError::database_error("rename source ns to blueprint", e.to_string()))?;
+    .map_err(|e| Runtime::catalog("rename source ns to blueprint", e.to_string()))?;
     conn.execute(
         "UPDATE cartridge SET source_ns = ?1 WHERE source_ns = ?2",
         rusqlite::params![bp_fq, source_ns],
     )
-    .map_err(|e| DelightQLError::database_error("move source cartridge", e.to_string()))?;
+    .map_err(|e| Runtime::catalog("move source cartridge", e.to_string()))?;
     drop_wrapper(&format!("{}::", source_ns))?;
 
     // Remove all enlistment of the consumed namespaces (root + descendants), in
@@ -1940,62 +1929,18 @@ fn consume_source_to_blueprint(
             "DELETE FROM enlisted_entity WHERE from_namespace_id = ?1 OR to_namespace_id = ?1",
             [ns_id],
         )
-        .map_err(|e| DelightQLError::database_error("delist consumed entity", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("delist consumed entity", e.to_string()))?;
         conn.execute(
             "DELETE FROM enlisted_namespace WHERE from_namespace_id = ?1 OR to_namespace_id = ?1",
             [ns_id],
         )
-        .map_err(|e| DelightQLError::database_error("delist consumed ns", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("delist consumed ns", e.to_string()))?;
     }
 
     // D2: register a catalog wrapper for the blueprint so it is visible.
     register_catalog_wrapper(conn, &bp_fq, sys_meta_ns_id, catalog_id)?;
 
     Ok(bp_fq)
-}
-
-/// Refuse an operation that would ANIMATE an archived blueprint namespace —
-/// the enforcement half of "visible-but-INERT". `imprint!` consumes a source
-/// namespace into `{target}::_N_blueprint`,
-/// stamping `kind='blueprint'` on the archive ROOT (see
-/// `consume_source_to_blueprint`); its descendants keep only their `fq_name`
-/// rewritten (kind stays NULL). So inertness is an ANCESTOR-OR-SELF test:
-/// `fq_name` is inert iff it equals, or is nested directly under, some
-/// blueprint-kind namespace. Membership is exact string-prefix (`==` or
-/// `starts_with("{bp}::")`) — mirroring the consume-side descendant discovery,
-/// no `LIKE` (`_`/`%` are ordinary namespace-name characters). Blueprints are
-/// rare, so the scan is a handful of rows; callers invoke this only on the
-/// namespace-qualified resolution / `enlist!` / `ground!` paths, never on
-/// bare table lookups. The `sys::meta` catalog functor stays VISIBLE because
-/// it resolves through `sys::meta`, never through the blueprint path — it does
-/// not call this. Pinned by companion_linear--70 (query), --71 (enlist),
-/// --73 (ground), --74 (function call); the visible half is pinned by --61.
-///
-/// Two layers (defense in depth): the LOUD front doors (relation resolution
-/// via `resolve_namespace_path`, function inlining via
-/// `ConsultRegistry::refuse_if_blueprint_fq`, `enlist!`, `ground!`) use
-/// `refuse_if_blueprint` for the badged error; the quiet safety net inside
-/// `ConsultRegistry::lookup_entity` uses `blueprint_shadowing` so ANY other
-/// present-or-future lookup route degrades to a clean not-found rather than
-/// silently executing archived rules — trusting the front doors alone is a
-/// tempting regression: a lookup route can bypass them without a compile error.
-pub(crate) fn blueprint_shadowing(conn: &Connection, fq_name: &str) -> Result<Option<String>> {
-    let mut stmt = conn
-        .prepare("SELECT fq_name FROM namespace WHERE kind = 'blueprint'")
-        .map_err(|e| {
-            DelightQLError::database_error("prepare blueprint inertness scan", e.to_string())
-        })?;
-    let blueprints = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .map_err(|e| DelightQLError::database_error("scan blueprint namespaces", e.to_string()))?;
-    for bp in blueprints {
-        let bp = bp
-            .map_err(|e| DelightQLError::database_error("read blueprint fq_name", e.to_string()))?;
-        if fq_name == bp || fq_name.starts_with(&format!("{}::", bp)) {
-            return Ok(Some(bp));
-        }
-    }
-    Ok(None)
 }
 
 /// Which of imprint!'s two verbs is running, named at the call site instead
@@ -2166,26 +2111,6 @@ fn created_object_existence_sql_scoped(
     }
 }
 
-/// The loud half of `blueprint_shadowing`: badged `imprint/blueprint/inert`.
-pub(crate) fn refuse_if_blueprint(conn: &Connection, fq_name: &str) -> Result<()> {
-    if let Some(bp) = blueprint_shadowing(conn, fq_name)? {
-        // The target the source was consumed into = the blueprint's
-        // parent (`{target}::_N_blueprint`); strip the last `::` segment.
-        let target = bp.rsplit_once("::").map(|(p, _)| p).unwrap_or(bp.as_str());
-        return Err(DelightQLError::validation_error_categorized(
-            "imprint/blueprint/inert",
-            format!(
-                "'{}' is an archived blueprint (imprint! consumed it into '{}'); \
-                 blueprints are visible but inert — re-consult the source path \
-                 for a live copy",
-                bp, target
-            ),
-            "archived blueprint is inert",
-        ));
-    }
-    Ok(())
-}
-
 /// Guard a USER-TYPED namespace-creation target against the reserved system
 /// name pool.
 ///
@@ -2228,16 +2153,14 @@ pub(crate) fn validate_user_namespace_target(fq: &str) -> Result<()> {
     // `main::_x`).
     for seg in &segments {
         if seg.starts_with('_') {
-            return Err(DelightQLError::validation_error_categorized(
-                "namespace/name/reserved",
-                format!(
+            return Err(DelightQLError::from(NamespaceName::Reserved {
+                message: format!(
                     "cannot create namespace '{}': the segment '{}' begins with '_', \
                      which is reserved for system machinery (e.g. _internal, \
                      _N_blueprint). Choose a name that does not begin with '_'.",
                     fq, seg
                 ),
-                "reserved system name",
-            ));
+            }));
         }
     }
 
@@ -2264,16 +2187,14 @@ pub(crate) fn validate_user_namespace_target(fq: &str) -> Result<()> {
 
     // Prong (d): creating UNDER `sys::`/`std::` — the reserved system subtree.
     if (top_lc == "sys" || top_lc == "std") && segments.len() > 1 {
-        return Err(DelightQLError::validation_error_categorized(
-            "namespace/name/system_subtree",
-            format!(
+        return Err(DelightQLError::from(NamespaceName::SystemSubtree {
+            message: format!(
                 "cannot create namespace '{}': the '{}::' subtree is reserved for \
                  system machinery. Create your namespace at the top level (or under \
                  home::) instead.",
                 fq, top_lc
             ),
-            "reserved system subtree",
-        ));
+        }));
     }
 
     // Prong (a): the bare top-level system name itself — creating AS it, or
@@ -2282,32 +2203,28 @@ pub(crate) fn validate_user_namespace_target(fq: &str) -> Result<()> {
     // in its bare form (its subtree case returned above, since creating under
     // home is the user's right).
     if matches!(top_lc.as_str(), "sys" | "std" | "home") {
-        return Err(DelightQLError::validation_error_categorized(
-            "namespace/name/reserved",
-            format!(
+        return Err(DelightQLError::from(NamespaceName::Reserved {
+            message: format!(
                 "cannot create namespace '{}': '{}' is a reserved system name. \
                  Choose a different top-level name (to author scratch under home, \
                  write home::{}).",
                 fq, top_lc, top_lc
             ),
-            "reserved system name",
-        ));
+        }));
     }
 
     // Prong (b): a top-level name PREFIXED `sys`/`std` (case-insensitive) — the
     // system's room to mint future siblings. Exact `main`/`home` handled above;
     // `maintenance`/`homework` are not prefix hits and pass through.
     if top_lc.starts_with("sys") || top_lc.starts_with("std") {
-        return Err(DelightQLError::validation_error_categorized(
-            "namespace/name/reserved",
-            format!(
+        return Err(DelightQLError::from(NamespaceName::Reserved {
+            message: format!(
                 "cannot create namespace '{}': the top-level name '{}' begins with a \
                  reserved system prefix (sys*/std*). Choose a name not beginning with \
                  sys or std (the prefix relaxes under home:: — home::{} is legal).",
                 fq, top, top
             ),
-            "reserved system name",
-        ));
+        }));
     }
 
     Ok(())
@@ -2362,10 +2279,10 @@ pub(crate) fn expand_plain_namespace(conn: &Connection, path: &str) -> Result<Op
              UNION
              SELECT 'home'",
         )
-        .map_err(|e| DelightQLError::database_error("prepare enlist-set scan", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("prepare enlist-set scan", e.to_string()))?;
     let parents: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(0))
-        .map_err(|e| DelightQLError::database_error("scan enlist set", e.to_string()))?
+        .map_err(|e| Runtime::catalog("scan enlist set", e.to_string()))?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -2380,9 +2297,7 @@ pub(crate) fn expand_plain_namespace(conn: &Connection, path: &str) -> Result<Op
                 |_| Ok(()),
             )
             .optional()
-            .map_err(|e| {
-                DelightQLError::database_error("probe enlisted child namespace", e.to_string())
-            })?
+            .map_err(|e| Runtime::catalog("probe enlisted child namespace", e.to_string()))?
             .is_some();
         if exists {
             if parent == "home" {
@@ -2404,17 +2319,15 @@ pub(crate) fn expand_plain_namespace(conn: &Connection, path: &str) -> Result<Op
             // Rule 3, loud ambiguity: two enlisted parents each hold a child of
             // this plain name — the user must spell the full path.
             other_matches.sort();
-            Err(DelightQLError::validation_error_categorized(
-                "namespace/plain/ambiguous",
-                format!(
+            Err(DelightQLError::from(Namespace::PlainAmbiguous {
+                message: format!(
                     "plain namespace qualifier '{}' is ambiguous: it names a child of \
                      multiple enlisted namespaces [{}]. Spell the full path to \
                      disambiguate.",
                     path,
                     other_matches.join(", "),
                 ),
-                "ambiguous plain namespace qualifier",
-            ))
+            }))
         }
     }
 }
@@ -2918,9 +2831,7 @@ mod readback_sql_tests {
 
 #[cfg(test)]
 mod created_object_catalog_tests {
-    use super::{
-        CatalogSavepoint, CreatedObjectCatalog, DelightQLSystem, RealCreatedObjectCatalog,
-    };
+    use super::{CatalogSavepoint, CreatedObjectCatalog, ReadySystem, RealCreatedObjectCatalog};
     use crate::external_effects::CreatedObjectRegistration;
     use delightql_types::introspect::DatabaseIntrospector;
     use delightql_types::test_utils::MockDatabaseConnection;
@@ -2943,9 +2854,9 @@ mod created_object_catalog_tests {
         }
     }
 
-    fn fresh_system() -> DelightQLSystem {
+    fn fresh_system() -> ReadySystem {
         let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+        ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh in-memory system should build")
     }
 
@@ -2978,6 +2889,7 @@ mod created_object_catalog_tests {
                 connection_id: 2,
                 namespace_id: 1,
                 attributes: vec![("id".to_string(), "INTEGER".to_string())],
+                interior_positions: Vec::new(),
             },
             CreatedObjectRegistration {
                 name: "second".to_string(),
@@ -2985,6 +2897,7 @@ mod created_object_catalog_tests {
                 connection_id: 2,
                 namespace_id: 1,
                 attributes: vec![("id".to_string(), "INTEGER".to_string())],
+                interior_positions: Vec::new(),
             },
         ];
         let savepoint = CatalogSavepoint::begin(
@@ -3021,7 +2934,7 @@ mod schema_mount_recording_tests {
     //! a second policy authority. A mount given a specific schema records THAT
     //! schema (and introspects it); a bare mount records unqualified policy and
     //! the namespace-keyed lookup resolves the engine default downstream.
-    use super::DelightQLSystem;
+    use super::ReadySystem;
     use delightql_types::factory::ConnectionComponents;
     use delightql_types::introspect::{
         DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity,
@@ -3056,9 +2969,9 @@ mod schema_mount_recording_tests {
         }
     }
 
-    fn fresh_system() -> DelightQLSystem {
+    fn fresh_system() -> ReadySystem {
         let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        DelightQLSystem::new(
+        ReadySystem::new(
             conn,
             Box::new(SchemaEchoIntrospector { schema: None }),
             "sqlite",
@@ -3271,9 +3184,11 @@ mod schema_mount_recording_tests {
     struct FailingIntrospector;
     impl DatabaseIntrospector for FailingIntrospector {
         fn introspect_entities(&self) -> Result<Vec<DiscoveredEntity>> {
-            Err(delightql_types::DelightQLError::database_error(
-                "induced external introspection failure",
-                "schema_mount_recording_tests",
+            Err(crate::diagnostic::DelightQLError::from(
+                crate::diagnostic::Runtime::General {
+                    message: "induced external introspection failure".to_string(),
+                    details: "schema_mount_recording_tests".to_string(),
+                },
             ))
         }
 
@@ -3390,9 +3305,8 @@ fn validate_function_clause_discipline(
 
     // Rule 3 (RULE 2): at most one unguarded clause.
     if unguarded_indices.len() > 1 {
-        return Err(DelightQLError::validation_error_categorized(
-            "ddl/head/unguarded_multiplicity",
-            format!(
+        return Err(DelightQLError::from(DdlHead::UnguardedMultiplicity {
+            message: format!(
                 "Disjunctive definition '{}': found {} unguarded clauses, but a value \
                  function (a colon-functor `{}:(…)`) must return exactly one value per \
                  input. Its clauses are ordered first-match alternatives — the functional \
@@ -3409,8 +3323,7 @@ fn validate_function_clause_discipline(
                 name,
                 name,
             ),
-            "Unguarded clause multiplicity",
-        ));
+        }));
     }
 
     // Rule 4: the single unguarded (default) clause must be last.
@@ -3418,9 +3331,8 @@ fn validate_function_clause_discipline(
     // not the generic parse_error family.
     if let Some(&idx) = unguarded_indices.first() {
         if idx != defs.len() - 1 {
-            return Err(DelightQLError::validation_error_categorized(
-                "ddl/head/unguarded_position",
-                format!(
+            return Err(DelightQLError::from(DdlHead::UnguardedPosition {
+                message: format!(
                     "Disjunctive definition '{}': unguarded clause is at position {} \
                      but must be the last clause (position {}). \
                      Move the default clause to the end.",
@@ -3428,8 +3340,7 @@ fn validate_function_clause_discipline(
                     idx + 1,
                     defs.len()
                 ),
-                "unguarded clause must be last",
-            ));
+            }));
         }
     }
 
@@ -3481,16 +3392,16 @@ fn validate_effect_algebra_discipline(
             if let DdlBody::Relational(ref query) = def.body {
                 let invocations = effects::collect_directive_invocations_in_query(query);
                 if let Some(inv) = invocations.first() {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "effect/rule/purity",
-                        format!(
-                            "definition '{}': its head lacks '!' but its body demands \
+                    return Err(DelightQLError::from(
+                        crate::diagnostic::EffectRule::Purity {
+                            message: format!(
+                                "definition '{}': its head lacks '!' but its body demands \
                              the directive '{}' — a rule without the effect marker must \
                              not contain a directive (EFFECT-ALGEBRA R1). Declare the \
                              effect in the head: '{}!(*) :- …'.",
-                            name, inv.name, name
-                        ),
-                        "directive in a pure rule body",
+                                name, inv.name, name
+                            ),
+                        },
                     ));
                 }
             }
@@ -3502,16 +3413,14 @@ fn validate_effect_algebra_discipline(
 
     // F2: main! may only be single-claused.
     if name == "main!" && defs.len() > 1 {
-        return Err(DelightQLError::validation_error_categorized(
-            "effect/main/multi_clause",
-            format!(
+        return Err(DelightQLError::from(EffectMain::MultiClause {
+            message: format!(
                 "effect rule 'main!' may only be single-claused (EFFECT-ALGEBRA F2): \
                  found {} clauses. Split the arms into named effect rules and demand \
                  them from the single main! body.",
                 defs.len()
             ),
-            "main! may only be single-claused",
-        ));
+        }));
     }
 
     let rule = effects::EffectRule::from_definition_group(group)?;
@@ -3520,15 +3429,15 @@ fn validate_effect_algebra_discipline(
     for clause in &rule.clauses {
         // R2: the body expression must end in a directive.
         if !effects::ends_in_directive(&clause.body.expression) {
-            return Err(DelightQLError::validation_error_categorized(
-                "effect/rule/ending",
-                format!(
-                    "effect rule '{}': its body must end in a directive \
+            return Err(DelightQLError::from(
+                crate::diagnostic::EffectRule::Ending {
+                    message: format!(
+                        "effect rule '{}': its body must end in a directive \
                      (EFFECT-ALGEBRA R2). To return an ordinary table, pipe it \
                      through the post-pipe returning! directive: '… |> returning!(*)'.",
-                    rule.name
-                ),
-                "effect body must end in a directive",
+                        rule.name
+                    ),
+                },
             ));
         }
 
@@ -3540,16 +3449,14 @@ fn validate_effect_algebra_discipline(
                     .subject()
                     .authored_name()
                     .expect("effect bodies contain only authored bindings");
-                return Err(DelightQLError::validation_error_categorized(
-                    "effect/cte/label",
-                    format!(
+                return Err(DelightQLError::from(EffectCte::Label {
+                    message: format!(
                         "effect rule '{}': the CTE '{}' demands a directive, so \
                          its label must be '!'-marked — write ': {}!' \
                          (EFFECT-ALGEBRA R4).",
                         rule.name, name, name
                     ),
-                    "effect CTE without ! label",
-                ));
+                }));
             }
         }
 
@@ -3557,10 +3464,10 @@ fn validate_effect_algebra_discipline(
         for inv in effects::demanded_directive_names(&clause.body) {
             match inv.category {
                 effects::DirectiveCategory::Session if inv.name != "doc!" => {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "effect/body/session_directive",
-                        format!(
-                            "effect rule '{}': its body demands the session directive \
+                    return Err(DelightQLError::from(
+                        crate::diagnostic::EffectBody::SessionDirective {
+                            message: format!(
+                                "effect rule '{}': its body demands the session directive \
                              '{}'. Session directives alter what the compiler resolves \
                              against — rules, connections, names — and are legal only in \
                              the liminal space and at the REPL/CLI top level \
@@ -3570,15 +3477,14 @@ fn validate_effect_algebra_discipline(
                              (Exempt, because they cannot change resolution: doc! — \
                              annotation only — and run_namespace! — its target's rules \
                              already exist when the body is compiled.)",
-                            rule.name, inv.name
-                        ),
-                        "session directive in effect body",
+                                rule.name, inv.name
+                            ),
+                        },
                     ));
                 }
                 effects::DirectiveCategory::Execution if inv.name == "run!" => {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "effect/body/run",
-                        format!(
+                    return Err(DelightQLError::from(crate::diagnostic::EffectBody::Run {
+                        message: format!(
                             "effect rule '{}': its body demands run!. run! consults its \
                              file, which would extend the set of rules the run was \
                              compiled against while the run is executing (EFFECT-ALGEBRA \
@@ -3588,8 +3494,7 @@ fn validate_effect_algebra_discipline(
                              already exist at compile time.",
                             rule.name
                         ),
-                        "run! in effect body",
-                    ));
+                    }));
                 }
                 _ => {}
             }
@@ -3640,16 +3545,16 @@ fn validate_effect_rule_recursion(edges: &[(String, Vec<String>)]) -> Result<()>
     for (name, _) in edges {
         let mut path = Vec::new();
         if let Some(cycle) = visit(name, &graph, &mut path) {
-            return Err(DelightQLError::validation_error_categorized(
-                "effect/rule/recursion",
-                format!(
-                    "effect rule '{}' must not recurse, directly or transitively \
+            return Err(DelightQLError::from(
+                crate::diagnostic::EffectRule::Recursion {
+                    message: format!(
+                        "effect rule '{}' must not recurse, directly or transitively \
                      (EFFECT-ALGEBRA R6: every effect rule expands to a finite \
                      static DAG). Cycle: {}.",
-                    name,
-                    cycle.join(" -> ")
-                ),
-                "recursive effect rule",
+                        name,
+                        cycle.join(" -> ")
+                    ),
+                },
             ));
         }
     }
@@ -3693,10 +3598,7 @@ fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
             rusqlite::params![SourceType::FileBin.as_i32()],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to create catalog wrapper cartridge: {}", e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to create catalog wrapper cartridge: {}", e), e.to_string())
         })?;
     let catalog_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
 
@@ -3708,7 +3610,7 @@ fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
             |row| row.get(0),
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to query sys::meta namespace: {}", e),
                 e.to_string(),
             )
@@ -3717,12 +3619,10 @@ fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
     // Register a catalog wrapper for every existing namespace
     let mut stmt = bootstrap_conn
         .prepare("SELECT fq_name FROM namespace ORDER BY id")
-        .map_err(|e| {
-            DelightQLError::database_error("Failed to prepare namespace query", e.to_string())
-        })?;
+        .map_err(|e| Runtime::catalog("Failed to prepare namespace query", e.to_string()))?;
     let ns_names: Vec<String> = stmt
         .query_map([], |row| row.get(0))
-        .map_err(|e| DelightQLError::database_error("Failed to query namespaces", e.to_string()))?
+        .map_err(|e| Runtime::catalog("Failed to query namespaces", e.to_string()))?
         .filter_map(|r| r.ok())
         .collect();
     drop(stmt);
@@ -3740,7 +3640,7 @@ fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
             |row| row.get(0),
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to query home namespace for enlist: {}", e),
                 e.to_string(),
             )
@@ -3753,7 +3653,7 @@ fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
             [sys_meta_ns_id, home_ns_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to enlist sys::meta into home: {}", e),
                 e.to_string(),
             )
@@ -3776,7 +3676,7 @@ fn register_catalog_views(bootstrap_conn: &Connection) -> Result<i32> {
                 [main_ns_id, home_ns_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("Failed to enlist main into home: {}", e),
                     e.to_string(),
                 )
@@ -3814,10 +3714,7 @@ fn ensure_catalog_initialized(
                 |row| row.get(0),
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to validate catalog cartridge cache",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to validate catalog cartridge cache", e.to_string())
             })?;
         if is_catalog {
             return Ok(id);
@@ -3829,6 +3726,18 @@ fn ensure_catalog_initialized(
     Ok(id)
 }
 
+/// The builtin cartridge registry every native system is constructed with.
+/// The pristine image is derived from exactly this inventory.
+fn builtin_registry() -> crate::bin_cartridge::registry::BinCartridgeRegistry {
+    let mut bin_registry = crate::bin_cartridge::registry::BinCartridgeRegistry::new();
+    // The prelude cartridge (contains import!, enlist!, delist!)
+    bin_registry.register_cartridge(crate::bin_cartridge::prelude::create_prelude_cartridge());
+    // The predicates cartridge (contains like(), etc.)
+    bin_registry
+        .register_cartridge(crate::bin_cartridge::predicates::create_predicates_cartridge());
+    bin_registry
+}
+
 /// Check that a namespace fq_name is not already registered in bootstrap.
 /// Returns Ok(()) if available, Err if already taken.
 fn ensure_namespace_available(conn: &rusqlite::Connection, fq_name: &str) -> Result<()> {
@@ -3838,18 +3747,16 @@ fn ensure_namespace_available(conn: &rusqlite::Connection, fq_name: &str) -> Res
             [fq_name],
             |row| row.get(0),
         )
-        .map_err(|e| {
-            DelightQLError::database_error("Failed to check namespace existence", e.to_string())
-        })?;
+        .map_err(|e| Runtime::catalog("Failed to check namespace existence", e.to_string()))?;
 
     if exists {
-        return Err(DelightQLError::database_error(
-            format!(
+        return Err(DelightQLError::from(Runtime::General {
+            message: format!(
                 "Namespace '{}' already exists. Cannot register the same namespace twice.",
                 fq_name
             ),
-            "Duplicate namespace",
-        ));
+            details: "Duplicate namespace".to_string(),
+        }));
     }
 
     // The inverse of register_namespace_alias's guard — the exclusivity
@@ -3868,12 +3775,10 @@ fn ensure_namespace_available(conn: &rusqlite::Connection, fq_name: &str) -> Res
             |row| row.get(0),
         )
         .optional()
-        .map_err(|e| {
-            DelightQLError::database_error("Failed to check alias collision", e.to_string())
-        })?;
+        .map_err(|e| Runtime::catalog("Failed to check alias collision", e.to_string()))?;
 
     if let Some(target) = alias_target {
-        return Err(DelightQLError::database_error(
+        return Err(Runtime::catalog(
             format!(
                 "'{}' is already an alias for namespace '{}'. A namespace may not \
                 take an alias's name — every reference to '{}' would resolve to \
@@ -3909,10 +3814,7 @@ impl CreatedObjectCatalog for RealCreatedObjectCatalog {
                 )
                 .optional()
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "query session-materialization cartridge",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("query session-materialization cartridge", e.to_string())
                 })? {
                 Some(id) => id,
                 None => {
@@ -3928,7 +3830,7 @@ impl CreatedObjectCatalog for RealCreatedObjectCatalog {
                             ],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error(
+                            Runtime::catalog(
                                 "Failed to create session-materialization cartridge",
                                 e.to_string(),
                             )
@@ -3945,9 +3847,7 @@ impl CreatedObjectCatalog for RealCreatedObjectCatalog {
                          WHERE ae.namespace_id = ?1 AND e.name = ?2
                            AND e.cartridge_id = ?3",
                     )
-                    .map_err(|e| {
-                        DelightQLError::database_error("query stale created entity", e.to_string())
-                    })?;
+                    .map_err(|e| Runtime::catalog("query stale created entity", e.to_string()))?;
                 let rows = statement
                     .query_map(
                         rusqlite::params![
@@ -3957,13 +3857,9 @@ impl CreatedObjectCatalog for RealCreatedObjectCatalog {
                         ],
                         |row| row.get(0),
                     )
-                    .map_err(|e| {
-                        DelightQLError::database_error("query stale created entity", e.to_string())
-                    })?;
+                    .map_err(|e| Runtime::catalog("query stale created entity", e.to_string()))?;
                 rows.collect::<std::result::Result<Vec<i64>, _>>()
-                    .map_err(|e| {
-                        DelightQLError::database_error("read stale created entity", e.to_string())
-                    })?
+                    .map_err(|e| Runtime::catalog("read stale created entity", e.to_string()))?
             };
             for entity_id in stale_ids {
                 for (table, label) in [
@@ -3977,13 +3873,11 @@ impl CreatedObjectCatalog for RealCreatedObjectCatalog {
                             &format!("DELETE FROM {table} WHERE entity_id = ?1"),
                             [entity_id],
                         )
-                        .map_err(|e| DelightQLError::database_error(label, e.to_string()))?;
+                        .map_err(|e| Runtime::catalog(label, e.to_string()))?;
                 }
                 catalog
                     .execute("DELETE FROM entity WHERE id = ?1", [entity_id])
-                    .map_err(|e| {
-                        DelightQLError::database_error("retire stale entity", e.to_string())
-                    })?;
+                    .map_err(|e| Runtime::catalog("retire stale entity", e.to_string()))?;
             }
 
             catalog
@@ -4001,7 +3895,7 @@ impl CreatedObjectCatalog for RealCreatedObjectCatalog {
                     ],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!("Failed to register created object '{}'", registration.name),
                         e.to_string(),
                     )
@@ -4022,9 +3916,38 @@ impl CreatedObjectCatalog for RealCreatedObjectCatalog {
                         ],
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error(
-                            format!(
+                        Runtime::catalog(format!(
                                 "Failed to register attribute '{}' for '{}'",
+                                column_name, registration.name
+                            ), e.to_string())
+                    })?;
+            }
+            // THE SHAPE THE PLAN KNEW: a nested-payload column is recorded
+            // as an interior entity of the created object, which is how a
+            // later read learns to embed it as a tree rather than a string.
+            // A position past the read-back heading is a disagreement
+            // between the plan and the engine, and is refused.
+            for position in &registration.interior_positions {
+                let Some((column_name, _)) = registration.attributes.get(*position) else {
+                    return Err(DelightQLError::from(Runtime::General {
+                        message: format!(
+                            "created object '{}' has no column at nested-payload position {}",
+                            registration.name, position
+                        ),
+                        details: "the plan's heading and the engine's read-back disagree"
+                            .to_string(),
+                    }));
+                };
+                catalog
+                    .execute(
+                        "INSERT INTO interior_entity (parent_entity_id, column_name) \
+                         VALUES (?1, ?2)",
+                        rusqlite::params![entity_id, column_name],
+                    )
+                    .map_err(|e| {
+                        Runtime::catalog(
+                            format!(
+                                "Failed to register interior '{}' for '{}'",
                                 column_name, registration.name
                             ),
                             e.to_string(),
@@ -4038,7 +3961,7 @@ impl CreatedObjectCatalog for RealCreatedObjectCatalog {
                     rusqlite::params![entity_id, registration.namespace_id, cartridge_id],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!("Failed to activate created object '{}'", registration.name),
                         e.to_string(),
                     )
@@ -4080,12 +4003,7 @@ impl DelightQLSystem {
                 },
             )
             .optional()
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to read namespace mount binding",
-                    e.to_string(),
-                )
-            })
+            .map_err(|e| Runtime::catalog("Failed to read namespace mount binding", e.to_string()))
     }
 
     /// Insert the single binding for a mounted namespace. The UNIQUE/FK
@@ -4114,9 +4032,7 @@ impl DelightQLSystem {
                     binding.class,
                 ],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to record mount binding", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to record mount binding", e.to_string()))?;
         Ok(())
     }
 
@@ -4125,449 +4041,8 @@ impl DelightQLSystem {
     fn clear_mount_binding(bootstrap_conn: &Connection, namespace_id: i64) -> Result<()> {
         bootstrap_conn
             .execute("DELETE FROM mount WHERE namespace_id = ?1", [namespace_id])
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to clear mount binding", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to clear mount binding", e.to_string()))?;
         Ok(())
-    }
-
-    /// Create a new DelightQL system from an injected connection
-    ///
-    /// Creates:
-    /// 1. Session tables in user database (sys, _c, delightql_diagnostics)
-    /// 2. Internal _bootstrap SQLite database (separate, not attached to user DB)
-    /// 3. Initializes _bootstrap with meta-circular metadata system
-    ///
-    /// # Arguments
-    /// * `connection` - User database connection trait object (for execution)
-    /// * `introspector` - Backend-specific introspector for discovering schema
-    /// * `db_type` - Database type string ("sqlite", "duckdb", "postgres")
-    ///
-    /// # Returns
-    /// A DelightQLSystem ready for query execution
-    pub fn new(
-        connection: Arc<Mutex<dyn DatabaseConnection>>,
-        introspector: Box<dyn crate::bootstrap::introspect::DatabaseIntrospector>,
-        db_type: &str,
-    ) -> Result<Self> {
-        // Create internal _bootstrap metadata store (ALWAYS SQLite)
-        let bootstrap_conn = Connection::open_in_memory().map_err(|e| {
-            DelightQLError::database_error_with_source(
-                "Failed to create _bootstrap metadata store",
-                format!("SQLite error: {}", e),
-                Box::new(e),
-            )
-        })?;
-
-        // Initialize _bootstrap schema and seed data
-        crate::bootstrap::initialize_bootstrap_db(&bootstrap_conn).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to initialize _bootstrap schema: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        // Create session tables on bootstrap (assertions, danger, finding)
-        setup_assertions_table_on_bootstrap(&bootstrap_conn)?;
-        setup_danger_table_on_bootstrap(&bootstrap_conn)?;
-        setup_finding_table_on_bootstrap(&bootstrap_conn)?;
-
-        // Register bootstrap connection (id=1) BEFORE installing cartridge
-        // (cartridge has FK to connection)
-        let bootstrap_conn_id = crate::import::register_connection(
-            &bootstrap_conn,
-            "session:bootstrap",
-            "in-process",
-            None,
-            5, // bootstrap connection type
-            "Internal engine metadata store",
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to register bootstrap connection: {}", e),
-                e.to_string(),
-            )
-        })? as i64;
-
-        // Sanity check: bootstrap connection should always be id=1
-        if bootstrap_conn_id != 1 {
-            return Err(DelightQLError::database_error(
-                format!(
-                    "Bootstrap connection has unexpected ID: expected id=1, got id={}",
-                    bootstrap_conn_id
-                ),
-                "Internal consistency error".to_string(),
-            ));
-        }
-
-        // Install bootstrap://sys cartridge and activate entities
-        // Note: introspects the _bootstrap database itself (schema = None, it's main)
-        let cartridge_id = crate::import::install_cartridge(
-            &bootstrap_conn,
-            "bootstrap://sys",
-            crate::import::SourceType::Db,
-            3,       // SQLite language ID
-            None,    // _bootstrap tables are in main schema, not attached
-            Some(1), // connection_id=1 (bootstrap connection)
-            false,   // not universal
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to install bootstrap cartridge: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        crate::import::create_bootstrap_namespaces(&bootstrap_conn).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to create bootstrap namespaces: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        crate::import::activate_bootstrap_entities(&bootstrap_conn, cartridge_id).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to activate bootstrap entities: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        // Initialize bin cartridge registry and sync to bootstrap
-        let mut bin_registry = crate::bin_cartridge::registry::BinCartridgeRegistry::new();
-
-        // Register the prelude cartridge (contains import!, enlist!, delist!)
-        bin_registry.register_cartridge(crate::bin_cartridge::prelude::create_prelude_cartridge());
-
-        // Register the predicates cartridge (contains like(), etc.)
-        bin_registry
-            .register_cartridge(crate::bin_cartridge::predicates::create_predicates_cartridge());
-
-        // Sync all bin cartridges to bootstrap metadata
-        let universal_namespaces =
-            crate::bootstrap::sync_bin_cartridges_to_bootstrap(&bootstrap_conn, &bin_registry)
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!("Failed to sync bin cartridges to bootstrap: {}", e),
-                        e.to_string(),
-                    )
-                })?;
-        // Register user connection in bootstrap metadata
-        // Determine connection type ID from database type string (case-insensitive)
-        let db_type_lower = db_type.to_lowercase();
-        let connection_type = match db_type_lower.as_str() {
-            "sqlite" => {
-                // TODO: Distinguish between file and memory SQLite
-                // For now, default to file (type 1)
-                1 // sqlite-file
-            }
-            "duckdb" => 4,
-            "postgres" | "postgresql" => 3,
-            _ => {
-                return Err(DelightQLError::validation_error(
-                    "Unsupported database type",
-                    format!("Database type '{}' is not supported", db_type),
-                ));
-            }
-        };
-
-        let user_conn_id = crate::import::register_connection(
-            &bootstrap_conn,
-            "session:primary",
-            if db_type_lower == "sqlite" {
-                "in-process"
-            } else {
-                "fatboy"
-            },
-            None,
-            connection_type,
-            "User target database (pre-mount placeholder)",
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to register user connection: {}", e),
-                e.to_string(),
-            )
-        })? as i64;
-
-        // "main" namespace is created empty by create_bootstrap_namespaces().
-        // No user cartridge, no introspection — the CLI sends mount!("path", "main")(*)
-        // as its first query to populate the namespace.
-
-        // Register session table metadata in bootstrap so they're queryable via DQL
-        // Create a cartridge for the sys schema session tables (on user connection)
-        bootstrap_conn
-            .execute(
-                "INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
-                 VALUES (?1, ?2, 'sys://session', NULL, 1, ?3, 0)",
-                rusqlite::params![
-                    3, // SQLite language (bootstrap is always SQLite)
-                    SourceType::Db.as_i32(),
-                    bootstrap_conn_id,
-                ],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to create sys session cartridge: {}", e),
-                    e.to_string(),
-                )
-            })?;
-        let sys_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
-
-        // Insert assertions entity (type 10 = DBPermanentTable)
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity (name, type, cartridge_id)
-                 VALUES ('assertions', 10, ?1)",
-                rusqlite::params![sys_cartridge_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.assertions entity: {}", e),
-                    e.to_string(),
-                )
-            })?;
-        let assertions_entity_id = bootstrap_conn.last_insert_rowid() as i32;
-
-        // Insert entity clause for assertions
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity_clause (entity_id, ordinal, definition)
-                 VALUES (?1, 1, '-- sys.assertions system table')",
-                rusqlite::params![assertions_entity_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.assertions entity clause: {}", e),
-                    e.to_string(),
-                )
-            })?;
-
-        // Insert column attributes for assertions entity
-        let assertion_columns = [
-            ("id", "INTEGER", 1, false),
-            ("name", "TEXT", 2, true),
-            ("source_file", "TEXT", 3, true),
-            ("source_line", "INTEGER", 4, true),
-            ("body", "TEXT", 5, false),
-            ("outcome", "TEXT", 6, false),
-            ("detail", "TEXT", 7, true),
-            ("run_id", "TEXT", 8, false),
-        ];
-        for (col_name, data_type, position, nullable) in &assertion_columns {
-            bootstrap_conn
-                .execute(
-                    "INSERT INTO entity_attribute
-                     (entity_id, attribute_name, attribute_type, data_type, position, is_nullable)
-                     VALUES (?1, ?2, 'output_column', ?3, ?4, ?5)",
-                    rusqlite::params![
-                        assertions_entity_id,
-                        col_name,
-                        data_type,
-                        position,
-                        nullable,
-                    ],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!(
-                            "Failed to insert sys.assertions column '{}': {}",
-                            col_name, e
-                        ),
-                        e.to_string(),
-                    )
-                })?;
-        }
-
-        // Insert danger entity (type 10 = DBPermanentTable)
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity (name, type, cartridge_id)
-                 VALUES ('danger', 10, ?1)",
-                rusqlite::params![sys_cartridge_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.danger entity: {}", e),
-                    e.to_string(),
-                )
-            })?;
-        let danger_entity_id = bootstrap_conn.last_insert_rowid() as i32;
-
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity_clause (entity_id, ordinal, definition)
-                 VALUES (?1, 1, '-- sys.danger system table')",
-                rusqlite::params![danger_entity_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.danger entity clause: {}", e),
-                    e.to_string(),
-                )
-            })?;
-
-        let danger_columns = [
-            ("uri", "TEXT", 1, false),
-            ("state", "TEXT", 2, false),
-            ("cli_overridable", "INTEGER", 3, false),
-            ("description", "TEXT", 4, true),
-        ];
-        for (col_name, data_type, position, nullable) in &danger_columns {
-            bootstrap_conn
-                .execute(
-                    "INSERT INTO entity_attribute
-                     (entity_id, attribute_name, attribute_type, data_type, position, is_nullable)
-                     VALUES (?1, ?2, 'output_column', ?3, ?4, ?5)",
-                    rusqlite::params![danger_entity_id, col_name, data_type, position, nullable,],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!("Failed to insert sys.danger column '{}': {}", col_name, e),
-                        e.to_string(),
-                    )
-                })?;
-        }
-
-        // Insert errors entity (type 10 = DBPermanentTable)
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity (name, type, cartridge_id)
-                 VALUES ('errors', 10, ?1)",
-                rusqlite::params![sys_cartridge_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.errors entity: {}", e),
-                    e.to_string(),
-                )
-            })?;
-        let errors_entity_id = bootstrap_conn.last_insert_rowid() as i32;
-
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity_clause (entity_id, ordinal, definition)
-                 VALUES (?1, 1, '-- sys.errors system table')",
-                rusqlite::params![errors_entity_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.errors entity clause: {}", e),
-                    e.to_string(),
-                )
-            })?;
-
-        let errors_columns = [
-            ("id", "INTEGER", 1, false),
-            ("uri", "TEXT", 2, false),
-            ("message", "TEXT", 3, false),
-            ("query_text", "TEXT", 4, true),
-            ("timestamp", "TEXT", 5, true),
-        ];
-        for (col_name, data_type, position, nullable) in &errors_columns {
-            bootstrap_conn
-                .execute(
-                    "INSERT INTO entity_attribute
-                     (entity_id, attribute_name, attribute_type, data_type, position, is_nullable)
-                     VALUES (?1, ?2, 'output_column', ?3, ?4, ?5)",
-                    rusqlite::params![errors_entity_id, col_name, data_type, position, nullable,],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!("Failed to insert sys.errors column '{}': {}", col_name, e),
-                        e.to_string(),
-                    )
-                })?;
-        }
-
-        // Get sys namespace ID and activate sys entities there
-        let sys_ns_id: i32 = bootstrap_conn
-            .query_row(
-                "SELECT id FROM namespace WHERE fq_name = 'sys'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to query sys namespace: {}", e),
-                    e.to_string(),
-                )
-            })?;
-
-        crate::import::activate_entities_from_cartridge(
-            &bootstrap_conn,
-            sys_cartridge_id,
-            sys_ns_id,
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to activate sys.assertions in sys namespace: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        // Register the burned identifier table (rows authored in
-        // bootstrap/schema.sql) as sys::identifiers.identifier. Its own cartridge so the bulk
-        // activation above cannot leak it into bare `sys`.
-        register_sys_identifier_table(&bootstrap_conn, bootstrap_conn_id)?;
-
-        // sys::diagnostics.finding: the session's own refusals and selftest
-        // findings, queryable. Own cartridge for the same reason.
-        register_sys_diagnostics_table(&bootstrap_conn, bootstrap_conn_id)?;
-
-        // sys::format: the burned formatter style-bundle table (book row
-        // = frozen defaults).
-        register_sys_format_table(&bootstrap_conn, bootstrap_conn_id)?;
-
-        // sys::connections: the curated safe-subset `connection` entity
-        // (non-secret columns only). Own cartridge so the bulk activation
-        // above cannot leak it into bare `sys`.
-        register_sys_connection_table(&bootstrap_conn, bootstrap_conn_id)?;
-        // sys::ns: curated public-column `namespace` entity (the physical
-        // table carries the internal mount relation).
-        register_sys_ns_namespace_table(&bootstrap_conn, bootstrap_conn_id)?;
-
-        // Initialize connection routing map
-        let mut connection_map: HashMap<i64, Arc<Mutex<dyn DatabaseConnection>>> = HashMap::new();
-        connection_map.insert(user_conn_id, Arc::clone(&connection)); // User connection
-
-        // Installation is complete: SEAL the catalog. Everything the
-        // canonical schema authority and the registrations above created is
-        // now protected against structural DDL, whatever SQL road reaches
-        // this connection. Later lazy loads (stdlib, seeds, catalog views)
-        // are row DML and pass untouched.
-        let bootstrap_guard = crate::bootstrap::guard::BootstrapGuard::seal(&bootstrap_conn)?;
-
-        let bootstrap_arc = Arc::new(Mutex::new(bootstrap_conn));
-        let schema = Box::new(crate::bootstrap_schema::BootstrapBackedSchema::new(
-            bootstrap_arc.clone(),
-        ));
-
-        let system = DelightQLSystem {
-            connection,
-            bootstrap_connection: bootstrap_arc,
-            schema: Some(schema),
-            connection_map,
-            introspector,
-            bin_registry: Arc::new(bin_registry),
-            namespace_authoritative: true,
-            connection_factory: None,
-            schema_map: HashMap::new(),
-            catalog_cartridge_id: Cell::new(None),
-            db_type: db_type.to_string(),
-            effects_executed: Cell::new(0),
-            session_materialized_names: Cell::new(false),
-            active_liminal_program: RefCell::new(None),
-            session_health: SessionHealth::default(),
-            byte_bindings: HashMap::new(),
-            bootstrap_guard,
-        };
-
-        // Eagerly load stdlib DQL overlays for universal (auto-enlisted) namespaces
-        for ns in &universal_namespaces {
-            system.ensure_stdlib_loaded(ns);
-        }
-
-        Ok(system)
     }
 
     /// Get the injected database schema
@@ -4585,10 +4060,11 @@ impl DelightQLSystem {
         self.schema
             .as_ref()
             .ok_or_else(|| {
-                DelightQLError::validation_error(
-                    "No database schema configured",
-                    "Use DelightQLSystem::new_with_schema() to inject a schema",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: "No database schema configured".to_string(),
+                    details: "Use DelightQLSystem::new_with_schema() to inject a schema"
+                        .to_string(),
+                })
             })
             .map(|boxed| boxed.as_ref())
     }
@@ -4757,13 +4233,13 @@ impl DelightQLSystem {
         } else {
             format!("{} has no target metadata read-back", dialect.family_name())
         };
-        Err(DelightQLError::validation_error_categorized(
-            "effect/ddl/created_object_registration_unsupported",
-            format!(
-                "{operation}!({target}) refuses: this target cannot register created objects; \
+        Err(DelightQLError::from(
+            EffectDdl::CreatedObjectRegistrationUnsupported {
+                message: format!(
+                    "{operation}!({target}) refuses: this target cannot register created objects; \
                  the object would not resolve by name ({reason})"
-            ),
-            "created-object registration unsupported",
+                ),
+            },
         ))
     }
 
@@ -4848,7 +4324,7 @@ impl DelightQLSystem {
         // writes only while this window is open.
         let _catalog_window = self.bootstrap_guard.catalog_window();
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for external connection",
                 format!("Connection was poisoned: {}", e),
             )
@@ -4891,26 +4367,23 @@ impl DelightQLSystem {
                                 |row| row.get(0),
                             )
                             .map_err(|e| {
-                                DelightQLError::database_error(
-                                    "Failed to check namespace occupancy",
-                                    e.to_string(),
-                                )
+                                Runtime::catalog("Failed to check namespace occupancy", e.to_string())
                             })?;
                         if occupied {
-                            return Err(DelightQLError::database_error(
-                                format!(
+                            return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                                     "Namespace '{}' already exists and is in use, cannot mount '{}' over it",
                                     namespace, connection_uri
                                 ),
-                                "Namespace occupied",
-                            ));
+    details: "Namespace occupied".to_string(),
+}));
                         }
                         empty_namespace_id = Some(ns_id);
                     }
                     None
                 }
                 Err(e) => {
-                    return Err(DelightQLError::database_error(
+                    return Err(Runtime::catalog(
                         "Failed to check namespace existence",
                         e.to_string(),
                     ));
@@ -4977,13 +4450,13 @@ impl DelightQLSystem {
                             return Ok((conn_id, entity_count));
                         }
                     }
-                    return Err(DelightQLError::database_error(
-                        format!(
+                    return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                             "Namespace '{}' already exists (mounted from '{}'), cannot re-mount from '{}'",
                             namespace, existing_uri, connection_uri
                         ),
-                        "Duplicate namespace with different source",
-                    ));
+    details: "Duplicate namespace with different source".to_string(),
+}));
                 }
             }
         }
@@ -5017,7 +4490,7 @@ impl DelightQLSystem {
             &format!("Mounted database: {}", namespace),
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to register connection: {}", e),
                 e.to_string(),
             )
@@ -5025,7 +4498,7 @@ impl DelightQLSystem {
 
         // Introspect the connection to discover entities
         let entities = components.introspector.introspect_entities().map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to introspect imported database: {}", e),
                 e.to_string(),
             )
@@ -5050,11 +4523,7 @@ impl DelightQLSystem {
                     ],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to insert cartridge",
-                        e.to_string(),
-                        Box::new(e),
-                    )
+                    Runtime::catalog("Failed to insert cartridge", e.to_string())
                 })?;
             bootstrap_conn.last_insert_rowid() as i32
         };
@@ -5067,7 +4536,7 @@ impl DelightQLSystem {
             &entities,
         )
         .map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("Failed to insert discovered entities: {}", e),
                 e.to_string(),
             )
@@ -5083,13 +4552,7 @@ impl DelightQLSystem {
                      WHERE id = ?1",
                     rusqlite::params![id, connection_uri],
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to update empty namespace",
-                        e.to_string(),
-                        Box::new(e),
-                    )
-                })?;
+                .map_err(|e| Runtime::catalog("Failed to update empty namespace", e.to_string()))?;
             (id, Vec::new())
         } else {
             create_mounted_namespace_path(&bootstrap_conn, namespace, "uri", connection_uri)?
@@ -5102,10 +4565,7 @@ impl DelightQLSystem {
             namespace_id,
         )
         .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to activate entities: {}", e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to activate entities: {}", e), e.to_string())
         })?;
 
         // External/factory mounts have no ATTACH alias.  Their qualification
@@ -5130,7 +4590,7 @@ impl DelightQLSystem {
                 |row| row.get(0),
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     "Failed to query sys::meta namespace for catalog wrapper",
                     e.to_string(),
                 )
@@ -5184,12 +4644,9 @@ impl DelightQLSystem {
         &self,
         context: &str,
     ) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                context,
-                format!("Connection was poisoned: {e}"),
-            )
-        })
+        self.bootstrap_connection
+            .lock()
+            .map_err(|e| Runtime::poisoned(context, format!("Connection was poisoned: {e}")))
     }
 
     /// Get the bin cartridge registry
@@ -5201,417 +4658,39 @@ impl DelightQLSystem {
         Arc::clone(&self.bin_registry)
     }
 
-    /// Reset the system to a clean state equivalent to `System::new()`.
-    ///
-    /// Drops and rebuilds the in-memory bootstrap database, clears session tables,
-    /// re-introspects the user connection, and resets all ancillary state.
-    /// Used by the server to cheaply reset between test queries (~5ms).
-    pub fn reinit_bootstrap(&mut self) -> Result<()> {
-        use crate::bootstrap::{
-            setup_assertions_table_on_bootstrap, setup_danger_table_on_bootstrap,
-            setup_finding_table_on_bootstrap,
-        };
-
-        // A quarantined reset first retries every pending inverse. If any
-        // inverse still fails, leave the incident and its inventory intact;
-        // replacing the catalog cannot make uncertain external state safe.
-        self.recover_pending_external_effects()?;
-
-        // 1. DETACH all imported schemas from user connection
-        {
-            let user_conn = self.connection.lock().map_err(|e| {
-                DelightQLError::connection_poison_error(
-                    "Failed to acquire user connection lock for reinit",
-                    format!("Connection was poisoned: {}", e),
-                )
-            })?;
-            // Query PRAGMA database_list and detach everything except "main", "temp", and "sys".
-            // "sys" is an in-memory ATTACH used for session tables — we keep it and clear its tables.
-            let schemas: Vec<String> = {
-                match user_conn.query_all_rows("PRAGMA database_list", &[]) {
-                    Ok((_cols, rows)) => rows
-                        .iter()
-                        .filter_map(|row| row.get(1).and_then(|v| v.as_wire_text()))
-                        .filter(|s| s != "main" && s != "temp" && s != "sys")
-                        .collect(),
-                    Err(_) => Vec::new(),
-                }
-            };
-            for schema in &schemas {
-                // A failed DETACH must ABORT the reinit:
-                // proceeding would replace the catalog — and every recorded
-                // cleanup identity — while the database stays physically
-                // attached. Failing here leaves the old catalog intact and
-                // consistent with the attachment state.
-                if let Err(e) = user_conn.execute(&format!("DETACH DATABASE '{}'", schema), &[]) {
-                    return Err(DelightQLError::database_error(
-                        format!(
-                            "reset aborted: could not DETACH '{}' — the session \
-                             catalog is left intact: {}",
-                            schema, e
-                        ),
-                        e.to_string(),
-                    ));
-                }
-            }
-        }
-
-        // 2. Create fresh in-memory bootstrap (session tables are created on bootstrap below)
-        let bootstrap_conn = Connection::open_in_memory().map_err(|e| {
-            DelightQLError::database_error_with_source(
-                "Failed to create _bootstrap metadata store during reinit",
-                format!("SQLite error: {}", e),
-                Box::new(e),
-            )
-        })?;
-
-        crate::bootstrap::initialize_bootstrap_db(&bootstrap_conn).map_err(|e| {
-            DelightQLError::database_error(
-                format!(
-                    "Failed to initialize _bootstrap schema during reinit: {}",
-                    e
-                ),
-                e.to_string(),
-            )
-        })?;
-
-        // 3. Create session tables on bootstrap
-        setup_assertions_table_on_bootstrap(&bootstrap_conn)?;
-        setup_danger_table_on_bootstrap(&bootstrap_conn)?;
-        setup_finding_table_on_bootstrap(&bootstrap_conn)?;
-
-        // 4. Register connections (bootstrap=1, user=2)
-        let bootstrap_conn_id = crate::import::register_connection(
-            &bootstrap_conn,
-            "session:bootstrap",
-            "in-process",
-            None,
-            5,
-            "Internal engine metadata store",
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!(
-                    "Failed to register bootstrap connection during reinit: {}",
-                    e
-                ),
-                e.to_string(),
-            )
-        })? as i64;
-
-        if bootstrap_conn_id != 1 {
-            return Err(DelightQLError::database_error(
-                format!(
-                    "Bootstrap connection has unexpected ID during reinit: expected id=1, got id={}",
-                    bootstrap_conn_id
-                ),
-                "Internal consistency error".to_string(),
-            ));
-        }
-
-        let db_type_lower = self.db_type.to_lowercase();
-        let connection_type = match db_type_lower.as_str() {
-            "sqlite" => 1,
-            "duckdb" => 4,
-            "postgres" | "postgresql" => 3,
-            _ => {
-                return Err(DelightQLError::validation_error(
-                    "Unsupported database type during reinit",
-                    format!("Database type '{}' is not supported", self.db_type),
-                ));
-            }
-        };
-
-        let user_conn_id = crate::import::register_connection(
-            &bootstrap_conn,
-            "session:primary",
-            if db_type_lower == "sqlite" {
-                "in-process"
-            } else {
-                "fatboy"
-            },
-            None,
-            connection_type,
-            "User target database (pre-mount placeholder)",
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to register user connection during reinit: {}", e),
-                e.to_string(),
-            )
-        })? as i64;
-
-        // 5. Install bootstrap cartridge, namespaces, entities
-        let cartridge_id = crate::import::install_cartridge(
-            &bootstrap_conn,
-            "bootstrap://sys",
-            crate::import::SourceType::Db,
-            3,
-            None,
-            Some(1),
-            false,
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to install bootstrap cartridge during reinit: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        crate::import::create_bootstrap_namespaces(&bootstrap_conn).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to create bootstrap namespaces during reinit: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        crate::import::activate_bootstrap_entities(&bootstrap_conn, cartridge_id).map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to activate bootstrap entities during reinit: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        // 6. Sync bin cartridges
-        let universal_namespaces =
-            crate::bootstrap::sync_bin_cartridges_to_bootstrap(&bootstrap_conn, &self.bin_registry)
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!("Failed to sync bin cartridges during reinit: {}", e),
-                        e.to_string(),
-                    )
-                })?;
-
-        // 7. Leave "main" namespace EMPTY — caller is expected to mount! the db they need.
-        //    This allows pack-man to reset + mount a different db each time.
-        //    The user connection still exists (connection_id=2) for SQL execution;
-        //    mount! will register entities and ATTACH the target db.
-
-        // 8. Register session table metadata in bootstrap (sys.assertions, sys.danger, sys.errors)
-        bootstrap_conn
-            .execute(
-                "INSERT INTO cartridge (language, source_type_enum, source_uri, source_ns, connected, connection_id, is_universal)
-                 VALUES (?1, ?2, 'sys://session', NULL, 1, ?3, 0)",
-                rusqlite::params![3, SourceType::Db.as_i32(), bootstrap_conn_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to create sys session cartridge during reinit: {}", e),
-                    e.to_string(),
-                )
-            })?;
-        let sys_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
-
-        // Register assertions entity
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity (name, type, cartridge_id) VALUES ('assertions', 10, ?1)",
-                rusqlite::params![sys_cartridge_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!(
-                        "Failed to insert sys.assertions entity during reinit: {}",
-                        e
-                    ),
-                    e.to_string(),
-                )
-            })?;
-        let assertions_entity_id = bootstrap_conn.last_insert_rowid() as i32;
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity_clause (entity_id, ordinal, definition) VALUES (?1, 1, '-- sys.assertions system table')",
-                rusqlite::params![assertions_entity_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.assertions clause during reinit: {}", e),
-                    e.to_string(),
-                )
-            })?;
-        for (col_name, data_type, position, nullable) in &[
-            ("id", "INTEGER", 1, false),
-            ("name", "TEXT", 2, true),
-            ("source_file", "TEXT", 3, true),
-            ("source_line", "INTEGER", 4, true),
-            ("body", "TEXT", 5, false),
-            ("outcome", "TEXT", 6, false),
-            ("detail", "TEXT", 7, true),
-            ("run_id", "TEXT", 8, false),
-        ] {
-            bootstrap_conn
-                .execute(
-                    "INSERT INTO entity_attribute (entity_id, attribute_name, attribute_type, data_type, position, is_nullable) VALUES (?1, ?2, 'output_column', ?3, ?4, ?5)",
-                    rusqlite::params![assertions_entity_id, col_name, data_type, position, nullable],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!("Failed to insert sys.assertions column during reinit: {}", e),
-                        e.to_string(),
-                    )
-                })?;
-        }
-
-        // Register danger entity
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity (name, type, cartridge_id) VALUES ('danger', 10, ?1)",
-                rusqlite::params![sys_cartridge_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.danger entity during reinit: {}", e),
-                    e.to_string(),
-                )
-            })?;
-        let danger_entity_id = bootstrap_conn.last_insert_rowid() as i32;
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity_clause (entity_id, ordinal, definition) VALUES (?1, 1, '-- sys.danger system table')",
-                rusqlite::params![danger_entity_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.danger clause during reinit: {}", e),
-                    e.to_string(),
-                )
-            })?;
-        for (col_name, data_type, position, nullable) in &[
-            ("uri", "TEXT", 1, false),
-            ("state", "TEXT", 2, false),
-            ("cli_overridable", "INTEGER", 3, false),
-            ("description", "TEXT", 4, true),
-        ] {
-            bootstrap_conn
-                .execute(
-                    "INSERT INTO entity_attribute (entity_id, attribute_name, attribute_type, data_type, position, is_nullable) VALUES (?1, ?2, 'output_column', ?3, ?4, ?5)",
-                    rusqlite::params![danger_entity_id, col_name, data_type, position, nullable],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!("Failed to insert sys.danger column during reinit: {}", e),
-                        e.to_string(),
-                    )
-                })?;
-        }
-
-        // Register errors entity
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity (name, type, cartridge_id) VALUES ('errors', 10, ?1)",
-                rusqlite::params![sys_cartridge_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.errors entity during reinit: {}", e),
-                    e.to_string(),
-                )
-            })?;
-        let errors_entity_id = bootstrap_conn.last_insert_rowid() as i32;
-        bootstrap_conn
-            .execute(
-                "INSERT INTO entity_clause (entity_id, ordinal, definition) VALUES (?1, 1, '-- sys.errors system table')",
-                rusqlite::params![errors_entity_id],
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to insert sys.errors clause during reinit: {}", e),
-                    e.to_string(),
-                )
-            })?;
-        for (col_name, data_type, position, nullable) in &[
-            ("id", "INTEGER", 1, false),
-            ("uri", "TEXT", 2, false),
-            ("message", "TEXT", 3, false),
-            ("query_text", "TEXT", 4, true),
-            ("timestamp", "TEXT", 5, true),
-        ] {
-            bootstrap_conn
-                .execute(
-                    "INSERT INTO entity_attribute (entity_id, attribute_name, attribute_type, data_type, position, is_nullable) VALUES (?1, ?2, 'output_column', ?3, ?4, ?5)",
-                    rusqlite::params![errors_entity_id, col_name, data_type, position, nullable],
-                )
-                .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!("Failed to insert sys.errors column during reinit: {}", e),
-                        e.to_string(),
-                    )
-                })?;
-        }
-
-        // Activate sys entities
-        let sys_ns_id: i32 = bootstrap_conn
-            .query_row(
-                "SELECT id FROM namespace WHERE fq_name = 'sys'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to query sys namespace during reinit: {}", e),
-                    e.to_string(),
-                )
-            })?;
-
-        crate::import::activate_entities_from_cartridge(
-            &bootstrap_conn,
-            sys_cartridge_id,
-            sys_ns_id,
-        )
-        .map_err(|e| {
-            DelightQLError::database_error(
-                format!("Failed to activate sys entities during reinit: {}", e),
-                e.to_string(),
-            )
-        })?;
-
-        // sys::format: burned formatter style bundles (mirrors the
-        // primary bootstrap path).
-        register_sys_format_table(&bootstrap_conn, bootstrap_conn_id)?;
-        // sys::connections: curated safe-subset `connection` entity, own
-        // cartridge (mirrors the primary bootstrap path).
-        register_sys_connection_table(&bootstrap_conn, bootstrap_conn_id)?;
-        // sys::ns: curated public-column `namespace` entity (the physical
-        // table carries the internal mount relation).
-        register_sys_ns_namespace_table(&bootstrap_conn, bootstrap_conn_id)?;
-
-        // Installation is complete: SEAL the rebuilt catalog exactly as
-        // construction seals a fresh one (the later steps are row DML).
-        self.bootstrap_guard = crate::bootstrap::guard::BootstrapGuard::seal(&bootstrap_conn)?;
-
-        // 9. Swap bootstrap connection
-        *self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire bootstrap lock for reinit swap",
+    /// DETACH every imported schema from the user connection, keeping
+    /// `main`, `temp` and `sys` (the in-memory ATTACH that carries session
+    /// tables; its rows are cleared by the world that replaces them).
+    fn detach_imported_schemas(&self) -> Result<()> {
+        let user_conn = self.connection.lock().map_err(|e| {
+            Runtime::poisoned(
+                "Failed to acquire user connection lock for reinit",
                 format!("Connection was poisoned: {}", e),
             )
-        })? = bootstrap_conn;
-
-        // 10. Reset ancillary state
-        self.connection_map.clear();
-        self.connection_map
-            .insert(user_conn_id, Arc::clone(&self.connection));
-        self.schema_map.clear();
-        self.schema = Some(Box::new(
-            crate::bootstrap_schema::BootstrapBackedSchema::new(self.bootstrap_connection.clone()),
-        )); // Empty until mount! runs again
-        self.catalog_cartridge_id.set(None);
-
-        // 11. Eagerly load stdlib DQL overlays for universal namespaces
-        //     (mirrors the same step in DelightQLSystem::new)
-        for ns in &universal_namespaces {
-            self.ensure_stdlib_loaded(ns);
+        })?;
+        let schemas: Vec<String> = match user_conn.query_all_rows("PRAGMA database_list", &[]) {
+            Ok((_cols, rows)) => rows
+                .iter()
+                .filter_map(|row| row.get(1).and_then(|v| v.as_wire_text()))
+                .filter(|s| s != "main" && s != "temp" && s != "sys")
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for schema in &schemas {
+            // A failed DETACH must ABORT the reinit: proceeding would replace
+            // the catalog — and every recorded cleanup identity — while the
+            // database stays physically attached.
+            if let Err(e) = user_conn.execute(&format!("DETACH DATABASE '{}'", schema), &[]) {
+                return Err(Runtime::catalog(
+                    format!(
+                        "reset aborted: could not DETACH '{}' — the session \
+                         catalog is left intact: {}",
+                        schema, e
+                    ),
+                    e.to_string(),
+                ));
+            }
         }
-
-        // 12. Run embedded seed programs for their effects (idempotent).
-        //     Mirrors the post-construction seed step in open().
-        self.run_seed_programs()?;
-
-        // Reset is the recovery boundary. Do not clear a quarantine before
-        // every rebuild step above has succeeded.
-        self.active_liminal_program.replace(None);
-        self.session_health = SessionHealth::Healthy;
-
         Ok(())
     }
 
@@ -5777,16 +4856,17 @@ impl DelightQLSystem {
 
     /// Compile and execute the effects of every statement in a seed program.
     ///
-    /// Seed programs (the embedded `seed/` bucket) are effect programs RUN at
-    /// startup — distinct from autoload modules, which INSTALL definitions via
-    /// consult. This is the core-internal entry reachable from both `open()`
-    /// (system fully built) and `reinit_bootstrap` (`&mut self`, no handle),
-    /// mirroring what `session.query()` does under the hood minus result
-    /// formatting: split the source into statements, then for each statement
-    /// build the unresolved AST and run the effect executor.
+    /// Seed programs (the embedded `seed/` bucket) are effect programs RUN
+    /// while the pristine world is constructed — distinct from autoload
+    /// modules, which INSTALL definitions via consult. This mirrors what
+    /// `session.query()` does under the hood minus result formatting: split
+    /// the source into statements, then for each statement build the
+    /// unresolved AST and run the effect executor.
     ///
-    /// Seeds run on EVERY startup and every reinit, so each program must be
-    /// idempotent. `doc!` qualifies (setting the same doc is a no-op-in-effect).
+    /// Their facts are frozen into the image; no reset runs them again.
+    /// Each program must still be idempotent, because the seed tests run
+    /// them over an already-finalized world. `doc!` qualifies (setting the
+    /// same doc is a no-op-in-effect).
     pub fn run_seed_program(&mut self, src: &str) -> Result<()> {
         // The arena is minted first because it is where this compilation arms
         // its limits, and the extent stays open across the parse and every
@@ -5798,7 +4878,7 @@ impl DelightQLSystem {
         // A seed program is a SEQUENCE of statements run in order, which is
         // the utility entrance's whole purpose.
         let tree = crate::pipeline::parse::query_sequence(src).map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("seed program failed to parse: {}", e),
                 "Seed parse error",
             )
@@ -5806,7 +4886,7 @@ impl DelightQLSystem {
 
         let normalized = crate::pipeline::normalize::query_sequence(&tree, registry.names())
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("seed program failed to build AST: {}", e),
                     "Seed build error",
                 )
@@ -5823,16 +4903,16 @@ impl DelightQLSystem {
             let before = self.effects_executed_count();
             crate::pipeline::effect_executor::execute_effects(query, self, registry.shared())?;
             if self.effects_executed_count() == before {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "statement #{} produced no effects — a seed statement \
                          must be effectful; a directive mistyped without its \
                          `!` parses as a plain table read and is silently \
                          discarded",
                         idx + 1
                     ),
-                    "Zero-effect seed statement",
-                ));
+                    details: "Zero-effect seed statement".to_string(),
+                }));
             }
         }
 
@@ -5853,15 +4933,15 @@ impl DelightQLSystem {
 
     /// Run every embedded seed program (the `seed/` bucket) for its effects.
     ///
-    /// Called after the system is fully constructed. Seeds are idempotent, so
-    /// this is safe to invoke on both fresh `open()` and `reinit_bootstrap`.
+    /// Called once, by the finalization that freezes the pristine world;
+    /// no reset runs a seed.
     pub fn run_seed_programs(&mut self) -> Result<()> {
         for (name, source) in crate::seed_manifest::SEED_PROGRAMS {
             self.run_seed_program(source).map_err(|e| {
-                DelightQLError::database_error(
-                    format!("seed program '{}' failed: {}", name, e),
-                    "Seed execution error",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("seed program '{}' failed: {}", name, e),
+                    details: "Seed execution error".to_string(),
+                })
             })?;
         }
         Ok(())
@@ -5884,13 +4964,13 @@ impl DelightQLSystem {
             .get(&connection_id)
             .cloned()
             .ok_or_else(|| {
-                DelightQLError::validation_error(
-                    "Unknown connection ID",
-                    format!(
+                DelightQLError::from(Runtime::General {
+                    message: "Unknown connection ID".to_string(),
+                    details: format!(
                         "Connection ID {} is not recognized. Valid IDs: 1 (bootstrap), 2 (user)",
                         connection_id
                     ),
-                )
+                })
             })
     }
 
@@ -5949,28 +5029,23 @@ impl DelightQLSystem {
         // registration loop below (mount_database's own pattern).
         let per_schema = {
             let factory = self.connection_factory.as_ref().ok_or_else(|| {
-                DelightQLError::validation_error(
-                    format!(
+                DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Cannot mount_tree! '{}': URI schemes require a connection factory \
                          (not available in this context)",
                         uri
                     ),
-                    "No connection factory configured",
-                )
+                    details: "No connection factory configured".to_string(),
+                })
             })?;
-            factory.create_tree(uri).map_err(|e| {
-                DelightQLError::database_error(
-                    format!("mount_tree!() failed for '{}': {}", uri, e),
-                    e.to_string(),
-                )
-            })?
+            factory.create_tree(uri)?
         };
 
         if per_schema.is_empty() {
-            return Err(DelightQLError::database_error(
-                format!("mount_tree!() found no persistent schemas on '{}'", uri),
-                "Empty schema tree",
-            ));
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!("mount_tree!() found no persistent schemas on '{}'", uri),
+                details: "Empty schema tree".to_string(),
+            }));
         }
 
         let mut created = Vec::with_capacity(per_schema.len());
@@ -5990,22 +5065,21 @@ impl DelightQLSystem {
     /// mounted namespace.
     pub fn bind_static_bytes(&mut self, name: &str, bytes: &'static [u8]) -> Result<()> {
         if !valid_byte_binding_name(name) {
-            return Err(DelightQLError::validation_error(
-                format!(
+            return Err(DelightQLError::from(Constraint::General {
+                message: format!(
                     "invalid byte-binding name '{}': expected [a-z][a-z0-9._-]*",
                     name
                 ),
-                "Binding names are lowercase capability labels",
-            ));
+            }));
         }
         if self.byte_bindings.contains_key(name) {
-            return Err(DelightQLError::validation_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!(
                     "byte binding '{}' already exists — bindings are immutable",
                     name
                 ),
-                "Rebinding refuses so a locator's referent cannot change",
-            ));
+                details: "Rebinding refuses so a locator's referent cannot change".to_string(),
+            }));
         }
         validate_sqlite_image(name, bytes)?;
         self.byte_bindings
@@ -6019,22 +5093,21 @@ impl DelightQLSystem {
     /// into SQLite-owned memory at attach.
     pub fn bind_owned_bytes(&mut self, name: &str, bytes: Vec<u8>) -> Result<()> {
         if !valid_byte_binding_name(name) {
-            return Err(DelightQLError::validation_error(
-                format!(
+            return Err(DelightQLError::from(Constraint::General {
+                message: format!(
                     "invalid byte-binding name '{}': expected [a-z][a-z0-9._-]*",
                     name
                 ),
-                "Binding names are lowercase capability labels",
-            ));
+            }));
         }
         if self.byte_bindings.contains_key(name) {
-            return Err(DelightQLError::validation_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!(
                     "byte binding '{}' already exists — bindings are immutable",
                     name
                 ),
-                "Rebinding refuses so a locator's referent cannot change",
-            ));
+                details: "Rebinding refuses so a locator's referent cannot change".to_string(),
+            }));
         }
         validate_sqlite_image(name, &bytes)?;
         self.byte_bindings.insert(
@@ -6067,22 +5140,17 @@ impl DelightQLSystem {
         let has_uri_scheme = db_path.contains("://");
         if has_uri_scheme {
             if let Some(factory) = self.connection_factory.as_ref() {
-                let components = factory.create(db_path).map_err(|e| {
-                    DelightQLError::database_error(
-                        format!("Failed to create connection for '{}': {}", db_path, e),
-                        e.to_string(),
-                    )
-                })?;
+                let components = factory.create(db_path)?;
                 self.register_external_connection(components, namespace, db_path)?;
                 return Ok(());
             } else {
-                return Err(DelightQLError::validation_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                         "Cannot mount '{}': URI schemes require a connection factory (not available in this context)",
                         db_path
                     ),
-                    "No connection factory configured",
-                ));
+    details: "No connection factory configured".to_string(),
+}));
             }
         }
 
@@ -6096,29 +5164,29 @@ impl DelightQLSystem {
         // Guard: file must exist and be a valid SQLite database
         let path = std::path::Path::new(db_path);
         if !path.exists() {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!(
                     "mount!() failed: file '{}' does not exist. \
                      Use create!() to make a new database.",
                     db_path
                 ),
-                "File not found",
-            ));
+                details: "File not found".to_string(),
+            }));
         }
         {
             use std::io::Read;
             let mut file = std::fs::File::open(path).map_err(|e| {
-                DelightQLError::database_error(
-                    format!("mount!() failed: cannot open '{}': {}", db_path, e),
-                    "File open failed",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("mount!() failed: cannot open '{}': {}", db_path, e),
+                    details: "File open failed".to_string(),
+                })
             })?;
             let mut header = [0u8; 16];
             let bytes_read = file.read(&mut header).map_err(|e| {
-                DelightQLError::database_error(
-                    format!("mount!() failed: cannot read '{}': {}", db_path, e),
-                    "File read failed",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("mount!() failed: cannot read '{}': {}", db_path, e),
+                    details: "File read failed".to_string(),
+                })
             })?;
             // DuckDB file (magic "DUCK" at offset 8): route through the
             // connection factory like any external resource — the factory
@@ -6126,23 +5194,18 @@ impl DelightQLSystem {
             // (resource-first surface).
             if bytes_read >= 12 && &header[8..12] == b"DUCK" {
                 if let Some(factory) = self.connection_factory.as_ref() {
-                    let components = factory.create(db_path).map_err(|e| {
-                        DelightQLError::database_error(
-                            format!("mount!() failed for '{}': {}", db_path, e),
-                            e.to_string(),
-                        )
-                    })?;
+                    let components = factory.create(db_path)?;
                     self.register_external_connection(components, namespace, db_path)?;
                     return Ok(());
                 }
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "mount!() failed: '{}' is a DuckDB database but no \
                          connection factory is available",
                         db_path
                     ),
-                    "No connection factory",
-                ));
+                    details: "No connection factory".to_string(),
+                }));
             }
             // mount! is attach-only. An empty (0-byte, e.g. /dev/null) or
             // short file is not a
@@ -6151,13 +5214,13 @@ impl DelightQLSystem {
             // Pinned by new_test_suite/balls/ddl_bugs/bug_nullmount--02 and
             // crates/delightql-cli/tests/mount_validation.rs.
             if bytes_read < 16 || &header != b"SQLite format 3\0" {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "mount!() failed: '{}' is not a valid SQLite database",
                         db_path
                     ),
-                    "Invalid database file",
-                ));
+                    details: "Invalid database file".to_string(),
+                }));
             }
         }
 
@@ -6192,10 +5255,10 @@ impl DelightQLSystem {
             )
             .map(|_| ())
             .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Failed to attach database: {}", e),
-                    e.to_string(),
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("Failed to attach database: {}", e),
+                    details: e.to_string(),
+                })
             })
         };
         self.mount_attach_class(
@@ -6262,7 +5325,7 @@ impl DelightQLSystem {
         attach: &dyn Fn(&dyn DatabaseConnection, &str) -> Result<()>,
     ) -> Result<()> {
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for mount",
                 format!("Connection was poisoned: {}", e),
             )
@@ -6277,7 +5340,7 @@ impl DelightQLSystem {
             Ok(pair) => Some(pair),
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
             Err(e) => {
-                return Err(DelightQLError::database_error(
+                return Err(Runtime::catalog(
                     "Failed to check namespace existence",
                     e.to_string(),
                 ));
@@ -6291,13 +5354,13 @@ impl DelightQLSystem {
                     drop(bootstrap_conn);
                     return Ok(());
                 }
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                         "Namespace '{}' already exists (mounted from '{}'), cannot re-mount from '{}'",
                         m.namespace, existing_source, m.source_uri
                     ),
-                    "Duplicate namespace with different source",
-                ));
+    details: "Duplicate namespace with different source".to_string(),
+}));
             }
             Some((ns_id, _)) => {
                 // Namespace exists with no recorded source (e.g. a
@@ -6310,19 +5373,16 @@ impl DelightQLSystem {
                         |row| row.get(0),
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error(
-                            "Failed to check namespace occupancy",
-                            e.to_string(),
-                        )
+                        Runtime::catalog("Failed to check namespace occupancy", e.to_string())
                     })?;
                 if occupied {
-                    return Err(DelightQLError::database_error(
-                        format!(
+                    return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                             "Namespace '{}' already exists and is in use, cannot mount '{}' over it",
                             m.namespace, m.source_uri
                         ),
-                        "Namespace occupied",
-                    ));
+    details: "Namespace occupied".to_string(),
+}));
                 }
                 Some(ns_id)
             }
@@ -6335,13 +5395,7 @@ impl DelightQLSystem {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| {
-                DelightQLError::database_error_with_source(
-                    "Failed to query next cartridge ID",
-                    e.to_string(),
-                    Box::new(e),
-                )
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to query next cartridge ID", e.to_string()))?;
         let schema_alias = match &m.existing_schema {
             Some(alias) => alias.clone(),
             None => format!("_imported_{}", next_id),
@@ -6362,7 +5416,7 @@ impl DelightQLSystem {
         if m.existing_schema.is_none() {
             {
                 let user_conn = self.connection.lock().map_err(|e| {
-                    DelightQLError::connection_poison_error(
+                    Runtime::poisoned(
                         "Failed to acquire user connection lock",
                         format!("Connection was poisoned: {}", e),
                     )
@@ -6390,7 +5444,7 @@ impl DelightQLSystem {
         };
         let registration = (|| -> Result<()> {
             let bootstrap_conn = self.bootstrap_connection.lock().map_err(|error| {
-                DelightQLError::connection_poison_error(
+                Runtime::poisoned(
                     "Failed to acquire bootstrap database lock for mount registration",
                     format!("Connection was poisoned: {error}"),
                 )
@@ -6401,7 +5455,7 @@ impl DelightQLSystem {
             // transaction" — the semantic merge conflict between the mount
             // reification and the program spine).
             if let Err(error) = bootstrap_conn.execute_batch("SAVEPOINT dql_mount_attach") {
-                return Err(DelightQLError::database_error(
+                return Err(Runtime::catalog(
                     "Failed to begin mount transaction",
                     error.to_string(),
                 ));
@@ -6421,7 +5475,7 @@ impl DelightQLSystem {
                     &m.conn_description,
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!("Failed to register connection: {}", e),
                         e.to_string(),
                     )
@@ -6431,7 +5485,7 @@ impl DelightQLSystem {
                     .introspector
                     .introspect_entities_in_schema(&schema_alias)
                     .map_err(|e| {
-                        DelightQLError::database_error(
+                        Runtime::catalog(
                             format!(
                                 "Failed to introspect attached database schema '{}': {}",
                                 schema_alias, e
@@ -6463,11 +5517,7 @@ impl DelightQLSystem {
                             ],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error_with_source(
-                                "Failed to insert cartridge",
-                                e.to_string(),
-                                Box::new(e),
-                            )
+                            Runtime::catalog("Failed to insert cartridge", e.to_string())
                         })?;
                     bootstrap_conn.last_insert_rowid() as i32
                 };
@@ -6478,7 +5528,7 @@ impl DelightQLSystem {
                     &entities,
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!("Failed to insert discovered entities: {}", e),
                         e.to_string(),
                     )
@@ -6493,10 +5543,9 @@ impl DelightQLSystem {
                             rusqlite::params![ns_id, m.provenance, &m.source_path],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error_with_source(
+                            Runtime::catalog(
                                 "Failed to record mount source on reused namespace",
                                 e.to_string(),
-                                Box::new(e),
                             )
                         })?;
                     (ns_id, Vec::new())
@@ -6515,10 +5564,7 @@ impl DelightQLSystem {
                     namespace_id,
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!("Failed to activate entities: {}", e),
-                        e.to_string(),
-                    )
+                    Runtime::catalog(format!("Failed to activate entities: {}", e), e.to_string())
                 })?;
                 debug!(
                     "mount_attach_class: activated {} entities in '{}'",
@@ -6559,7 +5605,7 @@ impl DelightQLSystem {
                         |row| row.get(0),
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error(
+                        Runtime::catalog(
                             "Failed to query sys::meta namespace for catalog wrapper",
                             e.to_string(),
                         )
@@ -6617,21 +5663,20 @@ impl DelightQLSystem {
         let locator = format!("delightql-bytes://{}", binding_name);
 
         if !valid_byte_binding_name(binding_name) {
-            return Err(DelightQLError::validation_error(
-                format!(
+            return Err(DelightQLError::from(Constraint::General {
+                message: format!(
                     "mount!() failed: invalid byte-binding name '{}': expected [a-z][a-z0-9._-]*",
                     binding_name
                 ),
-                "Binding names are lowercase capability labels",
-            ));
+            }));
         }
         let Some(binding) = self.byte_bindings.get(binding_name).cloned() else {
             // Bound names are an intentionally enumerable, non-secret host
             // surface — the miss teaches, like dql man.
             let mut known: Vec<&str> = self.byte_bindings.keys().map(|s| s.as_str()).collect();
             known.sort_unstable();
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!(
                     "mount!() failed: no byte binding named '{}' (bound: {})",
                     binding_name,
                     if known.is_empty() {
@@ -6640,8 +5685,8 @@ impl DelightQLSystem {
                         known.join(", ")
                     }
                 ),
-                "delightql-bytes:// resolves only names the host has bound",
-            ));
+                details: "delightql-bytes:// resolves only names the host has bound".to_string(),
+            }));
         };
 
         let expected = locator.clone();
@@ -6708,7 +5753,7 @@ impl DelightQLSystem {
         // `://` classification mount_database itself uses to route URIs.
         if db_path.contains("://") {
             let engine = db_path.split("://").next().unwrap_or("that engine");
-            return Err(DelightQLError::database_error(
+            return Err(Runtime::catalog(
                 format!(
                     "mount_new!() creates a new SQLite database; to create on {}, \
                      use its native tooling then mount!()",
@@ -6729,13 +5774,13 @@ impl DelightQLSystem {
         let prior_state = if path.exists() {
             let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if len > 0 {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "mount_new!() failed: '{}' already exists; use mount!() to attach it",
                         resolved.display()
                     ),
-                    "Refuse to clobber",
-                ));
+                    details: "Refuse to clobber".to_string(),
+                }));
             }
             CreatedFilePriorState::Empty
         } else {
@@ -6748,25 +5793,25 @@ impl DelightQLSystem {
         // rejects.
         {
             let conn = rusqlite::Connection::open(path).map_err(|e| {
-                DelightQLError::database_error(
-                    format!(
+                DelightQLError::from(Runtime::General {
+                    message: format!(
                         "mount_new!() failed: cannot create database at '{}': {}",
                         resolved.display(),
                         e
                     ),
-                    e.to_string(),
-                )
+                    details: e.to_string(),
+                })
             })?;
             conn.execute_batch("PRAGMA user_version = 0;")
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        format!(
+                    DelightQLError::from(Runtime::General {
+                        message: format!(
                             "mount_new!() failed: cannot initialize database at '{}': {}",
                             resolved.display(),
                             e
                         ),
-                        e.to_string(),
-                    )
+                        details: e.to_string(),
+                    })
                 })?;
         }
 
@@ -6814,7 +5859,7 @@ impl DelightQLSystem {
         );
 
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for consult",
                 format!("Connection was poisoned: {}", e),
             )
@@ -6833,10 +5878,10 @@ impl DelightQLSystem {
                     |row| row.get(0),
                 )
                 .map_err(|_| {
-                    DelightQLError::database_error(
-                        format!("Namespace '{}' not found", namespace),
-                        "Namespace not found",
-                    )
+                    DelightQLError::from(Runtime::General {
+                        message: format!("Namespace '{}' not found", namespace),
+                        details: "Namespace not found".to_string(),
+                    })
                 })?;
             // DELETE the old load whole — its families, declared edges, and
             // ledger — inside this savepoint. A failure anywhere below rolls
@@ -6859,12 +5904,7 @@ impl DelightQLSystem {
                         "UPDATE namespace SET source_path = ?1 WHERE id = ?2",
                         rusqlite::params![&path, ns_id],
                     )
-                    .map_err(|e| {
-                        DelightQLError::database_error(
-                            "Failed to update source_path",
-                            e.to_string(),
-                        )
-                    })?;
+                    .map_err(|e| Runtime::catalog("Failed to update source_path", e.to_string()))?;
             }
             // Every derived world that derives from this namespace — as its
             // root's source or as a transitive dependency — is rebuilt whole
@@ -6877,7 +5917,7 @@ impl DelightQLSystem {
                 &published,
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("Grounding contract violation: lib '{namespace}'. {e}"),
                     "Grounding contract violated",
                 )
@@ -6977,7 +6017,7 @@ impl DelightQLSystem {
             return Ok(());
         }
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for the liminal ledger",
                 format!("Connection was poisoned: {}", e),
             )
@@ -6989,10 +6029,10 @@ impl DelightQLSystem {
                 |row| row.get(0),
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("the ledger's namespace '{namespace}' is not in the catalog"),
-                    e.to_string(),
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("the ledger's namespace '{namespace}' is not in the catalog"),
+                    details: e.to_string(),
+                })
             })?;
         for row in rows {
             bootstrap_conn
@@ -7006,9 +6046,7 @@ impl DelightQLSystem {
                         row.receipt_json()
                     ],
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("Failed to record ledger row", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("Failed to record ledger row", e.to_string()))?;
         }
         Ok(())
     }
@@ -7048,10 +6086,7 @@ impl DelightQLSystem {
                 )
                 .optional()
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to check namespace existence",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to check namespace existence", e.to_string())
                 })?;
 
             match existing_id {
@@ -7076,16 +6111,15 @@ impl DelightQLSystem {
                             let source_info = ns_source
                                 .map(|s| format!(" (from {})", s))
                                 .unwrap_or_default();
-                            return Err(DelightQLError::database_error_categorized(
-                                "runtime",
-                                format!(
+                            return Err(DelightQLError::from(Runtime::General {
+                                details: "definition target".to_string(),
+                                message: format!(
                                     "Cannot write definitions to namespace '{}' — \
                                      it is a {} namespace{} and is not writable. \
                                      Use (~~ddl:\"name\" ~~) to create a scratch namespace instead.",
                                     namespace, ns_kind, source_info
                                 ),
-                                "Write protection",
-                            ));
+                            }));
                         }
                     }
 
@@ -7114,17 +6148,15 @@ impl DelightQLSystem {
                             )
                             .unwrap_or(false);
                         if has_source {
-                            return Err(DelightQLError::validation_error_categorized(
-                                "directive/consult/exists",
-                                format!(
+                            return Err(DelightQLError::from(Directive::ConsultExists {
+    message: format!(
                                     "consult! creates namespace '{namespace}' from one source, and it \
                                      already holds one. Reload the same source with \
                                      reconsult!(\"{namespace}\") or remove it first with \
                                      unconsult!(\"{namespace}\") — one consulted source owns one \
                                      namespace, and a second consult is never a merge"
                                 ),
-                                "consult lifecycle",
-                            ));
+}));
                         }
                     }
                     id
@@ -7157,11 +6189,7 @@ impl DelightQLSystem {
                             ],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error_with_source(
-                                "Failed to create consult namespace",
-                                e.to_string(),
-                                Box::new(e),
-                            )
+                            Runtime::catalog("Failed to create consult namespace", e.to_string())
                         })?;
                     bootstrap_conn.last_insert_rowid() as i32
                 }
@@ -7190,7 +6218,7 @@ impl DelightQLSystem {
                                AND c.source_uri LIKE '%inline%'",
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error(
+                            Runtime::catalog(
                                 "Failed to query conflicting inline entities",
                                 e.to_string(),
                             )
@@ -7200,7 +6228,7 @@ impl DelightQLSystem {
                             Ok((row.get(0)?, row.get(1)?))
                         })
                         .map_err(|e| {
-                            DelightQLError::database_error(
+                            Runtime::catalog(
                                 "Failed to query conflicting inline entities",
                                 e.to_string(),
                             )
@@ -7227,10 +6255,7 @@ impl DelightQLSystem {
                         bootstrap_conn
                             .execute("DELETE FROM cartridge WHERE id = ?1", [cartridge_id])
                             .map_err(|e| {
-                                DelightQLError::database_error(
-                                    "Failed to delete empty cartridge",
-                                    e.to_string(),
-                                )
+                                Runtime::catalog("Failed to delete empty cartridge", e.to_string())
                             })?;
                     }
                 }
@@ -7284,11 +6309,7 @@ impl DelightQLSystem {
                     ],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to insert consult cartridge",
-                        e.to_string(),
-                        Box::new(e),
-                    )
+                    Runtime::catalog("Failed to insert consult cartridge", e.to_string())
                 })?;
             bootstrap_conn.last_insert_rowid() as i32
         };
@@ -7330,20 +6351,12 @@ impl DelightQLSystem {
                     // Semantic constraint errors (TransformationError,
                     // categorized ValidationError) propagate directly to
                     // preserve their specific URI subcategory.
-                    if matches!(
-                        &e,
-                        DelightQLError::TransformationError { .. }
-                            | DelightQLError::ValidationError {
-                                subcategory: Some(_),
-                                ..
-                            }
-                    ) {
+                    if matches!(&e, DelightQLError::Semantic(_)) {
                         return e;
                     }
-                    DelightQLError::validation_error(
-                        format!("DDL definition '{subject}' has an invalid body: {e}"),
-                        "DDL body validation failed",
-                    )
+                    DelightQLError::from(Constraint::General {
+                        message: format!("DDL definition '{subject}' has an invalid body: {e}"),
+                    })
                 })?;
 
             // foo/foo! name collision: a namespace may not hold both a
@@ -7375,15 +6388,15 @@ impl DelightQLSystem {
                         )
                         .unwrap_or(false);
                     if base_exists {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "effect/rule/name_collision",
-                            format!(
-                                "cannot register effect rule '{}': namespace '{}' \
+                        return Err(DelightQLError::from(
+                            crate::diagnostic::EffectRule::NameCollision {
+                                message: format!(
+                                    "cannot register effect rule '{}': namespace '{}' \
                                  already holds an entity named '{}' — a namespace \
                                  may not hold both '{}' and '{}'.",
-                                group_name, namespace, base, base, group_name
-                            ),
-                            "effect-rule name collision",
+                                    group_name, namespace, base, base, group_name
+                                ),
+                            },
                         ));
                     }
                 } else {
@@ -7402,15 +6415,15 @@ impl DelightQLSystem {
                         )
                         .unwrap_or(false);
                     if effect_rule_exists {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "effect/rule/name_collision",
-                            format!(
-                                "cannot register '{}': namespace '{}' already \
+                        return Err(DelightQLError::from(
+                            crate::diagnostic::EffectRule::NameCollision {
+                                message: format!(
+                                    "cannot register '{}': namespace '{}' already \
                                  holds an effect rule '{}' — a namespace may not \
                                  hold both '{}' and '{}'.",
-                                group_name, namespace, banged, group_name, banged
-                            ),
-                            "effect-rule name collision",
+                                    group_name, namespace, banged, group_name, banged
+                                ),
+                            },
                         ));
                     }
                 }
@@ -7450,15 +6463,13 @@ impl DelightQLSystem {
                     )
                     .unwrap_or(false);
                 if already_has_main {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "effect/main/duplicate",
-                        format!(
+                    return Err(DelightQLError::from(EffectMain::Duplicate {
+                        message: format!(
                             "namespace '{}' already has a main! — at most one main! \
                              per namespace (EFFECT-ALGEBRA F2).",
                             namespace
                         ),
-                        "duplicate main! in namespace",
-                    ));
+                    }));
                 }
             }
 
@@ -7479,12 +6490,6 @@ impl DelightQLSystem {
             // what the assembler already made every clause agree on, and a
             // deferred body does not make a group any less assembled.
             let entity_type = ddl_group.entity_type().as_i32();
-            let param_names: Vec<&str> = ddl_group
-                .bound_param_names()
-                .into_iter()
-                .map(delightql_types::SqlIdentifier::as_str)
-                .collect();
-
             // Insert entity (without definition — clauses go into entity_clause).
             // The name's strop bit is identity, so the catalog keeps it.
             let name_stropped = ddl_group
@@ -7502,13 +6507,7 @@ impl DelightQLSystem {
                         &ddl_group.doc(),
                     ],
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to insert consult entity",
-                        e.to_string(),
-                        Box::new(e),
-                    )
-                })?;
+                .map_err(|e| Runtime::catalog("Failed to insert consult entity", e.to_string()))?;
             let entity_id = bootstrap_conn.last_insert_rowid() as i32;
 
             // Insert each clause into entity_clause. `clause_sources` is the
@@ -7521,11 +6520,7 @@ impl DelightQLSystem {
                         rusqlite::params![entity_id, (ordinal + 1) as i32, src],
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error_with_source(
-                            "Failed to insert entity clause",
-                            e.to_string(),
-                            Box::new(e),
-                        )
+                        Runtime::catalog("Failed to insert entity clause", e.to_string())
                     })?;
             }
 
@@ -7552,11 +6547,7 @@ impl DelightQLSystem {
                             rusqlite::params![entity_id, name.as_str(), attribute_type, position],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error_with_source(
-                                "Failed to insert entity attribute",
-                                e.to_string(),
-                                Box::new(e),
-                            )
+                            Runtime::catalog("Failed to insert entity attribute", e.to_string())
                         })?;
                     position += 1;
                 }
@@ -7589,11 +6580,7 @@ impl DelightQLSystem {
                             rusqlite::params![entity_id, left, right, context, (idx + 1) as i32],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error_with_source(
-                                "Failed to insert join_edge",
-                                e.to_string(),
-                                Box::new(e),
-                            )
+                            Runtime::catalog("Failed to insert join_edge", e.to_string())
                         })?;
                 }
             }
@@ -7607,96 +6594,20 @@ impl DelightQLSystem {
 
             // Extract references from ALL clauses (union of references)
             {
-                use crate::pipeline::asts::ddl::DdlBody;
-                let mut all_refs = Vec::new();
-                for ddl_def in ddl_group.clauses() {
-                    let clause_refs = match &ddl_def.body {
-                        DdlBody::Scalar(expr) => {
-                            crate::ddl::analyzer::extract_references_from_domain(expr)
-                        }
-                        DdlBody::Truth(expr) => {
-                            crate::ddl::analyzer::extract_references_from_truth(expr)
-                        }
-                        DdlBody::Relational(query) => {
-                            crate::ddl::analyzer::extract_references_from_query(query)
-                        }
-                        // A mode's references live in every authored output
-                        // cell, including the default. Extract them directly:
-                        // a default-bearing mode has no relational body to
-                        // synthesize merely for analysis.
-                        DdlBody::FactFunction(definition) => {
-                            let mode = definition.mode();
-                            let mut refs = Vec::new();
-                            for arm in mode.arms.iter() {
-                                for output in arm.outputs.iter() {
-                                    refs.extend(
-                                        crate::ddl::analyzer::extract_references_from_domain(
-                                            output,
-                                        ),
-                                    );
-                                }
-                            }
-                            if let Some(default) = &mode.default {
-                                for output in default.iter() {
-                                    refs.extend(
-                                        crate::ddl::analyzer::extract_references_from_domain(
-                                            output,
-                                        ),
-                                    );
-                                }
-                            }
-                            refs
-                        }
-                        // A deferred TEMPLATE has no parsed body to read, so
-                        // it is proffer-parsed: synthetic bindings stand in
-                        // for the call site's arguments, which is enough to
-                        // reach the references and to catch a body that is
-                        // broken rather than merely unsubstituted. The
-                        // deferral is the BODY's; the group it belongs to was
-                        // assembled with everyone else's.
-                        DdlBody::Deferred { source } => {
-                            let proffer_identities =
-                                crate::relation::Planning::open(crate::names::Registry::new(&[]));
-                            let bindings =
-                                crate::pipeline::resolver::grounding::create_proffer_bindings(
-                                    &ddl_def.head,
-                                    &proffer_identities,
-                                )?;
-                            // A REFUSAL THAT AWAITS SUBSTITUTION IS THE
-                            // DEFERRAL ITSELF. The proffer supplies stand-ins,
-                            // and a stand-in cannot be the integer a bound
-                            // wants — so refusing here would undo the deferral
-                            // the clause already made. Its references become
-                            // known at invocation, with the real arguments.
-                            match crate::ddl::reconstruct::bound_relex(source, bindings) {
-                                Ok(query) => {
-                                    crate::ddl::analyzer::extract_references_from_query(&query)
-                                }
-                                Err(e) if crate::pipeline::normalize::awaits_substitution(&e) => {
-                                    Vec::new()
-                                }
-                                Err(e) => {
-                                    return Err(DelightQLError::validation_error(
-                                        format!(
-                                            "HO view '{group_name}' body has a syntax error: {e}"
-                                        ),
-                                        "DDL body validation failed",
-                                    ))
-                                }
-                            }
-                        }
-                    };
-                    all_refs.extend(clause_refs);
-                }
+                // ONE CENSUS for the whole group: every clause, under the
+                // group's own declared parameters and every declaration
+                // each body opens inside itself. A body it cannot read
+                // refuses here rather than being recorded as a definition
+                // with no dependencies.
+                let all_refs = crate::ddl::analyzer::census_of_group(&ddl_group)
+                    .finish()
+                    .map_err(|e| {
+                        DelightQLError::from(Constraint::General {
+                            message: format!("HO view '{group_name}' body has a syntax error: {e}"),
+                        })
+                    })?;
 
-                // Filter out bound parameters from free variable references.
-                // HO view params like T in active_only(T)(*) are bound, not free.
-                let refs: Vec<_> = all_refs
-                    .into_iter()
-                    .filter(|r| !param_names.contains(&r.name.as_str()))
-                    .collect();
-
-                for ext_ref in &refs {
+                for ext_ref in &all_refs {
                     bootstrap_conn
                         .execute(
                             "INSERT INTO referenced_entity (name, namespace, apparent_type, containing_entity_id) VALUES (?1, ?2, ?3, ?4)",
@@ -7708,17 +6619,13 @@ impl DelightQLSystem {
                             ],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error_with_source(
-                                "Failed to insert referenced entity",
-                                e.to_string(),
-                                Box::new(e),
-                            )
+                            Runtime::catalog("Failed to insert referenced entity", e.to_string())
                         })?;
                 }
 
                 debug!(
                     "consult_file: Extracted {} references from '{}' ({} clause{})",
-                    refs.len(),
+                    all_refs.len(),
                     group_name,
                     ddl_group.clauses().len(),
                     if ddl_group.clauses().len() > 1 {
@@ -7739,35 +6646,43 @@ impl DelightQLSystem {
                 }
             }
 
-            // Activate in namespace. The store's family-identity trigger
-            // refuses a second same-named family in one namespace; hand
-            // that refusal back as the clause-agreement teaching, not raw
-            // SQL.
+            // Activate in namespace. ONE canonical name identifies one
+            // definition family in a namespace: the judgment is a catalog
+            // read made here, as the clause-agreement teaching. The store's
+            // `definition_family_identity` trigger guards the same law for
+            // every other road and is never read back as prose.
+            let same_named_family: bool = bootstrap_conn
+                .query_row(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM activated_entity ae
+                         JOIN entity e ON e.id = ae.entity_id
+                         WHERE ae.namespace_id = ?2
+                           AND (SELECT type FROM entity WHERE id = ?1) IN (1, 2, 3, 4, 8, 9, 16, 17, 20)
+                           AND e.type IN (1, 2, 3, 4, 8, 9, 16, 17, 20)
+                           AND (CASE WHEN e.name_stropped = 1 THEN e.name ELSE lower(e.name) END)
+                               = (SELECT CASE WHEN name_stropped = 1 THEN name ELSE lower(name) END
+                                  FROM entity WHERE id = ?1))",
+                    rusqlite::params![entity_id, namespace_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| Runtime::catalog("Failed to read the definition families of a namespace", e))?;
+            if same_named_family {
+                return Err(DelightQLError::from(Ddl::FamilyOneNameOneEntity {
+                    message: format!(
+                        "'{group_name}' is already defined in this source — one fully \
+                         qualified name identifies one entity, and category or arity \
+                         never selects among same-named definitions (heads-law, CLAUSE \
+                         AGREEMENT). Same-kind clauses of one entity belong under one \
+                         head; a different definition needs a different name."
+                    ),
+                }));
+            }
             bootstrap_conn
                 .execute(
                     "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id) VALUES (?1, ?2, ?3)",
                     rusqlite::params![entity_id, namespace_id, cartridge_id],
                 )
-                .map_err(|e| {
-                    if e.to_string().contains("definition_family_identity") {
-                        return DelightQLError::validation_error_categorized(
-                            "ddl/family/one_name_one_entity",
-                            format!(
-                                "'{group_name}' is already defined in this source — one fully \
-                                 qualified name identifies one entity, and category or arity \
-                                 never selects among same-named definitions (heads-law, CLAUSE \
-                                 AGREEMENT). Same-kind clauses of one entity belong under one \
-                                 head; a different definition needs a different name."
-                            ),
-                            "one name, one entity",
-                        );
-                    }
-                    DelightQLError::database_error_with_source(
-                        "Failed to activate consult entity",
-                        e.to_string(),
-                        Box::new(e),
-                    )
-                })?;
+                .map_err(|e| Runtime::catalog("Failed to activate consult entity", e))?;
         }
 
         // R6 (no recursion): the file's effect rules must form a DAG.
@@ -7812,7 +6727,7 @@ impl DelightQLSystem {
 
         // Get bootstrap connection
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for enlist",
                 format!("Connection was poisoned: {}", e),
             )
@@ -7839,35 +6754,35 @@ impl DelightQLSystem {
                                 |row| row.get(0),
                             )
                             .map_err(|e| {
-                                DelightQLError::database_error(
-                                    format!(
+                                DelightQLError::from(Runtime::General {
+                                    message: format!(
                                         "Namespace '{}' (expanded to '{}') not found.",
                                         namespace, expanded
                                     ),
-                                    e.to_string(),
-                                )
+                                    details: e.to_string(),
+                                })
                             })?;
                         (id, expanded)
                     }
                     None => {
-                        return Err(DelightQLError::database_error(
-                            format!(
+                        return Err(DelightQLError::from(Runtime::General {
+                            message: format!(
                                 "Namespace '{}' not found. Make sure to mount!() it first.",
                                 namespace
                             ),
-                            "namespace not found",
-                        ));
+                            details: "namespace not found".to_string(),
+                        }));
                     }
                 }
             }
             Err(e) => {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Namespace '{}' not found. Make sure to mount!() it first.",
                         namespace
                     ),
-                    e.to_string(),
-                ));
+                    details: e.to_string(),
+                }));
             }
         };
 
@@ -7887,10 +6802,12 @@ impl DelightQLSystem {
                 |row| row.get(0),
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Session namespace 'home' not found in bootstrap (database corruption)",
-                    e.to_string(),
-                )
+                DelightQLError::from(Runtime::General {
+                    message:
+                        "Session namespace 'home' not found in bootstrap (database corruption)"
+                            .to_string(),
+                    details: e.to_string(),
+                })
             })?;
 
         // Check for ER-context name collisions with already-enlisted namespaces.
@@ -7913,7 +6830,7 @@ impl DelightQLSystem {
                      WHERE existing_ns.id != ?1",
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         "Failed to prepare ER-context collision check",
                         e.to_string(),
                     )
@@ -7925,10 +6842,7 @@ impl DelightQLSystem {
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to check ER-context collisions",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to check ER-context collisions", e.to_string())
                 })?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -7938,15 +6852,15 @@ impl DelightQLSystem {
                     .iter()
                     .map(|(ctx, ns)| format!("context '{}' (already enlisted from '{}')", ctx, ns))
                     .collect();
-                return Err(DelightQLError::validation_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Cannot enlist namespace '{}': ER-context name collision — {}. \
                          Use qualified access (ns.view(*)) instead of enlist to avoid ambiguity.",
                         namespace,
                         details.join(", "),
                     ),
-                    "ER-context collision on enlist",
-                ));
+                    details: "ER-context collision on enlist".to_string(),
+                }));
             }
         }
 
@@ -7958,7 +6872,7 @@ impl DelightQLSystem {
                 [from_namespace_id, to_namespace_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("Failed to enlist namespace '{}': {}", namespace, e),
                     e.to_string(),
                 )
@@ -7993,7 +6907,7 @@ impl DelightQLSystem {
     /// [`Self::perform_enlist`] is.
     fn perform_alias(&mut self, alias: &str, namespace: &str) -> Result<DeclaredEdge> {
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for namespace alias",
                 format!("Connection was poisoned: {}", e),
             )
@@ -8006,13 +6920,13 @@ impl DelightQLSystem {
                 |row| row.get(0),
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    format!(
+                DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Namespace '{}' not found. Cannot create alias '{}'.",
                         namespace, alias
                     ),
-                    e.to_string(),
-                )
+                    details: e.to_string(),
+                })
             })?;
 
         // A shorthand that names an EXISTING namespace makes every lookup
@@ -8026,19 +6940,16 @@ impl DelightQLSystem {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to check alias collision", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to check alias collision", e.to_string()))?;
         if collision.is_some() {
-            return Err(DelightQLError::validation_error(
-                format!(
+            return Err(DelightQLError::from(Constraint::General {
+                message: format!(
                     "alias!() shorthand '{}' collides with an existing namespace of \
                      the same name — lookups for '{}' would be ambiguous. Choose a \
                      different shorthand.",
                     alias, alias
                 ),
-                "Alias shorthand collision",
-            ));
+            }));
         }
 
         // Colliding with an existing SHORTHAND is the same two-headed
@@ -8055,9 +6966,7 @@ impl DelightQLSystem {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to check alias holder", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to check alias holder", e.to_string()))?;
         if let Some((holder_id, holder_fq)) = taken {
             if i64::from(ns_id) == holder_id {
                 // Idempotent: the same binding, the same edge performed.
@@ -8066,14 +6975,13 @@ impl DelightQLSystem {
                     target: i64::from(ns_id),
                 }));
             }
-            return Err(DelightQLError::validation_error(
-                format!(
+            return Err(DelightQLError::from(Constraint::General {
+                message: format!(
                     "alias!() shorthand '{}' is already taken by '{}' — lookups for \
                      '{}' would be ambiguous. Choose a different shorthand.",
                     alias, holder_fq, alias
                 ),
-                "Alias shorthand collision",
-            ));
+            }));
         }
 
         bootstrap_conn
@@ -8082,7 +6990,7 @@ impl DelightQLSystem {
                 rusqlite::params![alias, ns_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!(
                         "Failed to register namespace alias '{}' → '{}': {}",
                         alias, namespace, e
@@ -8111,12 +7019,12 @@ impl DelightQLSystem {
     /// names, checked here and again at publication.
     fn perform_expose(&self, exposing_fq: &str, child_fq: &str) -> Result<DeclaredEdge> {
         if !child_fq.starts_with(&format!("{exposing_fq}::")) {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!(
                     "Cannot expose '{child_fq}' through '{exposing_fq}': not a child namespace"
                 ),
-                "Invalid expose target",
-            ));
+                details: "Invalid expose target".to_string(),
+            }));
         }
         let conn = self.lock_bootstrap("Failed to acquire bootstrap lock for expose")?;
         let id: i64 = conn
@@ -8126,10 +7034,10 @@ impl DelightQLSystem {
                 |row| row.get(0),
             )
             .map_err(|_| {
-                DelightQLError::database_error(
-                    format!("Namespace '{child_fq}' not found for expose"),
-                    "Namespace not found",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("Namespace '{child_fq}' not found for expose"),
+                    details: "Namespace not found".to_string(),
+                })
             })?;
         Ok(DeclaredEdge(LexicalAct::Expose { target: id }))
     }
@@ -8149,7 +7057,7 @@ impl DelightQLSystem {
     pub fn delist_namespace(&mut self, namespace: &str) -> Result<()> {
         // Get bootstrap connection
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for delist",
                 format!("Connection was poisoned: {}", e),
             )
@@ -8163,10 +7071,10 @@ impl DelightQLSystem {
                 |row| row.get(0),
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    format!("Namespace '{}' not found", namespace),
-                    e.to_string(),
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("Namespace '{}' not found", namespace),
+                    details: e.to_string(),
+                })
             })?;
 
         // The interactive session's scope is `home`: a
@@ -8179,10 +7087,12 @@ impl DelightQLSystem {
                 |row| row.get(0),
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Session namespace 'home' not found in bootstrap (database corruption)",
-                    e.to_string(),
-                )
+                DelightQLError::from(Runtime::General {
+                    message:
+                        "Session namespace 'home' not found in bootstrap (database corruption)"
+                            .to_string(),
+                    details: e.to_string(),
+                })
             })?;
 
         // Delete enlisted_namespace record
@@ -8193,18 +7103,20 @@ impl DelightQLSystem {
                 [from_namespace_id, to_namespace_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("Failed to delist namespace '{}': {}", namespace, e),
                     e.to_string(),
                 )
             })?;
 
         if rows_affected == 0 {
-            return Err(DelightQLError::database_error_categorized(
-                "useafterfree",
-                format!("Namespace '{}' is not currently enlisted", namespace),
-                "delist!() requires a prior enlist!() on the same namespace",
-            ));
+            return Err(DelightQLError::from(Runtime::UseAfterFree {
+                message: format!(
+                    "Namespace '{}' is not currently enlisted — delist!() requires a prior \
+                     enlist!() on the same namespace",
+                    namespace
+                ),
+            }));
         } else {
             debug!("delist_namespace: Delisted namespace '{}'", namespace);
         }
@@ -8216,7 +7128,7 @@ impl DelightQLSystem {
                 [from_namespace_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!(
                         "Failed to clean up aliases for namespace '{}': {}",
                         namespace, e
@@ -8235,7 +7147,7 @@ impl DelightQLSystem {
     /// Returns all (from_namespace_id, to_namespace_id) rows for later restoration.
     pub fn save_enlisted_state(&self) -> Result<Vec<(i32, i32)>> {
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for save_enlisted_state",
                 format!("Connection was poisoned: {}", e),
             )
@@ -8244,7 +7156,7 @@ impl DelightQLSystem {
         let mut stmt = bootstrap_conn
             .prepare("SELECT from_namespace_id, to_namespace_id FROM enlisted_namespace")
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     "Failed to prepare enlisted_namespace snapshot",
                     e.to_string(),
                 )
@@ -8252,12 +7164,7 @@ impl DelightQLSystem {
 
         let rows: Vec<(i32, i32)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to snapshot enlisted_namespace",
-                    e.to_string(),
-                )
-            })?
+            .map_err(|e| Runtime::catalog("Failed to snapshot enlisted_namespace", e.to_string()))?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -8268,7 +7175,7 @@ impl DelightQLSystem {
     /// Deletes all current rows and re-inserts the saved ones.
     pub fn restore_enlisted_state(&mut self, saved: &[(i32, i32)]) -> Result<()> {
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for restore_enlisted_state",
                 format!("Connection was poisoned: {}", e),
             )
@@ -8277,7 +7184,7 @@ impl DelightQLSystem {
         bootstrap_conn
             .execute("DELETE FROM enlisted_namespace", [])
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     "Failed to clear enlisted_namespace for restore",
                     e.to_string(),
                 )
@@ -8290,10 +7197,7 @@ impl DelightQLSystem {
                     [from_id, to_id],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to restore enlisted_namespace row",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to restore enlisted_namespace row", e.to_string())
                 })?;
         }
 
@@ -8304,7 +7208,7 @@ impl DelightQLSystem {
     /// Returns all (alias, target_namespace_id) rows for later restoration.
     pub fn save_alias_state(&self) -> Result<Vec<(String, i32)>> {
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for save_alias_state",
                 format!("Connection was poisoned: {}", e),
             )
@@ -8313,17 +7217,12 @@ impl DelightQLSystem {
         let mut stmt = bootstrap_conn
             .prepare("SELECT alias, target_namespace_id FROM namespace_alias")
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to prepare namespace_alias snapshot",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to prepare namespace_alias snapshot", e.to_string())
             })?;
 
         let rows: Vec<(String, i32)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to snapshot namespace_alias", e.to_string())
-            })?
+            .map_err(|e| Runtime::catalog("Failed to snapshot namespace_alias", e.to_string()))?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -8333,7 +7232,7 @@ impl DelightQLSystem {
     /// Restore namespace_alias to a previously saved state.
     pub fn restore_alias_state(&mut self, saved: &[(String, i32)]) -> Result<()> {
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for restore_alias_state",
                 format!("Connection was poisoned: {}", e),
             )
@@ -8342,10 +7241,7 @@ impl DelightQLSystem {
         bootstrap_conn
             .execute("DELETE FROM namespace_alias", [])
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to clear namespace_alias for restore",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to clear namespace_alias for restore", e.to_string())
             })?;
 
         for (alias, target_id) in saved {
@@ -8355,10 +7251,7 @@ impl DelightQLSystem {
                     rusqlite::params![alias, target_id],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to restore namespace_alias row",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to restore namespace_alias row", e.to_string())
                 })?;
         }
 
@@ -8381,7 +7274,7 @@ impl DelightQLSystem {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| DelightQLError::database_error("main namespace missing", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("main namespace missing", e.to_string()))?;
 
         // Physical cleanup identity, read from the authoritative relation
         // BEFORE clearing it.
@@ -8404,9 +7297,7 @@ impl DelightQLSystem {
                  WHERE id = ?1",
                 [ns_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to reset main namespace", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to reset main namespace", e.to_string()))?;
         Self::clear_namespace_contents(&bootstrap_conn, ns_id)?;
         if let Some((cart_id, _, _)) = link_identity {
             Self::clear_cartridge_entities(&bootstrap_conn, cart_id)?;
@@ -8435,10 +7326,10 @@ impl DelightQLSystem {
                 |row| row.get(0),
             )
             .map_err(|_| {
-                DelightQLError::database_error(
-                    format!("Namespace '{}' not found", namespace_fq),
-                    "Namespace not found",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("Namespace '{}' not found", namespace_fq),
+                    details: "Namespace not found".to_string(),
+                })
             })?;
 
         // Find ALL cartridge(s) and their connection info. The mount's own
@@ -8458,16 +7349,12 @@ impl DelightQLSystem {
                                     JOIN activated_entity ae ON ae.entity_id = e.id
                                     WHERE ae.namespace_id = ?1)",
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("Failed to query cartridges", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("Failed to query cartridges", e.to_string()))?;
             let rows = stmt
                 .query_map([namespace_id], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })
-                .map_err(|e| {
-                    DelightQLError::database_error("Failed to query cartridges", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("Failed to query cartridges", e.to_string()))?;
             rows.flatten().collect()
         };
 
@@ -8507,40 +7394,36 @@ impl DelightQLSystem {
         bootstrap_conn.execute(
             "DELETE FROM namespace_local_alias WHERE namespace_id = ?1 OR target_namespace_id = ?1",
             [namespace_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete namespace_local_alias", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete namespace_local_alias", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM namespace_local_enlist WHERE namespace_id = ?1 OR enlisted_namespace_id = ?1",
             [namespace_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete namespace_local_enlist", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete namespace_local_enlist", e.to_string()))?;
 
         bootstrap_conn
             .execute(
                 "DELETE FROM enlisted_entity WHERE from_namespace_id = ?1 OR to_namespace_id = ?1",
                 [namespace_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete enlisted_entity", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete enlisted_entity", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM enlisted_namespace WHERE from_namespace_id = ?1 OR to_namespace_id = ?1",
             [namespace_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete enlisted_namespace", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete enlisted_namespace", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM exposed_namespace WHERE exposing_namespace_id = ?1 OR exposed_namespace_id = ?1",
             [namespace_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete exposed_namespace", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete exposed_namespace", e.to_string()))?;
 
         bootstrap_conn
             .execute(
                 "DELETE FROM namespace_alias WHERE target_namespace_id = ?1",
                 [namespace_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete namespace_alias", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete namespace_alias", e.to_string()))?;
 
         // The liminal ledger dies with its namespace (EFFECT-ALGEBRA §8:
         // catalog state, session-scoped; pinned by
@@ -8550,9 +7433,7 @@ impl DelightQLSystem {
                 "DELETE FROM liminal_receipt WHERE namespace_id = ?1",
                 [namespace_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete liminal_receipt", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete liminal_receipt", e.to_string()))?;
 
         // 2. Grounding table
         bootstrap_conn
@@ -8560,9 +7441,7 @@ impl DelightQLSystem {
                 "DELETE FROM grounding WHERE grounded_namespace_id = ?1",
                 [namespace_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete grounding", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete grounding", e.to_string()))?;
 
         // 3. Entity-level tables (via cartridge)
         if !cartridge_infos.is_empty() {
@@ -8573,13 +7452,13 @@ impl DelightQLSystem {
                         SELECT ie.id FROM interior_entity ie JOIN entity e ON ie.parent_entity_id = e.id
                         WHERE e.cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete interior_entity_attribute", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to delete interior_entity_attribute", e.to_string()))?;
 
                 // interior_entity
                 bootstrap_conn.execute(
                     "DELETE FROM interior_entity WHERE parent_entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete interior_entity", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to delete interior_entity", e.to_string()))?;
 
                 // ho_param_column (FK to ho_param)
                 bootstrap_conn
@@ -8590,72 +7469,65 @@ impl DelightQLSystem {
                         [cartridge_id],
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error(
-                            "Failed to delete ho_param_column",
-                            e.to_string(),
-                        )
+                        Runtime::catalog("Failed to delete ho_param_column", e.to_string())
                     })?;
 
                 // entity_resolution
                 bootstrap_conn.execute(
                     "DELETE FROM entity_resolution WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete entity_resolution", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to delete entity_resolution", e.to_string()))?;
 
                 // ho_param
                 bootstrap_conn.execute(
                     "DELETE FROM ho_param WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete ho_param", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to delete ho_param", e.to_string()))?;
 
                 // join_edge
                 bootstrap_conn.execute(
                     "DELETE FROM join_edge WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete join_edge", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to delete join_edge", e.to_string()))?;
 
                 bootstrap_conn.execute(
                     "DELETE FROM functional_dependency WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete functional_dependency", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to delete functional_dependency", e.to_string()))?;
 
                 // referenced_entity
                 bootstrap_conn.execute(
                     "DELETE FROM referenced_entity WHERE containing_entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete referenced_entity", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to delete referenced_entity", e.to_string()))?;
 
                 // entity_attribute
                 bootstrap_conn.execute(
                     "DELETE FROM entity_attribute WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete entity_attribute", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to delete entity_attribute", e.to_string()))?;
 
                 // entity_clause
                 bootstrap_conn.execute(
                     "DELETE FROM entity_clause WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete entity_clause", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to delete entity_clause", e.to_string()))?;
 
                 // activated_entity
                 bootstrap_conn.execute(
                     "DELETE FROM activated_entity WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
                     [cartridge_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to delete activated_entity", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to delete activated_entity", e.to_string()))?;
 
                 // entity
                 bootstrap_conn
                     .execute("DELETE FROM entity WHERE cartridge_id = ?1", [cartridge_id])
-                    .map_err(|e| {
-                        DelightQLError::database_error("Failed to delete entity", e.to_string())
-                    })?;
+                    .map_err(|e| Runtime::catalog("Failed to delete entity", e.to_string()))?;
 
                 // cartridge
                 bootstrap_conn
                     .execute("DELETE FROM cartridge WHERE id = ?1", [cartridge_id])
-                    .map_err(|e| {
-                        DelightQLError::database_error("Failed to delete cartridge", e.to_string())
-                    })?;
+                    .map_err(|e| Runtime::catalog("Failed to delete cartridge", e.to_string()))?;
             }
         } else {
             // No cartridge — still clean up activated_entity rows referencing this namespace
@@ -8665,19 +7537,14 @@ impl DelightQLSystem {
                     [namespace_id],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to delete activated_entity",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to delete activated_entity", e.to_string())
                 })?;
         }
 
         // 4. Delete namespace itself
         bootstrap_conn
             .execute("DELETE FROM namespace WHERE id = ?1", [namespace_id])
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete namespace", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete namespace", e.to_string()))?;
 
         txn.commit()?;
 
@@ -8700,10 +7567,10 @@ impl DelightQLSystem {
         self.refuse_preexisting_namespace_mutation_in_program(
             namespace,
             "unmounting",
-            "directive/unmount/uncompensable",
+            |message| crate::diagnostic::Directive::UnmountUncompensable { message }.into(),
         )?;
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for unmount",
                 format!("Connection was poisoned: {}", e),
             )
@@ -8717,20 +7584,20 @@ impl DelightQLSystem {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|_| {
-                DelightQLError::database_error(
-                    format!("Namespace '{}' not found", namespace),
-                    "Namespace not found",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("Namespace '{}' not found", namespace),
+                    details: "Namespace not found".to_string(),
+                })
             })?;
 
         if kind != "data" {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                     "Cannot unmount '{}' — it is a {} namespace. Use unconsult!() for lib/grounded namespaces.",
                     namespace, kind
                 ),
-                "Wrong namespace kind",
-            ));
+    details: "Wrong namespace kind".to_string(),
+}));
         }
 
         // 2. Discover all descendant namespaces (for cascade)
@@ -8743,18 +7610,12 @@ impl DelightQLSystem {
                      ORDER BY length(fq_name) DESC",
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to query descendant namespaces",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to query descendant namespaces", e.to_string())
                 })?;
             let rows = stmt
                 .query_map([&pattern], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to query descendant namespaces",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to query descendant namespaces", e.to_string())
                 })?;
             rows.flatten().collect()
         };
@@ -8778,14 +7639,14 @@ impl DelightQLSystem {
                 .ok();
 
             if let Some((borrower_name, source_name)) = borrower_info {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Cannot unmount '{}' — {} is borrowed by grounded namespace '{}'. \
                          Unconsult the grounded namespace first.",
                         namespace, source_name, borrower_name
                     ),
-                    "Namespace borrowed",
-                ));
+                    details: "Namespace borrowed".to_string(),
+                }));
             }
 
             // Also check lib borrows from descendants
@@ -8805,14 +7666,14 @@ impl DelightQLSystem {
                 .ok();
 
             if let Some((borrower_name, source_name)) = lib_borrower {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Cannot unmount '{}' — {} is borrowed by grounded namespace '{}'. \
                          Unconsult the grounded namespace first.",
                         namespace, source_name, borrower_name
                     ),
-                    "Namespace borrowed",
-                ));
+                    details: "Namespace borrowed".to_string(),
+                }));
             }
         }
 
@@ -8839,10 +7700,7 @@ impl DelightQLSystem {
                        AND m.class = 'attach'",
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to snapshot unmount re-attach plan",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to snapshot unmount re-attach plan", e.to_string())
                 })?;
             let rows = stmt
                 .query_map(rusqlite::params![namespace, PRIMARY_CONNECTION_ID], |r| {
@@ -8852,10 +7710,7 @@ impl DelightQLSystem {
                     ))
                 })
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to snapshot unmount re-attach plan",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to snapshot unmount re-attach plan", e.to_string())
                 })?;
             rows.flatten()
                 .filter_map(|(alias, path)| Some((alias?, path?)))
@@ -8922,10 +7777,7 @@ impl DelightQLSystem {
                 )
                 .optional()
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to check surviving mount bindings",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to check surviving mount bindings", e.to_string())
                 })?;
             match heir {
                 Some(namespace_id) => {
@@ -8935,7 +7787,7 @@ impl DelightQLSystem {
                             [namespace_id],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error(
+                            Runtime::catalog(
                                 "Failed to hand the attachment to a surviving binding",
                                 e.to_string(),
                             )
@@ -8952,7 +7804,7 @@ impl DelightQLSystem {
         // connection, so the two cannot deadlock.)
         if !schemas_to_detach.is_empty() {
             let user_conn = self.connection.lock().map_err(|e| {
-                DelightQLError::connection_poison_error(
+                Runtime::poisoned(
                     "Failed to acquire user connection lock for unmount detach",
                     format!("Connection was poisoned: {}", e),
                 )
@@ -8975,7 +7827,7 @@ impl DelightQLSystem {
                             }
                         }
                     }
-                    return Err(DelightQLError::database_error(
+                    return Err(Runtime::catalog(
                         format!(
                             "unmount!() failed: could not DETACH '{}' — the mount is \
                              retained (catalog rolled back): {}",
@@ -9039,10 +7891,10 @@ impl DelightQLSystem {
         self.refuse_preexisting_namespace_mutation_in_program(
             namespace,
             "unconsulting",
-            "directive/unconsult/uncompensable",
+            |message| crate::diagnostic::Directive::UnconsultUncompensable { message }.into(),
         )?;
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for unconsult",
                 format!("Connection was poisoned: {}", e),
             )
@@ -9056,39 +7908,39 @@ impl DelightQLSystem {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|_| {
-                DelightQLError::database_error(
-                    format!("Namespace '{}' not found", namespace),
-                    "Namespace not found",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("Namespace '{}' not found", namespace),
+                    details: "Namespace not found".to_string(),
+                })
             })?;
 
         match kind.as_str() {
             "data" => {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Cannot unconsult '{}' — it is a data namespace. Use unmount!() instead.",
                         namespace
                     ),
-                    "Wrong namespace kind",
-                ));
+                    details: "Wrong namespace kind".to_string(),
+                }));
             }
             "system" => {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Cannot unconsult '{}' — system namespaces cannot be removed.",
                         namespace
                     ),
-                    "Protected namespace",
-                ));
+                    details: "Protected namespace".to_string(),
+                }));
             }
             "container" => {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                         "Cannot unconsult '{}' — structural container namespaces cannot be removed. Unmount or unconsult their child namespaces instead.",
                         namespace
                     ),
-                    "Protected namespace",
-                ));
+    details: "Protected namespace".to_string(),
+}));
             }
             "lib" | "grounded" | "scratch" | "unknown" => {
                 // These are all acceptable for unconsult
@@ -9109,18 +7961,12 @@ impl DelightQLSystem {
                      ORDER BY length(fq_name) DESC",
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to query descendant namespaces",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to query descendant namespaces", e.to_string())
                 })?;
             let rows = stmt
                 .query_map([&pattern], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to query descendant namespaces",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to query descendant namespaces", e.to_string())
                 })?;
             rows.flatten().collect()
         };
@@ -9146,14 +7992,14 @@ impl DelightQLSystem {
                 .ok();
 
             if let Some((borrower_name, source_name)) = borrower_info {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                         "Cannot unconsult '{}' — descendant '{}' is borrowed by grounded namespace '{}'. \
                          Unconsult the grounded namespace first.",
                         namespace, source_name, borrower_name
                     ),
-                    "Namespace borrowed",
-                ));
+    details: "Namespace borrowed".to_string(),
+}));
             }
 
             // Also check data namespace borrows
@@ -9173,14 +8019,14 @@ impl DelightQLSystem {
                 .ok();
 
             if let Some((borrower_name, source_name)) = data_borrower {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                         "Cannot unconsult '{}' — descendant '{}' is borrowed by grounded namespace '{}'. \
                          Unconsult the grounded namespace first.",
                         namespace, source_name, borrower_name
                     ),
-                    "Namespace borrowed",
-                ));
+    details: "Namespace borrowed".to_string(),
+}));
             }
         }
 
@@ -9235,27 +8081,25 @@ impl DelightQLSystem {
                 },
             };
 
-            // Use column_name for param_name when available, fall back to position-based name
+            // The declared identifier names the row, strop bit beside its
+            // bytes; a position no clause names falls back to its ordinal.
             let param_name_owned;
-            let param_name = match &pos_info.column_name {
-                Some(name) => name.as_str(),
+            let (param_name, stropped) = match &pos_info.column_name {
+                Some(name) => (name.as_str(), name.is_stropped()),
                 None => {
                     param_name_owned = format!("_pos{}", pos_info.position);
-                    &param_name_owned
+                    (param_name_owned.as_str(), false)
                 }
             };
+            let column_name = pos_info.column_name.as_ref().map(|name| name.as_str());
 
             bootstrap_conn
                 .execute(
-                    "INSERT INTO ho_param (entity_id, param_name, position, kind, column_name) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![entity_id, param_name, pos_info.position as i32, kind_str, &pos_info.column_name],
+                    "INSERT INTO ho_param (entity_id, param_name, position, kind, column_name, stropped) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![entity_id, param_name, pos_info.position as i32, kind_str, column_name, stropped],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to insert ho_param",
-                        e.to_string(),
-                        Box::new(e),
-                    )
+                    Runtime::catalog("Failed to insert ho_param", e.to_string())
                 })?;
             let ho_param_id = bootstrap_conn.last_insert_rowid() as i32;
 
@@ -9264,15 +8108,11 @@ impl DelightQLSystem {
                 for (col_pos, col_name) in columns.iter().enumerate() {
                     bootstrap_conn
                         .execute(
-                            "INSERT INTO ho_param_column (ho_param_id, column_name, column_position) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![ho_param_id, col_name, col_pos as i32],
+                            "INSERT INTO ho_param_column (ho_param_id, column_name, column_position, stropped) VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![ho_param_id, col_name.as_str(), col_pos as i32, col_name.is_stropped()],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error_with_source(
-                                "Failed to insert ho_param_column",
-                                e.to_string(),
-                                Box::new(e),
-                            )
+                            Runtime::catalog("Failed to insert ho_param_column", e.to_string())
                         })?;
                 }
             }
@@ -9314,11 +8154,7 @@ impl DelightQLSystem {
                 ],
             )
             .map_err(|e| {
-                DelightQLError::database_error_with_source(
-                    "Failed to insert functional_dependency",
-                    e.to_string(),
-                    Box::new(e),
-                )
+                Runtime::catalog("Failed to insert functional_dependency", e.to_string())
             })?;
         }
         Ok(())
@@ -9339,9 +8175,7 @@ impl DelightQLSystem {
              FROM entity_clause WHERE entity_id = ?2",
             rusqlite::params![new_entity_id, old_entity_id],
         )
-        .map_err(|e| {
-            DelightQLError::database_error("Failed to copy entity_clause", e.to_string())
-        })?;
+        .map_err(|e| Runtime::catalog("Failed to copy entity_clause", e.to_string()))?;
 
         // entity_attribute
         conn.execute(
@@ -9349,7 +8183,7 @@ impl DelightQLSystem {
              SELECT ?1, attribute_name, attribute_type, data_type, position, is_nullable, default_value
              FROM entity_attribute WHERE entity_id = ?2",
             rusqlite::params![new_entity_id, old_entity_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to copy entity_attribute", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to copy entity_attribute", e.to_string()))?;
 
         // referenced_entity
         conn.execute(
@@ -9357,16 +8191,16 @@ impl DelightQLSystem {
              SELECT name, namespace, apparent_type, ?1, location
              FROM referenced_entity WHERE containing_entity_id = ?2",
             rusqlite::params![new_entity_id, old_entity_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to copy referenced_entity", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to copy referenced_entity", e.to_string()))?;
 
         // ho_param + ho_param_column (FK chain: entity → ho_param → child)
         {
             let mut stmt = conn
-                .prepare("SELECT id, param_name, position, kind, column_name FROM ho_param WHERE entity_id = ?1")
+                .prepare("SELECT id, param_name, position, kind, column_name, stropped FROM ho_param WHERE entity_id = ?1")
                 .map_err(|e| {
-                    DelightQLError::database_error("Failed to query ho_param", e.to_string())
+                    Runtime::catalog("Failed to query ho_param", e.to_string())
                 })?;
-            let old_params: Vec<(i32, String, i32, String, Option<String>)> = stmt
+            let old_params: Vec<(i32, String, i32, String, Option<String>, bool)> = stmt
                 .query_map([old_entity_id], |row| {
                     Ok((
                         row.get(0)?,
@@ -9374,30 +8208,27 @@ impl DelightQLSystem {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 })
-                .map_err(|e| {
-                    DelightQLError::database_error("Failed to query ho_param", e.to_string())
-                })?
+                .map_err(|e| Runtime::catalog("Failed to query ho_param", e.to_string()))?
                 .flatten()
                 .collect();
 
-            for (old_hp_id, param_name, position, kind, column_name) in &old_params {
+            for (old_hp_id, param_name, position, kind, column_name, stropped) in &old_params {
                 conn.execute(
-                    "INSERT INTO ho_param (entity_id, param_name, position, kind, column_name) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![new_entity_id, param_name, position, kind, column_name],
-                ).map_err(|e| DelightQLError::database_error("Failed to copy ho_param", e.to_string()))?;
+                    "INSERT INTO ho_param (entity_id, param_name, position, kind, column_name, stropped) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![new_entity_id, param_name, position, kind, column_name, stropped],
+                ).map_err(|e| Runtime::catalog("Failed to copy ho_param", e.to_string()))?;
                 let new_hp_id = conn.last_insert_rowid() as i32;
 
                 conn.execute(
-                    "INSERT INTO ho_param_column (ho_param_id, column_name, column_position)
-                     SELECT ?1, column_name, column_position
+                    "INSERT INTO ho_param_column (ho_param_id, column_name, column_position, stropped)
+                     SELECT ?1, column_name, column_position, stropped
                      FROM ho_param_column WHERE ho_param_id = ?2",
                     rusqlite::params![new_hp_id, old_hp_id],
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("Failed to copy ho_param_column", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("Failed to copy ho_param_column", e.to_string()))?;
             }
         }
 
@@ -9408,7 +8239,7 @@ impl DelightQLSystem {
              FROM join_edge WHERE entity_id = ?2",
             rusqlite::params![new_entity_id, old_entity_id],
         )
-        .map_err(|e| DelightQLError::database_error("Failed to copy join_edge", e.to_string()))?;
+        .map_err(|e| Runtime::catalog("Failed to copy join_edge", e.to_string()))?;
 
         // functional_dependency — the declared mode travels with the entity
         // it is a capability of, or the copy would be relation-only.
@@ -9419,21 +8250,17 @@ impl DelightQLSystem {
             rusqlite::params![new_entity_id, old_entity_id],
         )
         .map_err(|e| {
-            DelightQLError::database_error("Failed to copy functional_dependency", e.to_string())
+            Runtime::catalog("Failed to copy functional_dependency", e.to_string())
         })?;
 
         // interior_entity + interior_entity_attribute (FK chain)
         {
             let mut stmt = conn
                 .prepare("SELECT id, column_name FROM interior_entity WHERE parent_entity_id = ?1")
-                .map_err(|e| {
-                    DelightQLError::database_error("Failed to query interior_entity", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("Failed to query interior_entity", e.to_string()))?;
             let old_ies: Vec<(i32, String)> = stmt
                 .query_map([old_entity_id], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| {
-                    DelightQLError::database_error("Failed to query interior_entity", e.to_string())
-                })?
+                .map_err(|e| Runtime::catalog("Failed to query interior_entity", e.to_string()))?
                 .flatten()
                 .collect();
 
@@ -9442,9 +8269,7 @@ impl DelightQLSystem {
                     "INSERT INTO interior_entity (parent_entity_id, column_name) VALUES (?1, ?2)",
                     rusqlite::params![new_entity_id, column_name],
                 )
-                .map_err(|e| {
-                    DelightQLError::database_error("Failed to copy interior_entity", e.to_string())
-                })?;
+                .map_err(|e| Runtime::catalog("Failed to copy interior_entity", e.to_string()))?;
                 let new_ie_id = conn.last_insert_rowid() as i32;
 
                 conn.execute(
@@ -9452,7 +8277,7 @@ impl DelightQLSystem {
                      SELECT ?1, attribute_name, position, child_interior_entity_id
                      FROM interior_entity_attribute WHERE interior_entity_id = ?2",
                     rusqlite::params![new_ie_id, old_ie_id],
-                ).map_err(|e| DelightQLError::database_error("Failed to copy interior_entity_attribute", e.to_string()))?;
+                ).map_err(|e| Runtime::catalog("Failed to copy interior_entity_attribute", e.to_string()))?;
             }
         }
 
@@ -9473,16 +8298,13 @@ impl DelightQLSystem {
                 [cartridge_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to delete interior_entity_attribute",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to delete interior_entity_attribute", e.to_string())
             })?;
 
         bootstrap_conn.execute(
             "DELETE FROM interior_entity WHERE parent_entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete interior_entity", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete interior_entity", e.to_string()))?;
 
         bootstrap_conn
             .execute(
@@ -9491,61 +8313,55 @@ impl DelightQLSystem {
                 WHERE e.cartridge_id = ?1)",
                 [cartridge_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete ho_param_column", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete ho_param_column", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM entity_resolution WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete entity_resolution", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete entity_resolution", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM ho_param WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete ho_param", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete ho_param", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM join_edge WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete join_edge", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete join_edge", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM functional_dependency WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete functional_dependency", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete functional_dependency", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM referenced_entity WHERE containing_entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete referenced_entity", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete referenced_entity", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM entity_attribute WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete entity_attribute", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete entity_attribute", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM entity_clause WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete entity_clause", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete entity_clause", e.to_string()))?;
 
         bootstrap_conn.execute(
             "DELETE FROM activated_entity WHERE entity_id IN (SELECT id FROM entity WHERE cartridge_id = ?1)",
             [cartridge_id],
-        ).map_err(|e| DelightQLError::database_error("Failed to delete activated_entity", e.to_string()))?;
+        ).map_err(|e| Runtime::catalog("Failed to delete activated_entity", e.to_string()))?;
 
         bootstrap_conn
             .execute("DELETE FROM entity WHERE cartridge_id = ?1", [cartridge_id])
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete entity", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete entity", e.to_string()))?;
 
         bootstrap_conn
             .execute("DELETE FROM cartridge WHERE id = ?1", [cartridge_id])
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete cartridge", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete cartridge", e.to_string()))?;
 
         Ok(())
     }
@@ -9561,10 +8377,7 @@ impl DelightQLSystem {
                 [entity_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to delete interior_entity_attribute",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to delete interior_entity_attribute", e.to_string())
             })?;
 
         bootstrap_conn
@@ -9572,9 +8385,7 @@ impl DelightQLSystem {
                 "DELETE FROM interior_entity WHERE parent_entity_id = ?1",
                 [entity_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete interior_entity", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete interior_entity", e.to_string()))?;
 
         bootstrap_conn
             .execute(
@@ -9582,30 +8393,22 @@ impl DelightQLSystem {
             SELECT hp.id FROM ho_param hp WHERE hp.entity_id = ?1)",
                 [entity_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete ho_param_column", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete ho_param_column", e.to_string()))?;
 
         bootstrap_conn
             .execute(
                 "DELETE FROM entity_resolution WHERE entity_id = ?1",
                 [entity_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete entity_resolution", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete entity_resolution", e.to_string()))?;
 
         bootstrap_conn
             .execute("DELETE FROM ho_param WHERE entity_id = ?1", [entity_id])
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete ho_param", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete ho_param", e.to_string()))?;
 
         bootstrap_conn
             .execute("DELETE FROM join_edge WHERE entity_id = ?1", [entity_id])
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete join_edge", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete join_edge", e.to_string()))?;
 
         bootstrap_conn
             .execute(
@@ -9613,10 +8416,7 @@ impl DelightQLSystem {
                 [entity_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to delete functional_dependency",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to delete functional_dependency", e.to_string())
             })?;
 
         bootstrap_conn
@@ -9624,42 +8424,32 @@ impl DelightQLSystem {
                 "DELETE FROM referenced_entity WHERE containing_entity_id = ?1",
                 [entity_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete referenced_entity", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete referenced_entity", e.to_string()))?;
 
         bootstrap_conn
             .execute(
                 "DELETE FROM entity_attribute WHERE entity_id = ?1",
                 [entity_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete entity_attribute", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete entity_attribute", e.to_string()))?;
 
         bootstrap_conn
             .execute(
                 "DELETE FROM entity_clause WHERE entity_id = ?1",
                 [entity_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete entity_clause", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete entity_clause", e.to_string()))?;
 
         bootstrap_conn
             .execute(
                 "DELETE FROM activated_entity WHERE entity_id = ?1",
                 [entity_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete activated_entity", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete activated_entity", e.to_string()))?;
 
         bootstrap_conn
             .execute("DELETE FROM entity WHERE id = ?1", [entity_id])
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete entity", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete entity", e.to_string()))?;
 
         Ok(())
     }
@@ -9687,20 +8477,14 @@ impl DelightQLSystem {
                  WHERE ae.namespace_id = ?1",
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to query cartridges for clear",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to query cartridges for clear", e.to_string())
                 })?;
             let rows = stmt
                 .query_map([namespace_id], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to query cartridges for clear",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to query cartridges for clear", e.to_string())
                 })?;
             rows.flatten().collect()
         };
@@ -9717,10 +8501,7 @@ impl DelightQLSystem {
                 [namespace_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to delete namespace_local_enlist",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to delete namespace_local_enlist", e.to_string())
             })?;
 
         bootstrap_conn
@@ -9729,10 +8510,7 @@ impl DelightQLSystem {
                 [namespace_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to delete namespace_local_alias",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to delete namespace_local_alias", e.to_string())
             })?;
 
         // Safety: catch orphan activated_entity rows
@@ -9742,10 +8520,7 @@ impl DelightQLSystem {
                 [namespace_id],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to delete activated_entity orphans",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to delete activated_entity orphans", e.to_string())
             })?;
 
         // Reconsulting replaces the liminal ledger WHOLE (EFFECT-ALGEBRA §8:
@@ -9757,9 +8532,7 @@ impl DelightQLSystem {
                 "DELETE FROM liminal_receipt WHERE namespace_id = ?1",
                 [namespace_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to clear liminal_receipt", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to clear liminal_receipt", e.to_string()))?;
 
         Ok(cartridge_infos)
     }
@@ -9776,9 +8549,7 @@ impl DelightQLSystem {
                 "DELETE FROM exposed_namespace WHERE exposing_namespace_id = ?1",
                 [namespace_id],
             )
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to delete exposed_namespace", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to delete exposed_namespace", e.to_string()))?;
         Ok(())
     }
 
@@ -9812,56 +8583,40 @@ impl DelightQLSystem {
         // they are validated by lookup below, not by this creation guard.)
         validate_user_namespace_target(new_ns_name)?;
 
-        let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire bootstrap database lock for ground",
-                format!("Connection was poisoned: {}", e),
-            )
-        })?;
+        // The catalog this grounding is judged and written in: locked under
+        // a shared borrow of the system for the operation's extent.
+        let bootstrap_conn = Catalog::open(
+            crate::defuse::CatalogRead::of(self),
+            "Failed to acquire bootstrap database lock for ground",
+        )?;
 
-        // 1. Validate data_ns exists
-        let data_ns_id: i32 = bootstrap_conn
-            .query_row(
-                "SELECT id FROM namespace WHERE fq_name = ?1",
-                [data_ns],
-                |row| row.get(0),
-            )
-            .map_err(|_| {
-                DelightQLError::database_error(
-                    format!(
-                        "Data namespace '{}' not found. Mount it first with mount!().",
-                        data_ns
-                    ),
-                    "Namespace not found",
-                )
-            })?;
-
-        // 2. Validate lib_ns exists
-        let lib_ns_id: i32 = bootstrap_conn
-            .query_row(
-                "SELECT id FROM namespace WHERE fq_name = ?1",
-                [lib_ns],
-                |row| row.get(0),
-            )
-            .map_err(|_| {
-                DelightQLError::database_error(
-                    format!(
-                        "Library namespace '{}' not found. Consult it first with consult!().",
-                        lib_ns
-                    ),
-                    "Namespace not found",
-                )
-            })?;
-
-        // Blueprint inertness (M2): grounding animates lib_ns's rules against
-        // data_ns's data. If EITHER is an archived blueprint (or a descendant
-        // of one), the grounded namespace would resurrect the inert archive —
-        // rules going live from lib_ns, or archived data being read from
-        // data_ns. Refuse both directions. (new_ns_name cannot be a blueprint:
+        // 1–2. Both namespaces must be LIVE: present, and neither an imprint
+        // archive nor nested in one. Grounding animates lib_ns's rules
+        // against data_ns's data; an archived side would resurrect the inert
+        // archive — rules going live from lib_ns, or archived data read from
+        // data_ns. (new_ns_name cannot be a blueprint:
         // ensure_namespace_available below refuses any existing name, and a
         // blueprint fq always already exists.)
-        refuse_if_blueprint(&bootstrap_conn, lib_ns)?;
-        refuse_if_blueprint(&bootstrap_conn, data_ns)?;
+        let data_live = LiveNamespace::admit(&bootstrap_conn, data_ns)?.ok_or_else(|| {
+            DelightQLError::from(Runtime::General {
+                message: format!(
+                    "Data namespace '{}' not found. Mount it first with mount!().",
+                    data_ns
+                ),
+                details: "Namespace not found".to_string(),
+            })
+        })?;
+        let data_ns_id: i32 = data_live.id();
+        let lib_live = LiveNamespace::admit(&bootstrap_conn, lib_ns)?.ok_or_else(|| {
+            DelightQLError::from(Runtime::General {
+                message: format!(
+                    "Library namespace '{}' not found. Consult it first with consult!().",
+                    lib_ns
+                ),
+                details: "Namespace not found".to_string(),
+            })
+        })?;
+        let lib_ns_id: i32 = lib_live.id();
 
         // 3. Validate new_ns_name does NOT exist
         ensure_namespace_available(&bootstrap_conn, new_ns_name)?;
@@ -9877,10 +8632,7 @@ impl DelightQLSystem {
                      WHERE n.fq_name = ?1",
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to query lib namespace entities",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to query lib namespace entities", e.to_string())
                 })?;
 
             let rows = match stmt.query_map([lib_ns], |row| {
@@ -9894,7 +8646,7 @@ impl DelightQLSystem {
             }) {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(DelightQLError::database_error(
+                    return Err(Runtime::catalog(
                         "Failed to query lib namespace entities",
                         e.to_string(),
                     ));
@@ -9903,13 +8655,14 @@ impl DelightQLSystem {
             rows.flatten().collect()
         };
 
-        // 4b. Discover manifest-only entities from _internal (if lib_ns has none of its own)
-        use crate::ddl::manifest;
-        let internal_ns_id = manifest::find_internal_ns(&bootstrap_conn, lib_ns)?;
+        // 4b. Discover manifest-only entities from _internal (if lib_ns has
+        // none of its own). The companions open through the judged live
+        // library — the only road to them.
+        let lib_manifest = crate::ddl::manifest::Manifest::open(&lib_live)?;
 
         let manifest_entity_names: Vec<String> = if entities.is_empty() {
-            if let Some(int_ns_id) = internal_ns_id {
-                manifest::discover_schema_entities(&bootstrap_conn, int_ns_id)?
+            if let Some(companions) = lib_manifest {
+                companions.schema_entities()?
             } else {
                 Vec::new()
             }
@@ -9936,16 +8689,14 @@ impl DelightQLSystem {
                 )
                 .unwrap_or(false);
             if intersects {
-                return Err(DelightQLError::validation_error_categorized(
-                    crate::uri_registry::subcat::GROUND_NAME_INTERSECTION,
-                    format!(
+                return Err(DelightQLError::from(Ground::NameIntersection {
+                    message: format!(
                         "ground!() refuses: '{entity_name}' is defined by BOTH the \
                          library '{lib_ns}' and the data namespace '{data_ns}'. A \
                          shared name makes every use of it ambiguous — grounding is \
                          refused whole and nothing is created (No intersection)."
                     ),
-                    "grounding name intersection",
-                ));
+                }));
             }
         }
         // THE DERIVATION IS ONE TRANSACTION: the namespace, its lexical
@@ -9967,10 +8718,7 @@ impl DelightQLSystem {
                     rusqlite::params![name, new_ns_name, data_ns],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to create grounded namespace",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to create grounded namespace", e.to_string())
                 })?;
             bootstrap_conn.last_insert_rowid() as i32
         };
@@ -9991,17 +8739,16 @@ impl DelightQLSystem {
         let mut count = world.root_families();
         for (_, entity_name, _, _, _) in &entities {
             // If entity has manifest data in _internal, create TEMP table from it
-            if let Some(int_ns_id) = internal_ns_id {
+            if let Some(companions) = lib_manifest {
                 if let Some(result) = crate::ddl_pipeline::create_temp_table_from_manifest(
-                    &bootstrap_conn,
-                    int_ns_id,
+                    companions,
                     entity_name,
                     self.bin_registry(),
                 )? {
                     bootstrap_conn
                         .execute_batch(&result.create_sql)
                         .map_err(|e| {
-                            DelightQLError::database_error(
+                            Runtime::catalog(
                                 format!(
                                     "Failed to CREATE TEMP TABLE for '{}': {}",
                                     entity_name, result.create_sql
@@ -10014,7 +8761,7 @@ impl DelightQLSystem {
         }
 
         // 8b. Create manifest-only entities (discovered from _internal, no entity in lib_ns)
-        if let (Some(int_ns_id), false) = (internal_ns_id, manifest_entity_names.is_empty()) {
+        if let (Some(companions), false) = (lib_manifest, manifest_entity_names.is_empty()) {
             // They register under the root's derivation cartridge, minted
             // here when the root derived no family of its own — a
             // cartridge exists only where entities stand under it.
@@ -10028,8 +8775,7 @@ impl DelightQLSystem {
             };
             for entity_name in &manifest_entity_names {
                 let result = match crate::ddl_pipeline::create_temp_table_from_manifest(
-                    &bootstrap_conn,
-                    int_ns_id,
+                    companions,
                     entity_name,
                     self.bin_registry(),
                 )? {
@@ -10041,7 +8787,7 @@ impl DelightQLSystem {
                     schema_rows,
                 } = result;
                 bootstrap_conn.execute_batch(&create_sql).map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!(
                             "Failed to CREATE TEMP TABLE for '{}': {}",
                             entity_name, create_sql
@@ -10062,10 +8808,7 @@ impl DelightQLSystem {
                         ],
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error(
-                            format!("Failed to create grounded entity '{}'", entity_name),
-                            e.to_string(),
-                        )
+                        Runtime::catalog(format!("Failed to create grounded entity '{}'", entity_name), e.to_string())
                     })?;
                 let new_entity_id = bootstrap_conn.last_insert_rowid() as i32;
 
@@ -10078,10 +8821,7 @@ impl DelightQLSystem {
                             rusqlite::params![new_entity_id, &sr.name, &sr.col_type, position as i32 + 1],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error(
-                                format!("Failed to register attribute '{}' for '{}'", sr.name, entity_name),
-                                e.to_string(),
-                            )
+                            Runtime::catalog(format!("Failed to register attribute '{}' for '{}'", sr.name, entity_name), e.to_string())
                         })?;
                 }
 
@@ -10092,10 +8832,7 @@ impl DelightQLSystem {
                         rusqlite::params![new_entity_id, new_ns_id, cartridge_id],
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error(
-                            format!("Failed to activate grounded entity '{}'", entity_name),
-                            e.to_string(),
-                        )
+                        Runtime::catalog(format!("Failed to activate grounded entity '{}'", entity_name), e.to_string())
                     })?;
 
                 count += 1;
@@ -10106,10 +8843,10 @@ impl DelightQLSystem {
         // any dependency, not from a manifest — has nothing to ground; a
         // pure facade over derivable children is not empty.
         if world.families() == 0 && manifest_entity_names.is_empty() {
-            return Err(DelightQLError::database_error(
-                format!("Library namespace '{}' has no entities to ground", lib_ns),
-                "Empty namespace",
-            ));
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!("Library namespace '{}' has no entities to ground", lib_ns),
+                details: "Empty namespace".to_string(),
+            }));
         }
 
         // 9. ADMISSION: every reference every derivative recorded is judged
@@ -10157,40 +8894,33 @@ impl DelightQLSystem {
                  WHERE n.fq_name || '.' || e.name = ?1",
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to prepare entity lookup for doc!()",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to prepare entity lookup for doc!()", e.to_string())
             })?;
         let ids: Vec<i64> = stmt
             .query_map([target], |row| row.get(0))
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to resolve doc!() target", e.to_string())
-            })?
+            .map_err(|e| Runtime::catalog("Failed to resolve doc!() target", e.to_string()))?
             .collect::<std::result::Result<Vec<i64>, _>>()
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to resolve doc!() target", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to resolve doc!() target", e.to_string()))?;
         drop(stmt);
         match ids.as_slice() {
-            [] => Err(DelightQLError::database_error(
-                format!("no such entity '{}'", target),
-                "doc!() target not found",
-            )),
+            [] => Err(DelightQLError::from(Runtime::General {
+                message: format!("no such entity '{}'", target),
+                details: "doc!() target not found".to_string(),
+            })),
             [entity_id] => {
                 conn.execute(
                     "UPDATE entity SET doc = ?1 WHERE id = ?2",
                     rusqlite::params![doc, entity_id],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!("Failed to set doc on entity '{}'", target),
                         e.to_string(),
                     )
                 })?;
                 Ok(())
             }
-            many => Err(DelightQLError::database_error(
+            many => Err(Runtime::catalog(
                 format!(
                     "ambiguous doc!() target '{}' resolves to {} entities",
                     target,
@@ -10206,7 +8936,7 @@ impl DelightQLSystem {
         // writes only while this window is open.
         let _catalog_window = self.bootstrap_guard.catalog_window();
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for doc",
                 format!("Connection was poisoned: {}", e),
             )
@@ -10220,27 +8950,20 @@ impl DelightQLSystem {
                  WHERE n.fq_name || '.' || e.name = ?1",
             )
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to prepare entity lookup for doc!()",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to prepare entity lookup for doc!()", e.to_string())
             })?;
 
         let ids: Vec<i64> = stmt
             .query_map([target], |row| row.get(0))
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to resolve doc!() target", e.to_string())
-            })?
+            .map_err(|e| Runtime::catalog("Failed to resolve doc!() target", e.to_string()))?
             .collect::<std::result::Result<Vec<i64>, _>>()
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to resolve doc!() target", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to resolve doc!() target", e.to_string()))?;
 
         match ids.as_slice() {
-            [] => Err(DelightQLError::database_error(
-                format!("no such entity '{}'", target),
-                "doc!() target not found",
-            )),
+            [] => Err(DelightQLError::from(Runtime::General {
+                message: format!("no such entity '{}'", target),
+                details: "doc!() target not found".to_string(),
+            })),
             [entity_id] => {
                 bootstrap_conn
                     .execute(
@@ -10248,14 +8971,14 @@ impl DelightQLSystem {
                         rusqlite::params![doc, entity_id],
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error(
+                        Runtime::catalog(
                             format!("Failed to set doc on entity '{}'", target),
                             e.to_string(),
                         )
                     })?;
                 Ok((target.to_string(), doc.to_string()))
             }
-            many => Err(DelightQLError::database_error(
+            many => Err(Runtime::catalog(
                 format!(
                     "ambiguous doc!() target '{}' resolves to {} entities",
                     target,
@@ -10288,86 +9011,54 @@ impl DelightQLSystem {
         // writes only while this window is open.
         let _catalog_window = self.bootstrap_guard.catalog_window();
         let replace = matches!(mode, ImprintMode::Replace);
-        let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                "Failed to acquire bootstrap lock for imprint",
-                format!("Connection was poisoned: {}", e),
-            )
-        })?;
+        // --- Phase 0: judge and read, under the catalog lock ---
+        // The lock is released before Phase 1 compiles (compilation locks
+        // the bootstrap store internally), so the proofs judged here reach
+        // only the manifest read; Phase 2 judges the source again under the
+        // lock that consumes it.
+        let bootstrap_conn = Catalog::open(
+            crate::defuse::CatalogRead::of(self),
+            "Failed to acquire bootstrap lock for imprint",
+        )?;
 
-        // 1. Validate source namespace exists and is a lib namespace
-        let (source_ns_id, source_kind): (i32, String) = bootstrap_conn
-            .query_row(
-                "SELECT id, kind FROM namespace WHERE fq_name = ?1",
-                [source_ns],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|_| {
-                DelightQLError::database_error(
-                    format!(
-                        "Source namespace '{}' not found. Consult it first with consult!().",
-                        source_ns
-                    ),
-                    "Namespace not found",
-                )
-            })?;
-
-        if source_kind == "data" || source_kind == "system" || source_kind == "container" {
-            return Err(DelightQLError::database_error(
-                format!(
-                    "imprint!() source '{}' is a {} namespace. Source must be a lib namespace.",
-                    source_ns, source_kind
-                ),
-                "Wrong namespace kind",
-            ));
-        }
-
-        // 2. Check borrow: source must not be borrowed by any active grounding
-        let borrowed: bool = bootstrap_conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM grounding WHERE lib_namespace_id = ?1)",
-                [source_ns_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if borrowed {
-            return Err(DelightQLError::database_error(
-                format!(
-                    "imprint!() cannot consume '{}' — it is borrowed by an active grounding. \
-                     Unconsult the grounded namespace first.",
+        // 1. The source: a live library — present, not an imprint archive
+        // nor nested in one, lib/scratch kind, not borrowed by a grounding.
+        // The proof is spent by the manifest read; it borrows the lock and
+        // does not outlive it.
+        let source = ImprintSource::admit(&bootstrap_conn, source_ns)?.ok_or_else(|| {
+            DelightQLError::from(Runtime::General {
+                message: format!(
+                    "Source namespace '{}' not found. Consult it first with consult!().",
                     source_ns
                 ),
-                "Source namespace borrowed",
-            ));
-        }
+                details: "Namespace not found".to_string(),
+            })
+        })?;
+        let source_ns_id = source.id();
 
-        // 3. Validate target namespace exists and is a data namespace
-        let (target_ns_id, target_kind): (i32, String) = bootstrap_conn
-            .query_row(
-                "SELECT id, kind FROM namespace WHERE fq_name = ?1",
-                [target_ns],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|_| {
-                DelightQLError::database_error(
-                    format!(
-                        "Target namespace '{}' not found. Mount it first with mount!().",
-                        target_ns
-                    ),
-                    "Namespace not found",
-                )
-            })?;
-
-        if target_kind != "data" {
-            return Err(DelightQLError::database_error(
+        // 2. The target: a live data namespace. A mount that an earlier
+        // consume relocated under an archive is inert with it — not a place
+        // new objects may land.
+        let target = LiveNamespace::admit(&bootstrap_conn, target_ns)?.ok_or_else(|| {
+            DelightQLError::from(Runtime::General {
+                message: format!(
+                    "Target namespace '{}' not found. Mount it first with mount!().",
+                    target_ns
+                ),
+                details: "Namespace not found".to_string(),
+            })
+        })?;
+        if target.kind() != "data" {
+            return Err(Runtime::catalog(
                 format!(
                     "imprint!() target '{}' is a {} namespace. Target must be a data namespace.",
-                    target_ns, target_kind
+                    target_ns,
+                    target.kind()
                 ),
                 "Wrong namespace kind",
             ));
         }
+        let target_ns_id = target.id();
 
         // 4. Get target connection info: schema alias + connection_id, via
         // the STORED mount link. An entity-path + source-match fallback
@@ -10444,30 +9135,23 @@ impl DelightQLSystem {
             }
         };
 
-        // 5. Find _internal child namespace for manifest data
+        // 5. The source's companions (`_internal`), opened through the judged
+        // source — the only road to manifest rows.
         use crate::ddl::manifest;
 
-        let internal_ns_id =
-            manifest::find_internal_ns(&bootstrap_conn, source_ns)?.ok_or_else(|| {
-                DelightQLError::database_error(
-                    format!(
-                        "imprint!() source '{}' has no schema definitions to \
-                         materialize. imprint! consumes a library whose .dql \
-                         file declares companion definitions — schema `(^)`, \
-                         constraints `(+)`, and/or defaults `($)` sigil blocks \
-                         alongside the rules (these populate the library's \
-                         _internal namespace). A rules-only library has \
-                         nothing to imprint; to persist its VIEWS, run the \
-                         queries via `dql query --to sql` against the target \
-                         instead.",
-                        source_ns
-                    ),
-                    "No _internal namespace",
-                )
-            })?;
+        let source_manifest = manifest::Manifest::open(source.live())?.ok_or_else(|| {
+            DelightQLError::from(Runtime::General {
+                message: format!(
+                    "imprint!() source '{}' has no schema definitions to \
+                         materialize.",
+                    source_ns
+                ),
+                details: "No _internal namespace".to_string(),
+            })
+        })?;
 
         // Discover entities: prefer imprinting() manifest, fall back to schema() ground values
-        let imprinting_rows = manifest::read_imprinting(&bootstrap_conn, internal_ns_id)?;
+        let imprinting_rows = source_manifest.imprinting()?;
 
         struct EntityTodo {
             name: String,
@@ -10486,8 +9170,7 @@ impl DelightQLSystem {
                 .collect()
         } else {
             // No imprinting() — discover from schema() ground values
-            let schema_entities =
-                manifest::discover_schema_entities(&bootstrap_conn, internal_ns_id)?;
+            let schema_entities = source_manifest.schema_entities()?;
             schema_entities
                 .into_iter()
                 .map(|name| EntityTodo {
@@ -10499,14 +9182,14 @@ impl DelightQLSystem {
         };
 
         if entity_todos.is_empty() {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!(
                     "imprint!() source '{}' has no manifest entities \
                      (no schema() or imprinting() definitions in _internal)",
                     source_ns
                 ),
-                "No manifest entities",
-            ));
+                details: "No manifest entities".to_string(),
+            }));
         }
 
         // --- Phase 0: Read ALL manifest data from bootstrap, then drop the lock ---
@@ -10531,11 +9214,9 @@ impl DelightQLSystem {
         for todo in &entity_todos {
             let entity_name = &todo.name;
 
-            let schema_rows = manifest::read_schema(&bootstrap_conn, internal_ns_id, entity_name)?;
-            let constraint_rows =
-                manifest::read_constraints(&bootstrap_conn, internal_ns_id, entity_name)?;
-            let default_rows =
-                manifest::read_defaults(&bootstrap_conn, internal_ns_id, entity_name)?;
+            let schema_rows = source_manifest.schema(entity_name)?;
+            let constraint_rows = source_manifest.constraints(entity_name)?;
+            let default_rows = source_manifest.defaults(entity_name)?;
 
             // Check for CTAS body: an entity with a view body in the source namespace
             let ctas_body: Option<String> = {
@@ -10633,8 +9314,8 @@ impl DelightQLSystem {
             // mid-imprint. Pinned by
             // system::imprint_helper_tests + companion_linear--77.
             if temp && target_schema_alias.is_some() {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "imprint!() entity '{}' is temporary but the target namespace is a \
                          mounted (aliased) database — SQLite requires a temporary table/view \
                          name to be unqualified, so it cannot be created in an attached schema. \
@@ -10642,8 +9323,8 @@ impl DelightQLSystem {
                          (A future fix can create it in the mounted connection's own temp schema.)",
                         entity_name
                     ),
-                    "Temporary imprint into a mounted target",
-                ));
+                    details: "Temporary imprint into a mounted target".to_string(),
+                }));
             }
 
             // Compile the rule body to SELECT once — used by view, CTAS, and the
@@ -10673,23 +9354,23 @@ impl DelightQLSystem {
                 // A view cannot carry a declaration — no column types/constraints/
                 // defaults on a view. v1 requires a bare rule.
                 if has_decl {
-                    return Err(DelightQLError::database_error(
-                        format!(
+                    return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                             "imprint!() entity '{}' is a view but declares schema/constraints/defaults — \
                              a view cannot carry them; drop the companions or materialize it as a table",
                             entity_name
                         ),
-                        "View with a declaration",
-                    ));
+    details: "View with a declaration".to_string(),
+}));
                 }
                 let select_sql = ctas_select_sql.ok_or_else(|| {
-                    DelightQLError::database_error(
-                        format!(
+                    DelightQLError::from(Runtime::General {
+                        message: format!(
                             "imprint!() view '{}' has no rule body — a view is a query",
                             entity_name
                         ),
-                        "View without a rule body",
-                    )
+                        details: "View without a rule body".to_string(),
+                    })
                 })?;
                 let temp_kw = if temp { "TEMP " } else { "" };
                 let qualified_create = format!(
@@ -10714,14 +9395,14 @@ impl DelightQLSystem {
             if item.schema_rows.is_empty()
                 && (!item.constraint_rows.is_empty() || !item.default_rows.is_empty())
             {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "imprint!() entity '{}' declares constraints/defaults but no schema() — \
                          declare column types in a schema(\"{}\") companion",
                         entity_name, entity_name
                     ),
-                    "Constraints/defaults without a schema declaration",
-                ));
+                    details: "Constraints/defaults without a schema declaration".to_string(),
+                }));
             }
 
             if has_decl {
@@ -10795,26 +9476,48 @@ impl DelightQLSystem {
                     materialized: Materialized::CtasTable,
                 });
             } else {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "imprint!() entity '{}' has neither a schema() nor a rule body — \
                          nothing to materialize",
                         entity_name
                     ),
-                    "No schema and no rule body",
-                ));
+                    details: "No schema and no rule body".to_string(),
+                }));
             }
         }
 
         // --- Phase 2: Execute (re-acquire bootstrap + target locks) ---
-        let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
-                "Failed to re-acquire bootstrap lock for imprint execution",
-                format!("Connection was poisoned: {}", e),
-            )
+        let bootstrap_conn = Catalog::open(
+            crate::defuse::CatalogRead::of(self),
+            "Failed to re-acquire bootstrap lock for imprint execution",
+        )?;
+        // The source is judged AGAIN under the lock that will consume it:
+        // the Phase 0 proof died with its lock, and this one is the only
+        // value the consume accepts. It must be the same row Phase 0 read —
+        // a namespace unconsulted and re-consulted at the path in between is
+        // a different library than the manifest being materialized.
+        let source = ImprintSource::admit(&bootstrap_conn, source_ns)?.ok_or_else(|| {
+            DelightQLError::from(Runtime::General {
+                message: format!(
+                    "imprint!() source '{}' disappeared while the imprint was being prepared",
+                    source_ns
+                ),
+                details: "Namespace not found".to_string(),
+            })
         })?;
+        if source.id() != source_ns_id {
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!(
+                    "imprint!() source '{}' was replaced while the imprint was being prepared; \
+                     re-run the imprint against the current library",
+                    source_ns
+                ),
+                details: "Source namespace replaced".to_string(),
+            }));
+        }
         let target_conn_guard = target_conn.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire target connection lock for imprint",
                 format!("Connection was poisoned: {}", e),
             )
@@ -10868,7 +9571,7 @@ impl DelightQLSystem {
                 }
             }
             if !clashes.is_empty() {
-                return Err(DelightQLError::database_error(
+                return Err(Runtime::catalog(
                     format!(
                         "imprint!() target object(s) already exist in '{}': {} — \
                          use imprint_replace!() to overwrite",
@@ -10898,10 +9601,10 @@ impl DelightQLSystem {
         target_conn_guard
             .execute("BEGIN IMMEDIATE", &[])
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "imprint: failed to open target transaction",
-                    e.to_string(),
-                )
+                DelightQLError::from(Runtime::General {
+                    message: "imprint: failed to open target transaction".to_string(),
+                    details: e.to_string(),
+                })
             })?;
         let mut target_txn = TargetTxnGuard {
             conn: &*target_conn_guard,
@@ -10919,7 +9622,7 @@ impl DelightQLSystem {
             target_conn_guard
                 .execute(&format!("DROP {} IF EXISTS {}", kw, qualified), &[])
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!("imprint_replace!() failed to drop existing '{}'", name),
                         e.to_string(),
                     )
@@ -10933,7 +9636,7 @@ impl DelightQLSystem {
             target_conn_guard
                 .execute(&entity.qualified_create, &[])
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!(
                             "Failed to execute CREATE TABLE for '{}': {}",
                             entity_name, entity.qualified_create,
@@ -10947,7 +9650,7 @@ impl DelightQLSystem {
             } = &entity.materialized
             {
                 target_conn_guard.execute(insert, &[]).map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!(
                             "Failed to execute CTAS INSERT for '{}': {}",
                             entity_name, insert,
@@ -10959,10 +9662,10 @@ impl DelightQLSystem {
         }
 
         target_conn_guard.execute("COMMIT", &[]).map_err(|e| {
-            DelightQLError::database_error(
-                "imprint: failed to commit target transaction",
-                e.to_string(),
-            )
+            DelightQLError::from(Runtime::General {
+                message: "imprint: failed to commit target transaction".to_string(),
+                details: e.to_string(),
+            })
         })?;
         target_txn.committed = true;
 
@@ -11008,10 +9711,10 @@ impl DelightQLSystem {
         // "materialized-but-not-cataloged" is the worst residual window, never
         // "data destroyed".
         bootstrap_conn.execute_batch("BEGIN").map_err(|e| {
-            DelightQLError::database_error(
-                "imprint: failed to begin catalog transaction",
-                e.to_string(),
-            )
+            DelightQLError::from(Runtime::General {
+                message: "imprint: failed to begin catalog transaction".to_string(),
+                details: e.to_string(),
+            })
         })?;
 
         let catalog_result = (|| -> Result<(Vec<(String, String, String)>, String)> {
@@ -11026,16 +9729,11 @@ impl DelightQLSystem {
                              WHERE ae.namespace_id = ?1 AND e.name = ?2",
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error(
-                                "prepare stale entity lookup",
-                                e.to_string(),
-                            )
+                            Runtime::catalog("prepare stale entity lookup", e.to_string())
                         })?;
                     let rows = stmt
                         .query_map(rusqlite::params![target_ns_id, name], |r| r.get(0))
-                        .map_err(|e| {
-                            DelightQLError::database_error("query stale entity", e.to_string())
-                        })?;
+                        .map_err(|e| Runtime::catalog("query stale entity", e.to_string()))?;
                     rows.filter_map(|r| r.ok()).collect()
                 };
                 for eid in stale_ids {
@@ -11063,10 +9761,7 @@ impl DelightQLSystem {
                     ],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
-                        "Failed to create imprint cartridge",
-                        e.to_string(),
-                    )
+                    Runtime::catalog("Failed to create imprint cartridge", e.to_string())
                 })?;
             let imprint_cartridge_id = bootstrap_conn.last_insert_rowid() as i32;
 
@@ -11094,10 +9789,7 @@ impl DelightQLSystem {
                         ],
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error(
-                            format!("Failed to register imprinted entity '{}'", entity_name),
-                            e.to_string(),
-                        )
+                        Runtime::catalog(format!("Failed to register imprinted entity '{}'", entity_name), e.to_string())
                     })?;
                 let new_entity_id = bootstrap_conn.last_insert_rowid() as i32;
 
@@ -11122,7 +9814,7 @@ impl DelightQLSystem {
                         let (_cols, rows) = target_conn_guard
                             .query_all_rows(&pragma, &[])
                             .map_err(|e| {
-                                DelightQLError::database_error(
+                                Runtime::catalog(
                                     format!(
                                         "Failed to read back schema for materialized entity '{}'",
                                         entity_name
@@ -11148,10 +9840,7 @@ impl DelightQLSystem {
                             rusqlite::params![new_entity_id, col_name, col_type, position as i32 + 1],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error(
-                                format!("Failed to register attribute '{}' for '{}'", col_name, entity_name),
-                                e.to_string(),
-                            )
+                            Runtime::catalog(format!("Failed to register attribute '{}' for '{}'", col_name, entity_name), e.to_string())
                         })?;
                 }
 
@@ -11162,10 +9851,7 @@ impl DelightQLSystem {
                         rusqlite::params![new_entity_id, target_ns_id, imprint_cartridge_id],
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error(
-                            format!("Failed to activate imprinted entity '{}'", entity_name),
-                            e.to_string(),
-                        )
+                        Runtime::catalog(format!("Failed to activate imprinted entity '{}'", entity_name), e.to_string())
                     })?;
 
                 // Populated = the CREATE also loaded rows: a CTAS table, or a
@@ -11200,15 +9886,13 @@ impl DelightQLSystem {
                     |row| row.get(0),
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         "Failed to query sys::meta namespace for imprint consume",
                         e.to_string(),
                     )
                 })?;
             let blueprint_fq = consume_source_to_blueprint(
-                &bootstrap_conn,
-                source_ns,
-                source_ns_id,
+                &source,
                 target_ns,
                 target_ns_id,
                 sys_meta_ns_id,
@@ -11221,25 +9905,25 @@ impl DelightQLSystem {
         let (results, blueprint_fq) = match catalog_result {
             Ok(v) => {
                 bootstrap_conn.execute_batch("COMMIT").map_err(|e| {
-                    DelightQLError::database_error(
-                        "imprint: failed to commit catalog transaction",
-                        e.to_string(),
-                    )
+                    DelightQLError::from(Runtime::General {
+                        message: "imprint: failed to commit catalog transaction".to_string(),
+                        details: e.to_string(),
+                    })
                 })?;
                 v
             }
             Err(e) => {
                 let _ = bootstrap_conn.execute_batch("ROLLBACK");
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "imprint: target '{}' WAS materialized, but cataloging it failed: {}. \
                          The data is safe; re-run as imprint_replace!() to finish the catalog \
                          (strict imprint! would now refuse — the materialized tables count as \
                          a clash).",
                         target_ns, e
                     ),
-                    "Imprint cataloging failed after materialization",
-                ));
+                    details: "Imprint cataloging failed after materialization".to_string(),
+                }));
             }
         };
 
@@ -11283,7 +9967,7 @@ impl DelightQLSystem {
         path: &delightql_types::namespace::NamespacePath,
     ) -> Result<Option<(Option<String>, i64)>> {
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for namespace resolution",
                 format!("Connection was poisoned: {}", e),
             )
@@ -11381,10 +10065,9 @@ impl DelightQLSystem {
                                 return Ok(None);
                             }
                             Err(e) => {
-                                return Err(DelightQLError::database_error_with_source(
+                                return Err(Runtime::catalog(
                                     "Failed to resolve namespace alias",
                                     e.to_string(),
-                                    Box::new(e),
                                 ));
                             }
                         }
@@ -11396,10 +10079,9 @@ impl DelightQLSystem {
                     // Bootstrap table doesn't exist - system not initialized
                     return Ok(None);
                 }
-                return Err(DelightQLError::database_error_with_source(
+                return Err(Runtime::catalog(
                     "Failed to query bootstrap.namespace",
                     e.to_string(),
-                    Box::new(e),
                 ));
             }
         };
@@ -11423,10 +10105,9 @@ impl DelightQLSystem {
             Ok(binding) => return Ok(Some(binding)),
             Err(rusqlite::Error::QueryReturnedNoRows) => {}
             Err(e) => {
-                return Err(DelightQLError::database_error_with_source(
+                return Err(Runtime::catalog(
                     "Failed to resolve namespace mount binding",
                     e.to_string(),
-                    Box::new(e),
                 ));
             }
         }
@@ -11460,10 +10141,9 @@ impl DelightQLSystem {
                 // Namespace exists but has no activated entities
                 Ok(None)
             }
-            Err(e) => Err(DelightQLError::database_error_with_source(
+            Err(e) => Err(Runtime::catalog(
                 "Failed to resolve backend schema and connection from bootstrap",
                 e.to_string(),
-                Box::new(e),
             )),
         }
     }
@@ -11490,7 +10170,7 @@ impl DelightQLSystem {
     ) -> Result<bool> {
         if self.active_liminal_program.borrow().is_none() {
             let conn = self.bootstrap_connection.lock().map_err(|e| {
-                DelightQLError::connection_poison_error(
+                Runtime::poisoned(
                     "Failed to acquire bootstrap lock for liminal program",
                     format!("Connection was poisoned: {e}"),
                 )
@@ -11522,7 +10202,7 @@ impl DelightQLSystem {
         commit: bool,
     ) -> Result<()> {
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock to close liminal program",
                 format!("Connection was poisoned: {e}"),
             )
@@ -11620,11 +10300,9 @@ impl DelightQLSystem {
                         schema_alias: schema_alias.to_string(),
                     }],
                 );
-                DelightQLError::database_error_categorized(
-                    "session_health/external_effect",
-                    message,
-                    "external effect recovery remains uncertain",
-                )
+                DelightQLError::from(crate::diagnostic::SessionHealth::ExternalEffect {
+                    message: message.to_string(),
+                })
             }
         }
     }
@@ -11694,16 +10372,16 @@ impl DelightQLSystem {
                             conn.execute(&format!("DETACH DATABASE '{escaped}'"), &[])
                                 .map(|_| ())
                                 .map_err(|error| {
-                                    DelightQLError::database_error(
-                                        format!(
+                                    DelightQLError::from(Runtime::General {
+                                        message: format!(
                                             "Failed to detach liminal alias '{}'",
                                             schema_alias
                                         ),
-                                        error.to_string(),
-                                    )
+                                        details: error.to_string(),
+                                    })
                                 })
                         }
-                        Err(error) => Err(DelightQLError::connection_poison_error(
+                        Err(error) => Err(Runtime::poisoned(
                             "Failed to acquire connection lock for liminal detach",
                             format!("Connection was poisoned: {error}"),
                         )),
@@ -11759,10 +10437,12 @@ impl DelightQLSystem {
             incident.message =
                 format!("{}; reset compensation failed: {message}", incident.message);
         }
-        Err(DelightQLError::database_error_categorized(
-            "session_health/external_effect",
-            format!("reset could not complete pending external-effect compensation: {message}"),
-            "external-effect recovery remains uncertain",
+        Err(DelightQLError::from(
+            crate::diagnostic::SessionHealth::ExternalEffect {
+                message: format!(
+                    "reset could not complete pending external-effect compensation: {message}"
+                ),
+            },
         ))
     }
 
@@ -11780,14 +10460,12 @@ impl DelightQLSystem {
         match &self.session_health {
             SessionHealth::Healthy => Ok(()),
             SessionHealth::Quarantined(incident) => Err(
-                DelightQLError::database_error_categorized(
-                    "session_health/external_effect",
-                    format!(
+                DelightQLError::from(crate::diagnostic::SessionHealth::ExternalEffect {
+    message: format!(
                         "the session is quarantined after {}: {} — reset or reconnect before issuing another query",
                         incident.operation, incident.message
                     ),
-                    "external effect recovery is uncertain",
-                ),
+}),
             ),
         }
     }
@@ -11832,7 +10510,7 @@ impl DelightQLSystem {
     /// The namespace row id for an fq name, if it exists.
     pub(crate) fn namespace_id(&self, fq: &str) -> Result<Option<i64>> {
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for namespace id",
                 format!("Connection was poisoned: {}", e),
             )
@@ -11841,7 +10519,7 @@ impl DelightQLSystem {
             r.get(0)
         })
         .optional()
-        .map_err(|e| DelightQLError::database_error("namespace id", e.to_string()))
+        .map_err(|e| Runtime::catalog("namespace id", e.to_string()))
     }
 
     /// Policy refusal for session-rearranging operations against namespaces
@@ -11855,25 +10533,21 @@ impl DelightQLSystem {
         &self,
         target_fq: &str,
         verb: &str,
-        badge: &'static str,
+        refuse: fn(String) -> DelightQLError,
     ) -> Result<()> {
         let Some((mark, _kind)) = self.active_liminal_program() else {
             return Ok(());
         };
         if let Some(id) = self.namespace_id(target_fq)? {
             if id <= mark {
-                return Err(DelightQLError::validation_error_categorized(
-                    badge,
-                    format!(
-                        "a consulted file executes as ONE atomic program: if any part \
-                         fails, everything the program created is torn down. \
-                         '{target_fq}' existed BEFORE this program began, so {verb} it \
-                         here could not be undone by that teardown — the program \
-                         refuses rather than risk leaving the session half-changed. \
-                         Do it at the prompt, outside the file"
-                    ),
-                    "uncompensable in liminal program",
-                ));
+                return Err(refuse(format!(
+                    "a consulted file executes as ONE atomic program: if any part \
+                     fails, everything the program created is torn down. \
+                     '{target_fq}' existed BEFORE this program began, so {verb} it \
+                     here could not be undone by that teardown — the program \
+                     refuses rather than risk leaving the session half-changed. \
+                     Do it at the prompt, outside the file"
+                )));
             }
         }
         Ok(())
@@ -11881,7 +10555,7 @@ impl DelightQLSystem {
 
     pub fn max_namespace_id(&self) -> Result<i64> {
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for namespace snapshot",
                 format!("Connection was poisoned: {}", e),
             )
@@ -11896,7 +10570,7 @@ impl DelightQLSystem {
     /// Does a namespace row exist for this fq name?
     pub fn namespace_exists(&self, fq: &str) -> Result<bool> {
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for namespace existence",
                 format!("Connection was poisoned: {}", e),
             )
@@ -11906,7 +10580,7 @@ impl DelightQLSystem {
                 Ok(())
             })
             .optional()
-            .map_err(|e| DelightQLError::database_error("namespace existence", e.to_string()))?
+            .map_err(|e| Runtime::catalog("namespace existence", e.to_string()))?
             .is_some())
     }
 
@@ -11922,7 +10596,7 @@ impl DelightQLSystem {
         )>,
     > {
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap connection lock",
                 format!("Connection was poisoned: {}", e),
             )
@@ -11940,10 +10614,9 @@ impl DelightQLSystem {
                 return Ok(None);
             }
             Err(e) => {
-                return Err(DelightQLError::database_error_with_source(
+                return Err(Runtime::catalog(
                     "Failed to query current namespace",
                     e.to_string(),
-                    Box::new(e),
                 ));
             }
         };
@@ -11980,7 +10653,7 @@ impl DelightQLSystem {
         ";
 
         let mut stmt = conn.prepare(query).map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 "Failed to prepare unqualified entity resolution",
                 e.to_string(),
             )
@@ -11994,12 +10667,7 @@ impl DelightQLSystem {
                     row.get::<_, bool>(2)?,
                 ))
             })
-            .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to resolve unqualified entity",
-                    e.to_string(),
-                )
-            })?
+            .map_err(|e| Runtime::catalog("Failed to resolve unqualified entity", e.to_string()))?
             .filter_map(|r| r.ok())
             .collect();
         drop(stmt);
@@ -12047,7 +10715,7 @@ impl DelightQLSystem {
                      WHERE e.name = ?1 COLLATE NOCASE",
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         "Failed to prepare fallback entity resolution",
                         e.to_string(),
                     )
@@ -12062,7 +10730,7 @@ impl DelightQLSystem {
                     ))
                 })
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         "Failed to resolve entity in fallback namespace",
                         e.to_string(),
                     )
@@ -12122,8 +10790,8 @@ impl DelightQLSystem {
                     .iter()
                     .find(|ns| **ns != scope_namespace)
                     .unwrap_or(namespaces.last().unwrap_or(&"ns"));
-                Err(DelightQLError::validation_error(
-                    format!(
+                Err(DelightQLError::from(Constraint::General {
+                    message: format!(
                         "Ambiguous entity '{}': found in namespaces {}. \
                          enlist!() brought overlapping names into scope. \
                          Fix: use qualified access ({}.{}(*)), \
@@ -12134,8 +10802,7 @@ impl DelightQLSystem {
                         entity_name,
                         enlisted_ns,
                     ),
-                    "Ambiguous unqualified entity resolution",
-                ))
+                }))
             }
         }
     }
@@ -12191,13 +10858,13 @@ impl DelightQLSystem {
     ) -> Result<Option<(String, String)>> {
         use rusqlite::OptionalExtension;
         let db = |what: &str, e: rusqlite::Error| {
-            DelightQLError::database_error(format!("{what}: {e}"), "effect target ownership")
+            Runtime::catalog(format!("{what}: {e}"), "effect target ownership")
         };
         let fq: Option<String> = match spelled_namespace {
             Some(ns) => {
                 let conn = self.get_bootstrap_connection();
                 let guard = conn.lock().map_err(|e| {
-                    DelightQLError::connection_poison_error(
+                    Runtime::poisoned(
                         "Failed to acquire bootstrap lock for target ownership",
                         format!("Connection was poisoned: {}", e),
                     )
@@ -12241,7 +10908,7 @@ impl DelightQLSystem {
         };
         let conn = self.get_bootstrap_connection();
         let guard = conn.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for target ownership",
                 format!("Connection was poisoned: {}", e),
             )
@@ -12272,13 +10939,13 @@ impl DelightQLSystem {
         use crate::pipeline::compiled_query::GuardPolarity;
         let conn = self.get_bootstrap_connection();
         let guard = conn.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for effect-plan materialization",
                 format!("Connection was poisoned: {}", e),
             )
         })?;
         let step = |msg: &str, e: rusqlite::Error| {
-            DelightQLError::database_error(format!("{msg}: {e}"), "effect-plan materialization")
+            Runtime::catalog(format!("{msg}: {e}"), "effect-plan materialization")
         };
         // Atomic clear-and-replace: a mid-
         // materialization failure must not leave a partial "canonical"
@@ -12363,7 +11030,7 @@ impl DelightQLSystem {
     ) -> Result<()> {
         let conn = self.get_bootstrap_connection();
         let guard = conn.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for effect-run materialization",
                 format!("Connection was poisoned: {}", e),
             )
@@ -12372,7 +11039,7 @@ impl DelightQLSystem {
         // a PARTIAL post-mortem behind — same boundary discipline as the
         // plan materializer.
         guard.execute_batch("BEGIN").map_err(|e| {
-            DelightQLError::database_error(
+            Runtime::catalog(
                 format!("beginning the run-outcome batch: {e}"),
                 "effect-run materialization",
             )
@@ -12386,7 +11053,7 @@ impl DelightQLSystem {
                         rusqlite::params![step_id as i64, status, detail],
                     )
                     .map_err(|e| {
-                        DelightQLError::database_error(
+                        Runtime::catalog(
                             format!("inserting a run outcome: {e}"),
                             "effect-run materialization",
                         )
@@ -12396,7 +11063,7 @@ impl DelightQLSystem {
         })();
         match body {
             Ok(()) => guard.execute_batch("COMMIT").map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("committing the run-outcome batch: {e}"),
                     "effect-run materialization",
                 )
@@ -12419,7 +11086,7 @@ impl DelightQLSystem {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let conn = self.bootstrap_connection.lock().map_err(|e| {
-                DelightQLError::connection_poison_error(
+                Runtime::poisoned(
                     "Failed to acquire bootstrap lock for assertion recording",
                     format!("Connection was poisoned: {e}"),
                 )
@@ -12440,7 +11107,7 @@ impl DelightQLSystem {
                 ],
             )
             .map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("recording an assertion verdict: {e}"),
                     "assertion verdict materialization",
                 )
@@ -12491,14 +11158,14 @@ impl DelightQLSystem {
             self.get_connection(connection_id)?
         };
         let guard = conn_arc.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire connection lock for created-object read-back",
                 format!("Connection was poisoned: {e}"),
             )
         })?;
         let (_existence_columns, existence_rows) =
             guard.query_all_rows(&existence_sql, &[]).map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("Failed to probe created object '{name}' existence"),
                     e.to_string(),
                 )
@@ -12510,10 +11177,11 @@ impl DelightQLSystem {
             });
         }
         if existence_rows.iter().any(|row| row.is_empty()) {
-            return Err(DelightQLError::validation_error(
-                format!("created-object existence probe for '{name}' returned a malformed row"),
-                "target metadata response is malformed",
-            ));
+            return Err(DelightQLError::from(Constraint::General {
+                message: format!(
+                    "created-object existence probe for '{name}' returned a malformed row"
+                ),
+            }));
         }
 
         // SQLite can expose a durable object through an attached schema and a
@@ -12548,29 +11216,27 @@ impl DelightQLSystem {
         };
         let (metadata_columns, metadata_rows) =
             guard.query_all_rows(&readback_sql, &[]).map_err(|e| {
-                DelightQLError::database_error(
+                Runtime::catalog(
                     format!("Failed to read created object '{name}' metadata"),
                     e.to_string(),
                 )
             })?;
         let required_columns = name_col.max(type_col) + 1;
         if metadata_columns.len() < required_columns {
-            return Err(DelightQLError::validation_error(
-                format!(
+            return Err(DelightQLError::from(Constraint::General {
+    message: format!(
                     "created-object metadata for '{name}' has {} columns; expected at least {required_columns}",
                     metadata_columns.len()
                 ),
-                "target metadata response is malformed",
-            ));
+}));
         }
         let attributes = metadata_rows
             .into_iter()
             .map(|row| {
                 if row.len() < required_columns {
-                    return Err(DelightQLError::validation_error(
-                        format!("created-object metadata row for '{name}' is truncated"),
-                        "target metadata response is malformed",
-                    ));
+                    return Err(DelightQLError::from(Constraint::General {
+                        message: format!("created-object metadata row for '{name}' is truncated"),
+                    }));
                 }
                 Ok((
                     row[name_col].as_wire_text().unwrap_or_default(),
@@ -12612,7 +11278,7 @@ impl DelightQLSystem {
                         .connection_namespace_fq(connection_id)?
                         .unwrap_or_else(|| "main".to_string());
                     let bootstrap = self.bootstrap_connection.lock().map_err(|e| {
-                        DelightQLError::connection_poison_error(
+                        Runtime::poisoned(
                             "Failed to acquire bootstrap lock for created-object namespace",
                             format!("Connection was poisoned: {e}"),
                         )
@@ -12625,19 +11291,16 @@ impl DelightQLSystem {
                         )
                         .optional()
                         .map_err(|e| {
-                            DelightQLError::database_error(
-                                "query created-object namespace",
-                                e.to_string(),
-                            )
+                            Runtime::catalog("query created-object namespace", e.to_string())
                         })?;
                     drop(bootstrap);
                     let Some(namespace_id) = namespace_id else {
-                        return Err(DelightQLError::validation_error(
-                            format!(
+                        return Err(DelightQLError::from(Runtime::General {
+                            message: format!(
                                 "created-object target namespace '{namespace_fq}' is not present"
                             ),
-                            "created-object catalog namespace is unavailable",
-                        ));
+                            details: "created-object catalog namespace is unavailable".to_string(),
+                        }));
                     };
                     registrations.push(CreatedObjectRegistration {
                         name: object.name.clone(),
@@ -12645,6 +11308,7 @@ impl DelightQLSystem {
                         connection_id,
                         namespace_id,
                         attributes: readback.attributes,
+                        interior_positions: object.interior_positions.clone(),
                     });
                     outcomes.push(RegistrationOutcome::Registered);
                 }
@@ -12665,7 +11329,7 @@ impl DelightQLSystem {
         }
 
         let bootstrap = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for created-object reconciliation",
                 format!("Connection was poisoned: {e}"),
             )
@@ -12703,7 +11367,7 @@ impl DelightQLSystem {
             return Ok(None);
         }
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for shadow-split probe",
                 format!("Connection was poisoned: {}", e),
             )
@@ -12723,7 +11387,7 @@ impl DelightQLSystem {
                 rusqlite::params![entity_name, namespace_fq],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .map_err(|e| DelightQLError::database_error("shadow-split probe", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("shadow-split probe", e.to_string()))?;
         Ok(match (session_id, competitor_id) {
             (Some(s), Some(c)) => Some((s, c)),
             _ => None,
@@ -12747,7 +11411,7 @@ impl DelightQLSystem {
     ) -> Result<Option<String>> {
         let source_path: Option<String> = {
             let conn = self.bootstrap_connection.lock().map_err(|e| {
-                DelightQLError::connection_poison_error(
+                Runtime::poisoned(
                     "Failed to acquire bootstrap lock for schema-alias recovery",
                     format!("Connection was poisoned: {}", e),
                 )
@@ -12772,7 +11436,7 @@ impl DelightQLSystem {
             .cloned()
             .unwrap_or_else(|| Arc::clone(&self.connection));
         let guard = target_conn.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire connection lock for schema-alias recovery",
                 format!("Connection was poisoned: {}", e),
             )
@@ -12800,33 +11464,38 @@ impl DelightQLSystem {
         entity_id: i64,
     ) -> Result<Vec<delightql_types::schema::ColumnInfo>> {
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for entity columns",
                 format!("Connection was poisoned: {}", e),
             )
         })?;
         let mut stmt = conn
             .prepare(
-                "SELECT attribute_name, position, is_nullable, data_type
-                 FROM entity_attribute
-                 WHERE entity_id = ?1 AND attribute_type = 'output_column'
-                 ORDER BY position",
+                "SELECT ea.attribute_name, ea.position, ea.is_nullable, ea.data_type,
+                        EXISTS (SELECT 1 FROM interior_entity ie
+                                 WHERE ie.parent_entity_id = ea.entity_id
+                                   AND ie.column_name = ea.attribute_name) AS interior
+                 FROM entity_attribute ea
+                 WHERE ea.entity_id = ?1 AND ea.attribute_type = 'output_column'
+                 ORDER BY ea.position",
             )
-            .map_err(|e| DelightQLError::database_error("entity column query", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("entity column query", e.to_string()))?;
         let cols = stmt
             .query_map([entity_id], |row| {
                 let name: String = row.get(0)?;
                 let position: i32 = row.get(1)?;
                 let is_nullable: Option<i32> = row.get(2)?;
                 let data_type: Option<String> = row.get(3)?;
+                let interior: i32 = row.get(4)?;
                 Ok(delightql_types::schema::ColumnInfo {
                     name: name.into(),
                     nullable: is_nullable.unwrap_or(1) != 0,
                     position: (position + 1) as usize, // 0-based to 1-based
                     declared_type: data_type.filter(|t| !t.is_empty()),
+                    interior: interior != 0,
                 })
             })
-            .map_err(|e| DelightQLError::database_error("entity column query", e.to_string()))?
+            .map_err(|e| Runtime::catalog("entity column query", e.to_string()))?
             .filter_map(|r| r.ok())
             .collect();
         Ok(cols)
@@ -12849,7 +11518,7 @@ impl DelightQLSystem {
             return Ok(Some("main".to_string()));
         }
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for connection-namespace lookup",
                 format!("Connection was poisoned: {}", e),
             )
@@ -12898,7 +11567,7 @@ impl DelightQLSystem {
         namespace_fq: &str,
     ) -> Result<Option<String>> {
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for mounted-schema lookup",
                 format!("Connection was poisoned: {}", e),
             )
@@ -12948,7 +11617,7 @@ impl DelightQLSystem {
             return self.mounted_engine_schema_for_namespace(&ns);
         }
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for mounted-schema lookup",
                 format!("Connection was poisoned: {}", e),
             )
@@ -12983,7 +11652,7 @@ impl DelightQLSystem {
             return Ok(None);
         }
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for holder-kind probe",
                 format!("Connection was poisoned: {}", e),
             )
@@ -13015,7 +11684,7 @@ impl DelightQLSystem {
         // writes only while this window is open.
         let _catalog_window = self.bootstrap_guard.catalog_window();
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for refresh",
                 format!("Connection was poisoned: {}", e),
             )
@@ -13029,21 +11698,21 @@ impl DelightQLSystem {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|_| {
-                DelightQLError::database_error(
-                    format!("Namespace '{}' not found", namespace),
-                    "Namespace not found",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("Namespace '{}' not found", namespace),
+                    details: "Namespace not found".to_string(),
+                })
             })?;
 
         if kind != "data" {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                     "Cannot refresh '{}' — it is a {} namespace. refresh!() only works on data namespaces. \
                      Use reconsult!() for lib namespaces.",
                     namespace, kind
                 ),
-                "Wrong namespace kind",
-            ));
+    details: "Wrong namespace kind".to_string(),
+}));
         }
 
         // 2. Retrieve cartridge metadata for re-introspection
@@ -13083,10 +11752,7 @@ impl DelightQLSystem {
             )
             .optional()
             .map_err(|e| {
-                DelightQLError::database_error(
-                    "Failed to read mount binding for refresh",
-                    e.to_string(),
-                )
+                Runtime::catalog("Failed to read mount binding for refresh", e.to_string())
             })?;
 
         let (
@@ -13113,13 +11779,13 @@ impl DelightQLSystem {
                 },
             ),
             None => {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Namespace '{}' has no cartridge — cannot refresh",
                         namespace
                     ),
-                    "No cartridge found",
-                ));
+                    details: "No cartridge found".to_string(),
+                }));
             }
         };
 
@@ -13127,14 +11793,14 @@ impl DelightQLSystem {
         // image cannot have changed, so a refresh has
         // nothing to observe. unmount!/mount! if a re-mount is really wanted.
         if source_uri.starts_with("delightql-bytes://") {
-            return Err(DelightQLError::database_error(
-                format!(
+            return Err(DelightQLError::from(Runtime::General {
+                message: format!(
                     "Cannot refresh '{}': it is mounted from an immutable embedded image ({}). \
                      Use unmount!() and mount!() to re-mount.",
                     namespace, source_uri
                 ),
-                "Embedded images are immutable",
-            ));
+                details: "Embedded images are immutable".to_string(),
+            }));
         }
 
         // 3. Begin a nestable transaction: refresh! is liminal-eligible and
@@ -13160,65 +11826,58 @@ impl DelightQLSystem {
         }
 
         // 5. Re-introspect
-        let entities = if connection_id == PRIMARY_CONNECTION_ID {
-            // ATTACH path: the PHYSICAL alias comes from the mount binding.
-            // Substituting the namespace NAME would introspect SQLite's hub
-            // instead of the attached database.
-            // The read is LOUD: for an attach-class
-            // mount the alias is REQUIRED identity — a catalog error or a
-            // NULL is an internal consistency failure, never a silent
-            // fallback that would recreate the hub-introspection bug.
-            let Some(alias) = attach_alias.as_deref() else {
-                let _ = bootstrap_conn.execute_batch("ROLLBACK");
-                return Err(DelightQLError::database_error(
-                    format!(
-                        "Cannot refresh '{}': it has a mount cartridge but no recorded \
+        let entities =
+            if connection_id == PRIMARY_CONNECTION_ID {
+                // ATTACH path: the PHYSICAL alias comes from the mount binding.
+                // Substituting the namespace NAME would introspect SQLite's hub
+                // instead of the attached database.
+                // The read is LOUD: for an attach-class
+                // mount the alias is REQUIRED identity — a catalog error or a
+                // NULL is an internal consistency failure, never a silent
+                // fallback that would recreate the hub-introspection bug.
+                let Some(alias) = attach_alias.as_deref() else {
+                    let _ = bootstrap_conn.execute_batch("ROLLBACK");
+                    return Err(DelightQLError::from(Runtime::General {
+                        message: format!(
+                            "Cannot refresh '{}': it has a mount cartridge but no recorded \
                          attachment alias — internal catalog inconsistency",
-                        namespace
-                    ),
-                    "Missing attach_alias for attach-class mount",
-                ));
-            };
-            match self.introspector.introspect_entities_in_schema(alias) {
-                Ok(e) => e,
-                Err(e) => {
-                    return Err(DelightQLError::database_error(
-                        format!("Failed to re-introspect schema '{}': {}", alias, e),
-                        e.to_string(),
-                    ));
-                }
-            }
-        } else {
-            // Factory path: use connection_factory
-            match &self.connection_factory {
-                Some(factory) => {
-                    let components = match factory.create(&source_uri) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            return Err(DelightQLError::database_error(
-                                format!("Failed to create connection for refresh: {}", e),
-                                e.to_string(),
-                            ));
-                        }
-                    };
-                    match components.introspector.introspect_entities() {
-                        Ok(e) => e,
-                        Err(e) => {
-                            return Err(DelightQLError::database_error(
-                                format!("Failed to re-introspect '{}': {}", source_uri, e),
-                                e.to_string(),
-                            ));
-                        }
+                            namespace
+                        ),
+                        details: "Missing attach_alias for attach-class mount".to_string(),
+                    }));
+                };
+                match self.introspector.introspect_entities_in_schema(alias) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        return Err(Runtime::catalog(
+                            format!("Failed to re-introspect schema '{}': {}", alias, e),
+                            e.to_string(),
+                        ));
                     }
                 }
-                None => {
-                    return Err(DelightQLError::database_error(
-                        "Cannot refresh factory-mounted namespace without connection factory",
-                        "No connection factory",
-                    ));
+            } else {
+                // Factory path: use connection_factory
+                match &self.connection_factory {
+                    Some(factory) => {
+                        let components = factory.create(&source_uri)?;
+                        match components.introspector.introspect_entities() {
+                            Ok(e) => e,
+                            Err(e) => {
+                                return Err(Runtime::catalog(
+                                    format!("Failed to re-introspect '{}': {}", source_uri, e),
+                                    e.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        return Err(DelightQLError::from(Runtime::General {
+    message: "Cannot refresh factory-mounted namespace without connection factory".to_string(),
+    details: "No connection factory".to_string(),
+}));
+                    }
                 }
-            }
-        };
+            };
 
         // 6. Re-register: new cartridge + entities
         let cartridge_id = {
@@ -13244,7 +11903,7 @@ impl DelightQLSystem {
                     connection_id,
                 ],
             ).map_err(|e| {
-                DelightQLError::database_error("Failed to create refresh cartridge", e.to_string())
+                Runtime::catalog("Failed to create refresh cartridge", e.to_string())
             })?;
             bootstrap_conn.last_insert_rowid() as i32
         };
@@ -13255,10 +11914,11 @@ impl DelightQLSystem {
                 cartridge_id as i64,
                 connection_id,
                 attach_alias.clone().ok_or_else(|| {
-                    DelightQLError::database_error(
-                        "Cannot refresh attach mount without an attachment alias",
-                        "Missing mount alias",
-                    )
+                    DelightQLError::from(Runtime::General {
+                        message: "Cannot refresh attach mount without an attachment alias"
+                            .to_string(),
+                        details: "Missing mount alias".to_string(),
+                    })
                 })?,
                 // Refresh re-reads a schema that is already open; it opens
                 // nothing, so it cannot turn a borrowed handle into an owned
@@ -13284,7 +11944,7 @@ impl DelightQLSystem {
             cartridge_id,
             &entities,
         ) {
-            return Err(DelightQLError::database_error(
+            return Err(Runtime::catalog(
                 format!("Failed to insert discovered entities: {}", e),
                 e.to_string(),
             ));
@@ -13295,7 +11955,7 @@ impl DelightQLSystem {
             cartridge_id,
             ns_id as i32,
         ) {
-            return Err(DelightQLError::database_error(
+            return Err(Runtime::catalog(
                 format!("Failed to activate entities: {}", e),
                 e.to_string(),
             ));
@@ -13308,7 +11968,7 @@ impl DelightQLSystem {
             crate::defuse::grounded_world::DerivedWorld::current(&bootstrap_conn, root_id)?
                 .admit(&bootstrap_conn, crate::defuse::CatalogRead::of(self))
                 .map_err(|e| {
-                    DelightQLError::database_error(
+                    Runtime::catalog(
                         format!("Grounding contract violation: data '{namespace}'. {e}"),
                         "Grounding contract violated",
                     )
@@ -13349,11 +12009,11 @@ impl DelightQLSystem {
             self.refuse_preexisting_namespace_mutation_in_program(
                 namespace,
                 "reloading",
-                "directive/reconsult/uncompensable",
+                |message| crate::diagnostic::Directive::ReconsultUncompensable { message }.into(),
             )?;
         }
         let bootstrap_conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap database lock for reconsult",
                 format!("Connection was poisoned: {}", e),
             )
@@ -13367,48 +12027,48 @@ impl DelightQLSystem {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(|_| {
-                DelightQLError::database_error(
-                    format!("Namespace '{}' not found", namespace),
-                    "Namespace not found",
-                )
+                DelightQLError::from(Runtime::General {
+                    message: format!("Namespace '{}' not found", namespace),
+                    details: "Namespace not found".to_string(),
+                })
             })?;
 
         match kind.as_str() {
             "data" => {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Cannot reconsult '{}' — it is a data namespace. Use refresh!() instead.",
                         namespace
                     ),
-                    "Wrong namespace kind",
-                ));
+                    details: "Wrong namespace kind".to_string(),
+                }));
             }
             "system" => {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+                    message: format!(
                         "Cannot reconsult '{}' — system namespaces cannot be modified.",
                         namespace
                     ),
-                    "Protected namespace",
-                ));
+                    details: "Protected namespace".to_string(),
+                }));
             }
             "container" => {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                         "Cannot reconsult '{}' — structural container namespaces have no authored source. Reconsult their child namespaces instead.",
                         namespace
                     ),
-                    "Protected namespace",
-                ));
+    details: "Protected namespace".to_string(),
+}));
             }
             "grounded" => {
-                return Err(DelightQLError::database_error(
-                    format!(
+                return Err(DelightQLError::from(Runtime::General {
+    message: format!(
                         "Cannot reconsult '{}' — it is a grounded namespace. Reconsult the source lib namespace instead.",
                         namespace
                     ),
-                    "Wrong namespace kind",
-                ));
+    details: "Wrong namespace kind".to_string(),
+}));
             }
             "lib" | "scratch" | "unknown" => { /* acceptable */ }
             other => panic!(
@@ -13440,14 +12100,14 @@ impl DelightQLSystem {
                     match uri {
                         Some(u) if u.starts_with("file://") => u[7..].to_string(),
                         _ => {
-                            return Err(DelightQLError::database_error(
-                                format!(
+                            return Err(DelightQLError::from(Runtime::General {
+                                message: format!(
                                     "Cannot determine source file for namespace '{}'. \
                                      Provide a file path: reconsult!(\"ns\", \"path/to/file.dql\")",
                                     namespace
                                 ),
-                                "No source file",
-                            ));
+                                details: "No source file".to_string(),
+                            }));
                         }
                     }
                 }
@@ -13462,16 +12122,15 @@ impl DelightQLSystem {
         let file_path = resolved_path.display().to_string();
 
         let source = std::fs::read_to_string(&file_path).map_err(|e| {
-            DelightQLError::database_error(
-                format!("reconsult!() failed to read file '{}': {}", file_path, e),
-                "File read error",
-            )
+            DelightQLError::from(Runtime::Io {
+                message: format!("reconsult!() failed to read file '{}': {}", file_path, e),
+            })
         })?;
 
         // ONE PARSE PER CONSULTED SUBMISSION, reconsult's as much as consult's.
         let consulted = crate::bin_cartridge::prelude::consult::Consulted::read(&source).map_err(
             |e| match e {
-                DelightQLError::ParseError { .. } => DelightQLError::database_error(
+                DelightQLError::Parse(_) => Runtime::catalog(
                     format!("reconsult!() failed to parse '{}': {}", file_path, e),
                     "Parse error",
                 ),
@@ -13552,7 +12211,7 @@ impl DelightQLSystem {
     /// namespace.
     pub fn liminal_echo_columns(&self, ns_fq: &str) -> Result<Option<(String, Vec<String>)>> {
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap lock for liminal ledger",
                 format!("Connection was poisoned: {}", e),
             )
@@ -13565,9 +12224,7 @@ impl DelightQLSystem {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to look up namespace", e.to_string())
-            })?
+            .map_err(|e| Runtime::catalog("Failed to look up namespace", e.to_string()))?
             .or_else(|| {
                 conn.query_row(
                     "SELECT n.id, n.fq_name FROM namespace_alias a
@@ -13589,21 +12246,17 @@ impl DelightQLSystem {
         // order; first appearance wins the column position.
         let mut stmt = conn
             .prepare("SELECT echoes FROM liminal_receipt WHERE namespace_id = ?1 ORDER BY id")
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to read liminal ledger", e.to_string())
-            })?;
+            .map_err(|e| Runtime::catalog("Failed to read liminal ledger", e.to_string()))?;
         let echo_lists: Vec<String> = stmt
             .query_map([ns_id], |row| row.get::<_, String>(0))
-            .map_err(|e| {
-                DelightQLError::database_error("Failed to read liminal ledger", e.to_string())
-            })?
+            .map_err(|e| Runtime::catalog("Failed to read liminal ledger", e.to_string()))?
             .flatten()
             .collect();
 
         let mut union: Vec<String> = Vec::new();
         for list in echo_lists {
             let names: Vec<String> = serde_json::from_str(&list).map_err(|e| {
-                DelightQLError::database_error("Corrupt liminal receipt echo list", e.to_string())
+                Runtime::catalog("Corrupt liminal receipt echo list", e.to_string())
             })?;
             for name in names {
                 if !union.contains(&name) {
@@ -13627,14 +12280,14 @@ impl DelightQLSystem {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| DelightQLError::database_error("ns lookup", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("ns lookup", e.to_string()))?;
         let Some(ns_id) = ns_id else { return Ok(None) };
         let mut stmt = conn
             .prepare("SELECT operation FROM liminal_receipt WHERE namespace_id = ?1 ORDER BY id")
-            .map_err(|e| DelightQLError::database_error("ledger read", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("ledger read", e.to_string()))?;
         let ops = stmt
             .query_map([ns_id], |row| row.get::<_, String>(0))
-            .map_err(|e| DelightQLError::database_error("ledger read", e.to_string()))?
+            .map_err(|e| Runtime::catalog("ledger read", e.to_string()))?
             .flatten()
             .collect();
         Ok(Some(ops))
@@ -13658,7 +12311,7 @@ impl DelightQLSystem {
         entity_name: &str,
     ) -> Result<Option<delightql_types::SqlIdentifier>> {
         let conn = self.bootstrap_connection.lock().map_err(|e| {
-            DelightQLError::connection_poison_error(
+            Runtime::poisoned(
                 "Failed to acquire bootstrap connection lock",
                 format!("Connection was poisoned: {}", e),
             )
@@ -13679,10 +12332,9 @@ impl DelightQLSystem {
         }) {
             Ok(canonical) => Ok(Some(delightql_types::SqlIdentifier::new(canonical))),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(DelightQLError::database_error_with_source(
+            Err(e) => Err(Runtime::catalog(
                 "Failed to get canonical entity name",
                 e.to_string(),
-                Box::new(e),
             )),
         }
     }
@@ -13757,13 +12409,7 @@ fn register_tree_group(
         "INSERT INTO interior_entity (parent_entity_id, column_name) VALUES (?1, ?2)",
         rusqlite::params![entity_id, alias],
     )
-    .map_err(|e| {
-        DelightQLError::database_error_with_source(
-            "Failed to insert interior_entity",
-            e.to_string(),
-            Box::new(e),
-        )
-    })?;
+    .map_err(|e| Runtime::catalog("Failed to insert interior_entity", e.to_string()))?;
     let interior_entity_id = conn.last_insert_rowid() as i32;
 
     register_record_members(conn, interior_entity_id, entity_id, members)?;
@@ -13794,11 +12440,7 @@ fn register_record_members(
                     rusqlite::params![interior_entity_id, column.as_str(), position as i32],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to insert interior_entity_attribute",
-                        e.to_string(),
-                        Box::new(e),
-                    )
+                    Runtime::catalog("Failed to insert interior_entity_attribute", e.to_string())
                 })?;
             }
             RecordMember::Induced { key, value } => {
@@ -13812,11 +12454,7 @@ fn register_record_members(
                             rusqlite::params![parent_entity_id, key.as_str()],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error_with_source(
-                                "Failed to insert child interior_entity",
-                                e.to_string(),
-                                Box::new(e),
-                            )
+                            Runtime::catalog("Failed to insert child interior_entity", e.to_string())
                         })?;
                         let child_interior_entity_id = conn.last_insert_rowid() as i32;
 
@@ -13841,11 +12479,7 @@ fn register_record_members(
                             ],
                         )
                         .map_err(|e| {
-                            DelightQLError::database_error_with_source(
-                                "Failed to insert interior_entity_attribute (nested)",
-                                e.to_string(),
-                                Box::new(e),
-                            )
+                            Runtime::catalog("Failed to insert interior_entity_attribute (nested)", e.to_string())
                         })?;
                     }
                 }
@@ -13858,11 +12492,7 @@ fn register_record_members(
                     rusqlite::params![interior_entity_id, key.as_str(), position as i32],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to insert interior_entity_attribute",
-                        e.to_string(),
-                        Box::new(e),
-                    )
+                    Runtime::catalog("Failed to insert interior_entity_attribute", e.to_string())
                 })?;
             }
             // A metadata member's interior keys are data, so there is no
@@ -13875,11 +12505,7 @@ fn register_record_members(
                     rusqlite::params![interior_entity_id, key.as_str(), position as i32],
                 )
                 .map_err(|e| {
-                    DelightQLError::database_error_with_source(
-                        "Failed to insert interior_entity_attribute",
-                        e.to_string(),
-                        Box::new(e),
-                    )
+                    Runtime::catalog("Failed to insert interior_entity_attribute", e.to_string())
                 })?;
             }
             // A spread is spent at resolution and this registrar reads the
@@ -13962,15 +12588,15 @@ mod stdlib_load_tests {
 
 #[cfg(test)]
 mod seed_program_tests {
-    //! Embedded `seed/*.dql` programs RUN at every `open()` and every
-    //! `reinit_bootstrap` for their effects (unlike autoloads, which only
-    //! parse-and-consult on demand). `open()` already runs them collaterally,
-    //! so a broken seed fails half the suite with no clue which seed is at
-    //! fault (the ptzxpkmx lesson). These tests are TARGETED: they build a
-    //! fresh in-memory system and run each seed individually, naming the
-    //! culprit on failure.
+    //! Embedded `seed/*.dql` programs RUN ONCE, while the pristine world is
+    //! finalized, for their effects (unlike autoloads, which only
+    //! parse-and-consult on demand); every session is an instance of the
+    //! frozen result and no reset runs them. Construction already runs them
+    //! collaterally, so a broken seed fails half the suite with no clue
+    //! which seed is at fault. These tests are TARGETED: they build a fresh
+    //! system and run each seed individually, naming the culprit on failure.
 
-    use super::DelightQLSystem;
+    use super::ReadySystem;
     use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
     use delightql_types::test_utils::MockDatabaseConnection;
     use delightql_types::Result;
@@ -13988,9 +12614,9 @@ mod seed_program_tests {
         }
     }
 
-    fn fresh_system() -> DelightQLSystem {
+    fn fresh_system() -> ReadySystem {
         let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+        ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh in-memory system should build")
     }
 
@@ -14153,7 +12779,7 @@ mod mount_link_tests {
     //! a full citizen); a failed refresh rolls back link and cartridge
     //! TOGETHER; the bootstrap catalog stays FK-consistent.
 
-    use super::DelightQLSystem;
+    use super::{DelightQLSystem, ReadySystem};
     use delightql_types::introspect::{
         DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity,
     };
@@ -14207,7 +12833,7 @@ mod mount_link_tests {
             if self.calls.fetch_add(1, Ordering::SeqCst) < self.ok_calls {
                 Ok(vec![])
             } else {
-                Err(delightql_types::DelightQLError::database_error(
+                Err(crate::diagnostic::Runtime::catalog(
                     "induced introspection failure",
                     "mount_link_tests",
                 ))
@@ -14215,9 +12841,9 @@ mod mount_link_tests {
         }
     }
 
-    fn system_with(introspector: Box<dyn DatabaseIntrospector>) -> DelightQLSystem {
+    fn system_with(introspector: Box<dyn DatabaseIntrospector>) -> ReadySystem {
         let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        DelightQLSystem::new(conn, introspector, "sqlite").expect("system should build")
+        ReadySystem::new(conn, introspector, "sqlite").expect("system should build")
     }
 
     /// A VALID SQLite file with zero tables — the empty-image case.
@@ -14405,7 +13031,7 @@ mod mount_link_tests {
         let db = empty_db(&dir, "aux.sqlite");
         let mock = Arc::new(Mutex::new(MockDatabaseConnection::new()));
         let conn: Arc<Mutex<dyn DatabaseConnection>> = mock.clone();
-        let mut system = DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite").unwrap();
+        let mut system = ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite").unwrap();
 
         // The auxiliary cartridge is created BEFORE the mount: its LOWER id
         // precedes the mount cartridge in the
@@ -14530,7 +13156,7 @@ mod mount_link_tests {
         let db = empty_db(&dir, "dt.sqlite");
         let mock = Arc::new(Mutex::new(MockDatabaseConnection::new()));
         let conn: Arc<Mutex<dyn DatabaseConnection>> = mock.clone();
-        let mut system = DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite").unwrap();
+        let mut system = ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite").unwrap();
         system.mount_database(&db, "dtns").expect("mount");
         let link = link_of(&system, "dtns").expect("link set");
 
@@ -14727,7 +13353,7 @@ mod mount_new_database_tests {
     //! round-trip (mount_new! then mount! the same file, with a real read-back)
     //! is the CLI `mount_new_roundtrip` integration test.
 
-    use super::{DelightQLSystem, LiminalProgramKind};
+    use super::{LiminalProgramKind, ReadySystem};
     use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
     use delightql_types::test_utils::MockDatabaseConnection;
     use delightql_types::Result;
@@ -14743,9 +13369,9 @@ mod mount_new_database_tests {
         }
     }
 
-    fn fresh_system() -> DelightQLSystem {
+    fn fresh_system() -> ReadySystem {
         let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+        ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh in-memory system should build")
     }
 
@@ -15096,7 +13722,7 @@ mod red5_w9_tree_group_tests {
 
 #[cfg(test)]
 mod liminal_boundary_tests {
-    use super::{DelightQLSystem, LiminalProgramKind};
+    use super::{LiminalProgramKind, ReadySystem};
     use crate::external_effects::{
         CreatedFilePriorState, ExternalEffect, LiminalCatalogBoundary, LiminalClose, LiminalFileOps,
     };
@@ -15119,9 +13745,9 @@ mod liminal_boundary_tests {
         }
     }
 
-    fn fresh_system() -> DelightQLSystem {
+    fn fresh_system() -> ReadySystem {
         let connection = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        DelightQLSystem::new(connection, Box::new(EmptyIntrospector), "sqlite")
+        ReadySystem::new(connection, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh system should build")
     }
 
@@ -15171,9 +13797,11 @@ mod liminal_boundary_tests {
                 LiminalClose::Rollback => self.fail_rollback,
             };
             if failed {
-                Err(delightql_types::DelightQLError::database_error(
-                    "scripted liminal close failure",
-                    format!("{close:?}"),
+                Err(crate::diagnostic::DelightQLError::from(
+                    crate::diagnostic::Runtime::General {
+                        message: "scripted liminal close failure".to_string(),
+                        details: format!("{close:?}"),
+                    },
                 ))
             } else {
                 Ok(())
@@ -15204,9 +13832,11 @@ mod liminal_boundary_tests {
                 .unwrap()
                 .push(format!("remove:{}", path.display()));
             if self.fail_remove {
-                Err(delightql_types::DelightQLError::database_error(
-                    "scripted remove failure",
-                    path.display().to_string(),
+                Err(crate::diagnostic::DelightQLError::from(
+                    crate::diagnostic::Runtime::General {
+                        message: "scripted remove failure".to_string(),
+                        details: path.display().to_string(),
+                    },
                 ))
             } else {
                 Ok(())
@@ -15219,9 +13849,11 @@ mod liminal_boundary_tests {
                 .unwrap()
                 .push(format!("restore:{}", path.display()));
             if self.fail_restore {
-                Err(delightql_types::DelightQLError::database_error(
-                    "scripted restore failure",
-                    path.display().to_string(),
+                Err(crate::diagnostic::DelightQLError::from(
+                    crate::diagnostic::Runtime::General {
+                        message: "scripted restore failure".to_string(),
+                        details: path.display().to_string(),
+                    },
                 ))
             } else {
                 Ok(())
@@ -15319,16 +13951,13 @@ mod liminal_boundary_tests {
     #[test]
     fn failed_mount_inverse_uses_health_identity_and_retains_both_uris() {
         let mut system = fresh_system();
-        let primary = crate::error::DelightQLError::database_error_categorized(
-            "mount/registration",
-            "mount registration failed",
-            "catalog registration",
-        );
-        let cleanup = crate::error::DelightQLError::database_error_categorized(
-            "mount/detach",
-            "detach failed",
-            "alias cleanup",
-        );
+        let primary =
+            crate::diagnostic::DelightQLError::from(crate::diagnostic::Mount::Registration {
+                message: "mount registration failed".to_string(),
+            });
+        let cleanup = crate::diagnostic::DelightQLError::from(crate::diagnostic::Mount::Detach {
+            message: "detach failed".to_string(),
+        });
         let primary_uri = primary.error_uri();
         let cleanup_uri = cleanup.error_uri();
 
@@ -15518,7 +14147,7 @@ mod liminal_boundary_tests {
 // =============================================================================
 #[cfg(test)]
 mod compiler_limit_publication_tests {
-    use super::DelightQLSystem;
+    use super::{DelightQLSystem, ReadySystem};
     use crate::compiler_limits::{
         ArmedLimits, CompilerLimit, ProcessLimitLease, ALL, NESTING, REFINEMENT_DEPTH,
     };
@@ -15539,9 +14168,9 @@ mod compiler_limit_publication_tests {
         }
     }
 
-    fn fresh_system() -> DelightQLSystem {
+    fn fresh_system() -> ReadySystem {
         let connection = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        DelightQLSystem::new(connection, Box::new(EmptyIntrospector), "sqlite")
+        ReadySystem::new(connection, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh in-memory system should build")
     }
 
@@ -15726,7 +14355,7 @@ mod compiler_limit_publication_tests {
 // =============================================================================
 #[cfg(test)]
 mod compilation_extent_tests {
-    use super::DelightQLSystem;
+    use super::{DelightQLSystem, ReadySystem};
     use crate::compiler_limits::{ArmedLimits, NestingBudget, ProcessLimitLease, Running, NESTING};
     use crate::names::Registry;
     use crate::pipeline::Pipeline;
@@ -15748,9 +14377,9 @@ mod compilation_extent_tests {
         }
     }
 
-    fn fresh_system() -> DelightQLSystem {
+    fn fresh_system() -> ReadySystem {
         let connection = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        DelightQLSystem::new(connection, Box::new(EmptyIntrospector), "sqlite")
+        ReadySystem::new(connection, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh in-memory system should build")
     }
 
@@ -15946,7 +14575,7 @@ mod compilation_extent_tests {
 /// raw SQL road against the sealed catalog is denied by the authorizer.
 #[cfg(test)]
 mod bootstrap_guard_pins {
-    use super::DelightQLSystem;
+    use super::{DelightQLSystem, ReadySystem};
     use delightql_types::introspect::DatabaseIntrospector;
     use delightql_types::test_utils::MockDatabaseConnection;
     use std::sync::{Arc, Mutex};
@@ -15966,9 +14595,9 @@ mod bootstrap_guard_pins {
         }
     }
 
-    fn fresh_system() -> DelightQLSystem {
+    fn fresh_system() -> ReadySystem {
         let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
-        DelightQLSystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+        ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
             .expect("fresh in-memory system should build")
     }
 
@@ -16049,3 +14678,7 @@ mod bootstrap_guard_pins {
         assert_catalog_is_sealed(&system);
     }
 }
+
+// =============================================================================
+// THE PRISTINE WORLD: CONSTRUCTED ONCE, INSTANTIATED PRIVATELY
+// =============================================================================

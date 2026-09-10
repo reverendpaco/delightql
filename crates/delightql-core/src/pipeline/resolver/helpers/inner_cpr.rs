@@ -23,5 +23,10 @@ pub(in crate::pipeline::resolver) fn resolve_inner_cpr_during_bubbling(
     subquery: ast_unresolved::Chain,
     fold: &mut crate::pipeline::resolver::resolver_fold::ResolverFold<'_, '_>,
 ) -> Result<Vec<ColumnReference>> {
-    Ok(fold.resolve_interior(subquery)?.into_needs())
+    // Bubbling learns what the interior NEEDS and discards the resolution,
+    // so it opens the interior in place: an obligation minted here would
+    // be owed by relations nothing keeps.
+    Ok(fold
+        .resolve_interior(subquery, crate::pipeline::resolver::Correlations::InPlace)?
+        .into_needs())
 }

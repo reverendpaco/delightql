@@ -11,6 +11,7 @@
 //! frontier can say otherwise.
 
 /// Why an admission judgment refused.
+use crate::diagnostic::{DelightQLError, Semantic};
 #[derive(Debug)]
 pub enum ScopeActivationRefusal {
     /// Two live scopes cannot share one canonical answering name. Carries
@@ -23,12 +24,9 @@ impl From<ScopeActivationRefusal> for crate::error::DelightQLError {
     fn from(refusal: ScopeActivationRefusal) -> Self {
         match refusal {
             ScopeActivationRefusal::DuplicateAnswer { spelling } => {
-                crate::error::DelightQLError::validation_error_categorized(
-                    crate::uri_registry::subcat::SCOPE_DUPLICATE,
-                    format!("two live scopes cannot share the name '{spelling}'"),
-                    "give one of them its own name with `as` — or acknowledge \
-                     delightql-danger://scope/duplicate to admit the ambiguity",
-                )
+                DelightQLError::from(Semantic::ScopeDuplicate {
+                    message: format!("two live scopes cannot share the name '{spelling}'"),
+                })
             }
         }
     }

@@ -108,6 +108,7 @@ spine:
     - dql/fundamentals/null-semantics.md
     - dql/fundamentals/the-meaning-is-sql.md
     - dql/fundamentals/the-meaning-is-not-sql.md
+    - dql/fundamentals/entity-scoping.md
     - dql/fundamentals/default-transpilation-strategy.md
     - dql/fundamentals/scoping/_index.md:
       - dql/fundamentals/scoping/relational-continuation.md

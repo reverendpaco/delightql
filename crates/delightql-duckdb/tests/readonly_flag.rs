@@ -13,7 +13,7 @@
 
 use std::process::{Command, Stdio};
 
-use delightql_backends::{DuckDBConnectionManager, DuckDBExecutorImpl, DuckDBExecutor};
+use delightql_backends::{DuckDBConnectionManager, DuckDBExecutor, DuckDBExecutorImpl};
 use delightql_protocol::stdio::StdioTransport;
 use delightql_protocol::{
     Client, FetchResponse, Orientation, Projection, QueryResponse, VersionResult,
@@ -36,7 +36,8 @@ fn temp_db() -> std::path::PathBuf {
     {
         let mgr = DuckDBConnectionManager::new_file(path.to_str().unwrap()).unwrap();
         let mut ex = DuckDBExecutorImpl::new(&mgr);
-        ex.execute_query("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+        ex.execute_query("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
         ex.execute_query("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta')")
             .unwrap();
     }
@@ -61,7 +62,12 @@ fn run_via_binary(db: &std::path::Path, readonly: bool, sql: &str) -> Result<Vec
     let transport = StdioTransport::from_child(child).expect("stdio transport");
     let client = Client::new(transport);
     let VersionResult::Accepted(mut session) = client
-        .version(1_000_000, b"relay0".to_vec(), 300_000, vec![Orientation::Rows])
+        .version(
+            1_000_000,
+            b"relay0".to_vec(),
+            300_000,
+            vec![Orientation::Rows],
+        )
         .unwrap()
     else {
         panic!("handshake should succeed")
@@ -71,11 +77,14 @@ fn run_via_binary(db: &std::path::Path, readonly: bool, sql: &str) -> Result<Vec
         QueryResponse::Header { handle, dimensions } => {
             // Drain so the statement fully completes before we return.
             loop {
-                match session.fetch(&handle, Projection::All, 1000, rows_o).unwrap() {
+                match session
+                    .fetch(&handle, Projection::All, 1000, rows_o)
+                    .unwrap()
+                {
                     FetchResponse::Data { .. } => {}
                     FetchResponse::End => break,
-                    FetchResponse::Error { message, .. } => {
-                        return Err(String::from_utf8_lossy(&message).into_owned())
+                    FetchResponse::Error(error) => {
+                        return Err(String::from_utf8_lossy(error.message()).into_owned())
                     }
                 }
             }
@@ -85,9 +94,7 @@ fn run_via_binary(db: &std::path::Path, readonly: bool, sql: &str) -> Result<Vec
                 .map(|d| String::from_utf8_lossy(&d.name).into_owned())
                 .collect())
         }
-        QueryResponse::Error { message, .. } => {
-            Err(String::from_utf8_lossy(&message).into_owned())
-        }
+        QueryResponse::Error(error) => Err(String::from_utf8_lossy(error.message()).into_owned()),
     }
 }
 

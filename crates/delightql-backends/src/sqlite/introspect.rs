@@ -9,9 +9,9 @@
 // The separation ensures that runtime infrastructure and transpilation targets
 // remain distinct dependencies, even though the implementation is similar.
 
-use anyhow::Result;
 use delightql_types::introspect::{DiscoveredAttribute, DiscoveredEntity};
 use rusqlite::Connection;
+use rusqlite::Result;
 
 /// Introspect a user's SQLite database and discover tables/views
 ///
@@ -28,7 +28,7 @@ use rusqlite::Connection;
 ///
 /// # Returns
 /// * `Ok(Vec<DiscoveredEntity>)` - List of discovered tables and views with their columns
-/// * `Err(anyhow::Error)` - If introspection queries fail
+/// * `Err(rusqlite::Error)` - If introspection queries fail
 ///
 /// # Example
 /// ```
@@ -98,7 +98,7 @@ pub fn introspect_sqlite_database(
 ///
 /// # Returns
 /// * `Ok(Vec<DiscoveredAttribute>)` - List of columns with metadata
-/// * `Err(anyhow::Error)` - If PRAGMA query fails
+/// * `Err(rusqlite::Error)` - If PRAGMA query fails
 pub(super) fn introspect_table_columns(
     conn: &Connection,
     schema: Option<&str>,

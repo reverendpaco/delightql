@@ -208,3 +208,61 @@ fn register_probe_connection(system: &mut crate::system::DelightQLSystem) -> i64
     );
     connection_id
 }
+
+/// Wire ingress is one act: a party's identity is admitted against the
+/// declared tree before it is matched, carried, or forwarded.
+mod ingress {
+    use super::super::{admitted_bytes, judge_bytes};
+    use crate::diagnostic::{selector, DiagnosticClass};
+
+    #[test]
+    fn a_declared_identity_is_admitted_and_matched_typed() {
+        let occurrence = admitted_bytes(
+            b"delightql-error://semantic/resolution/table",
+            b"Table not found: t",
+        );
+        assert_eq!(
+            occurrence.error_uri(),
+            "delightql-error://semantic/resolution/table"
+        );
+        assert_eq!(occurrence.class(), DiagnosticClass::Syntax);
+        assert_eq!(occurrence.to_string(), "Table not found: t");
+        let family = selector(&["semantic"]).unwrap();
+        let (matched, detail) = judge_bytes(
+            &family,
+            b"delightql-error://semantic/resolution/table",
+            b"x",
+        );
+        assert!(matched, "{detail}");
+        let native = admitted_bytes(b"delightql-error://target/sqlite/constraint/2067", b"dup");
+        assert_eq!(native.class(), DiagnosticClass::Constraint);
+        assert!(selector(&["target", "sqlite"])
+            .unwrap()
+            .matches(&native.id()));
+    }
+
+    #[test]
+    fn an_undeclared_identity_is_a_protocol_violation_and_matches_no_family() {
+        let occurrence = admitted_bytes(b"delightql-error://semantic/invented", b"peer text");
+        assert_eq!(
+            occurrence.error_uri(),
+            "delightql-error://runtime/relay/protocol"
+        );
+        let family = selector(&["semantic"]).unwrap();
+        let (matched, detail) = judge_bytes(&family, b"delightql-error://semantic/invented", b"x");
+        assert!(!matched, "{detail}");
+        // A tail the provider's code law contradicts is undeclared too.
+        let (matched, _) = judge_bytes(
+            &selector(&["target", "postgres"]).unwrap(),
+            b"delightql-error://target/postgres/constraint/42P01",
+            b"x",
+        );
+        assert!(!matched);
+        // A party that named nothing is judged under runtime/bug, as always.
+        let nameless = admitted_bytes(b"", b"engine text");
+        assert_eq!(nameless.error_uri(), "delightql-error://runtime/bug");
+        assert!(selector(&["runtime", "bug"])
+            .unwrap()
+            .matches(&nameless.id()));
+    }
+}

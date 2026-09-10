@@ -23,9 +23,10 @@ use std::time::{Duration, Instant};
 use super::config::{
     ReplEditorHelperPolicy, ReplParserBudgets, ReplParserOperation, ReplParserOperationKind,
 };
-use crate::client::database::{ClientDatabase, IncidentRecordOutcome};
-use crate::client::incident::{self, hierarchy, Incident, IncidentKind, WorkerEvidence};
 use super::worker::{read_frame, write_frame, WorkerRequest, WorkerResponse, WorkerResult};
+use crate::client::database::{ClientDatabase, IncidentRecordOutcome};
+use crate::client::incident::{self, Incident, IncidentKind, WorkerEvidence};
+use delightql_types::diagnostic::{Client, Internal};
 
 /// Grace beyond the cooperative budget for the reply to cross the wire.
 /// Protocol latency, not a parser budget — the exhaustive budget mapping
@@ -233,8 +234,9 @@ impl ParserWorkerController {
             Err(e) => {
                 incident::warning(
                     "parser_worker",
-                    hierarchy::WORKER_UNAVAILABLE,
-                    format!("could not spawn the REPL parser worker: {e}"),
+                    Client::WorkerUnavailable {
+                        message: format!("could not spawn the REPL parser worker: {e}"),
+                    },
                 );
                 return None;
             }
@@ -419,11 +421,14 @@ impl ParserWorkerController {
                     // the same evidence a budget incident carries.
                     let generation = worker.generation;
                     drop(slot);
-                    let mut incident = Incident::plain(
+                    let mut incident = Incident::of(
                         IncidentKind::Panic,
                         "parser_worker",
-                        "internal/panic",
-                        message.clone(),
+                        &Internal::Panic {
+                            message: message.clone(),
+                            location: location.clone(),
+                        }
+                        .into(),
                     );
                     incident.location = location.clone();
                     incident.input = Some(input.to_string());
@@ -535,8 +540,9 @@ impl ParserWorkerController {
     fn replace_after_protocol_incident(&self, slot: &mut Option<WorkerHandle>, what: &str) {
         incident::warning(
             "parser_worker",
-            hierarchy::WORKER_UNAVAILABLE,
-            format!("REPL parser worker protocol violation ({what}); worker replaced"),
+            Client::WorkerUnavailable {
+                message: format!("REPL parser worker protocol violation ({what}); worker replaced"),
+            },
         );
         if let Some(worker) = slot.take() {
             worker.kill_and_reap();
@@ -599,18 +605,22 @@ impl ParserWorkerController {
             ) {
                 incident::warning(
                     "ledger",
-                    hierarchy::LEDGER_WRITE_LOST,
-                    format!(
-                        "repl::config.option 'editor_parser_helpers' projection \
+                    Client::LedgerWriteLost {
+                        message: format!(
+                            "repl::config.option 'editor_parser_helpers' projection \
                          failed ({reason}); the typed value stands"
-                    ),
+                        ),
+                    },
                 );
             }
         }
         incident::warning(
             "parser_worker",
-            hierarchy::ASSISTANCE_DISABLED,
-            format!("optional REPL parser assistance was disabled after\n         {headline}"),
+            Client::AssistanceDisabled {
+                message: format!(
+                    "optional REPL parser assistance was disabled after\n         {headline}"
+                ),
+            },
         );
         eprintln!();
         eprintln!("         Syntax coloring, parse-aware prompts, and continuation navigation");
@@ -630,7 +640,12 @@ impl ParserWorkerController {
 
     /// One line per recorded panic row, on the terminal, with where the
     /// record is; a lost record says so instead.
-    fn announce_panic(&self, recorded: &IncidentRecordOutcome, message: &str, location: Option<&str>) {
+    fn announce_panic(
+        &self,
+        recorded: &IncidentRecordOutcome,
+        message: &str,
+        location: Option<&str>,
+    ) {
         let at = location.map(|l| format!(" (at {l})")).unwrap_or_default();
         match recorded {
             IncidentRecordOutcome::Recorded { incident_id } => {
@@ -642,17 +657,17 @@ impl ParserWorkerController {
                 if first {
                     eprintln!(
                         "[{}] {message}{at} — recorded as repl::errors.incident #{incident_id}",
-                        incident::PANIC_URI
+                        incident::panic_uri()
                     );
                 }
             }
             IncidentRecordOutcome::Queued { pending_id } => eprintln!(
                 "[{}] {message}{at} — recorded as repl::errors.incident (pending-{pending_id})",
-                incident::PANIC_URI
+                incident::panic_uri()
             ),
             IncidentRecordOutcome::Lost(reason) => eprintln!(
                 "[{}] {message}{at} — NOT recorded: {reason}",
-                incident::PANIC_URI
+                incident::panic_uri()
             ),
         }
     }
@@ -724,14 +739,16 @@ impl ParserWorkerController {
 
 /// A budget incident: the exact input, the evidence, one identity.
 fn budget_incident(input: &str, cursor_byte: Option<u64>, worker: WorkerEvidence) -> Incident {
-    let mut incident = Incident::plain(
+    let mut incident = Incident::of(
         IncidentKind::Error,
         "parser_worker",
-        hierarchy::WORKER_BUDGET,
-        format!(
-            "prompt parser exceeded its {} ms budget ({})",
-            worker.budget_ms, worker.containment
-        ),
+        &Client::WorkerBudget {
+            message: format!(
+                "prompt parser exceeded its {} ms budget ({})",
+                worker.budget_ms, worker.containment
+            ),
+        }
+        .into(),
     );
     incident.input = Some(input.to_string());
     incident.cursor_byte = cursor_byte;

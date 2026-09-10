@@ -18,6 +18,7 @@
 
 use super::landing;
 use super::Normalizer;
+use crate::diagnostic::{Compression, Effect, Internal, Parse, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::expressions::ValueTemplatePart;
 use crate::pipeline::asts::core::ArgumentValue;
@@ -28,7 +29,7 @@ use crate::pipeline::asts::core::{
     RegexSelector, Spread, StandardApplication, Tuple, Unresolved,
 };
 use crate::pipeline::asts::core::{NamedReference, Reference};
-use crate::pipeline::asts::vocabulary::Vec1;
+use crate::pipeline::asts::vocabulary::{Mark, ResolutionMode, Vec1};
 use crate::pipeline::syntax::cst;
 use delightql_types::SqlIdentifier;
 
@@ -127,17 +128,14 @@ impl<'t> Normalizer<'t> {
             let refused = self.text(refused);
             let qualifier = qualifier.as_ref().map_or("", |q| q.as_str());
             let name = self.text(name);
-            return Err(DelightQLError::validation_error_categorized(
-                "reference/multi_segment_qualifier",
-                format!(
-                    "'{refused}.{qualifier}.{name}' carries two qualifiers — a column \
+            return Err(DelightQLError::from(
+                Semantic::ReferenceMultiSegmentQualifier {
+                    message: format!(
+                        "'{refused}.{qualifier}.{name}' carries two qualifiers — a column \
                      reference takes at most one, and only the segment next to the column \
                      name is ever read"
-                ),
-                format!(
-                    "write '{qualifier}.{name}'; to reach another namespace, qualify the \
-                     relation instead"
-                ),
+                    ),
+                },
             ));
         }
         Ok(AuthoredColumn {
@@ -153,7 +151,9 @@ impl<'t> Normalizer<'t> {
         let reverse = position < 0;
         Ok(ColumnOrdinal {
             position: position.unsigned_abs().try_into().map_err(|_| {
-                DelightQLError::parse_error(format!("column ordinal |{position}| is out of range"))
+                crate::diagnostic::DelightQLError::from(crate::diagnostic::Constraint::General {
+                    message: format!("column ordinal |{position}| is out of range"),
+                })
             })?,
             reverse,
             qualifier: self.written_qualifier(node.qualifier())?,
@@ -212,23 +212,26 @@ impl<'t> Normalizer<'t> {
     }
 
     fn column_range(&mut self, node: cst::PositionalSpan<'t>) -> Result<ColumnRange> {
-        let endpoint =
-            |normalizer: &Self, slot: Option<cst::Number<'t>>| -> Result<Option<(u16, bool)>> {
-                slot.map(|number| {
-                    let text = normalizer.text(number);
-                    let (digits, reverse) = match text.strip_prefix('-') {
-                        Some(rest) => (rest, true),
-                        None => (text, false),
-                    };
-                    digits
-                        .parse::<u16>()
-                        .map(|position| (position, reverse))
-                        .map_err(|_| {
-                            DelightQLError::parse_error(format!("invalid span endpoint: {text}"))
+        let endpoint = |normalizer: &Self,
+                        slot: Option<cst::Number<'t>>|
+         -> Result<Option<(u16, bool)>> {
+            slot.map(|number| {
+                let text = normalizer.text(number);
+                let (digits, reverse) = match text.strip_prefix('-') {
+                    Some(rest) => (rest, true),
+                    None => (text, false),
+                };
+                digits
+                    .parse::<u16>()
+                    .map(|position| (position, reverse))
+                    .map_err(|_| {
+                        crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+                            message: format!("invalid span endpoint: {text}"),
                         })
-                })
-                .transpose()
-            };
+                    })
+            })
+            .transpose()
+        };
         Ok(ColumnRange {
             start: endpoint(self, node.start())?,
             end: endpoint(self, node.end())?,
@@ -267,7 +270,10 @@ impl<'t> Normalizer<'t> {
         let operator = self.require(operator, "an infix form has an operator")?;
         let text = self.text(operator);
         let operator = binary_operator(text).ok_or_else(|| {
-            DelightQLError::parse_error(format!("'{text}' is not a binary operator"))
+            Internal::invariant(
+                "normalize::value",
+                format!("'{text}' is not a binary operator"),
+            )
         })?;
         let mut operands = operands.into_iter();
         let left = self.require(operands.next(), "an infix form has a left operand")?;
@@ -340,9 +346,14 @@ impl<'t> Normalizer<'t> {
             // The nullary consumer. `:f` IS `f:()`, and after this line
             // nothing can tell them apart — which is the point.
             cst::FunctorLike::Citation(citation) => {
-                let callee = self.require(citation.callee(), "a citation names a callee")?;
-                let callee = self.require(callee.child(), "a callee is a predicate identifier")?;
-                let call = FunctorCall::scalar(self.plain_reference(callee)?, Vec::new());
+                let name = self.require(citation.name(), "a citation names a function")?;
+                let callee = self.written_reference(
+                    citation.namespace(),
+                    name,
+                    Mark::Plain,
+                    ResolutionMode::Normal,
+                )?;
+                let call = FunctorCall::scalar(callee, Vec::new());
                 StandardApplication::plain(self.seal_pure(call)?)
             }
             cst::FunctorLike::WindowApplication(window) => self.window_application(window)?,
@@ -480,14 +491,12 @@ impl<'t> Normalizer<'t> {
     /// a mark on the authored name, and no effect name derives here.
     pub(crate) fn seal_pure(&self, call: FunctorCall<Unresolved>) -> Result<PureCall<Unresolved>> {
         PureCall::seal(call).map_err(|call| {
-            DelightQLError::validation_error_categorized(
-                "effect/position",
-                format!(
+            DelightQLError::from(Effect::Position {
+                message: format!(
                     "'{}!' is a directive and cannot stand where a pure call stands",
                     call.callee.name_text()
                 ),
-                "effects are legal only as direct operands of a chain join",
-            )
+            })
         })
     }
 
@@ -537,9 +546,10 @@ impl<'t> Normalizer<'t> {
             "range" => FrameMode::Range,
             "groups" => FrameMode::Groups,
             other => {
-                return Err(DelightQLError::parse_error(format!(
-                    "'{other}' is not a frame mode"
-                )))
+                return Err(Internal::invariant(
+                    "normalize::value",
+                    format!("'{other}' is not a frame mode"),
+                ))
             }
         };
         let mut bounds = node.children();
@@ -864,22 +874,25 @@ impl<'t> Normalizer<'t> {
                     ) = expression
                     {
                         let written = self.text(expression);
-                        return Err(DelightQLError::parse_error_categorized(
-                            crate::uri_registry::subcat::PARSE_PONY,
-                            format!(
+                        return Err(DelightQLError::from(Parse::Pony {
+                            message: format!(
                                 "'{written}' composes an infix operator with a function pipe and \
 nothing groups them: DelightQL has NO operator precedence, so the expression \
 has no reading. Parenthesize the operand the pipe receives."
                             ),
-                        ));
+                        }));
                     }
                     value = Some(self.domain_expression(expression)?)
                 }
                 cst::FunctionPipeChild::DomainExpression(expression) => {
-                    return Err(DelightQLError::parse_error(format!(
-                        "a function pipe has one source; '{}' is a second",
-                        self.text(expression)
-                    )))
+                    return Err(crate::diagnostic::DelightQLError::from(
+                        crate::diagnostic::Constraint::General {
+                            message: format!(
+                                "a function pipe has one source; '{}' is a second",
+                                self.text(expression)
+                            ),
+                        },
+                    ))
                 }
                 cst::FunctionPipeChild::FunctionPipeStep(step) => steps.push(step),
             }
@@ -977,15 +990,14 @@ has no reading. Parenthesize the operand the pipe receives."
                     CallArguments::None => Vec::new(),
                     other @ CallArguments::HigherOrder(_) => {
                         call.arguments = other;
-                        return Err(DelightQLError::parse_error(
+                        return Err(Internal::invariant(
+                            "normalize::value",
                             "a scalar application carries a scalar argument row",
                         ));
                     }
                 };
-                call.arguments = CallArguments::Scalar(landing::land_final(
-                    Argument::plain(flowing),
-                    arguments,
-                ));
+                call.arguments =
+                    CallArguments::Scalar(landing::land_final(Argument::plain(flowing), arguments));
                 application
             }
             _ => landing::spend_in_application(application, &flowing)?,
@@ -1086,26 +1098,14 @@ has no reading. Parenthesize the operand the pipe receives."
         Ok((condition, self.domain_expression(result)?))
     }
 
-    /// `,` as `and` is scoped to case-arm conditions and nowhere else.
+    /// A truth-only position: the grammar reads the comma there as the
+    /// conjunction it is, so the condition arrives as one truth.
     fn arm_condition(
         &mut self,
         node: cst::ArmCondition<'t>,
     ) -> Result<crate::pipeline::asts::core::TruthExpression<Unresolved>> {
-        use crate::pipeline::asts::core::TruthExpression;
-
-        let mut conditions = Vec::new();
-        for child in node.children() {
-            match child {
-                cst::ArmConditionChild::TruthExpression(truth) => {
-                    conditions.push(self.truth_expression(truth)?)
-                }
-                cst::ArmConditionChild::CommaSigil(_) => {}
-            }
-        }
-        self.require(
-            TruthExpression::all(conditions),
-            "an arm condition has a test",
-        )
+        let condition = self.require(node.child(), "an arm condition has a test")?;
+        self.truth_expression(condition)
     }
 
     fn default_arm(&mut self, node: cst::DefaultArm<'t>) -> Result<Domex> {
@@ -1426,7 +1426,8 @@ has no reading. Parenthesize the operand the pipe receives."
                 let PipeOp::Group(GroupSpec::Reduce { reductions, .. }) =
                     self.singleton_reduction(reduction)?
                 else {
-                    return Err(DelightQLError::parse_error(
+                    return Err(Internal::invariant(
+                        "normalize::value",
                         "a singleton reduction is the zero-key group".to_string(),
                     ));
                 };
@@ -1478,7 +1479,10 @@ has no reading. Parenthesize the operand the pipe receives."
     pub(crate) fn path(&self, node: cst::Path<'t>) -> Result<Path> {
         let steps = self.path_steps(node)?;
         Path::try_from_steps(steps).ok_or_else(|| {
-            DelightQLError::parse_error("a path reaches at least one key".to_string())
+            Internal::invariant(
+                "normalize::value",
+                "a path reaches at least one key".to_string(),
+            )
         })
     }
 
@@ -1499,7 +1503,10 @@ has no reading. Parenthesize the operand the pipe receives."
                 cst::PathKey::Number(number) => {
                     let text = self.text(number);
                     let index_value = text.parse::<i64>().map_err(|_| {
-                        DelightQLError::parse_error(format!("'{text}' is not a path index"))
+                        Internal::invariant(
+                            "normalize::value",
+                            format!("'{text}' is not a path index"),
+                        )
                     })?;
                     PathStep::Index(index_value)
                 }
@@ -1516,12 +1523,11 @@ has no reading. Parenthesize the operand the pipe receives."
 /// is what the compression reduces. An interior that names none reduces
 /// nothing.
 fn sourceless_needs_a_base() -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        "compression/sourceless_base",
-        "a sourceless inner form's interior supplies its own base relation; \
-         this one names none, so the compression has nothing to reduce",
-        "write the relation the reduction consumes: `_:(, _(1; 2) ~> sum:(|1|))`",
-    )
+    DelightQLError::from(Compression::SourcelessBase {
+        message: "a sourceless inner form's interior supplies its own base relation; \
+         this one names none, so the compression has nothing to reduce"
+            .to_string(),
+    })
 }
 
 /// The closed binary vocabulary, decoded at the one boundary that sees the
@@ -1588,18 +1594,16 @@ fn template_escapes(text: &str) -> Result<String> {
             Some('q') => out.push('\''),
             Some('Q') => out.push('"'),
             Some(other) => {
-                return Err(DelightQLError::parse_error_categorized(
-                    "template/escape",
-                    format!(
+                return Err(DelightQLError::from(Parse::TemplateEscape {
+    message: format!(
                         "unrecognized escape '\\{other}' in a template; the escapes are \\n \\t \\\\ \\q \\Q"
                     ),
-                ))
+}))
             }
             None => {
-                return Err(DelightQLError::parse_error_categorized(
-                    "template/escape",
-                    "a template ends in a trailing backslash",
-                ))
+                return Err(DelightQLError::from(Parse::TemplateEscape {
+    message: "a template ends in a trailing backslash".to_string(),
+}))
             }
         }
     }

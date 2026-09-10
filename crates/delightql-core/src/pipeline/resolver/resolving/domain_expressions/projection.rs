@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
+use crate::diagnostic::{Internal, Resolution};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_transform::AstTransform;
@@ -39,8 +40,11 @@ fn expand_pattern(
     use crate::pipeline::pattern::bre_to_rust_regex;
     let regex_pattern = bre_to_rust_regex(pattern)?;
 
-    let re = regex::Regex::new(&regex_pattern)
-        .map_err(|e| DelightQLError::parse_error(format!("Invalid column pattern: {}", e)))?;
+    let re = regex::Regex::new(&regex_pattern).map_err(|e| {
+        crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+            message: format!("Invalid column pattern: {}", e),
+        })
+    })?;
 
     // THE FRONTIER ANSWERS THE SPREAD: the positions of the heading in
     // view whose published names the pattern matches.
@@ -54,10 +58,11 @@ fn expand_pattern(
 
     if columns.is_empty() {
         if !allow_zero_matches {
-            return Err(DelightQLError::parse_error(format!(
-                "Pattern '{}' does not match any columns",
-                pattern
-            )));
+            return Err(crate::diagnostic::DelightQLError::from(
+                crate::diagnostic::Constraint::General {
+                    message: format!("Pattern '{}' does not match any columns", pattern),
+                },
+            ));
         }
     }
 
@@ -70,31 +75,31 @@ fn calculate_ordinal_index(
 ) -> Result<usize> {
     if ordinal.reverse {
         if ordinal.position as usize > total_cols {
-            return Err(DelightQLError::ColumnNotFoundError {
-                column: column_ordinal_text(ordinal.position, true),
+            return Err(DelightQLError::from(Resolution::Column {
+                column: column_ordinal_text(ordinal.position, true).to_string(),
                 context: format!(
                     "Position {} from end exceeds {} available columns",
                     ordinal.position, total_cols
                 ),
-            });
+            }));
         }
         Ok(total_cols - ordinal.position as usize)
     } else {
         if ordinal.position == 0 {
-            return Err(DelightQLError::ColumnNotFoundError {
-                column: column_ordinal_text(0, false),
+            return Err(DelightQLError::from(Resolution::Column {
+                column: column_ordinal_text(0, false).to_string(),
                 context: "Column positions start at 1".to_string(),
-            });
+            }));
         }
         let pos = (ordinal.position - 1) as usize;
         if pos >= total_cols {
-            return Err(DelightQLError::ColumnNotFoundError {
-                column: column_ordinal_text(ordinal.position, false),
+            return Err(DelightQLError::from(Resolution::Column {
+                column: column_ordinal_text(ordinal.position, false).to_string(),
                 context: format!(
                     "Position {} exceeds {} available columns",
                     ordinal.position, total_cols
                 ),
-            });
+            }));
         }
         Ok(pos)
     }
@@ -104,31 +109,31 @@ fn calculate_range_start(range: &ast_unresolved::ColumnRange, total_cols: usize)
     if let Some((pos, reverse)) = range.start {
         if reverse {
             if pos as usize > total_cols {
-                return Err(DelightQLError::ColumnNotFoundError {
-                    column: column_range_text(Some((pos, true)), None),
+                return Err(DelightQLError::from(Resolution::Column {
+                    column: column_range_text(Some((pos, true)), None).to_string(),
                     context: format!(
                         "Start position {} from end exceeds {} available columns",
                         pos, total_cols
                     ),
-                });
+                }));
             }
             Ok(total_cols - pos as usize)
         } else {
             if pos == 0 {
-                return Err(DelightQLError::ColumnNotFoundError {
-                    column: column_range_text(Some((0, false)), None),
+                return Err(DelightQLError::from(Resolution::Column {
+                    column: column_range_text(Some((0, false)), None).to_string(),
                     context: "Column positions start at 1".to_string(),
-                });
+                }));
             }
             let idx = (pos - 1) as usize;
             if idx >= total_cols {
-                return Err(DelightQLError::ColumnNotFoundError {
-                    column: column_range_text(Some((pos, false)), None),
+                return Err(DelightQLError::from(Resolution::Column {
+                    column: column_range_text(Some((pos, false)), None).to_string(),
                     context: format!(
                         "Start position {} exceeds {} available columns",
                         pos, total_cols
                     ),
-                });
+                }));
             }
             Ok(idx)
         }
@@ -141,31 +146,31 @@ fn calculate_range_end(range: &ast_unresolved::ColumnRange, total_cols: usize) -
     if let Some((pos, reverse)) = range.end {
         if reverse {
             if pos as usize > total_cols {
-                return Err(DelightQLError::ColumnNotFoundError {
-                    column: column_range_text(None, Some((pos, true))),
+                return Err(DelightQLError::from(Resolution::Column {
+                    column: column_range_text(None, Some((pos, true))).to_string(),
                     context: format!(
                         "End position {} from end exceeds {} available columns",
                         pos, total_cols
                     ),
-                });
+                }));
             }
             Ok(total_cols - pos as usize)
         } else {
             if pos == 0 {
-                return Err(DelightQLError::ColumnNotFoundError {
-                    column: column_range_text(None, Some((0, false))),
+                return Err(DelightQLError::from(Resolution::Column {
+                    column: column_range_text(None, Some((0, false))).to_string(),
                     context: "Column positions start at 1".to_string(),
-                });
+                }));
             }
             let idx = (pos - 1) as usize;
             if idx >= total_cols {
-                return Err(DelightQLError::ColumnNotFoundError {
-                    column: column_range_text(None, Some((pos, false))),
+                return Err(DelightQLError::from(Resolution::Column {
+                    column: column_range_text(None, Some((pos, false))).to_string(),
                     context: format!(
                         "End position {} exceeds {} available columns",
                         pos, total_cols
                     ),
-                });
+                }));
             }
             Ok(idx)
         }
@@ -192,13 +197,13 @@ pub(in crate::pipeline::resolver) fn expand_spread(
         Spread::Glob(Glob { qualifier, .. }) => {
             let columns = expand_glob(qualifier.clone(), &fold.lexical, &fold.core.identities)?;
             if columns.is_empty() && qualifier.is_some() {
-                return Err(DelightQLError::validation_error(
-                    format!(
+                return Err(crate::diagnostic::DelightQLError::from(
+                    crate::diagnostic::Constraint::General {
+                        message: format!(
                         "Qualified glob '{}.*' matched no columns - table or alias not in scope",
                         qualifier.as_ref().expect("a qualifier was just observed")
                     ),
-                    "Check that the qualifier matches a table name or alias in the query"
-                        .to_string(),
+                    },
                 ));
             }
             Ok(columns)
@@ -228,24 +233,24 @@ fn expand_range(
         .in_order(range.qualifier.as_ref(), &fold.core.identities)?;
 
     if candidates.is_empty() {
-        return Err(DelightQLError::ColumnNotFoundError {
-            column: format_range_string(range),
+        return Err(DelightQLError::from(Resolution::Column {
+            column: format_range_string(range).to_string(),
             context: "No columns available for range resolution".to_string(),
-        });
+        }));
     }
 
     let start_idx = calculate_range_start(range, candidates.len())?;
     let end_idx = calculate_range_end(range, candidates.len())?;
 
     if start_idx > end_idx {
-        return Err(DelightQLError::ColumnNotFoundError {
-            column: format_range_string(range),
+        return Err(DelightQLError::from(Resolution::Column {
+            column: format_range_string(range).to_string(),
             context: format!(
                 "Invalid range: start position {} is after end position {}",
                 start_idx + 1,
                 end_idx + 1
             ),
-        });
+        }));
     }
 
     Ok((start_idx..=end_idx)
@@ -288,15 +293,15 @@ pub(in crate::pipeline::resolver) fn resolve_selector_via_fold(
         };
         for expression in expanded {
             let ast_resolved::DomainExpression::Reference(reference) = expression else {
-                return Err(DelightQLError::transformation_error(
-                    "a selector addresses columns, and this item resolved to a value",
+                return Err(Internal::invariant(
                     "selector",
+                    "a selector addresses columns, and this item resolved to a value",
                 ));
             };
             let Some(column) = reference_column(&reference) else {
-                return Err(DelightQLError::transformation_error(
-                    "a selector item resolved to an address with no occurrence",
+                return Err(Internal::invariant(
                     "selector",
+                    "a selector item resolved to an address with no occurrence",
                 ));
             };
             // A SELECTOR ADDRESSES THE HEADING STANDING HERE. A qualified
@@ -306,9 +311,9 @@ pub(in crate::pipeline::resolver) fn resolve_selector_via_fold(
             let Some(column) =
                 crate::relation::landed_in(&fold.core.identities, available, column)?
             else {
-                return Err(DelightQLError::transformation_error(
-                    "a selector item addresses a position this heading does not stand on",
+                return Err(Internal::invariant(
                     "selector",
+                    "a selector item addresses a position this heading does not stand on",
                 ));
             };
             if columns.contains(&column) {
@@ -403,25 +408,22 @@ pub(in crate::pipeline::resolver) fn resolve_out_items_via_fold(
 ) -> Result<Vec<PendingOutItem>> {
     let mut resolved = Vec::new();
     for item in items {
+        // EACH ITEM IS THE FOLD'S PUBLICATION ACT: one extent, and the
+        // position born from what it reached. ONE ITEM, ONE VALUE — by
+        // type: neither a domain value nor a crossing admits an enumerating
+        // form, so the one-value road cannot fan out and no name is
+        // published across more than one column.
         match item {
-            ast_unresolved::OutItem::Many(spread) => {
-                for expr in expand_spread(fold, &spread, available, allow_zero_pattern_matches)? {
-                    resolved.push(PendingOutItem::Expanded { expr, naming: None });
-                }
-            }
+            ast_unresolved::OutItem::Many(spread) => resolved.extend(fold.publication_spread(
+                &spread,
+                available,
+                allow_zero_pattern_matches,
+            )?),
             // The compiler's own whole-operand item passes through: there
             // is no heading question in it for resolution to answer.
             ast_unresolved::OutItem::Whole => resolved.push(PendingOutItem::Whole),
             ast_unresolved::OutItem::One(one) => {
-                let (expr, naming) = (one.expr, one.naming);
-                // ONE ITEM, ONE VALUE — by type. Neither a domain value nor
-                // a crossing admits an enumerating form, so this road cannot
-                // fan out and no name is published across more than one
-                // column.
-                resolved.push(PendingOutItem::Authored {
-                    expr: resolve_out_value_via_fold(fold, expr, available)?,
-                    naming,
-                });
+                resolved.push(fold.publication_item(one, available)?);
             }
         }
     }
@@ -460,13 +462,18 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                     .in_order(ordinal.qualifier.as_ref(), &fold.core.identities)?;
 
                 if candidates.is_empty() {
-                    return Err(DelightQLError::ColumnNotFoundError {
-                        column: column_ordinal_text(ordinal.position, false),
+                    return Err(DelightQLError::from(Resolution::Column {
+                        column: column_ordinal_text(ordinal.position, false).to_string(),
                         context: "No columns available for ordinal resolution".to_string(),
-                    });
+                    }));
                 }
 
                 let idx = calculate_ordinal_index(&ordinal, candidates.len())?;
+                // THE JUDGMENT IS THE POSITION'S whichever road selected:
+                // an ordinal that reached the enclosing row is an escape
+                // exactly as the name of that position would be.
+                fold.lexical
+                    .judged(&candidates[idx], &fold.core.identities)?;
                 resolved.push(ast_resolved::DomainExpression::Reference(Reference::Named(
                     NamedReference(candidates[idx].clone()),
                 )));
@@ -505,7 +512,6 @@ pub(in crate::pipeline::resolver) fn resolve_expressions_via_fold(
                     lvar_expr,
                     &fold.lexical,
                     in_correlation,
-                    &mut fold.correlation_witness,
                     &fold.core.identities,
                 )?);
             }
@@ -547,7 +553,11 @@ mod tests {
         };
 
         let error = calculate_range_end(&range, 3).unwrap_err();
-        let DelightQLError::ColumnNotFoundError { column, .. } = error else {
+        let DelightQLError::Semantic(crate::diagnostic::Semantic::Resolution(Resolution::Column {
+            column,
+            ..
+        })) = error
+        else {
             panic!("expected an out-of-range column refusal");
         };
         assert_eq!(column, "|:-99|");

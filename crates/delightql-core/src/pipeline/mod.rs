@@ -91,7 +91,8 @@ pub mod verdict; // Verdict types for assertion and error hook outcomes
 
 // Re-export key types and functions
 
-use crate::error::{DelightQLError, Result};
+use crate::diagnostic::{Internal, Parse, Runtime};
+use crate::error::Result;
 use crate::lispy::ToLispy;
 use crate::names::Registry;
 use crate::probe;
@@ -137,9 +138,9 @@ impl Epoch {
     fn planning(&self) -> Result<&crate::relation::Planning> {
         match self {
             Epoch::Open(planning) => Ok(planning),
-            Epoch::Closed { .. } | Epoch::Sealing => Err(DelightQLError::transformation_error(
-                "semantic construction was asked for after this compilation was sealed",
+            Epoch::Closed { .. } | Epoch::Sealing => Err(Internal::invariant(
                 "semantic relation",
+                "semantic construction was asked for after this compilation was sealed",
             )),
         }
     }
@@ -465,7 +466,8 @@ impl<'a> Pipeline<'a> {
     ) -> Result<()> {
         for spec in &overrides {
             if !danger_gates::is_cli_overridable(&spec.uri) {
-                return Err(crate::error::DelightQLError::validation_error(
+                return Err(Internal::invariant(
+                    "pipeline",
                     format!(
                         "Danger '{}' cannot be overridden from the CLI. \
                          It changes language semantics and must be specified inline \
@@ -473,7 +475,6 @@ impl<'a> Pipeline<'a> {
                         spec.uri,
                         spec.uri.trim_start_matches(danger_gates::DANGER_URI_SCHEME)
                     ),
-                    "set_cli_danger_overrides",
                 ));
             }
         }
@@ -592,10 +593,7 @@ impl<'a> Pipeline<'a> {
                 let sql = self.execute_to_sql()?;
                 Ok(sql.to_string())
             }
-            _ => Err(crate::error::DelightQLError::database_error(
-                format!("Unknown stage: '{}'. Valid: cst, ast-unresolved, ast-resolved, ast-refined, ast-sql, sql", stage),
-                "Invalid stage",
-            )),
+            _ => Err(Runtime::catalog(format!("Unknown stage: '{}'. Valid: cst, ast-unresolved, ast-resolved, ast-refined, ast-sql, sql", stage), "Invalid stage")),
         }
     }
 
@@ -819,10 +817,7 @@ impl<'a> Pipeline<'a> {
             .lock()
             .expect("FATAL: Failed to acquire bootstrap lock for dialect pack");
         let pack = dialect_pack::DialectPack::load(&conn).map_err(|e| {
-            crate::error::DelightQLError::database_error(
-                format!("Failed to load dialect pack: {}", e),
-                e.to_string(),
-            )
+            Runtime::catalog(format!("Failed to load dialect pack: {}", e), e.to_string())
         })?;
         Ok(std::sync::Arc::new(pack))
     }
@@ -982,6 +977,7 @@ mod reference_admission_tests {
                     nullable: true,
                     position: 0,
                     declared_type: Some("INTEGER".to_string()),
+                    interior: false,
                 }]
             }))
         }
@@ -995,14 +991,14 @@ mod reference_admission_tests {
         }
     }
 
+    // No word is reserved: a keyword-named backend table is read bare, and
+    // the emission owes the target a delimited spelling of it.
     #[test]
-    fn a_backend_table_cannot_admit_a_bare_keyword_reference() {
-        let error = super::compile_source_to_sql("select(*)", &KeywordTable)
-            .expect_err("authored name admission precedes backend lookup");
-        assert_eq!(
-            error.error_uri(),
-            "delightql-error://semantic/identifier/keyword"
-        );
+    fn a_backend_table_named_by_a_keyword_is_read_bare_and_emitted_quoted() {
+        let sql = super::compile_source_to_sql("select(*)", &KeywordTable)
+            .expect("a keyword is an ordinary relation name");
+        assert!(sql.contains("\"select\""), "{sql}");
+        assert!(!sql.contains(" select "), "{sql}");
     }
 }
 
@@ -1039,6 +1035,7 @@ mod standalone_helper_depth_tests {
                 nullable: true,
                 position: 0,
                 declared_type: Some("INTEGER".to_string()),
+                interior: false,
             }]))
         }
 
@@ -1157,7 +1154,11 @@ pub fn split_queries(source: &str) -> Result<Vec<String>> {
     let tree = parse::query_sequence_showing_defects(source)?;
     let extents = parse::statement_extents(&tree);
     if extents.is_empty() {
-        return Err(DelightQLError::parse_error("no queries found in source"));
+        return Err(crate::diagnostic::DelightQLError::from(
+            crate::diagnostic::Parse::General {
+                message: "no queries found in source".to_string(),
+            },
+        ));
     }
     Ok(extents.into_iter().map(|s| source[s].to_string()).collect())
 }
@@ -1177,20 +1178,16 @@ pub(crate) fn one_goal(mut normalized: normalize::Normalized) -> Result<normaliz
         // refused here when it PARSED as a sequence and at the entrance when
         // it did not; both are the same fact about the same submission, so
         // they carry the same identity and say the same thing.
-        return Err(DelightQLError::ParseError {
-            message: format!(
-                "multi-query input rejected: found {} queries in one submission \
-                 (send each query separately, or run the file through the \
-                 sequential entrance)",
-                queries.len()
-            ),
-            source: None,
-            subcategory: Some("multi_query"),
-        });
+        return Err(Parse::MultiQuery {
+            count: queries.len(),
+        }
+        .into());
     }
-    let mut goal = queries
-        .pop()
-        .ok_or_else(|| DelightQLError::parse_error("this submission declares nothing to run"))?;
+    let mut goal = queries.pop().ok_or_else(|| {
+        crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+            message: "this submission declares nothing to run".to_string(),
+        })
+    })?;
     goal.declared.dangers.extend(file_level.dangers);
     goal.declared.options.extend(file_level.options);
     goal.declared.ddl_blocks.extend(file_level.ddl_blocks);

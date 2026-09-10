@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
 use crate::layer0::{ClientTerm, ServerTerm, Transport, TransportError};
-use crate::layer1::{ClientMessage, ControlOp, ControlResult, ServerMessage};
+use crate::layer1::{ClientMessage, ControlOp, ControlResponse, ServerMessage};
 use crate::manifest;
 
 /// Transport implementation over a Unix domain socket.
@@ -28,7 +28,7 @@ impl SocketTransport {
 
     /// Send a control operation and receive the result.
     /// This is layer1-only — data terms go through Transport::exchange().
-    pub fn control(&mut self, op: ControlOp) -> Result<ControlResult, TransportError> {
+    pub fn control(&mut self, op: ControlOp) -> Result<ControlResponse, TransportError> {
         let msg = ClientMessage::Control(op);
         let frame = manifest::frame_client_message(&msg)?;
         self.stream.write_all(&frame).map_err(|e| TransportError {
@@ -41,7 +41,9 @@ impl SocketTransport {
                     let response = manifest::decode_server_message(payload)?;
                     self.buf = rest.to_vec();
                     match response {
-                        ServerMessage::Control(result) => return Ok(result),
+                        ServerMessage::Control(result) => {
+                            return Ok(ControlResponse::of_result(result))
+                        }
                         ServerMessage::Data(term) => {
                             return Err(TransportError {
                                 message: format!(
@@ -169,18 +171,18 @@ use crate::layer0::Session;
 
 impl Session<SocketTransport> {
     /// Send a Reset control op to the server. Only available over socket transport.
-    pub fn reset(&mut self) -> Result<ControlResult, TransportError> {
+    pub fn reset(&mut self) -> Result<ControlResponse, TransportError> {
         self.transport.control(ControlOp::Reset)
     }
 
     /// Send a Shutdown control op to the server. Only available over socket transport.
-    pub fn shutdown(&mut self) -> Result<ControlResult, TransportError> {
+    pub fn shutdown(&mut self) -> Result<ControlResponse, TransportError> {
         self.transport.control(ControlOp::Shutdown)
     }
 
     /// Set the session's base path for relative file resolution.
     /// Cleared by reset(). Only available over socket transport.
-    pub fn cwd(&mut self, path: String) -> Result<ControlResult, TransportError> {
+    pub fn cwd(&mut self, path: String) -> Result<ControlResponse, TransportError> {
         self.transport.control(ControlOp::Cwd(path))
     }
 }
@@ -189,6 +191,7 @@ impl Session<SocketTransport> {
 mod tests {
     use super::*;
     use crate::layer0::*;
+    use crate::layer1::ControlResult;
     use std::os::unix::net::UnixStream;
 
     fn b(s: &str) -> ByteSeq {
@@ -245,16 +248,11 @@ mod tests {
 
         // Version handshake
         let session_result = client
-            .version(
-                1_000_000,
-                b("relay0"),
-                300_000,
-                vec![Orientation::Rows],
-            )
+            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
             .unwrap();
         let mut session = match session_result {
             VersionResult::Accepted(s) => s,
-            VersionResult::Rejected { .. } => panic!("expected Accepted"),
+            VersionResult::Rejected(_) => panic!("expected Accepted"),
         };
 
         let rows = session.agreed_orientation(Orientation::Rows).unwrap();
@@ -300,7 +298,10 @@ mod tests {
 
             // Read version handshake
             let msg = read_client_message(&mut server_stream, &mut buf).unwrap();
-            assert!(matches!(msg, ClientMessage::Data(ClientTerm::Version { .. })));
+            assert!(matches!(
+                msg,
+                ClientMessage::Data(ClientTerm::Version { .. })
+            ));
             write_server_message(
                 &mut server_stream,
                 &ServerMessage::Data(ServerTerm::Version {
@@ -330,13 +331,72 @@ mod tests {
             .unwrap()
         {
             VersionResult::Accepted(s) => s,
-            VersionResult::Rejected { .. } => panic!("expected Accepted"),
+            VersionResult::Rejected(_) => panic!("expected Accepted"),
         };
 
         // Send Reset
         let result = session.reset().unwrap();
-        assert_eq!(result, ControlResult::Ok);
+        assert_eq!(result, ControlResponse::Ok);
 
+        server.join().unwrap();
+    }
+
+    /// A server's control refusal crosses the wire with one typed identity
+    /// and reaches the client as the peer's statement, never as prose.
+    #[test]
+    fn socket_transport_control_refusal_is_received_typed() {
+        use std::thread;
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut buf = Vec::new();
+            let msg = read_client_message(&mut server_stream, &mut buf).unwrap();
+            assert!(matches!(
+                msg,
+                ClientMessage::Data(ClientTerm::Version { .. })
+            ));
+            write_server_message(
+                &mut server_stream,
+                &ServerMessage::Data(ServerTerm::Version {
+                    max_message_size: 1_000_000,
+                    protocol_version: b("relay0"),
+                    lease_ms: 300_000,
+                    orientations: vec![Orientation::Rows],
+                }),
+            )
+            .unwrap();
+            let msg = read_client_message(&mut server_stream, &mut buf).unwrap();
+            assert_eq!(msg, ClientMessage::Control(ControlOp::Reset));
+            let refusal: delightql_types::DelightQLError =
+                delightql_types::diagnostic::Runtime::Protocol {
+                    message: "reset failed: db locked".to_string(),
+                }
+                .into();
+            write_server_message(
+                &mut server_stream,
+                &ServerMessage::Control(ControlResult::Error(WireError::of(&refusal))),
+            )
+            .unwrap();
+        });
+
+        let transport = SocketTransport::new(client_stream);
+        let client = Client::new(transport);
+        let mut session = match client
+            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .unwrap()
+        {
+            VersionResult::Accepted(s) => s,
+            VersionResult::Rejected(_) => panic!("expected Accepted"),
+        };
+        match session.reset().unwrap() {
+            ControlResponse::Error(received) => {
+                assert_eq!(
+                    received.identity(),
+                    b("delightql-error://runtime/relay/protocol")
+                );
+                assert_eq!(received.message(), b("reset failed: db locked"));
+            }
+            ControlResponse::Ok => panic!("expected the refusal"),
+        }
         server.join().unwrap();
     }
 
@@ -349,7 +409,10 @@ mod tests {
 
             // Read version handshake
             let msg = read_client_message(&mut server_stream, &mut buf).unwrap();
-            assert!(matches!(msg, ClientMessage::Data(ClientTerm::Version { .. })));
+            assert!(matches!(
+                msg,
+                ClientMessage::Data(ClientTerm::Version { .. })
+            ));
             write_server_message(
                 &mut server_stream,
                 &ServerMessage::Data(ServerTerm::Version {
@@ -391,16 +454,16 @@ mod tests {
             .unwrap()
         {
             VersionResult::Accepted(s) => s,
-            VersionResult::Rejected { .. } => panic!("expected Accepted"),
+            VersionResult::Rejected(_) => panic!("expected Accepted"),
         };
 
         // Send Cwd
         let result = session.cwd("/tmp/dql-isolate-abc123".into()).unwrap();
-        assert_eq!(result, ControlResult::Ok);
+        assert_eq!(result, ControlResponse::Ok);
 
         // Reset clears it
         let result = session.reset().unwrap();
-        assert_eq!(result, ControlResult::Ok);
+        assert_eq!(result, ControlResponse::Ok);
 
         server.join().unwrap();
     }

@@ -32,6 +32,7 @@
 //! - `r_lower_drill_down` — `|> .col(*)`
 //! - `r_lower_dml_terminal` — `|> update!()(*)`
 
+use crate::diagnostic::{Constraint, DmlShape, Internal, Limitation, Recursion, Setop};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::ColumnOccurrence;
 use crate::pipeline::asts::core::Refined;
@@ -60,6 +61,7 @@ use super::anchors;
 use super::builder::{
     wrap_origin, Builder, NameGenerator, Projected, Qualify, ScopeName, SqlLayout, Unprojected,
 };
+use super::collected_windows;
 use super::scalar;
 use super::tree_group;
 use super::TransformCtx;
@@ -259,7 +261,7 @@ fn select_carried_items(
         .into_iter()
         .map(|(output, sources)| {
             let [source] = sources.as_slice() else {
-                return Err(DelightQLError::parse_error(format!(
+                return Err(Internal::invariant("transformer::relational", format!(
                     "a carried output position must have exactly one construction-recorded source; {:?} has {}",
                     output,
                     sources.len()
@@ -270,6 +272,23 @@ fn select_carried_items(
                 ), slot: output.column(), printed: true })
         })
         .collect()
+}
+
+/// The melt's read of one cell: `json_extract(value, '$[cell]')` over the
+/// row `json_each` expanded.
+fn extraction(
+    value_column: crate::names::ColId,
+    cell: usize,
+) -> crate::pipeline::sql_ast::DomainExpression {
+    crate::pipeline::sql_ast::DomainExpression::function(
+        "json_extract",
+        vec![
+            crate::pipeline::sql_ast::DomainExpression::Column(value_column),
+            crate::pipeline::sql_ast::DomainExpression::literal(
+                crate::pipeline::asts::core::LiteralValue::String(format!("$[{cell}]")),
+            ),
+        ],
+    )
 }
 
 /// Build a `json_each(source.column) AS alias` table-valued function expression.
@@ -357,11 +376,13 @@ fn lower_tvf_argument(
         ast_refined::DomainExpression::Reference(Reference::Physical(column)) => {
             Ok(TvfArgument::Column(column))
         }
-        _ => Err(DelightQLError::ParseError {
-            message: "TVF arguments must be resolved columns or literals".to_string(),
-            source: None,
-            subcategory: None,
-        }),
+        _ => Err(crate::diagnostic::DelightQLError::from(
+            crate::diagnostic::Constraint::General {
+                message: "TVF arguments must be resolved columns or literals"
+                    .to_string()
+                    .to_string(),
+            },
+        )),
     }
 }
 
@@ -441,7 +462,8 @@ fn r_lower_anonymous(
         let stmt = if row_idx == 0 {
             published.publish(sb)?
         } else {
-            sb.standing_at(scope).map_err(DelightQLError::parse_error)?
+            sb.standing_at(scope)
+                .map_err(|e| Internal::invariant("transformer::relational", e))?
         };
         row_queries.push(QueryExpression::Select(Box::new(stmt)));
     }
@@ -453,10 +475,11 @@ fn r_lower_anonymous(
             left: Box::new(left),
             right: Box::new(right),
         })
-        .ok_or_else(|| DelightQLError::ParseError {
-            message: "r_lower_anonymous: empty rows".to_string(),
-            source: None,
-            subcategory: None,
+        .ok_or_else(|| {
+            Internal::invariant(
+                "transformer::relational",
+                "r_lower_anonymous: empty rows".to_string(),
+            )
         })?;
 
     let columns = columns_from_relation(&result, ctx)?;
@@ -499,13 +522,11 @@ fn r_lower_inner_relation(
     );
     let subquery = match pattern {
         ast_refined::InnerRelationPattern::Indeterminate { .. } => {
-            return Err(DelightQLError::ParseError {
-                message:
-                    "r_lower_inner_relation: Indeterminate pattern should be classified by refiner"
-                        .to_string(),
-                source: None,
-                subcategory: None,
-            });
+            return Err(Internal::invariant(
+                "transformer::relational",
+                "r_lower_inner_relation: Indeterminate pattern should be classified by refiner"
+                    .to_string(),
+            ));
         }
         ast_refined::InnerRelationPattern::UncorrelatedDerivedTable { subquery, .. }
         | ast_refined::InnerRelationPattern::CorrelatedScalarJoin { subquery, .. }
@@ -551,9 +572,8 @@ fn r_lower_inner_relation(
         publish_relation_body(inner_builder, &result, ctx)?
     };
 
-    // Hygienic columns (__dql_corr_0 etc.) are in the subquery output for
-    // JOIN ON but NOT in the published scope. The Qualify fallback uses the
-    // scope's own name as qualifier, so join conditions still resolve correctly.
+    // The correlation support the body owes is in the subquery output for
+    // the enclosing join's ON, beside the published heading and never in it.
 
     // Return as Table with subquery — not Frozen. This way, the join
     // handler's into_table_expr() passes the TableExpression through
@@ -656,7 +676,8 @@ fn r_lower_positional_relation(
     let mut columns = columns_from_relation(&result, ctx)?;
     let carried = ctx.relations.carried_sources(&result)?;
     let Some(input) = ctx.relations.read_source(&result)? else {
-        return Err(DelightQLError::parse_error(
+        return Err(Internal::invariant(
+            "transformer::relational",
             "a positional relation has no construction-recorded read to stand on",
         ));
     };
@@ -670,12 +691,14 @@ fn r_lower_positional_relation(
     for (col, (port, sources)) in columns.iter().zip(carried) {
         let output = col.identity();
         if port.column() != output {
-            return Err(DelightQLError::parse_error(
+            return Err(Internal::invariant(
+                "transformer::relational",
                 "a positional output disagrees with its construction record",
             ));
         }
         if sources.len() != 1 {
-            return Err(DelightQLError::parse_error(
+            return Err(Internal::invariant(
+                "transformer::relational",
                 "a positional output does not carry exactly one source",
             ));
         }
@@ -701,12 +724,14 @@ fn r_lower_positional_relation(
         let source = match named.as_slice() {
             [source] => *source,
             [] => {
-                return Err(DelightQLError::parse_error(
+                return Err(Internal::invariant(
+                    "transformer::relational",
                     "a positional output has no construction-recorded source port",
                 ))
             }
             _ => {
-                return Err(DelightQLError::parse_error(
+                return Err(Internal::invariant(
+                    "transformer::relational",
                     "a positional output carries several source ports",
                 ))
             }
@@ -755,7 +780,8 @@ fn r_lower_positional_relation(
     let mut emitted = columns.iter().map(ColumnMetadata::identity);
     for port in ctx.relations.interface(&result)?.ports().to_vec() {
         let slot = emitted.next().ok_or_else(|| {
-            DelightQLError::parse_error(
+            Internal::invariant(
+                "transformer::relational",
                 "a positional relation emits fewer positions than it publishes",
             )
         })?;
@@ -771,7 +797,7 @@ fn r_lower_positional_relation(
         .from_tables(vec![from]);
     let stmt = select
         .standing_at(scope)
-        .map_err(crate::error::DelightQLError::parse_error)?;
+        .map_err(|e| Internal::invariant("transformer::relational", e))?;
 
     let query = QueryExpression::Select(Box::new(stmt));
     Builder::from_frozen_at_site(
@@ -857,7 +883,8 @@ fn cte_occurrence(
         .into_iter()
         .map(|(target, sources)| {
             let [source] = sources.as_slice() else {
-                return Err(DelightQLError::parse_error(
+                return Err(Internal::invariant(
+                    "transformer::relational",
                     "a CTE occurrence output must carry exactly one definition port",
                 ));
             };
@@ -872,7 +899,7 @@ fn cte_occurrence(
         .select_all(items)
         .from_tables(vec![TableExpression::Scope(cte)]))
     .standing_at(scope)
-    .map_err(crate::error::DelightQLError::parse_error)
+    .map_err(|e| Internal::invariant("transformer::relational", e))
     {
         Ok(select) => Ok(TableExpression::subquery(
             QueryExpression::Select(Box::new(select)),
@@ -915,7 +942,8 @@ fn ground_table_expression(
     if ctx.relations.instance_kind(relation)? == Some(crate::relation::form::DefinitionKind::Cte) {
         let inputs = ctx.relations.inputs(relation)?;
         let [definition] = inputs.as_slice() else {
-            return Err(DelightQLError::parse_error(
+            return Err(Internal::invariant(
+                "transformer::relational",
                 "a CTE occurrence does not have exactly one construction-recorded definition",
             ));
         };
@@ -974,13 +1002,12 @@ pub(super) fn r_lower_read(
             // implemented. Refuse cleanly instead of lowering the call as a
             // read.
             if super::is_mutation_call(&call, ctx) {
-                return Err(DelightQLError::validation_error_categorized(
-                    "dml/shape/multi_terminal",
-                    "a DML terminal (insert!/update!/delete!) must be the \
+                return Err(DelightQLError::from(DmlShape::MultiTerminal {
+                    message: "a DML terminal (insert!/update!/delete!) must be the \
                      final operation of a statement; multi-step DML via `,` \
-                     (dataflow) or `;` (sequential) is not yet supported",
-                    "run each mutation as a separate statement",
-                ));
+                     (dataflow) or `;` (sequential) is not yet supported"
+                        .to_string(),
+                }));
             }
             let call = call.into_inner();
             let function = call.callee;
@@ -996,8 +1023,8 @@ pub(super) fn r_lower_read(
 /// rename projection before finalizing. This ensures the SQL output matches
 /// the scope names — the alias-scope invariant.
 ///
-/// For columns beyond the heading's width (hygienic columns like `__dql_corr_0`),
-/// they are passed through unchanged.
+/// Columns beyond the heading's width — the correlation support the body
+/// owes — are passed through unchanged.
 /// Extract column metadata from a CTE binding's expression.
 /// Used by the CTE lowering in mod.rs to reconcile CTE body output columns.
 ///
@@ -1026,14 +1053,12 @@ fn check_recursive_argumentative_binding(
         .into_iter()
         .any(|part| expr_has_positional_self_ref(part, binding_scope.scope(), identities))
     {
-        return Err(DelightQLError::ValidationError {
+        return Err(DelightQLError::from(Recursion::ArgumentativeBinding {
             message: "a recursive CTE reference uses argumentative binding; renames and \
                  constraints on the self-reference do not bind inside a recursive \
                  definition yet. Use glob binding and rename or filter in a pipe stage."
                 .to_string(),
-            context: "transformer::lower_cte_binding".to_string(),
-            subcategory: Some(crate::uri_registry::subcat::RECURSION_ARGUMENTATIVE_BINDING),
-        });
+        }));
     }
     Ok(())
 }
@@ -1070,6 +1095,8 @@ fn expr_has_positional_self_ref(
         | ast_refined::Continuation::Pipe { .. }
         | ast_refined::Continuation::Structural(_)
         | ast_refined::Continuation::ErJoin(_) => false,
+        // Spent at classification: none reaches the refined phase.
+        ast_refined::Continuation::Correlated(never) => match *never {},
     })
 }
 
@@ -1177,12 +1204,15 @@ fn publish_fixpoint_member(
     ctx: &TransformCtx,
 ) -> Result<crate::pipeline::sql_ast::QueryExpression> {
     if builder.columns().len() != published.len() {
-        return Err(DelightQLError::parse_error(format!(
-            "a fixpoint clause publishing {} positions cannot accumulate under a \
+        return Err(Internal::invariant(
+            "transformer::relational",
+            format!(
+                "a fixpoint clause publishing {} positions cannot accumulate under a \
              binding publishing {}",
-            builder.columns().len(),
-            published.len()
-        )));
+                builder.columns().len(),
+                published.len()
+            ),
+        ));
     }
     let pairs: Vec<_> = builder
         .columns()
@@ -1249,11 +1279,25 @@ fn publish_relation_body(
         let columns = inner_builder.columns().to_vec();
         return Ok((inner_builder.to_sql()?, columns));
     }
-    let carried = ctx.relations.carried_sources(cte)?;
+    // A POSITION THE ENCLOSING JOIN COMPUTES is the boundary's to publish
+    // and the join's to emit: the body carried it unread, and this level
+    // emits every other position.
+    let realized = ports.iter().any(|port| ctx.relations.unemitted_here(*port));
+    let ports: Vec<_> = ports
+        .into_iter()
+        .filter(|port| !ctx.relations.unemitted_here(*port))
+        .collect();
+    let carried: Vec<_> = ctx
+        .relations
+        .carried_sources(cte)?
+        .into_iter()
+        .filter(|(output, _)| ports.contains(output))
+        .collect();
     let mut sources = Vec::with_capacity(carried.len());
     for (_, input) in &carried {
         let [source] = input.as_slice() else {
-            return Err(DelightQLError::parse_error(
+            return Err(Internal::invariant(
+                "transformer::relational",
                 "a CTE output must carry exactly one body position",
             ));
         };
@@ -1276,7 +1320,7 @@ fn publish_relation_body(
         .iter()
         .map(ColumnMetadata::identity)
         .collect();
-    if outputs != sources || !support.is_empty() {
+    if outputs != sources || !support.is_empty() || realized {
         let mut items: Vec<_> = sources
             .into_iter()
             .zip(&ports)
@@ -1294,6 +1338,24 @@ fn publish_relation_body(
                 alias,
             ));
             columns.push(ColumnMetadata::new(alias));
+        }
+        // THE PRESENCE WITNESS. A position the enclosing join computes for
+        // this boundary is NULL where the boundary contributed no row —
+        // the padded side of an outer join — and no published column can
+        // say so (each may be NULL in the data). The boundary emits one
+        // non-null scaffold after its support; the join reads presence off
+        // it and nothing else addresses it.
+        if realized {
+            let present =
+                ctx.identities
+                    .sql_column(cte.scope(), None, crate::names::Addressing::Hygienic);
+            items.push(SelectItem::expression_with_alias(
+                DomainExpression::literal(
+                    crate::pipeline::asts::core::literals::LiteralValue::Number("1".to_string()),
+                ),
+                present,
+            ));
+            columns.push(ColumnMetadata::new(present));
         }
         let published = inner_builder.add_projection_publishing(items, cte.scope(), columns)?;
         let columns = published.columns().to_vec();
@@ -1404,12 +1466,10 @@ pub(super) fn published_reduction_values(
         .into_iter()
         .map(|payload| match payload {
             ReductionPayload::Value(value) => Ok(value),
-            ReductionPayload::Metadata(_) => Err(DelightQLError::ParseError {
+            ReductionPayload::Metadata(_) => Err(DelightQLError::from(Constraint::Unsupported {
                 message: "a metadata group stands in this reduction, which lowers values only"
                     .to_string(),
-                source: None,
-                subcategory: None,
-            }),
+            })),
         })
         .collect()
 }
@@ -1436,16 +1496,13 @@ pub(super) fn alias_unaliased(
 
 /// Lower a restriction: add WHERE to the child builder.
 ///
-/// Transparent — it passes through the child's scope. The `origin` records
-/// where the filter came from (comma vs interior).
+/// Transparent — it passes through the child's scope. A restriction's
+/// origin decides nothing here: the one restriction another level
+/// evaluates, the correlated one, is a continuation kind of its own that
+/// the refined phase cannot hold.
 pub(super) fn r_lower_filter(
     child: Builder<Unprojected>,
     condition: ast_refined::TruthExpression,
-    #[expect(
-        unused_variables,
-        reason = "all filter origins currently share one lowering"
-    )]
-    origin: ast_refined::FilterOrigin,
     result: crate::relation::SemanticRelation,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
@@ -1493,9 +1550,9 @@ fn row_clause(
         TupleOrdinalOperator::GreaterThan => level.add_offset(bound.value),
         // `#=` has no authored spelling: `row_bound` derives `#<` and `#>`
         // and nothing builds this arm.
-        TupleOrdinalOperator::Exactly => Err(DelightQLError::transformation_error(
-            "an exact row bound has no authored spelling",
+        TupleOrdinalOperator::Exactly => Err(Internal::invariant(
             "row_bound",
+            "an exact row bound has no authored spelling",
         )),
     }
 }
@@ -1513,6 +1570,7 @@ pub(super) fn r_lower_join(
     join_type: Option<ast_refined::JoinType>,
     result: crate::relation::SemanticRelation,
     emitted_swapped: bool,
+    deferred: DeferredSides,
     ctx: &TransformCtx,
 ) -> Result<Builder<Unprojected>> {
     use crate::pipeline::sql_ast::{JoinCondition as SqlJoinCondition, JoinType as SqlJoinType};
@@ -1533,6 +1591,37 @@ pub(super) fn r_lower_join(
         outer: &right_op,
     };
     let operation = super::builder::AncestralQualify::over(&result, &ctx.relations, &combined)?;
+
+    // THE POSITIONS THIS JOIN COMPUTES FOR AN INTERIOR BOUNDARY are lowered
+    // over the same operands the hoisted conditions are: the enclosing row
+    // on one side, the interior occurrences the boundary keeps readable
+    // beside its heading on the other. On a side an outer join pads, the
+    // value stands only where the boundary contributed a row: its presence
+    // witness says which.
+    let padded_left = sql_join_type == SqlJoinType::Full;
+    let padded_right = matches!(sql_join_type, SqlJoinType::Left | SqlJoinType::Full);
+    let mut realized: Vec<Realized> = Vec::new();
+    let mut witnesses: Vec<crate::names::ColId> = Vec::new();
+    for (items, operand, padded) in [
+        (deferred.left, &left_op, padded_left),
+        (deferred.right, &right_op, padded_right),
+    ] {
+        if items.is_empty() {
+            continue;
+        }
+        // The boundary emitted its witness whether or not this join pads
+        // it; the wrap below sets it aside either way.
+        let witness = operand.presence_witness()?;
+        witnesses.push(witness);
+        for item in items {
+            let port = item.port();
+            realized.push(Realized {
+                port,
+                value: scalar::s_lower_expression(item.into_value(), &operation, ctx)?,
+                presence: padded.then_some(witness),
+            });
+        }
+    }
 
     // Lower the join condition against the POST-WRAP scopes.
     // ChainedQualify lives in the builder module — the qualify logic stays
@@ -1581,7 +1670,148 @@ pub(super) fn r_lower_join(
         ast_refined::MemberCorrelation::Cartesian(()) => SqlJoinCondition::Cartesian,
     };
 
-    Builder::from_join(left_op, right_op, sql_join_type, condition, emitted_swapped)
+    let joined = Builder::from_join(left_op, right_op, sql_join_type, condition, emitted_swapped)?;
+    if realized.is_empty() {
+        return Ok(joined);
+    }
+    realizing_deferred(joined, realized, &witnesses, result, ctx)
+}
+
+/// THE POSITIONS A JOIN COMPUTES, by the member each interior boundary
+/// stands as — in EMISSION order, the left being the SQL left.
+#[derive(Default)]
+pub(super) struct DeferredSides {
+    pub(super) left: Vec<ast_refined::DeferredItem>,
+    pub(super) right: Vec<ast_refined::DeferredItem>,
+}
+
+/// One position the join computes: the interior position it stands for,
+/// the lowered value, and — on a side the join pads — the operand's
+/// presence witness the value is gated by.
+struct Realized {
+    port: crate::relation::PortId,
+    value: crate::pipeline::sql_ast::DomainExpression,
+    presence: Option<crate::names::ColId>,
+}
+
+/// THE JOIN EMITS THE POSITIONS IT COMPUTES FOR A BOUNDARY. A flat join
+/// offers its operands' slots; a computed position needs a SELECT of its
+/// own, so the join becomes one level: every published position in
+/// interface order — an operand's column, or the computed value at the
+/// position the boundary published, NULL where a padded boundary
+/// contributed no row — then the support its operands emitted, then the
+/// operands' scaffolds, and the level stands as a derived table over it.
+fn realizing_deferred(
+    builder: Builder<Unprojected>,
+    realized: Vec<Realized>,
+    witnesses: &[crate::names::ColId],
+    result: crate::relation::SemanticRelation,
+    ctx: &TransformCtx,
+) -> Result<Builder<Unprojected>> {
+    use crate::pipeline::asts::core::literals::LiteralValue;
+    use crate::pipeline::sql_ast::{
+        BinaryOperator, DomainExpression as SqlDomainExpr, SelectItem, WhenClause,
+    };
+    let ports = ctx.relations.interface(&result)?.ports().to_vec();
+    let columns = builder.columns().to_vec();
+    // The operands' slots in emission order — the headings, then the
+    // support runs — with each boundary's presence witness set aside: it
+    // stands among a heading's slots and belongs to no position.
+    let mut emitted = columns
+        .iter()
+        .filter(|column| !witnesses.contains(&column.identity()));
+    let mut consumed: Vec<crate::names::ColId> = Vec::new();
+    let mut items = Vec::with_capacity(columns.len() + realized.len());
+    let mut metadata = Vec::with_capacity(columns.len() + realized.len());
+    for port in ports {
+        // The deferred position this join position CONTINUES, by the
+        // construction record: the boundary carried the interior's minted
+        // position into its own, and the join carried the boundary's.
+        let continued = ctx.relations.continued_occurrences(port);
+        let computing: Vec<&Realized> = realized
+            .iter()
+            .filter(|item| item.port == port || continued.contains(&item.port))
+            .collect();
+        let expr = match computing.as_slice() {
+            [] => {
+                let column = emitted.next().ok_or_else(|| {
+                    Internal::invariant(
+                        "transformer::relational",
+                        "a join emits fewer positions than the relation it realizes publishes",
+                    )
+                })?;
+                consumed.push(column.identity());
+                SqlDomainExpr::Column(column.identity())
+            }
+            [item] => match item.presence {
+                None => item.value.clone(),
+                Some(present) => SqlDomainExpr::Case {
+                    expr: None,
+                    when_clauses: vec![WhenClause::new(
+                        SqlDomainExpr::Binary {
+                            left: Box::new(SqlDomainExpr::Column(present)),
+                            op: BinaryOperator::IsNot,
+                            right: Box::new(SqlDomainExpr::literal(LiteralValue::Null)),
+                        },
+                        item.value.clone(),
+                    )],
+                    else_clause: None,
+                },
+            },
+            _ => {
+                return Err(Internal::invariant(
+                    "transformer::relational",
+                    "one join position continues two positions the join computes",
+                ))
+            }
+        };
+        items.push(SelectItem::Publishing {
+            expr,
+            slot: port.column(),
+            printed: true,
+        });
+        metadata.push(ColumnMetadata::new(port.column()));
+    }
+    // THE SUPPORT THE OPERANDS EMITTED rides next: a join's row is its
+    // operands' runs after their headings, left then right, which is the
+    // order the level's dependencies name — under this level's own
+    // hygienic slots; the operands' scaffolds — a boundary's presence
+    // witness — after that.
+    for _ in ctx.relations.dependencies(&result)? {
+        let column = emitted.next().ok_or_else(|| {
+            Internal::invariant(
+                "transformer::relational",
+                "a join emits fewer support positions than its operands owe",
+            )
+        })?;
+        consumed.push(column.identity());
+        let support =
+            ctx.identities
+                .sql_column(result.scope(), None, crate::names::Addressing::Hygienic);
+        items.push(SelectItem::Publishing {
+            expr: SqlDomainExpr::Column(column.identity()),
+            slot: support,
+            printed: true,
+        });
+        metadata.push(ColumnMetadata::new(support));
+    }
+    for column in columns
+        .iter()
+        .filter(|column| !consumed.contains(&column.identity()))
+    {
+        let scaffold =
+            ctx.identities
+                .sql_column(result.scope(), None, crate::names::Addressing::Hygienic);
+        items.push(SelectItem::Publishing {
+            expr: SqlDomainExpr::Column(column.identity()),
+            slot: scaffold,
+            printed: true,
+        });
+        metadata.push(ColumnMetadata::new(scaffold));
+    }
+    builder
+        .add_projection_publishing(items, result.scope(), metadata)?
+        .demote()
 }
 
 /// Lower a join where the right side is an anonymous table.
@@ -1618,7 +1848,16 @@ pub(super) fn r_lower_join_anonymous(
     if !has_column_refs {
         // No correlated refs — use normal UNION ALL path.
         let right = r_lower_anonymous(rows, anonymous_relation, names, ctx)?;
-        return r_lower_join(left, right, correlation, join_type, result, false, ctx);
+        return r_lower_join(
+            left,
+            right,
+            correlation,
+            join_type,
+            result,
+            false,
+            DeferredSides::default(),
+            ctx,
+        );
     }
 
     // --- JSON melt path ---
@@ -1688,10 +1927,11 @@ fn r_lower_melt_join(
     let projected_packet = projected_columns
         .last()
         .map(ColumnMetadata::identity)
-        .ok_or_else(|| DelightQLError::ParseError {
-            message: "melt packet projection produced no column".to_string(),
-            source: None,
-            subcategory: None,
+        .ok_or_else(|| {
+            Internal::invariant(
+                "transformer::relational",
+                "melt packet projection produced no column".to_string(),
+            )
         })?;
     let source_origin = wrap_origin(
         &projected_columns,
@@ -1758,12 +1998,66 @@ fn r_lower_melt_join(
     };
 
     let mut lowered_condition = match correlation {
-        ast_refined::MemberCorrelation::Correspond(_) => {
-            return Err(DelightQLError::validation_error_categorized(
-                "transform/melt-join/using",
-                "a correlated anonymous join cannot lower an implicit USING condition",
-                "write an explicit predicate between the left and anonymous columns",
-            ));
+        // A CORRESPONDENCE IS AN EQUALITY OVER THE JOIN'S OWN HEADING. Each
+        // pair names the exact left port and the exact anonymous cell it
+        // merges; the left port stands at the output position that carries
+        // it, the cell rides the site as its own position (support when
+        // the merge drops it from the interface), and the pair lowers as
+        // the target's equality — correspondence, not the language's
+        // null-safe judgment.
+        ast_refined::MemberCorrelation::Correspond(correspondence) => {
+            // Spelled over the FROM directly: the merged output stands for
+            // BOTH operands' ports, so a logical reference to the cell would
+            // be answered by the left column it merges with. The left port
+            // is the wrapped column at the output position that carries it;
+            // the cell is its own extraction.
+            let anon_ports =
+                crate::relation::published_ports(&ctx.identities, &anonymous_relation)?;
+            let mut equalities: Vec<SqlDomainExpr> = Vec::with_capacity(correspondence.pairs.len());
+            for pair in correspondence.pairs {
+                let output = ctx
+                    .relations
+                    .translated_port(&result, pair.left)?
+                    .map(|port| port.column())
+                    .ok_or_else(|| {
+                        Internal::invariant(
+                            "transformer::relational",
+                            "a merged left port stands at no position of the join it merges into",
+                        )
+                    })?;
+                let left = output_ids
+                    .iter()
+                    .position(|id| *id == output)
+                    .filter(|index| *index < source_metadata.len())
+                    .and_then(|index| wrapped_columns.get(index).copied())
+                    .ok_or_else(|| {
+                        Internal::invariant(
+                            "transformer::relational",
+                            "a merged left port stands outside the left operand's emitted heading",
+                        )
+                    })?;
+                let cell = anon_ports
+                    .iter()
+                    .position(|port| *port == pair.right)
+                    .ok_or_else(|| {
+                        Internal::invariant(
+                            "transformer::relational",
+                            "a merged anonymous port is not a cell of the row it merges",
+                        )
+                    })?;
+                equalities.push(SqlDomainExpr::eq(
+                    SqlDomainExpr::Column(left),
+                    extraction(value_column, cell),
+                ));
+            }
+            equalities
+                .into_iter()
+                .reduce(|all, next| SqlDomainExpr::Binary {
+                    left: Box::new(all),
+                    op: crate::pipeline::sql_ast::BinaryOperator::And,
+                    right: Box::new(next),
+                })
+                .expect("a correspondence names at least one pair")
         }
         ast_refined::MemberCorrelation::Condition(condition) => {
             scalar::s_lower_boolean(condition, &condition_qualify, ctx)?.into_expr()
@@ -1802,27 +2096,31 @@ fn r_lower_melt_join(
             None => SelectItem::bare_column(*column),
         });
     }
-    for (position, column) in melt_ids.iter().enumerate() {
-        let extracted = SqlDomainExpr::function(
-            "json_extract",
-            vec![
-                SqlDomainExpr::Column(value_column),
-                SqlDomainExpr::literal(crate::pipeline::asts::core::LiteralValue::String(format!(
-                    "$[{position}]"
-                ))),
-            ],
-        );
-        // A zero-width anonymous table gives this cell no slot in the join
-        // heading: the extraction is spent entirely inside the condition,
-        // and selecting it would emit a column the wrap above has no
-        // target for.
-        match output_ids.get(source_metadata.len() + position).copied() {
+    // WHICH CELLS THE JOIN PUBLISHES is the construction's record: a cell
+    // the join carries stands at its own output position; a cell a merge
+    // dropped, or one a zero-width table never published, has no slot in
+    // the heading — its extraction is spent entirely inside the condition,
+    // and selecting it would emit a column the wrap above has no target
+    // for. Read off the translation, never counted from a position.
+    let left_outputs = &output_ids[..source_metadata.len().min(output_ids.len())];
+    for (position, port) in crate::relation::published_ports(&ctx.identities, &anonymous_relation)?
+        .into_iter()
+        .enumerate()
+    {
+        let column = port.column();
+        let extracted = extraction(value_column, position);
+        match ctx
+            .relations
+            .translated_port(&result, port)?
+            .map(|output| output.column())
+            .filter(|output| !left_outputs.contains(output))
+        {
             Some(output) => {
                 replacements.insert(output, extracted.clone());
                 select_items.push(SelectItem::expression_with_alias(extracted, output));
             }
             None => {
-                replacements.insert(*column, extracted);
+                replacements.insert(column, extracted);
             }
         }
     }
@@ -1838,7 +2136,7 @@ fn r_lower_melt_join(
             join_condition: SqlJoinCondition::On(lowered_condition),
         }]))
     .standing_at(output_scope)
-    .map_err(crate::error::DelightQLError::parse_error)?;
+    .map_err(|e| Internal::invariant("transformer::relational", e))?;
     Builder::from_query(
         QueryExpression::Select(Box::new(select)),
         ScopeName::Resolved(output_scope),
@@ -1993,27 +2291,35 @@ impl Qualify for DummyQualify<'_> {
 
     // AN ANONYMOUS ROW EMITS NOTHING TO NAME. Its cells are literals and
     // computed values; there is no site under them and no column a
-    // reference could mean. It says so here, in its own words, rather than
-    // answering `None` to a question every scope used to be asked.
-    fn rebind_port(&self, port: crate::relation::PortId) -> Result<crate::names::ColId> {
-        Err(no_emission(port))
+    // reference could mean. A cell that READS a column stands here only
+    // where the melt — the one road that expands a row beside the relation
+    // it reads — was not taken, and that placement has no lowering yet.
+    fn rebind_port(&self, _port: crate::relation::PortId) -> Result<crate::names::ColId> {
+        Err(no_emission())
     }
 
-    fn slot_of_port(&self, port: crate::relation::PortId) -> Result<usize> {
-        Err(no_emission(port))
+    fn slot_of_port(&self, _port: crate::relation::PortId) -> Result<usize> {
+        Err(no_emission())
     }
 
     fn slot_of_physical(&self, column: crate::names::ColId) -> Result<usize> {
-        Err(DelightQLError::parse_error(format!(
-            "physical column {column:?} was looked for in an anonymous row, which emits none"
-        )))
+        Err(Internal::invariant(
+            "transformer::relational",
+            format!(
+                "physical column {column:?} was looked for in an anonymous row, which emits none"
+            ),
+        ))
     }
 }
 
-fn no_emission(port: crate::relation::PortId) -> DelightQLError {
-    DelightQLError::parse_error(format!(
-        "semantic port {port:?} was looked for in an anonymous row, which emits no column"
-    ))
+fn no_emission() -> DelightQLError {
+    DelightQLError::from(Limitation::NotImplemented {
+        message: "a cell of this anonymous relation reads a column of another relation; \
+                  that is lowered only for a comma member whose every header position \
+                  publishes — a consumed slot (ground, repeated, `_`, or computed) beside \
+                  a row-reading cell has no lowering yet"
+            .to_string(),
+    })
 }
 
 /// The two exact physical sites named by one set correlation.
@@ -2041,10 +2347,12 @@ impl Qualify for ArmPairQualify<'_> {
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [column] => Ok(*column),
-            [] => Err(DelightQLError::parse_error(
+            [] => Err(Internal::invariant(
+                "transformer::relational",
                 "a set correlation names a port neither exact arm emits",
             )),
-            _ => Err(DelightQLError::parse_error(
+            _ => Err(Internal::invariant(
+                "transformer::relational",
                 "a set correlation names a port both exact arms emit",
             )),
         }
@@ -2059,17 +2367,23 @@ impl Qualify for ArmPairQualify<'_> {
     // their columns out independently and there is no one ordinal a
     // reference could mean.
     fn slot_of_port(&self, port: crate::relation::PortId) -> Result<usize> {
-        Err(DelightQLError::parse_error(format!(
-            "semantic port {port:?} was asked for a position across a set-arm pair, \
+        Err(Internal::invariant(
+            "transformer::relational",
+            format!(
+                "semantic port {port:?} was asked for a position across a set-arm pair, \
              which lays out two"
-        )))
+            ),
+        ))
     }
 
     fn slot_of_physical(&self, column: crate::names::ColId) -> Result<usize> {
-        Err(DelightQLError::parse_error(format!(
-            "physical column {column:?} was asked for a position across a set-arm pair, \
+        Err(Internal::invariant(
+            "transformer::relational",
+            format!(
+                "physical column {column:?} was asked for a position across a set-arm pair, \
              which lays out two"
-        )))
+            ),
+        ))
     }
 }
 
@@ -2320,7 +2634,8 @@ pub(super) fn r_lower_set_op(
         // minus IS the whole-tuple anti-semijoin, and that is where the
         // predicate is written. There is no set-difference capability to
         // fall back to.
-        ast_refined::SetOperator::MinusCorresponding => Err(DelightQLError::parse_error(
+        ast_refined::SetOperator::MinusCorresponding => Err(Internal::invariant(
+            "transformer::relational",
             "minus reached lowering without its anti-semijoin correlation",
         )),
     }
@@ -2328,7 +2643,10 @@ pub(super) fn r_lower_set_op(
 
 /// A bag run has one step per operator and one operand per arm.
 fn empty_run() -> DelightQLError {
-    DelightQLError::parse_error("a bag run reached lowering with no step to lower")
+    Internal::invariant(
+        "transformer::relational",
+        "a bag run reached lowering with no step to lower",
+    )
 }
 
 /// Shape one branch to the operation's output heading, from the binding
@@ -2437,6 +2755,14 @@ pub(super) fn r_lower_projection(
             }
             continue;
         }
+        // A POSITION THE ENCLOSING JOIN COMPUTES is published here and
+        // emitted nowhere here: its value reads a row this level cannot
+        // see, and the site accounts for the position without a slot.
+        if let ast_refined::OutItem::One(one) = &item {
+            if ctx.relations.unemitted_here(*one.output()) {
+                continue;
+            }
+        }
         let lowered = scalar::s_lower_out_item(item, &builder, ctx)?;
         // A resolved reference to a hygienic position is construction-owned:
         // authored resolution cannot name one. It may feed a temporary
@@ -2462,15 +2788,23 @@ fn project_publishing_resolved(
     ctx: &TransformCtx,
 ) -> Result<Builder<Projected>> {
     if let Some(relation) = result {
-        let ports = ctx.relations.interface(&relation)?.ports().to_vec();
+        // The positions this level EMITS: the interface less the ones the
+        // enclosing join computes, in order.
+        let ports: Vec<_> = ctx
+            .relations
+            .interface(&relation)?
+            .ports()
+            .iter()
+            .copied()
+            .filter(|port| !ctx.relations.unemitted_here(*port))
+            .collect();
         if ports.len() != items.len() {
-            return Err(DelightQLError::parse_error(
-                "a lowered semantic operation emitted a different number of positions than its interface",
-            ));
+            return Err(Internal::invariant("transformer::relational", "a lowered semantic operation emitted a different number of positions than its interface"));
         }
         for (item, port) in items.iter_mut().zip(&ports) {
             let Some(realized) = item.realizing(port.column()) else {
-                return Err(DelightQLError::parse_error(
+                return Err(Internal::invariant(
+                    "transformer::relational",
                     "a semantic output position reached lowering as an unexpanded star",
                 ));
             };
@@ -2518,13 +2852,15 @@ fn group_by_publishing_resolved(
     items.append(&mut spec.aggregates);
     let ports = ctx.relations.interface(&result)?.ports().to_vec();
     if ports.len() != items.len() {
-        return Err(DelightQLError::parse_error(
+        return Err(Internal::invariant(
+            "transformer::relational",
             "a grouped operation emitted a different number of positions than its interface",
         ));
     }
     for (item, port) in items.iter_mut().zip(&ports) {
         let Some(realized) = item.realizing(port.column()) else {
-            return Err(DelightQLError::parse_error(
+            return Err(Internal::invariant(
+                "transformer::relational",
                 "a grouped semantic position reached lowering as an unexpanded star",
             ));
         };
@@ -2740,10 +3076,11 @@ fn build_delegate_relation(
         .columns()
         .last()
         .map(ColumnMetadata::identity)
-        .ok_or_else(|| DelightQLError::ParseError {
-            message: "delegate row-number projection produced no column".to_string(),
-            source: None,
-            subcategory: None,
+        .ok_or_else(|| {
+            Internal::invariant(
+                "transformer::relational",
+                "delegate row-number projection produced no column".to_string(),
+            )
         })?;
     // The demote wraps the tagged select one more time, so the filter must
     // reference the occurrence the demoted layer publishes, not the window
@@ -2836,13 +3173,11 @@ fn r_lower_n_way_delegate_join(
         .map(
             |expr| match scalar::s_lower_expression(expr.clone(), &builder, ctx)? {
                 SqlDomainExpr::Column(column) => Ok(column),
-                _ => Err(DelightQLError::ParseError {
+                _ => Err(DelightQLError::from(Constraint::Unsupported {
                     message: "N-way delegate join requires plain column group keys \
                               (expression keys with ordered delegates are not yet supported)"
                         .to_string(),
-                    source: None,
-                    subcategory: None,
-                }),
+                })),
             },
         )
         .collect::<Result<_>>()?;
@@ -2915,7 +3250,8 @@ fn r_lower_n_way_delegate_join(
                             .get(position)
                             .map(ColumnMetadata::identity)
                             .ok_or_else(|| {
-                                DelightQLError::parse_error(
+                                Internal::invariant(
+                                    "transformer::relational",
                                     "an aggregate operand omitted a group key",
                                 )
                             })?
@@ -2928,7 +3264,8 @@ fn r_lower_n_way_delegate_join(
                             .get(position)
                             .map(ColumnMetadata::identity)
                             .ok_or_else(|| {
-                                DelightQLError::parse_error(
+                                Internal::invariant(
+                                    "transformer::relational",
                                     "a delegate operand omitted a group key",
                                 )
                             })?
@@ -2963,7 +3300,10 @@ fn r_lower_n_way_delegate_join(
                 .columns()
                 .get(position)
                 .ok_or_else(|| {
-                    DelightQLError::parse_error("an aggregate operand omitted a group key")
+                    Internal::invariant(
+                        "transformer::relational",
+                        "an aggregate operand omitted a group key",
+                    )
                 })?
                 .identity()
         } else {
@@ -3053,11 +3393,23 @@ fn r_lower_group_by_spec(
 
     if has_pivot {
         let result = result.ok_or_else(|| {
-            DelightQLError::parse_error("an internal delegate aggregate cannot contain a pivot")
+            Internal::invariant(
+                "transformer::relational",
+                "an internal delegate aggregate cannot contain a pivot",
+            )
         })?;
         let keys = published_values(keys);
         return r_lower_pivot(builder, keys, reductions, result, ctx);
     }
+
+    // A window inside a collected row is one value per input row that SQL
+    // can only compute before the collecting aggregate runs: realize those
+    // over the input first, and let every road below read the staged
+    // columns.
+    let mut keys = keys;
+    let mut reductions = reductions;
+    let builder =
+        collected_windows::stage_collected_windows(builder, &mut keys, &mut reductions, ctx)?;
 
     // Check if any keys expression is a tree group (a record or a
     // metadata level with nested reductions). This pattern:
@@ -3069,7 +3421,10 @@ fn r_lower_group_by_spec(
 
     if by_needs_cte {
         let result = result.ok_or_else(|| {
-            DelightQLError::parse_error("an internal delegate aggregate cannot contain a tree key")
+            Internal::invariant(
+                "transformer::relational",
+                "an internal delegate aggregate cannot contain a tree key",
+            )
         })?;
         // Tree-group-in-keys lowering owns its output schema; unwrap the
         // stamps at the boundary.
@@ -3087,7 +3442,8 @@ fn r_lower_group_by_spec(
 
     if needs_cte {
         let result = result.ok_or_else(|| {
-            DelightQLError::parse_error(
+            Internal::invariant(
+                "transformer::relational",
                 "an internal delegate aggregate cannot contain a tree reduction",
             )
         })?;
@@ -3295,12 +3651,10 @@ fn r_lower_pivot(
                 None => continue,
             },
             ast_refined::ReductionItem::Metadata(_) => {
-                return Err(DelightQLError::ParseError {
+                return Err(DelightQLError::from(Constraint::Unsupported {
                     message: "a metadata group stands beside a pivot, which lowers values only"
                         .to_string(),
-                    source: None,
-                    subcategory: None,
-                })
+                }))
             }
             // Delegates were split off at the group dispatch; the pivot
             // road lowers values only.
@@ -3318,11 +3672,10 @@ fn r_lower_pivot(
             })
             .sum::<usize>();
     if output_columns.len() != expected_outputs {
-        return Err(DelightQLError::ParseError {
-            message: "pivot output heading does not match its reductions".to_string(),
-            source: None,
-            subcategory: None,
-        });
+        return Err(Internal::invariant(
+            "transformer::relational",
+            "pivot output heading does not match its reductions".to_string(),
+        ));
     }
     let group_outputs = output_columns[..keys.len()].to_vec();
     let mut output_cursor = keys.len();
@@ -3375,12 +3728,10 @@ fn r_lower_pivot(
             .any(|expr| matches!(expr, ast_refined::DomainExpression::Application(_)))
     });
     if needs_preagg && !regular_sql.is_empty() {
-        return Err(DelightQLError::ParseError {
+        return Err(DelightQLError::from(Constraint::Pivot {
             message: "pivot cannot combine pre-aggregated values with regular reductions"
                 .to_string(),
-            source: None,
-            subcategory: None,
-        });
+        }));
     }
 
     let internal_scope = ctx.identities.anonymous_scope(None);
@@ -3484,11 +3835,12 @@ fn r_lower_pivot(
                 .from_tables(vec![TableExpression::Scope(input.scope())])
                 .group_by(rebound_groups.into_iter().chain(rebound_keys).collect()))
             .standing_at(at)
-            .map_err(crate::error::DelightQLError::parse_error)?;
+            .map_err(|e| Internal::invariant("transformer::relational", e))?;
             Ok(CteBody {
                 query: QueryExpression::Select(Box::new(query)),
                 input_slots: vec![None; outputs.len()],
                 physical_aliases,
+                materialized_once: false,
                 output_columns: outputs,
             })
         })?;
@@ -3635,11 +3987,12 @@ fn r_lower_pivot(
         }
         let query = (select)
             .standing_at(at)
-            .map_err(crate::error::DelightQLError::parse_error)?;
+            .map_err(|e| Internal::invariant("transformer::relational", e))?;
         Ok(CteBody {
             query: QueryExpression::Select(Box::new(query)),
             input_slots: vec![None; outputs.len()],
             physical_aliases,
+            materialized_once: false,
             output_columns: outputs,
         })
     })?;
@@ -3763,7 +4116,8 @@ pub(super) fn r_lower_map_cover(
     // repeated publications independently addressable downstream.
     let outputs = ctx.relations.interface(&result)?.ports().to_vec();
     if outputs.len() != builder.columns().len() {
-        return Err(DelightQLError::parse_error(
+        return Err(Internal::invariant(
+            "transformer::relational",
             "a map cover and its input have different widths",
         ));
     }
@@ -3777,7 +4131,8 @@ pub(super) fn r_lower_map_cover(
         .into_iter()
         .map(|(_, sources)| {
             let [source] = sources.as_slice() else {
-                return Err(DelightQLError::parse_error(
+                return Err(Internal::invariant(
+                    "transformer::relational",
                     "a map cover output must carry exactly one input position",
                 ));
             };
@@ -3890,10 +4245,14 @@ pub(super) fn r_lower_transform(
             .iter()
             .map(|(output, expr)| {
                 let sources = carried.get(output).ok_or_else(|| {
-                    DelightQLError::parse_error("a transform output is absent from its relation")
+                    Internal::invariant(
+                        "transformer::relational",
+                        "a transform output is absent from its relation",
+                    )
                 })?;
                 let [source] = sources.as_slice() else {
-                    return Err(DelightQLError::parse_error(
+                    return Err(Internal::invariant(
+                        "transformer::relational",
                         "a transformed output must carry exactly one input position",
                     ));
                 };
@@ -3902,7 +4261,8 @@ pub(super) fn r_lower_transform(
             .collect::<Result<_>>()?;
     let outputs = ctx.relations.interface(&result)?.ports().to_vec();
     if outputs.len() != builder.columns().len() {
-        return Err(DelightQLError::parse_error(
+        return Err(Internal::invariant(
+            "transformer::relational",
             "a transform and its input have different widths",
         ));
     }
@@ -3912,7 +4272,8 @@ pub(super) fn r_lower_transform(
         .into_iter()
         .map(|(_, sources)| {
             let [source] = sources.as_slice() else {
-                return Err(DelightQLError::parse_error(
+                return Err(Internal::invariant(
+                    "transformer::relational",
                     "a transform output must carry exactly one input position",
                 ));
             };
@@ -3988,14 +4349,12 @@ pub(super) fn r_lower_embed_map(
     // minted for it.
     for (position, cell) in cells.iter().enumerate() {
         let fn_expr = scalar::s_lower_expression(cell.expr.clone(), &builder, ctx)?;
-        let alias = appended
-            .get(position)
-            .copied()
-            .ok_or_else(|| DelightQLError::ParseError {
-                message: "embed-map output schema is missing a generated column".to_string(),
-                source: None,
-                subcategory: None,
-            })?;
+        let alias = appended.get(position).copied().ok_or_else(|| {
+            Internal::invariant(
+                "transformer::relational",
+                "embed-map output schema is missing a generated column".to_string(),
+            )
+        })?;
 
         items.push(SelectItem::Publishing {
             expr: fn_expr,
@@ -4025,27 +4384,31 @@ pub(super) fn r_lower_meta_ize(
     };
     let source_columns = builder.columns().to_vec();
     let mut inputs = ctx.relations.inputs(&result)?.into_iter();
-    let subject = inputs
-        .next()
-        .ok_or_else(|| DelightQLError::parse_error("meta-ize has no semantic subject"))?;
+    let subject = inputs.next().ok_or_else(|| {
+        Internal::invariant(
+            "transformer::relational",
+            "meta-ize has no semantic subject",
+        )
+    })?;
     if inputs.next().is_some() {
-        return Err(DelightQLError::parse_error(
+        return Err(Internal::invariant(
+            "transformer::relational",
             "meta-ize has more than one semantic subject",
         ));
     }
     let subject_ports = ctx.relations.interface(&subject)?.ports().to_vec();
     if subject_ports.len() != source_columns.len() {
-        return Err(DelightQLError::parse_error(
+        return Err(Internal::invariant(
+            "transformer::relational",
             "meta-ize's semantic and physical subjects have different widths",
         ));
     }
     let output_columns = relation_output_columns(&result, ctx)?;
     if source_columns.is_empty() || output_columns.len() < 3 {
-        return Err(DelightQLError::ParseError {
-            message: "meta-ize requires an input heading and three output columns".to_string(),
-            source: None,
-            subcategory: None,
-        });
+        return Err(Internal::invariant(
+            "transformer::relational",
+            "meta-ize requires an input heading and three output columns".to_string(),
+        ));
     }
     let scope = result.scope();
     let make_row = |position: usize, column: &ColumnMetadata| -> Result<Vec<SqlDomainExpr>> {
@@ -4097,7 +4460,7 @@ pub(super) fn r_lower_meta_ize(
                     .collect(),
             )
             .standing_at(scope)
-            .map_err(DelightQLError::parse_error)?;
+            .map_err(|e| Internal::invariant("transformer::relational", e))?;
         query = QueryExpression::SetOperation {
             op: SetOperator::UnionAll,
             left: Box::new(query),
@@ -4136,19 +4499,17 @@ pub(super) fn r_lower_witness(
         SqlDomainExpr::not_exists(source_query)
     };
     let output_columns = relation_output_columns(&result, ctx)?;
-    let output = output_columns
-        .first()
-        .copied()
-        .ok_or_else(|| DelightQLError::ParseError {
-            message: "witness requires one resolved output column".to_string(),
-            source: None,
-            subcategory: None,
-        })?;
+    let output = output_columns.first().copied().ok_or_else(|| {
+        Internal::invariant(
+            "transformer::relational",
+            "witness requires one resolved output column".to_string(),
+        )
+    })?;
     let scope = result.scope();
     let select = (SelectStatement::builder()
         .select(SelectItem::expression_with_alias(exists_expr, output)))
     .standing_at(scope)
-    .map_err(crate::error::DelightQLError::parse_error)?;
+    .map_err(|e| Internal::invariant("transformer::relational", e))?;
 
     let query = QueryExpression::Select(Box::new(select));
 
@@ -4188,21 +4549,19 @@ pub(super) fn r_lower_signed_witness(
         SelectStatement,
     };
 
-    let err = |e: String| DelightQLError::ParseError {
-        message: format!("SignedWitness: {}", e),
-        source: None,
-        subcategory: None,
-    };
+    let err =
+        |e: String| Internal::invariant("transformer::relational", format!("SignedWitness: {}", e));
 
     let names_fork = builder.names().fork();
     let projected = builder.project_all()?;
     let source_columns = projected.columns().to_vec();
     let mut source_query = projected.to_sql()?;
     let source_scope = ColumnMetadata::common_identity_scope(&source_columns, &ctx.identities)
-        .ok_or_else(|| DelightQLError::ParseError {
-            message: "signed witness input has no common scope".to_string(),
-            source: None,
-            subcategory: None,
+        .ok_or_else(|| {
+            Internal::invariant(
+                "transformer::relational",
+                "signed witness input has no common scope".to_string(),
+            )
         })?;
 
     let one = || SqlDomainExpr::literal(LiteralValue::Number("1".to_string()));
@@ -4214,7 +4573,7 @@ pub(super) fn r_lower_signed_witness(
     let dee = (SelectStatement::builder()
         .select(SelectItem::expression_with_alias(one(), dee_column)))
     .standing_at(dee_scope)
-    .map_err(crate::error::DelightQLError::parse_error)?;
+    .map_err(|e| Internal::invariant("transformer::relational", e))?;
 
     let source_alias_scope = ctx.identities.wrap_scope(source_scope, WrapReason::Witness);
     let source_alias_columns: Vec<_> = super::builder::republish_under(
@@ -4263,7 +4622,7 @@ pub(super) fn r_lower_signed_witness(
         )]);
     let sentinel = (sentinel)
         .standing_at(sentinel_scope)
-        .map_err(crate::error::DelightQLError::parse_error)?;
+        .map_err(|e| Internal::invariant("transformer::relational", e))?;
 
     let join = TableExpression::Join {
         left: Box::new(TableExpression::subquery(
@@ -4280,11 +4639,10 @@ pub(super) fn r_lower_signed_witness(
 
     let output_columns = relation_output_columns(&result, ctx)?;
     if output_columns.len() != sentinel_payload.len() + 1 {
-        return Err(DelightQLError::ParseError {
-            message: "signed witness output heading does not match its input".to_string(),
-            source: None,
-            subcategory: None,
-        });
+        return Err(Internal::invariant(
+            "transformer::relational",
+            "signed witness output heading does not match its input".to_string(),
+        ));
     }
     let mut items: Vec<SelectItem> = Vec::with_capacity(output_columns.len());
     for (source, output) in sentinel_payload
@@ -4324,7 +4682,7 @@ pub(super) fn r_lower_signed_witness(
         .select_all(items)
         .from_tables(vec![join]))
     .standing_at(scope)
-    .map_err(crate::error::DelightQLError::parse_error)?;
+    .map_err(|e| Internal::invariant("transformer::relational", e))?;
 
     let query = QueryExpression::Select(Box::new(select));
     Builder::from_query(
@@ -4370,9 +4728,9 @@ pub(super) fn r_lower_narrowing_destructure(
     use crate::pipeline::asts::core::{NamedReference, Reference};
 
     let Reference::Named(NamedReference(ColumnOccurrence { column, .. })) = nest else {
-        return Err(DelightQLError::transformation_error(
-            "narrowing requires a semantic source port",
+        return Err(Internal::invariant(
             "narrow/source",
+            "narrowing requires a semantic source port",
         ));
     };
     let source_column = builder.rebind_port(column)?;
@@ -4446,18 +4804,18 @@ fn narrowing_items(
                 .and_then(|mapping| {
                     Path::try_from_steps(vec![PathStep::Key(mapping.json_key.clone())])
                 })
-                .ok_or_else(|| DelightQLError::ParseError {
-                    message: "a narrowing binder has no authored key".to_string(),
-                    source: None,
-                    subcategory: None,
+                .ok_or_else(|| {
+                    Internal::invariant(
+                        "transformer::relational",
+                        "a narrowing binder has no authored key".to_string(),
+                    )
                 })?,
             RecordPatternMember::Path(binding) => binding.path.clone(),
             other => {
-                return Err(DelightQLError::ParseError {
-                    message: format!("a narrowing publishes fields; {other:?} publishes none"),
-                    source: None,
-                    subcategory: None,
-                })
+                return Err(Internal::invariant(
+                    "transformer::relational",
+                    format!("a narrowing publishes fields; {other:?} publishes none"),
+                ))
             }
         };
         items.push((path, output));
@@ -4500,16 +4858,15 @@ fn r_lower_interior_drill_down(
     let num_context = context_columns.len();
     let output_columns = relation_output_columns(&result, ctx)?;
     if output_columns.len() < num_context + selected.len() {
-        return Err(DelightQLError::ParseError {
-            message: "interior drill output heading is incomplete".to_string(),
-            source: None,
-            subcategory: None,
-        });
+        return Err(Internal::invariant(
+            "transformer::relational",
+            "interior drill output heading is incomplete".to_string(),
+        ));
     }
     let interior = ctx.relations.interior(column)?.ok_or_else(|| {
-        DelightQLError::transformation_error(
-            "a drilled semantic port has no construction-recorded interior",
+        Internal::invariant(
             "drill/interior",
+            "a drilled semantic port has no construction-recorded interior",
         )
     })?;
     let interior_ports = ctx.relations.interface(&interior)?;
@@ -4523,15 +4880,15 @@ fn r_lower_interior_drill_down(
                 .into_iter()
                 .filter(|source| interior_ports.ports().contains(source));
             let source = sources.next().ok_or_else(|| {
-                DelightQLError::transformation_error(
-                    "a drill output has no construction-recorded interior source",
+                Internal::invariant(
                     "drill/interior",
+                    "a drill output has no construction-recorded interior source",
                 )
             })?;
             if sources.next().is_some() {
-                return Err(DelightQLError::transformation_error(
-                    "a drill output carries several interior source ports",
+                return Err(Internal::invariant(
                     "drill/interior",
+                    "a drill output carries several interior source ports",
                 ));
             }
             Ok(source.column())
@@ -4624,11 +4981,10 @@ pub(super) fn r_lower_destructure(
                 ColumnOccurrence { column, .. },
             ))) => builder.rebind_port(*column)?,
             _ => {
-                return Err(DelightQLError::ParseError {
-                    message: "aggregate destructure: expected Lvar for json column".into(),
-                    source: None,
-                    subcategory: None,
-                });
+                return Err(Internal::invariant(
+                    "transformer::relational",
+                    "aggregate destructure: expected Lvar for json column",
+                ));
             }
         };
         lower_with_json_each(builder, json_column, pattern, mappings, &mut outputs, ctx)
@@ -4636,11 +4992,10 @@ pub(super) fn r_lower_destructure(
         lower_destructure_pattern(builder, &source_expr, pattern, mappings, &mut outputs, ctx)
     }?;
     if outputs.peek().is_some() {
-        return Err(DelightQLError::ParseError {
-            message: "destructure did not account for its resolved output heading".to_string(),
-            source: None,
-            subcategory: None,
-        });
+        return Err(Internal::invariant(
+            "transformer::relational",
+            "destructure did not account for its resolved output heading".to_string(),
+        ));
     }
     Ok(lowered)
 }
@@ -4648,10 +5003,11 @@ pub(super) fn r_lower_destructure(
 fn next_destructure_output(
     outputs: &mut std::iter::Peekable<impl Iterator<Item = crate::names::ColId>>,
 ) -> Result<crate::names::ColId> {
-    outputs.next().ok_or_else(|| DelightQLError::ParseError {
-        message: "destructure produced more columns than its resolved heading".to_string(),
-        source: None,
-        subcategory: None,
+    outputs.next().ok_or_else(|| {
+        Internal::invariant(
+            "transformer::relational",
+            "destructure produced more columns than its resolved heading".to_string(),
+        )
     })
 }
 
@@ -4885,7 +5241,8 @@ fn lower_metadata_level<I: Iterator<Item = crate::names::ColId>>(
     // taken before it finds nothing — the position it stood at is what
     // carries across, and the nested level only appends after it.
     if builder.columns().len() <= value_slot {
-        return Err(DelightQLError::parse_error(
+        return Err(Internal::invariant(
+            "transformer::relational",
             "a metadata level lost the position its value stood at",
         ));
     }
@@ -4955,7 +5312,9 @@ fn remove_physical_slot(
     let column = builder
         .columns()
         .get(slot)
-        .ok_or_else(|| DelightQLError::parse_error("physical support slot is absent"))?
+        .ok_or_else(|| {
+            Internal::invariant("transformer::relational", "physical support slot is absent")
+        })?
         .identity();
     remove_current_column(builder, column, ctx)
 }
@@ -5041,7 +5400,8 @@ fn make_destructure_shorthand_item(
         .map(|mapping| mapping.json_key.as_str())
         .collect();
     let [key] = keys.as_slice() else {
-        return Err(DelightQLError::parse_error(
+        return Err(Internal::invariant(
+            "transformer::relational",
             "resolved destructure shorthand does not have exactly one authored JSON key",
         ));
     };
@@ -5130,27 +5490,25 @@ pub(super) fn expand_whole_heading(
                 [] => {}
                 [left] => pairs.push((*left, right_column)),
                 _ => {
-                    return Err(crate::error::DelightQLError::validation_error_categorized(
-                        "setop/correlation/ambiguous",
-                        "whole-heading correlation found a duplicate name in one operand",
-                        "project or rename the operand to a unique heading",
-                    ))
+                    return Err(DelightQLError::from(Setop::CorrelationAmbiguous {
+                        message: "whole-heading correlation found a duplicate name in one operand"
+                            .to_string(),
+                    }))
                 }
             }
         }
         if pairs.is_empty() {
-            return Err(crate::error::DelightQLError::validation_error(
-                "Whole-heading correlation has no shared columns",
-                "The two operands have no column names in common",
-            ));
+            return Err(DelightQLError::from(Constraint::General {
+                message: "Whole-heading correlation has no shared columns".to_string(),
+            }));
         }
     } else {
         let width = left_columns.len().min(right_columns.len());
         if width == 0 {
-            return Err(crate::error::DelightQLError::validation_error(
-                "Positional whole-heading correlation has no columns to compare",
-                "At least one operand has no columns",
-            ));
+            return Err(DelightQLError::from(Constraint::General {
+                message: "Positional whole-heading correlation has no columns to compare"
+                    .to_string(),
+            }));
         }
         pairs.extend((0..width).map(|slot| (left_columns[slot], right_columns[slot])));
     }
@@ -5175,11 +5533,9 @@ pub(super) fn expand_whole_heading(
         })
     });
     ast_refined::TruthExpression::all(comparisons.collect()).ok_or_else(|| {
-        crate::error::DelightQLError::validation_error_categorized(
-            "setop/correlation/ambiguous",
-            "whole-heading correlation found no columns to pair",
-            "project or rename the operands to a shared heading",
-        )
+        DelightQLError::from(Setop::CorrelationAmbiguous {
+            message: "whole-heading correlation found no columns to pair".to_string(),
+        })
     })
 }
 
@@ -5209,20 +5565,17 @@ pub(super) fn r_lower_correlated_set_op(
 
     let result = *steps.last().ok_or_else(|| empty_run())?;
     if operands.len() < 2 {
-        return Err(DelightQLError::ParseError {
-            message: "a correlated set operation requires at least 2 operands".to_string(),
-            source: None,
-            subcategory: None,
-        });
+        return Err(Internal::invariant(
+            "transformer::relational",
+            "a correlated set operation requires at least 2 operands".to_string(),
+        ));
     }
     for correlation in &correlations {
         if correlation.left >= operands.len() || correlation.right >= operands.len() {
-            return Err(DelightQLError::ParseError {
-                message: "a set-operation correlation names an arm this run does not have"
-                    .to_string(),
-                source: None,
-                subcategory: None,
-            });
+            return Err(Internal::invariant(
+                "transformer::relational",
+                "a set-operation correlation names an arm this run does not have".to_string(),
+            ));
         }
     }
     let output_columns = relation_output_columns(&result, ctx)?;
@@ -5378,10 +5731,12 @@ fn intersection_column_pairs(
         });
         match (found.next(), found.next()) {
             (Some((index, _)), None) => Ok(index),
-            (Some(_), Some(_)) => Err(DelightQLError::parse_error(
+            (Some(_), Some(_)) => Err(Internal::invariant(
+                "transformer::relational",
                 "a bag intersection's correlation names a position both operands publish",
             )),
-            (None, _) => Err(DelightQLError::parse_error(
+            (None, _) => Err(Internal::invariant(
+                "transformer::relational",
                 "a bag intersection's correlation names a position neither operand publishes",
             )),
         }
@@ -5405,21 +5760,23 @@ fn intersection_column_pairs(
                     crate::pipeline::sql_ast::BinaryOperator::Equal
                         | crate::pipeline::sql_ast::BinaryOperator::IsNotDistinctFrom
                 ) {
-                    return Err(DelightQLError::validation_error_categorized(
-                        "setop/min_multiplicity/correlation_operator",
-                        "minimum-multiplicity intersection requires equality correlation",
-                        "correlate the two operand columns with equality, or turn semantics/min_multiplicity OFF",
+                    return Err(DelightQLError::from(
+                        Setop::MinMultiplicityCorrelationOperator {
+                            message:
+                                "minimum-multiplicity intersection requires equality correlation"
+                                    .to_string(),
+                        },
                     ));
                 }
-                let left = resolved_column(left).ok_or_else(|| DelightQLError::ParseError {
-                    message: "bag intersection requires column-pair correlation".to_string(),
-                    source: None,
-                    subcategory: None,
+                let left = resolved_column(left).ok_or_else(|| {
+                    DelightQLError::from(Constraint::General {
+                        message: "bag intersection requires column-pair correlation".to_string(),
+                    })
                 })?;
-                let right = resolved_column(right).ok_or_else(|| DelightQLError::ParseError {
-                    message: "bag intersection requires column-pair correlation".to_string(),
-                    source: None,
-                    subcategory: None,
+                let right = resolved_column(right).ok_or_else(|| {
+                    DelightQLError::from(Constraint::General {
+                        message: "bag intersection requires column-pair correlation".to_string(),
+                    })
                 })?;
                 match (
                     owner(left, operands, identities)?,
@@ -5428,12 +5785,10 @@ fn intersection_column_pairs(
                     (0, 1) => pairs.push((left, right)),
                     (1, 0) => pairs.push((right, left)),
                     _ => {
-                        return Err(DelightQLError::ParseError {
+                        return Err(DelightQLError::from(Constraint::General {
                             message: "bag intersection correlation must cross its two operands"
                                 .to_string(),
-                            source: None,
-                            subcategory: None,
-                        });
+                        }));
                     }
                 }
             }
@@ -5443,11 +5798,9 @@ fn intersection_column_pairs(
                 }
             }
             _ => {
-                return Err(DelightQLError::ParseError {
+                return Err(DelightQLError::from(Constraint::General {
                     message: "bag intersection requires a conjunction of column pairs".to_string(),
-                    source: None,
-                    subcategory: None,
-                });
+                }));
             }
         }
         Ok(())
@@ -5473,12 +5826,17 @@ fn exact_republication(
             .get(position)
             .map(ColumnMetadata::identity)
             .ok_or_else(|| {
-                DelightQLError::parse_error("an exact republication dropped its source position")
+                Internal::invariant(
+                    "transformer::relational",
+                    "an exact republication dropped its source position",
+                )
             }),
-        (None, _) => Err(DelightQLError::parse_error(
+        (None, _) => Err(Internal::invariant(
+            "transformer::relational",
             "an exact republication does not contain its source occurrence",
         )),
-        (Some(_), Some(_)) => Err(DelightQLError::parse_error(
+        (Some(_), Some(_)) => Err(Internal::invariant(
+            "transformer::relational",
             "an exact occurrence appears twice in one physical heading",
         )),
     }
@@ -5615,7 +5973,8 @@ fn r_lower_intersect_min_multiplicity(
                 .get(source)
                 .map(|column| item.with_expr(SqlDomainExpr::Column(*column)))
                 .ok_or_else(|| {
-                    DelightQLError::parse_error(
+                    Internal::invariant(
+                        "transformer::relational",
                         "a bound set column is not one the intersection's left operand carries",
                     )
                 }),

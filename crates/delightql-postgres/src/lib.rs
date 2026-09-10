@@ -69,15 +69,14 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use delightql_protocol::{
-    resolve_projection, Cell, ClientTerm, Dimension, ErrorKind, Handle, Handler, MetaItem,
-    Orientation, Projection, ServerTerm,
+    resolve_projection, Cell, ClientTerm, Dimension, Handle, Handler, MetaItem, Orientation,
+    Projection, ServerTerm, WireError,
 };
 use postgres::{Client, NoTls, SimpleQueryMessage};
 
 /// Identity URI namespace for this adapter's own errors. Foreign-engine
 /// SQLSTATEs get their full identity mapping in step 8.
-const IDENT_UNIMPLEMENTED: &str = "delightql-error://target/postgres/unimplemented";
-const IDENT_PG_ERROR: &str = "delightql-error://target/postgres/error";
+use delightql_types::diagnostic::{DelightQLError, Postgres, PostgresNative};
 
 struct ResultState {
     columns: Vec<String>,
@@ -158,9 +157,7 @@ fn first_two_keywords(fragment: &str) -> (String, String) {
             }
         } else if c.is_ascii_alphabetic() || c == b'_' {
             let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
             words.push(fragment[start..i].to_ascii_uppercase());
@@ -258,9 +255,10 @@ impl PgParty {
     /// in-txn, the direction that can only degrade descriptors, never
     /// abort anyone's bracket.
     fn resync_txn_state(&mut self) {
-        self.txn_state = match self.client.simple_query(
-            "SAVEPOINT __pgparty_txn_probe; RELEASE SAVEPOINT __pgparty_txn_probe",
-        ) {
+        self.txn_state = match self
+            .client
+            .simple_query("SAVEPOINT __pgparty_txn_probe; RELEASE SAVEPOINT __pgparty_txn_probe")
+        {
             Ok(_) => TxnState::InTxn,
             Err(e) => match e.code().map(|c| c.code()) {
                 Some("25P01") => TxnState::Idle,
@@ -273,7 +271,9 @@ impl PgParty {
         let sql = match String::from_utf8(text) {
             Ok(s) => s,
             Err(_) => {
-                return error(ErrorKind::Syntax, IDENT_PG_ERROR, b"query is not UTF-8".to_vec())
+                return error(Postgres::ProtocolText {
+                    message: "query is not UTF-8".to_string(),
+                })
             }
         };
 
@@ -345,10 +345,10 @@ impl PgParty {
         // Column names+descriptors: prepared metadata when available
         // (covers empty result sets), else names from the rows.
         let (names, descriptors): (Vec<String>, Vec<String>) = match (&prepared, &row_columns) {
-            (Some(cols), _) if !cols.is_empty() => {
-                (cols.iter().map(|(n, _)| n.clone()).collect(),
-                 cols.iter().map(|(_, t)| t.clone()).collect())
-            }
+            (Some(cols), _) if !cols.is_empty() => (
+                cols.iter().map(|(n, _)| n.clone()).collect(),
+                cols.iter().map(|(_, t)| t.clone()).collect(),
+            ),
             (_, Some(names)) => (names.clone(), vec![String::new(); names.len()]),
             // No row description anywhere: a DML/DDL result. Per the
             // spec's appendix, outcomes are ordinary relations:
@@ -376,7 +376,11 @@ impl PgParty {
 
         self.handles.insert(
             handle.clone(),
-            ResultState { columns: names, rows, exec_ms },
+            ResultState {
+                columns: names,
+                rows,
+                exec_ms,
+            },
         );
 
         ServerTerm::Header { handle, dimensions }
@@ -390,11 +394,9 @@ impl PgParty {
         orientation: Orientation,
     ) -> ServerTerm {
         if orientation != Orientation::Rows {
-            return error(
-                ErrorKind::Connection,
-                "delightql-error://target/postgres/orientation",
-                b"orientation Columns not supported".to_vec(),
-            );
+            return error(Postgres::Orientation {
+                message: "orientation Columns not supported".to_string(),
+            });
         }
         let state = match self.handles.get_mut(&handle) {
             Some(s) => s,
@@ -432,23 +434,29 @@ impl PgParty {
         let copy_sql = match String::from_utf8(text) {
             Ok(s) => s,
             Err(_) => {
-                return error(ErrorKind::Syntax, IDENT_PG_ERROR, b"prepare text is not UTF-8".to_vec())
+                return error(Postgres::ProtocolText {
+                    message: "prepare text is not UTF-8".to_string(),
+                })
             }
         };
         // Layer-1 convention: the load command IS a COPY ... FROM STDIN.
         let upper = copy_sql.to_uppercase();
         if !(upper.trim_start().starts_with("COPY") && upper.contains("FROM STDIN")) {
-            return error(
-                ErrorKind::Syntax,
-                IDENT_PG_ERROR,
-                b"prepare text must be a COPY ... FROM STDIN statement".to_vec(),
-            );
+            return error(Postgres::ProtocolText {
+                message: "prepare text must be a COPY ... FROM STDIN statement".to_string(),
+            });
         }
 
         let handle_id = self.next_handle_id;
         self.next_handle_id += 1;
         let handle: Handle = format!("pgload{}", handle_id).into_bytes();
-        self.loads.insert(handle.clone(), LoadState { copy_sql, rows: Vec::new() });
+        self.loads.insert(
+            handle.clone(),
+            LoadState {
+                copy_sql,
+                rows: Vec::new(),
+            },
+        );
         // Echo the client-declared dimensions back, per the spec's
         // load-path script (Prepare -> Header).
         ServerTerm::Header { handle, dimensions }
@@ -461,11 +469,9 @@ impl PgParty {
         orientation: Orientation,
     ) -> ServerTerm {
         if orientation != Orientation::Rows {
-            return error(
-                ErrorKind::Connection,
-                "delightql-error://target/postgres/orientation",
-                b"orientation Columns not supported".to_vec(),
-            );
+            return error(Postgres::Orientation {
+                message: "orientation Columns not supported".to_string(),
+            });
         }
         match self.loads.get_mut(&handle) {
             None => unknown_handle(),
@@ -511,11 +517,9 @@ impl PgParty {
                     .write_all(line.as_bytes())
                     .and_then(|_| writer.write_all(b"\n"))
                 {
-                    return error(
-                        ErrorKind::Connection,
-                        IDENT_PG_ERROR,
-                        format!("copy stream write failed: {e}").into_bytes(),
-                    );
+                    return error(Postgres::Connection {
+                        message: format!("copy stream write failed: {e}"),
+                    });
                 }
             }
             return match writer.finish() {
@@ -529,69 +533,39 @@ impl PgParty {
     }
 }
 
-fn error(kind: ErrorKind, identity: &str, message: impl Into<Vec<u8>>) -> ServerTerm {
-    ServerTerm::Error {
-        kind,
-        identity: identity.as_bytes().to_vec(),
-        message: message.into(),
-    }
+/// The one projection of an adapter diagnostic onto the wire: identity,
+/// kind and message all derive from the typed leaf.
+fn error(diagnostic: Postgres) -> ServerTerm {
+    ServerTerm::Error(WireError::of(&DelightQLError::from(diagnostic)))
 }
 
 fn unknown_handle() -> ServerTerm {
-    error(ErrorKind::Connection, IDENT_PG_ERROR, b"unknown handle".to_vec())
+    error(Postgres::UnknownHandle)
 }
 
-/// SQLSTATE → identity-URI class.
-///
-/// Identity = `delightql-error://target/postgres/<class>/<sqlstate>` — the class for
-/// programmatic matching by prefix, the exact SQLSTATE as the leaf for
-/// precision (feeds the diagnostics catalog). Exact codes override
-/// their class where the class default would mislead.
-fn sqlstate_class(code: &str) -> &'static str {
-    match code {
-        "42601" => "syntax",
-        "42804" => "type-mismatch",
-        "42501" => "permission",
-        _ => match code.get(..2) {
-            Some("42") => "undefined-object", // 42883 fn, 42P01 table, 42703 col, …
-            Some("22") => "type-mismatch",    // data exceptions (22P02 …)
-            Some("23") => "constraint",
-            Some("57") => "timeout",          // incl. 57014 statement_timeout
-            Some("08") => "connection",
-            Some("28") => "permission",
-            _ => "error",
-        },
-    }
-}
-
-/// Map a postgres error to a protocol Error term: coarse ErrorKind from
-/// the SQLSTATE class, precise identity URI, message preserved.
+/// Map a postgres error to its typed diagnostic: the SQLSTATE becomes the
+/// provider-owned terminal `target/postgres/<class>/<sqlstate>` (class word
+/// and wire kind both derived from the code by the terminal itself, message
+/// preserved); a failure with no database error is the connection's.
 fn pg_error(e: &postgres::Error) -> ServerTerm {
-    let exact = e.code().map(|c| c.code());
-    let kind = match (exact, exact.and_then(|c| c.get(..2))) {
-        (Some("42501"), _) | (_, Some("28")) => ErrorKind::Permission,
-        (_, Some("23")) => ErrorKind::Constraint,
-        (_, Some("57")) => ErrorKind::Timeout,
-        (_, Some("08")) => ErrorKind::Connection,
-        (_, Some(_)) => ErrorKind::Syntax,
-        _ => ErrorKind::Connection,
-    };
     // postgres::Error's Display is terse ("db error"); the server's
     // actual message (with SQLSTATE) lives in the DbError.
-    let (identity, message) = match e.as_db_error() {
+    let diagnostic = match e.as_db_error() {
         Some(db) => {
             let code = db.code().code();
-            (
-                format!("delightql-error://target/postgres/{}/{}", sqlstate_class(code), code),
-                format!("{}: {}", code, db.message()),
-            )
+            let message = format!("{}: {}", code, db.message());
+            match PostgresNative::new(code, message.clone()) {
+                Some(native) => Postgres::Native(native),
+                // A code outside the SQLSTATE shape is still the engine's
+                // refusal; it is reported as the connection's own text.
+                None => Postgres::Connection { message },
+            }
         }
-        None => (
-            "delightql-error://target/postgres/connection".to_string(),
-            e.to_string(),
-        ),
+        None => Postgres::Connection {
+            message: e.to_string(),
+        },
     };
-    error(kind, &identity, message.into_bytes())
+    error(diagnostic)
 }
 
 impl Handler for PgParty {
@@ -616,11 +590,9 @@ impl Handler for PgParty {
                     .filter(|o| supported.contains(o))
                     .collect();
                 if agreed.is_empty() {
-                    error(
-                        ErrorKind::Connection,
-                        "delightql-error://target/postgres/orientation",
-                        b"no common orientation".to_vec(),
-                    )
+                    error(Postgres::Orientation {
+                        message: "no common orientation".to_string(),
+                    })
                 } else {
                     ServerTerm::Version {
                         max_message_size,
@@ -633,9 +605,12 @@ impl Handler for PgParty {
 
             ClientTerm::Query { text } => self.handle_query(text),
 
-            ClientTerm::Fetch { handle, projection, count, orientation } => {
-                self.handle_fetch(handle, projection, count, orientation)
-            }
+            ClientTerm::Fetch {
+                handle,
+                projection,
+                count,
+                orientation,
+            } => self.handle_fetch(handle, projection, count, orientation),
 
             ClientTerm::Stat { handle } => self.handle_stat(handle),
 
@@ -643,9 +618,11 @@ impl Handler for PgParty {
 
             ClientTerm::Prepare { text, dimensions } => self.handle_prepare(text, dimensions),
 
-            ClientTerm::Offer { handle, cells, orientation } => {
-                self.handle_offer(handle, cells, orientation)
-            }
+            ClientTerm::Offer {
+                handle,
+                cells,
+                orientation,
+            } => self.handle_offer(handle, cells, orientation),
         }
     }
 }
@@ -667,8 +644,8 @@ fn kind_of(term: &ClientTerm) -> &'static str {
 mod tests {
     use super::*;
     use delightql_protocol::{
-        AgreedOrientation, Client as RelayClient, ColumnRef, DirectTransport, FetchResponse,
-        QueryResponse, Session, StatResponse, VersionResult,
+        AgreedOrientation, Client as RelayClient, ColumnRef, DirectTransport, ErrorKind,
+        FetchResponse, QueryResponse, Session, StatResponse, VersionResult,
     };
 
     /// The sweep container's loopback (new_test_suite/sweep.py). Tests
@@ -741,8 +718,8 @@ mod tests {
                 assert!(session.agreed_orientation(Orientation::Rows).is_some());
                 assert!(session.agreed_orientation(Orientation::Columns).is_none());
             }
-            VersionResult::Rejected { message, .. } => {
-                panic!("rejected: {}", String::from_utf8_lossy(&message))
+            VersionResult::Rejected(error) => {
+                panic!("rejected: {}", error.message_str())
             }
         }
     }
@@ -754,12 +731,14 @@ mod tests {
         let result = client
             .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Columns])
             .unwrap();
-        assert!(matches!(result, VersionResult::Rejected { .. }));
+        assert!(matches!(result, VersionResult::Rejected(_)));
     }
 
     #[test]
     fn select_one_with_foreign_descriptor() {
-        let Some((mut session, rows_o)) = session() else { return };
+        let Some((mut session, rows_o)) = session() else {
+            return;
+        };
         let QueryResponse::Header { handle, dimensions } =
             session.query(b("SELECT 1 AS x")).unwrap()
         else {
@@ -770,12 +749,17 @@ mod tests {
         assert_eq!(dimensions[0].descriptor, b("int4")); // foreign descriptor!
         assert_eq!(dimensions[0].position, 1);
 
-        match session.fetch(&handle, Projection::All, 100, rows_o).unwrap() {
+        match session
+            .fetch(&handle, Projection::All, 100, rows_o)
+            .unwrap()
+        {
             FetchResponse::Data { cells } => assert_eq!(cells, vec![vec![cell("1")]]),
             other => panic!("expected Data, got {:?}", other),
         }
         assert!(matches!(
-            session.fetch(&handle, Projection::All, 100, rows_o).unwrap(),
+            session
+                .fetch(&handle, Projection::All, 100, rows_o)
+                .unwrap(),
             FetchResponse::End
         ));
         session.close(handle).unwrap();
@@ -786,7 +770,9 @@ mod tests {
     /// rendering the pipe bridge pinned into the 897 baselines.
     #[test]
     fn text_mode_is_pg_rendered() {
-        let Some((mut session, rows_o)) = session() else { return };
+        let Some((mut session, rows_o)) = session() else {
+            return;
+        };
         let QueryResponse::Header { handle, dimensions } = session
             .query(b("SELECT balance FROM users WHERE id IN (1,3) ORDER BY id"))
             .unwrap()
@@ -794,7 +780,10 @@ mod tests {
             panic!("expected Header")
         };
         assert_eq!(dimensions[0].descriptor, b("float8"));
-        match session.fetch(&handle, Projection::All, 100, rows_o).unwrap() {
+        match session
+            .fetch(&handle, Projection::All, 100, rows_o)
+            .unwrap()
+        {
             FetchResponse::Data { cells } => {
                 assert_eq!(cells, vec![vec![cell("150.5")], vec![cell("0")]]);
             }
@@ -805,17 +794,16 @@ mod tests {
 
     #[test]
     fn projection_by_name_and_index() {
-        let Some((mut session, rows_o)) = session() else { return };
+        let Some((mut session, rows_o)) = session() else {
+            return;
+        };
         let QueryResponse::Header { handle, .. } = session
             .query(b("SELECT id, first_name, country FROM users WHERE id = 1"))
             .unwrap()
         else {
             panic!("expected Header")
         };
-        let proj = Projection::Select(vec![
-            ColumnRef::ByName(b("country")),
-            ColumnRef::ByIndex(1),
-        ]);
+        let proj = Projection::Select(vec![ColumnRef::ByName(b("country")), ColumnRef::ByIndex(1)]);
         match session.fetch(&handle, proj, 100, rows_o).unwrap() {
             FetchResponse::Data { cells } => {
                 assert_eq!(cells, vec![vec![cell("USA"), cell("1")]]);
@@ -827,7 +815,9 @@ mod tests {
 
     #[test]
     fn empty_result_set_has_dimensions_then_end() {
-        let Some((mut session, rows_o)) = session() else { return };
+        let Some((mut session, rows_o)) = session() else {
+            return;
+        };
         let QueryResponse::Header { handle, dimensions } = session
             .query(b("SELECT id, email FROM users WHERE false"))
             .unwrap()
@@ -838,7 +828,9 @@ mod tests {
         assert_eq!(dimensions.len(), 2);
         assert_eq!(dimensions[1].name, b("email"));
         assert!(matches!(
-            session.fetch(&handle, Projection::All, 100, rows_o).unwrap(),
+            session
+                .fetch(&handle, Projection::All, 100, rows_o)
+                .unwrap(),
             FetchResponse::End
         ));
         session.close(handle).unwrap();
@@ -846,7 +838,9 @@ mod tests {
 
     #[test]
     fn dml_yields_affected_rows_relation() {
-        let Some((mut session, rows_o)) = session() else { return };
+        let Some((mut session, rows_o)) = session() else {
+            return;
+        };
         // TEMP table: session-scoped, the shared fixture is untouched.
         let QueryResponse::Header { handle, .. } = session
             .query(b("CREATE TEMP TABLE step2_scratch (x int)"))
@@ -872,27 +866,43 @@ mod tests {
 
     #[test]
     fn erroring_query_maps_sqlstate_to_identity() {
-        let Some((mut session, _)) = session() else { return };
+        let Some((mut session, _)) = session() else {
+            return;
+        };
         // 42P01 undefined_table -> undefined-object class.
-        match session.query(b("SELECT * FROM table_that_does_not_exist")).unwrap() {
-            QueryResponse::Error { kind, identity, message } => {
-                assert_eq!(kind, ErrorKind::Syntax);
-                assert_eq!(identity, b("delightql-error://target/postgres/undefined-object/42P01"));
-                assert!(String::from_utf8_lossy(&message).contains("table_that_does_not_exist"));
+        match session
+            .query(b("SELECT * FROM table_that_does_not_exist"))
+            .unwrap()
+        {
+            QueryResponse::Error(error) => {
+                assert_eq!(error.kind(), ErrorKind::Syntax);
+                assert_eq!(
+                    error.identity(),
+                    b("delightql-error://target/postgres/undefined-object/42P01")
+                );
+                assert!(
+                    String::from_utf8_lossy(error.message()).contains("table_that_does_not_exist")
+                );
             }
             QueryResponse::Header { .. } => panic!("expected Error"),
         }
         // 42601 -> syntax (exact-code override of the 42 class).
         match session.query(b("SELECTT 1")).unwrap() {
-            QueryResponse::Error { identity, .. } => {
-                assert_eq!(identity, b("delightql-error://target/postgres/syntax/42601"));
+            QueryResponse::Error(error) => {
+                assert_eq!(
+                    error.identity(),
+                    b("delightql-error://target/postgres/syntax/42601")
+                );
             }
             QueryResponse::Header { .. } => panic!("expected Error"),
         }
         // 42883 undefined_function -> undefined-object class.
         match session.query(b("SELECT json_extract('{}', 'x')")).unwrap() {
-            QueryResponse::Error { identity, .. } => {
-                assert_eq!(identity, b("delightql-error://target/postgres/undefined-object/42883"));
+            QueryResponse::Error(error) => {
+                assert_eq!(
+                    error.identity(),
+                    b("delightql-error://target/postgres/undefined-object/42883")
+                );
             }
             QueryResponse::Header { .. } => panic!("expected Error"),
         }
@@ -900,10 +910,10 @@ mod tests {
 
     #[test]
     fn stat_reports_backend_and_timing() {
-        let Some((mut session, _)) = session() else { return };
-        let QueryResponse::Header { handle, .. } =
-            session.query(b("SELECT 1")).unwrap()
-        else {
+        let Some((mut session, _)) = session() else {
+            return;
+        };
+        let QueryResponse::Header { handle, .. } = session.query(b("SELECT 1")).unwrap() else {
             panic!("expected Header")
         };
         match session.stat(&handle).unwrap() {
@@ -911,7 +921,9 @@ mod tests {
                 assert!(items.iter().any(|i| matches!(
                     i, MetaItem::Backend(name, _) if name == b"postgres"
                 )));
-                assert!(items.iter().any(|i| matches!(i, MetaItem::ExecutionTime(_))));
+                assert!(items
+                    .iter()
+                    .any(|i| matches!(i, MetaItem::ExecutionTime(_))));
             }
             other => panic!("expected Metadata, got {:?}", other),
         }
@@ -922,7 +934,9 @@ mod tests {
     /// load-Close executes on the same PG session as queries.
     #[test]
     fn load_path_maiden_voyage() {
-        let Some((mut session, rows_o)) = session() else { return };
+        let Some((mut session, rows_o)) = session() else {
+            return;
+        };
 
         let QueryResponse::Header { handle, .. } = session
             .query(b("CREATE TEMP TABLE step7_cargo (id int, name text)"))
@@ -956,8 +970,11 @@ mod tests {
                 assert_eq!(dimensions.len(), 2);
                 handle
             }
-            delightql_protocol::PrepareResponse::Error { message, .. } => {
-                panic!("prepare rejected: {}", String::from_utf8_lossy(&message))
+            delightql_protocol::PrepareResponse::Error(error) => {
+                panic!(
+                    "prepare rejected: {}",
+                    String::from_utf8_lossy(error.message())
+                )
             }
         };
 
@@ -966,10 +983,7 @@ mod tests {
         match session
             .offer(
                 &load,
-                vec![
-                    vec![cell("1"), cell("alpha")],
-                    vec![cell("2"), None],
-                ],
+                vec![vec![cell("1"), cell("alpha")], vec![cell("2"), None]],
                 rows_o,
             )
             .unwrap()
@@ -978,7 +992,11 @@ mod tests {
             other => panic!("expected Ok, got {:?}", other),
         }
         match session
-            .offer(&load, vec![vec![cell("3"), cell("comma, \"quoted\"")]], rows_o)
+            .offer(
+                &load,
+                vec![vec![cell("3"), cell("comma, \"quoted\"")]],
+                rows_o,
+            )
             .unwrap()
         {
             delightql_protocol::OfferResponse::Ok { .. } => {}
@@ -988,8 +1006,11 @@ mod tests {
         // Close executes the COPY; count_hint = rows written.
         match session.close(load).unwrap() {
             delightql_protocol::CloseResponse::Ok => {}
-            delightql_protocol::CloseResponse::Error { message, .. } => {
-                panic!("load close failed: {}", String::from_utf8_lossy(&message))
+            delightql_protocol::CloseResponse::Error(error) => {
+                panic!(
+                    "load close failed: {}",
+                    String::from_utf8_lossy(error.message())
+                )
             }
         }
 
@@ -1001,7 +1022,10 @@ mod tests {
         else {
             panic!("expected Header")
         };
-        match session.fetch(&handle, Projection::All, 100, rows_o).unwrap() {
+        match session
+            .fetch(&handle, Projection::All, 100, rows_o)
+            .unwrap()
+        {
             FetchResponse::Data { cells } => {
                 assert_eq!(
                     cells,
@@ -1019,13 +1043,15 @@ mod tests {
 
     #[test]
     fn prepare_rejects_non_copy_text() {
-        let Some((mut session, _)) = session() else { return };
+        let Some((mut session, _)) = session() else {
+            return;
+        };
         match session
             .prepare(b("INSERT INTO t VALUES (1)"), vec![])
             .unwrap()
         {
-            delightql_protocol::PrepareResponse::Error { message, .. } => {
-                assert!(String::from_utf8_lossy(&message).contains("COPY"));
+            delightql_protocol::PrepareResponse::Error(error) => {
+                assert!(String::from_utf8_lossy(error.message()).contains("COPY"));
             }
             other => panic!("expected Error, got {:?}", other),
         }
@@ -1081,16 +1107,19 @@ mod tests {
             let drop_sql = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", name);
             match admin.query(b(&drop_sql)).unwrap() {
                 QueryResponse::Header { .. } => {}
-                QueryResponse::Error { message, .. } => panic!(
+                QueryResponse::Error(error) => panic!(
                     "scratch pre-drop failed: {}",
-                    String::from_utf8_lossy(&message)
+                    String::from_utf8_lossy(error.message())
                 ),
             }
-            match admin.query(b(&format!("CREATE DATABASE {}", name))).unwrap() {
+            match admin
+                .query(b(&format!("CREATE DATABASE {}", name)))
+                .unwrap()
+            {
                 QueryResponse::Header { .. } => {}
-                QueryResponse::Error { message, .. } => panic!(
+                QueryResponse::Error(error) => panic!(
                     "scratch create failed: {}",
-                    String::from_utf8_lossy(&message)
+                    String::from_utf8_lossy(error.message())
                 ),
             }
             Some(ScratchDb { name })
@@ -1112,19 +1141,17 @@ mod tests {
     ) -> (delightql_protocol::QueryHandle, Vec<Dimension>) {
         match session.query(b(sql)).unwrap() {
             QueryResponse::Header { handle, dimensions } => (handle, dimensions),
-            QueryResponse::Error { message, .. } => panic!(
+            QueryResponse::Error(error) => panic!(
                 "expected Header for {:?}, got Error: {}",
                 sql,
-                String::from_utf8_lossy(&message)
+                String::from_utf8_lossy(error.message())
             ),
         }
     }
 
     fn expect_error(session: &mut Session<DirectTransport<PgParty>>, sql: &str) -> String {
         match session.query(b(sql)).unwrap() {
-            QueryResponse::Error { message, .. } => {
-                String::from_utf8_lossy(&message).to_string()
-            }
+            QueryResponse::Error(error) => String::from_utf8_lossy(error.message()).to_string(),
             QueryResponse::Header { .. } => {
                 panic!("expected Error for {:?}, got Header", sql)
             }
@@ -1280,7 +1307,10 @@ mod tests {
         assert_eq!(txn_effect("ROLLBACK"), Closes);
         // Spelling variants.
         assert_eq!(txn_effect("  begin;"), Opens);
-        assert_eq!(txn_effect("START TRANSACTION ISOLATION LEVEL SERIALIZABLE"), Opens);
+        assert_eq!(
+            txn_effect("START TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+            Opens
+        );
         assert_eq!(txn_effect("BEGIN TRANSACTION READ WRITE"), Opens);
         assert_eq!(txn_effect("END"), Closes);
         assert_eq!(txn_effect("abort"), Closes);
@@ -1295,7 +1325,10 @@ mod tests {
         assert_eq!(txn_effect("SAVEPOINT s1"), None);
         // Ordinary statements — including CASE…END, which must NOT
         // read as transaction control.
-        assert_eq!(txn_effect("SELECT CASE WHEN x THEN 1 ELSE 2 END FROM t"), None);
+        assert_eq!(
+            txn_effect("SELECT CASE WHEN x THEN 1 ELSE 2 END FROM t"),
+            None
+        );
         assert_eq!(txn_effect("INSERT INTO t VALUES (1)"), None);
         assert_eq!(txn_effect("SELECT 'BEGIN' FROM t"), None);
         // Multi-statement with transaction control: Murky (probe).
@@ -1334,7 +1367,9 @@ mod tests {
 
     #[test]
     fn load_close_surfaces_copy_errors() {
-        let Some((mut session, rows_o)) = session() else { return };
+        let Some((mut session, rows_o)) = session() else {
+            return;
+        };
         let QueryResponse::Header { handle, .. } = session
             .query(b("CREATE TEMP TABLE step7_strict (x int)"))
             .unwrap()
@@ -1357,9 +1392,12 @@ mod tests {
             .offer(&load, vec![vec![cell("not-an-int")]], rows_o)
             .unwrap();
         match session.close(load).unwrap() {
-            delightql_protocol::CloseResponse::Error { identity, message, .. } => {
-                assert!(String::from_utf8_lossy(&message).contains("22P02"));
-                assert_eq!(identity, b("delightql-error://target/postgres/type-mismatch/22P02"));
+            delightql_protocol::CloseResponse::Error(error) => {
+                assert!(String::from_utf8_lossy(error.message()).contains("22P02"));
+                assert_eq!(
+                    error.identity(),
+                    b("delightql-error://target/postgres/type-mismatch/22P02")
+                );
             }
             delightql_protocol::CloseResponse::Ok => {
                 panic!("COPY of bad data must error at close")

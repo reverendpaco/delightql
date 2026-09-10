@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The diagnostic hierarchy's derive (#[derive(Taxon)]).
+delightql-macros = { path = "../delightql-macros" }
 # Error handling
 thiserror.workspace = true
 

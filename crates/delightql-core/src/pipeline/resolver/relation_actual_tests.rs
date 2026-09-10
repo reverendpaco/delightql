@@ -9,10 +9,10 @@
 //! interior refuses as capture, and neither reaches a column lookup or a
 //! physical-binding error.
 
+use crate::diagnostic::{Resolution, Semantic};
 use crate::error::DelightQLError;
 use crate::pipeline::Pipeline;
-use crate::system::DelightQLSystem;
-use crate::uri_registry::subcat;
+use crate::system::ReadySystem;
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
 use delightql_types::test_utils::MockDatabaseConnection;
 use std::sync::{Arc, Mutex};
@@ -32,8 +32,8 @@ impl DatabaseIntrospector for NoTables {
     }
 }
 
-fn world() -> DelightQLSystem {
-    let mut system = DelightQLSystem::new(
+fn world() -> ReadySystem {
+    let mut system = ReadySystem::new(
         Arc::new(Mutex::new(MockDatabaseConnection::new())),
         Box::new(NoTables),
         "sqlite",
@@ -63,11 +63,11 @@ fn refusal_of(source: &str) -> DelightQLError {
     }
 }
 
-fn badge(error: &DelightQLError) -> Option<&str> {
-    match error {
-        DelightQLError::ValidationError { subcategory, .. } => subcategory.as_deref(),
-        _ => None,
-    }
+fn badge(error: &DelightQLError) -> Option<String> {
+    error
+        .error_uri()
+        .strip_prefix("delightql-error://semantic/")
+        .map(str::to_string)
 }
 
 /// An argumentative access is not a relation value: its binders are
@@ -80,7 +80,7 @@ fn an_argumentative_actual_refuses_as_a_form() {
     ));
     assert_eq!(
         badge(&error),
-        Some(subcat::HO_RELATION_ACTUAL_FORM),
+        Some("resolution/ho/relation_actual_form".to_string()),
         "the form refusal, not a column lookup: {error}"
     );
 }
@@ -95,7 +95,7 @@ fn a_sibling_lvar_read_by_an_interior_refuses_as_capture() {
     ));
     assert_eq!(
         badge(&error),
-        Some(subcat::HO_RELATION_ACTUAL_CAPTURE),
+        Some("resolution/ho/relation_actual_capture".to_string()),
         "the capture refusal: {error}"
     );
 }
@@ -110,7 +110,7 @@ fn an_outer_qualifier_read_by_an_interior_refuses_as_capture() {
     ));
     assert_eq!(
         badge(&error),
-        Some(subcat::HO_RELATION_ACTUAL_CAPTURE),
+        Some("resolution/ho/relation_actual_capture".to_string()),
         "the capture refusal: {error}"
     );
 }
@@ -122,7 +122,10 @@ fn an_unknown_name_in_an_interior_is_an_ordinary_miss() {
         "{EMPLOYEES}lib.pass_through(employees(, salary < nowhere |> (name)))(*)"
     ));
     assert!(
-        matches!(error, DelightQLError::ColumnNotFoundError { .. }),
+        matches!(
+            error,
+            DelightQLError::Semantic(Semantic::Resolution(Resolution::Column { .. }))
+        ),
         "an ordinary column miss: {error}"
     );
 }

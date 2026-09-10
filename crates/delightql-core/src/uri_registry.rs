@@ -2,18 +2,21 @@
 // Copyright 2026 Daniel Eklund
 // URI registry — the compiler-owned catalog behind `dql explain`.
 //
-// The authority is generated from the compiler registry — this module IS
-// that registry. `dql explain` reads it today; the delightql.org/uri/
-// pages are generated from it later, so the CLI and the website can
-// never disagree.
+// The registry is the burned `sys::identifiers.identifier` relation. For the
+// ERROR kind its rows are a PROJECTION of the typed hierarchy in
+// `delightql_types::diagnostic`: bootstrap walks the hierarchy's declared
+// inventory (families, emitted leaves, external roots, retired identities)
+// and inserts one row per hierarchy with its role. The Rust declaration is
+// the active mint authority; nothing here or in bootstrap/schema.sql authors
+// an error row by hand, so the table cannot list an identity the compiler
+// cannot emit, nor omit one it can. Danger, config and diagnostic rows keep
+// their own authorities (bootstrap/schema.sql beside their runtime registries).
 //
 // Identifier permanence begins at the first public release, or at an
 // explicit earlier vocabulary freeze (URI-DESIGN.md §3). From that boundary
-// on the registry is append-only: entries may gain text or successors, but a
-// hierarchy is never reassigned or deleted. Before it, a hierarchy that has
-// appeared in no released version may be deleted outright — there is no
-// external version whose identity has to survive, so pre-release pruning
-// owes no aliases, tombstones, or succession rows.
+// on the hierarchy is append-only: an identity is retired into the RETIRED
+// population rather than deleted. Before it, a hierarchy that has appeared
+// in no released version may be deleted outright.
 
 /// One identifier kind (one compound scheme).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +57,7 @@ impl UriKind {
 }
 
 /// One identifier row, as read from the burned `sys::identifiers.identifier`
-/// table. The rows are AUTHORED in
-/// bootstrap/schema.sql — this module keeps only spelling
-/// normalization and identity vocabulary; the registry data itself
-/// lives as data.
+/// table.
 pub struct IdentifierEntry {
     pub kind: UriKind,
     /// Bare hierarchy, e.g. "semantic/resolution/column".
@@ -66,6 +66,9 @@ pub struct IdentifierEntry {
     pub summary: String,
     /// Longer explanation shown by `dql explain`.
     pub explanation: String,
+    /// The declared role word (`family`, `leaf`, `family_leaf`,
+    /// `external_root`, `retired`); every non-error kind is a `leaf`.
+    pub role: String,
 }
 
 /// UriKind from its URL word ("error" | "danger" | "config") — the
@@ -117,42 +120,6 @@ pub fn danger_cli_overridable(hierarchy: &str) -> bool {
     )
 }
 
-/// The mintable top segments of the error kind — the closed set ratified
-/// by the vocabulary audit. `error_uri()` mints only
-/// under these; the soundness test below keeps the registry inside them.
-pub const ERROR_TOP_SEGMENTS: &[&str] = &[
-    "parse",
-    "semantic",
-    "dml",
-    "operational",
-    "runtime",
-    "target",
-    // The CLI panic hook (main.rs mints
-    // delightql-error://internal/panic on any Rust panic): dql's own
-    // bugs get their own top segment, distinct from runtime/ (the
-    // query failed) — internal/ means DQL failed.
-    "internal",
-    // Blueprint-inertness enforcement:
-    // imprint!'s linear lifecycle refusals (imprint/blueprint/inert — an
-    // archived blueprint namespace is visible but inert). Its own top
-    // segment: not a query semantic error, a lifecycle-policy refusal.
-    "imprint",
-    // The system name guard: USER-facing namespace creation refuses the
-    // reserved system name pool (exact sys/std/home, sys*/std* prefixes, `_`
-    // machinery segments, the sys::/std:: subtree). Its own top segment: a
-    // creation-policy refusal, not a query semantic error.
-    "namespace",
-    // The client's own incidents (repl::errors.incident): the parser
-    // containment worker, the prompt, the client database, the exit —
-    // facts about the PROCESS, recorded by the CLI, never minted by the
-    // compiler.
-    "client",
-];
-
-/// A `ServerTerm::Error` that crossed the session boundary with no
-/// identity: recorded under this so the hole shows in the log.
-pub const INTERNAL_UNBADGED: &str = "delightql-error://internal/unbadged";
-
 /// The mintable top segments of the diagnostic kind — one per provider.
 /// Only `autoload` emits today; the rest are
 /// reserved by the provider inventory so the taxonomy is stable before the
@@ -160,224 +127,11 @@ pub const INTERNAL_UNBADGED: &str = "delightql-error://internal/unbadged";
 pub const DIAGNOSTIC_TOP_SEGMENTS: &[&str] =
     &["autoload", "adapter", "identity", "catalog", "connectivity"];
 
-/// Subcategory constants. Error sites reference
-/// these — never raw string literals — and the `subcategory_constants_are_
-/// registered` test below asserts every constant resolves to a registered
-/// hierarchy under its family's render prefix (`error_uri()`: Validation →
-/// `semantic/<sub>`, Parse → `parse/<sub>`). A raw literal at an error site
-/// would let a typo mint a phantom identifier no registry row explains.
-pub mod subcat {
-    /// ValidationError family — rendered as `semantic/<const>`.
-    pub const RECURSION_LIMIT_BOUND: &str = "recursion/limit_bound";
-    pub const RECURSION_ARGUMENTATIVE_BINDING: &str = "recursion/argumentative_binding";
-    pub const RECURSION_CONSULTED_CLAUSE_ORDER: &str = "recursion/consulted_clause_order";
-    pub const RECURSION_MUTUAL: &str = "recursion/mutual";
-    pub const RECURSION_SET_OPERATOR: &str = "recursion/set_operator";
-    /// Clauses of one target disagreeing about the fixpoint badge.
-    pub const RECURSION_MIXED_BADGE: &str = "recursion/mixed_badge";
-    /// A `%` badge on a target with no self-reference: a fixpoint flavor on
-    /// a non-fixpoint is a false statement.
-    pub const RECURSION_FALSE_FIXPOINT: &str = "recursion/false_fixpoint";
-    /// A self-reference of an in-progress parameterized definition with a
-    /// DIFFERENT semantic actual: parameters configure the fixpoint and
-    /// never widen; changing recursive state belongs in ordinary columns.
-    pub const RECURSION_PARAMETER_WIDENING: &str = "recursion/parameter-widening";
-    /// ground!'s No-intersection law: a name defined by both the library
-    /// and the data namespace refuses whole.
-    pub const GROUND_NAME_INTERSECTION: &str = "ground/name_intersection";
-    /// ground!'s strict validation over QUALIFIED references: a dangling
-    /// qualified reference refuses and nothing is created.
-    pub const GROUND_UNRESOLVED_REFERENCE: &str = "ground/unresolved_reference";
-    /// A free data name of a consulted declaration whose world no `ground!`
-    /// bound: a hole crosses worlds only through explicit grounding, never
-    /// through the caller's tables, CTEs, or session database.
-    pub const GROUNDING_DATA_HOLE_UNBOUND: &str = "grounding/data_hole_unbound";
-    /// A consulted goal that compiled to a statement which writes. A
-    /// consultation may READ user data only.
-    pub const CONSULT_WITNESS_READ_ONLY: &str = "consult/witness/read_only";
-    /// A liminal statement declaring something no load can spend.
-    pub const CONSULT_LIMINAL_DECLARATION: &str = "consult/liminal/declaration";
-    /// A consulted goal whose body has no canonical spelling.
-    pub const CONSULT_GOAL_UNSPELLABLE: &str = "consult/goal/unspellable";
-    pub const COMPOUND_SCALAR_COLUMN: &str = "compound/scalar_column";
-    pub const LIMIT_VALUE: &str = "limit/value";
-    pub const RESOLUTION_SCHEMA: &str = "resolution/schema";
-    /// A minus whose operands do not publish the same exact heading.
-    ///
-    /// Its own identity under `setop/` rather than the general schema
-    /// refusal: the operands each have a perfectly good heading, and what
-    /// is wrong is that they are not the SAME one — which is a property of
-    /// the operator, not of either relation.
-    pub const RESOLUTION_SETOP_MINUS_HEADING: &str = "resolution/setop/minus_heading";
-    pub const CONSTRAINT_POSITIONAL_ALIAS: &str = "constraint/positional_alias";
-    /// Exact `_` written as an authored name — reserved deixis, bare or
-    /// stropped (strops-law).
-    pub const IDENTIFIER_DEIXIS: &str = "identifier/deixis";
-    /// A reserved word written as a classic bare name (top-grammar: an
-    /// identifier only when stropped).
-    pub const IDENTIFIER_KEYWORD: &str = "identifier/keyword";
-    /// Two live scopes answering one canonical name (TWO LIVE SCOPES NEVER
-    /// SHARE A NAME), judged at scope activation.
-    pub const SCOPE_DUPLICATE: &str = "scope/duplicate";
-    /// An explicitly qualified callable name that no DQL entity answers.
-    /// Only an UNQUALIFIED miss falls through to the open target provider;
-    /// a qualified miss names DQL's own world and refuses.
-    pub const RESOLUTION_CALLABLE_UNKNOWN: &str = "resolution/callable_unknown";
-    /// A total fact function, armed with `_ -> outputs`, was demanded as a
-    /// relation. Its unbounded input complement has no finite row set.
-    pub const RESOLUTION_FACT_FUNCTION_RELATIONAL_FACE: &str =
-        "resolution/fact_function/relational_face";
-    /// A common higher-order expression whose body reaches itself: a
-    /// query-scoped parameterized rule has no fixpoint to re-enter.
-    pub const RESOLUTION_CHOE_RECURSION: &str = "resolution/choe/recursion";
-    /// The clauses of one common higher-order expression disagree — about
-    /// their arity, their published heading, or a position's name.
-    pub const RESOLUTION_CHOE_HEAD_AGREEMENT: &str = "resolution/choe/head_agreement";
-    /// A relation-valued higher-order actual whose form is not a closed
-    /// relation value: an argumentative access, whose names are binders.
-    pub const HO_RELATION_ACTUAL_FORM: &str = "resolution/ho/relation_actual_form";
-    /// A relation actual's interior reading the calling row: a relation
-    /// actual is closed and captures no caller lvar or column.
-    pub const HO_RELATION_ACTUAL_CAPTURE: &str = "resolution/ho/relation_actual_capture";
-    pub const SEMANTIC_FAMILY: &[&str] = &[
-        RECURSION_LIMIT_BOUND,
-        RECURSION_ARGUMENTATIVE_BINDING,
-        RECURSION_CONSULTED_CLAUSE_ORDER,
-        RECURSION_MUTUAL,
-        RECURSION_SET_OPERATOR,
-        RECURSION_MIXED_BADGE,
-        RECURSION_FALSE_FIXPOINT,
-        RECURSION_PARAMETER_WIDENING,
-        GROUND_NAME_INTERSECTION,
-        GROUND_UNRESOLVED_REFERENCE,
-        GROUNDING_DATA_HOLE_UNBOUND,
-        CONSULT_WITNESS_READ_ONLY,
-        CONSULT_LIMINAL_DECLARATION,
-        CONSULT_GOAL_UNSPELLABLE,
-        COMPOUND_SCALAR_COLUMN,
-        LIMIT_VALUE,
-        RESOLUTION_SCHEMA,
-        RESOLUTION_SETOP_MINUS_HEADING,
-        RESOLUTION_CALLABLE_UNKNOWN,
-        RESOLUTION_FACT_FUNCTION_RELATIONAL_FACE,
-        RESOLUTION_CHOE_RECURSION,
-        RESOLUTION_CHOE_HEAD_AGREEMENT,
-        CONSTRAINT_POSITIONAL_ALIAS,
-        IDENTIFIER_DEIXIS,
-        IDENTIFIER_KEYWORD,
-        SCOPE_DUPLICATE,
-        HO_RELATION_ACTUAL_FORM,
-        HO_RELATION_ACTUAL_CAPTURE,
-    ];
-
-    /// Operational family: the query is valid and this session refuses to
-    /// run it. The prefix is CARRIED, because `operational/` is one of the
-    /// top segments a validation refusal keeps rather than being folded
-    /// under `semantic/` — a resource budget is policy, not meaning.
-    pub const RESOURCE_NESTING: &str = "operational/resource/nesting";
-
-    /// The refinement budget's refusal. A SEPARATE identity from
-    /// `RESOURCE_NESTING` on purpose: the two guards measure different
-    /// objects at different times, and raising one must not raise the other.
-    pub const RESOURCE_REFINEMENT_DEPTH: &str = "operational/resource/refinement-depth";
-
-    /// ParseError family — rendered as `parse/<const>`.
-    pub const PARSE_DDL: &str = "ddl";
-    pub const PARSE_SIGIL: &str = "sigil";
-    /// Parse-failure diagnoses (`pipeline/parse/diagnosis.rs`): teaching
-    /// errors mined from the recovery tree for rules the grammar itself
-    /// enforces and therefore cannot explain.
-    pub const PARSE_PONY: &str = "pony";
-    pub const PARSE_IS_NULL: &str = "is_null";
-    pub const PARSE_ANON_SPACE: &str = "anon_space";
-    pub const PARSE_ANON_EMPTY: &str = "anon/empty";
-    pub const PARSE_COMMENT: &str = "comment";
-    pub const PARSE_SORT_MINUS: &str = "sort_minus";
-    /// A retired comparison glyph (`==`, `!==`): the target's own equality is
-    /// a prelude predicate, and DelightQL's is `=` / `!=`.
-    pub const PARSE_RETIRED_OPERATOR: &str = "retired_operator";
-    pub const PARSE_SESSION_POSITION: &str = "session_position";
-    pub const PARSE_ASSERTION_RETIRED: &str = "assertion/retired";
-    pub const PARSE_METADATA_INDUCTION: &str = "metadata_induction";
-    pub const PARSE_PATH_VARIABLE: &str = "path_variable";
-    /// A pure head over an effectful body: the grammar refuses the shape, and
-    /// the rule the author broke is the effect algebra's purity law.
-    pub const PARSE_EFFECT_PURITY: &str = "effect/purity";
-    /// A non-session directive written where only a relation derives. The law
-    /// admits one under an effect head; its lowering is what is missing.
-    pub const PARSE_DIRECTIVE_POSITION: &str = "directive/position";
-    /// An effectful body bound under a pure label.
-    pub const PARSE_EFFECT_LABEL: &str = "effect/label";
-    /// A reserved structural head parameter.
-    pub const PARSE_STRUCTURAL_HEAD: &str = "structural_head";
-    /// A guard composing operators without grouping.
-    pub const PARSE_GUARD_GROUPING: &str = "guard_grouping";
-    /// A bare glob written where a higher-order argument stands.
-    pub const PARSE_GLOB_ARGUMENT: &str = "glob_argument";
-    /// A computation standing in a defining head (HEADS: a head that
-    /// computes is not a head).
-    pub const PARSE_HEAD_COMPUTES: &str = "head_computes";
-    /// A lift tail (`… & cols`) in a one-group call, where the group is the
-    /// arguments alone and projection belongs to the access group.
-    pub const PARSE_LIFT_TAIL: &str = "lift_tail";
-    /// A row of named values written as a definition's body.
-    pub const PARSE_VALUE_NAMING: &str = "value_naming";
-    /// A bare iteration binder: `~> v` has no derivation. The binder for an
-    /// array of plain values is written inside brackets.
-    pub const PARSE_ITERATION_BINDER: &str = "iteration_binder";
-    /// A qualified name written as a pattern member. A pattern extracts
-    /// values; qualifying would assert an equality instead. The reach into
-    /// a document is the path binding.
-    pub const PARSE_PATTERN_QUALIFIED: &str = "pattern_qualified";
-    /// A compound relation expression — a set operator or pipe — inside a
-    /// higher-order argument list, which embeds no relation grammar.
-    pub const PARSE_HO_RELATION_ACTUAL: &str = "ho/relation_actual";
-    pub const PARSE_FAMILY: &[&str] = &[
-        PARSE_DDL,
-        PARSE_SIGIL,
-        PARSE_PONY,
-        PARSE_IS_NULL,
-        PARSE_ANON_SPACE,
-        PARSE_ANON_EMPTY,
-        PARSE_COMMENT,
-        PARSE_SORT_MINUS,
-        PARSE_RETIRED_OPERATOR,
-        PARSE_SESSION_POSITION,
-        PARSE_ASSERTION_RETIRED,
-        PARSE_METADATA_INDUCTION,
-        PARSE_PATH_VARIABLE,
-        PARSE_EFFECT_PURITY,
-        PARSE_DIRECTIVE_POSITION,
-        PARSE_EFFECT_LABEL,
-        PARSE_STRUCTURAL_HEAD,
-        PARSE_GUARD_GROUPING,
-        PARSE_GLOB_ARGUMENT,
-        PARSE_HEAD_COMPUTES,
-        PARSE_LIFT_TAIL,
-        PARSE_VALUE_NAMING,
-        PARSE_ITERATION_BINDER,
-        PARSE_PATTERN_QUALIFIED,
-        PARSE_HO_RELATION_ACTUAL,
-    ];
-
-    /// The parse teachings that name a rule the DEFINITION broke, rather than
-    /// a shape inside an expression. A consulted file's ordinary parse failure
-    /// is a consult failure and is wrapped as one; these keep their badge
-    /// through that wrapper, because the identity IS what the teaching
-    /// publishes.
-    pub const PARSE_DEFINITION_SHAPED: &[&str] = &[
-        PARSE_EFFECT_PURITY,
-        PARSE_DIRECTIVE_POSITION,
-        PARSE_EFFECT_LABEL,
-        PARSE_STRUCTURAL_HEAD,
-        PARSE_GUARD_GROUPING,
-        PARSE_HEAD_COMPUTES,
-    ];
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use delightql_types::diagnostic::{inventory, Role};
+    use std::collections::HashMap;
 
     #[test]
     fn parses_all_accepted_spellings() {
@@ -401,15 +155,13 @@ mod tests {
         );
     }
 
-    /// The burned rows, loaded exactly the way the live system loads
-    /// them: by executing bootstrap/schema.sql. The table is the source;
-    /// these tests keep it sound.
-    fn burned_rows() -> Vec<(UriKind, String, String, String)> {
+    /// The burned rows, loaded exactly the way the live system loads them:
+    /// schema plus the bootstrap seeding that projects the typed hierarchy.
+    fn burned_rows() -> Vec<(UriKind, String, String, String, String)> {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(crate::bootstrap::BOOTSTRAP_SCHEMA)
-            .unwrap();
+        crate::bootstrap::initialize_bootstrap_db(&conn).unwrap();
         let mut stmt = conn
-            .prepare("SELECT kind, hierarchy, summary, explanation FROM identifier")
+            .prepare("SELECT kind, hierarchy, summary, explanation, role FROM identifier")
             .unwrap();
         let rows = stmt
             .query_map([], |r| {
@@ -418,16 +170,18 @@ mod tests {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })
             .unwrap()
             .map(|r| r.unwrap())
-            .map(|(k, h, s, e)| {
+            .map(|(k, h, s, e, role)| {
                 (
                     kind_from_word(&k).expect("bad kind word in identifier row"),
                     h,
                     s,
                     e,
+                    role,
                 )
             })
             .collect::<Vec<_>>();
@@ -438,28 +192,80 @@ mod tests {
     #[test]
     fn burned_registry_lookups() {
         let rows = burned_rows();
-        let find = |kind: UriKind, h: &str| rows.iter().any(|(k, hh, _, _)| *k == kind && hh == h);
+        let find = |kind: UriKind, h: &str| rows.iter().any(|(k, hh, ..)| *k == kind && hh == h);
         assert!(find(UriKind::Error, "semantic/resolution/column"));
         assert!(!find(UriKind::Error, "not/a/thing"));
         // family listing (segment-prefix semantics)
         let kids = rows
             .iter()
-            .filter(|(k, h, _, _)| *k == UriKind::Error && h.starts_with("semantic/resolution/"))
+            .filter(|(k, h, ..)| *k == UriKind::Error && h.starts_with("semantic/resolution/"))
             .count();
         assert!(kids >= 3);
         // bare search is unambiguous for this one
         assert_eq!(
             rows.iter()
-                .filter(|(_, h, _, _)| h == "cardinality/cartesian")
+                .filter(|(_, h, ..)| h == "cardinality/cartesian")
                 .count(),
             1
         );
     }
 
+    /// THE REGISTRY IS THE HIERARCHY'S PROJECTION. Every error row is exactly
+    /// one declared inventory row with the same role and prose, and every
+    /// inventory row is in the table: the two cannot drift because one is
+    /// computed from the other, and this pins the computation.
+    #[test]
+    fn error_rows_are_the_typed_inventory() {
+        let declared: HashMap<String, (Role, String, String)> = inventory()
+            .into_iter()
+            .map(|row| (row.hierarchy, (row.role, row.summary, row.explanation)))
+            .collect();
+        let mut seen = 0;
+        for (kind, hierarchy, summary, explanation, role) in burned_rows() {
+            if kind != UriKind::Error {
+                continue;
+            }
+            seen += 1;
+            let Some((declared_role, declared_summary, declared_explanation)) =
+                declared.get(&hierarchy)
+            else {
+                panic!("error row '{hierarchy}' is not declared by the typed hierarchy")
+            };
+            assert_eq!(role, declared_role.word(), "{hierarchy}: role");
+            assert_eq!(&summary, declared_summary, "{hierarchy}: summary");
+            assert_eq!(
+                &explanation, declared_explanation,
+                "{hierarchy}: explanation"
+            );
+        }
+        assert_eq!(seen, declared.len(), "every declared hierarchy is a row");
+    }
+
+    /// Every error row's top segment is a family the root declares — the
+    /// mintable top set is the root enum, not a list kept beside it.
+    #[test]
+    fn error_entries_stay_inside_the_root_families() {
+        let tops: Vec<String> = inventory()
+            .into_iter()
+            .filter(|row| !row.hierarchy.contains('/'))
+            .map(|row| row.hierarchy)
+            .collect();
+        for (kind, hierarchy, ..) in burned_rows() {
+            if kind == UriKind::Error {
+                let top = hierarchy.split('/').next().unwrap();
+                assert!(
+                    tops.iter().any(|t| t == top),
+                    "error identifier row '{}' is outside the root families",
+                    hierarchy
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_registered_danger_and_config_exists_in_its_runtime_registry() {
         use crate::pipeline::{danger_gates, option_map};
-        for (kind, hierarchy, _, _) in burned_rows() {
+        for (kind, hierarchy, ..) in burned_rows() {
             match kind {
                 UriKind::Danger => assert!(
                     danger_gates::known_danger_hierarchies().contains(&hierarchy.as_str()),
@@ -472,26 +278,9 @@ mod tests {
                     "identifier row documents unknown config {}",
                     hierarchy
                 ),
-                // No separate runtime registry to reconcile against — the
-                // diagnostic providers are the source. Soundness is the
-                // top-segment test below.
+                // Error rows are reconciled by `error_rows_are_the_typed_inventory`;
+                // the diagnostic providers are their own source.
                 UriKind::Error | UriKind::Diagnostic => {}
-            }
-        }
-    }
-
-    #[test]
-    fn error_entries_stay_inside_the_mintable_top_segments() {
-        // Soundness: an identifier row whose hierarchy starts outside the
-        // ratified top set documents a phantom nothing can mint.
-        for (kind, hierarchy, _, _) in burned_rows() {
-            if kind == UriKind::Error {
-                let top = hierarchy.split('/').next().unwrap();
-                assert!(
-                    ERROR_TOP_SEGMENTS.contains(&top),
-                    "error identifier row '{}' is outside the mintable top segments",
-                    hierarchy
-                );
             }
         }
     }
@@ -500,7 +289,7 @@ mod tests {
     fn diagnostic_entries_stay_inside_the_provider_top_segments() {
         // Every diagnostic row's top segment is a known provider —
         // a row outside them documents a check no provider emits.
-        for (kind, hierarchy, _, _) in burned_rows() {
+        for (kind, hierarchy, ..) in burned_rows() {
             if kind == UriKind::Diagnostic {
                 let top = hierarchy.split('/').next().unwrap();
                 assert!(
@@ -516,7 +305,7 @@ mod tests {
     fn every_runtime_gate_and_config_is_documented() {
         use crate::pipeline::{danger_gates, option_map};
         let rows = burned_rows();
-        let find = |kind: UriKind, h: &str| rows.iter().any(|(k, hh, _, _)| *k == kind && hh == h);
+        let find = |kind: UriKind, h: &str| rows.iter().any(|(k, hh, ..)| *k == kind && hh == h);
         for h in danger_gates::known_danger_hierarchies() {
             assert!(
                 find(UriKind::Danger, h),
@@ -533,45 +322,11 @@ mod tests {
         }
     }
 
-    /// Every subcategory constant must resolve to
-    /// an identifier row under its family's render prefix (error_uri:
-    /// Validation → semantic/<sub>, Parse → parse/<sub>). Error sites use
-    /// the constants, never raw literals — so a typo'd subcategory fails
-    /// HERE instead of silently minting a phantom identifier at runtime.
-    #[test]
-    fn subcategory_constants_are_registered() {
-        let rows = burned_rows();
-        let find = |h: &str| {
-            rows.iter()
-                .any(|(k, hh, _, _)| *k == UriKind::Error && hh == h)
-        };
-        for sub in subcat::SEMANTIC_FAMILY {
-            let h = format!("semantic/{}", sub);
-            assert!(
-                find(&h),
-                "subcategory constant '{}' has no identifier row at '{}' — \
-                 register it or fix the constant",
-                sub,
-                h
-            );
-        }
-        for sub in subcat::PARSE_FAMILY {
-            let h = format!("parse/{}", sub);
-            assert!(
-                find(&h),
-                "subcategory constant '{}' has no identifier row at '{}' — \
-                 register it or fix the constant",
-                sub,
-                h
-            );
-        }
-    }
-
     #[test]
     fn identifier_rows_are_wellformed() {
         // Row hygiene the schema cannot express: prose non-empty,
         // hierarchies lowercase slash-paths, no accidental scheme prefixes.
-        for (_, hierarchy, summary, explanation) in burned_rows() {
+        for (_, hierarchy, summary, explanation, role) in burned_rows() {
             assert!(!summary.trim().is_empty(), "{hierarchy}: empty summary");
             assert!(
                 !explanation.trim().is_empty(),
@@ -580,6 +335,13 @@ mod tests {
             assert!(
                 !hierarchy.contains("://") && !hierarchy.starts_with('/'),
                 "{hierarchy}: hierarchy must be a bare slash-path"
+            );
+            assert!(
+                matches!(
+                    role.as_str(),
+                    "family" | "leaf" | "family_leaf" | "external_root" | "retired"
+                ),
+                "{hierarchy}: unknown role {role}"
             );
         }
     }

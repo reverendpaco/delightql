@@ -37,7 +37,12 @@ impl HighlightConfig {
             Some(p) => match std::fs::read_to_string(p) {
                 Ok(content) => HighlightConfig::FromFile(content),
                 Err(e) => {
-                    crate::client::incident::warning("config", crate::client::incident::hierarchy::CONFIG, format!("failed to read the highlights file: {e}"));
+                    crate::client::incident::warning(
+                        "config",
+                        delightql_types::diagnostic::Client::Config {
+                            message: format!("failed to read the highlights file: {e}"),
+                        },
+                    );
                     HighlightConfig::Hardcoded
                 }
             },

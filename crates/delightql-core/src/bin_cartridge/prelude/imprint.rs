@@ -20,6 +20,7 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
+use crate::diagnostic::DirectiveBinding;
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::unresolved::*;
@@ -141,24 +142,22 @@ fn run_imprint(
     verb: &str,
 ) -> Result<EntityResult> {
     if arguments.len() != 2 {
-        return Err(DelightQLError::database_error(
-            format!(
+        return Err(DelightQLError::from(DirectiveBinding::Arity {
+            message: format!(
                 "{}() expects 2 arguments (source_ns, target_ns), got {}",
                 verb,
                 arguments.len()
             ),
-            "Invalid argument count",
-        ));
+        }));
     }
 
     let source_ns = extract_string_literal(&arguments[0], "source_ns")?;
     let target_ns = extract_string_literal(&arguments[1], "target_ns")?;
 
     if source_ns.is_empty() || target_ns.is_empty() {
-        return Err(DelightQLError::database_error(
-            format!("{}() arguments cannot be empty", verb),
-            "Empty argument",
-        ));
+        return Err(DelightQLError::from(DirectiveBinding::Value {
+            message: format!("{}() arguments cannot be empty", verb),
+        }));
     }
 
     let mode = if replace {
@@ -198,9 +197,8 @@ fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<Str
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(s))) => {
             Ok(s.clone())
         }
-        _ => Err(DelightQLError::database_error(
-            format!("imprint!() {} must be a string literal", arg_name),
-            "Invalid argument type",
-        )),
+        _ => Err(DelightQLError::from(DirectiveBinding::Value {
+            message: format!("imprint!() {} must be a string literal", arg_name),
+        })),
     }
 }

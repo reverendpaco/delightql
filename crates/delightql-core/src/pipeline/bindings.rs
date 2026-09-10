@@ -42,6 +42,7 @@
 //! fences::lowering_holds_no_construction_capability` holds that none of
 //! them may so much as name `Planning`.
 
+use crate::diagnostic::{Internal, Recursion, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::lispy::ToLispy;
 use crate::names::ScopeId;
@@ -357,17 +358,35 @@ impl CteBinding<crate::pipeline::asts::core::Unresolved> {
         }
     }
 
-    fn into_resolution(
-        self,
-    ) -> (
-        ast_unresolved::Chain,
-        crate::pipeline::asts::core::CteAuthority,
-    ) {
+    /// RESOLVE THIS CLAUSE'S BODY through the capability the fixpoint
+    /// authority hands in. An authored or generated clause resolves and
+    /// republishes the crossing carriers; a frontier clause resolves inside
+    /// its own carrier, which alone can carry the frontier's support.
+    fn resolve_clause(self, resolver: &mut dyn CteResolver) -> Result<ResolvedClauseBody> {
         match self.state.0 {
             UnresolvedBinding::Ordinary {
                 body, authority, ..
-            } => (body, authority),
-            UnresolvedBinding::Frontier(carrier) => carrier.into_resolution(),
+            } => {
+                let origin = authority.origin;
+                let expression = resolver.resolve_cte_expression(body, authority.horizon)?;
+                let crossing = resolver.crossing_carriers().to_vec();
+                let expression = crate::defuse::carriers::inject_crossing_carriers(
+                    expression,
+                    &crossing,
+                    resolver.identities(),
+                )?;
+                Ok(ResolvedClauseBody { expression, origin })
+            }
+            UnresolvedBinding::Frontier(carrier) => carrier.resolve(resolver),
+        }
+    }
+
+    /// How a frontier clause reaches its caller, as the definition-use
+    /// authority shaped it; an authored binding states nothing.
+    fn frontier_caller(&self) -> Option<crate::defuse::ClauseCaller> {
+        match &self.state.0 {
+            UnresolvedBinding::Ordinary { .. } => None,
+            UnresolvedBinding::Frontier(carrier) => Some(carrier.caller()),
         }
     }
 
@@ -612,10 +631,8 @@ pub(crate) fn bind_carrier(
     let row = identities
         .authority()
         .bind_carrier(witness, part, &body.semantic_relation())?;
-    let binding = ast_resolved::CteBinding::bound(
-        DefinitionBody::Ordinary(body.into_body()),
-        row.relation(),
-    );
+    let binding =
+        ast_resolved::CteBinding::bound(DefinitionBody::Ordinary(body.into_body()), row.relation());
     Ok(BoundCarrier { row, binding })
 }
 
@@ -938,15 +955,13 @@ fn group_ctes(
 
 /// The refusal of a name two query-local binding kinds both declare.
 pub(crate) fn one_query_local_name(name: &delightql_types::SqlIdentifier) -> DelightQLError {
-    DelightQLError::validation_error_categorized(
-        crate::uri_registry::subcat::SCOPE_DUPLICATE,
-        format!(
+    DelightQLError::from(Semantic::ScopeDuplicate {
+        message: format!(
             "'{name}' is declared twice in this query's bindings: a common table \
              expression, a common function expression and a common higher-order \
              expression share one query-local name space"
         ),
-        "give each binding its own name",
-    )
+    })
 }
 
 /// Resolve and register a flat CTE list without exposing the grouping carrier
@@ -1004,6 +1019,10 @@ fn register_named_cte(
 #[derive(Debug, Clone, Copy)]
 struct AuthoredClauseFacts {
     contains_union_family: bool,
+    /// How the clause was shaped to reach its caller, when it is a frontier
+    /// clause: the prediction `decide` verifies against the resolved
+    /// self-reference.
+    caller: Option<crate::defuse::ClauseCaller>,
 }
 
 struct AuthoredClause {
@@ -1041,10 +1060,12 @@ impl AuthoredClause {
         };
         walk_visit_relational(&mut collector, binding.body())
             .expect("authored set-form collection is infallible");
+        let caller = binding.frontier_caller();
         AuthoredClause {
             binding,
             authored: AuthoredClauseFacts {
                 contains_union_family: collector.contains_union_family,
+                caller,
             },
         }
     }
@@ -1105,7 +1126,8 @@ fn resolve_definition_group(
         )
     } else {
         let (CteGroupKey::Authored(_) | CteGroupKey::Frontier(_), Some(name)) = (key, &name) else {
-            return Err(DelightQLError::parse_error(
+            return Err(Internal::invariant(
+                "pipeline::bindings",
                 "a compiler-built CTE binding was defined more than once",
             ));
         };
@@ -1124,9 +1146,8 @@ fn agreed_badge(group: &[ast_unresolved::CteBinding], teaching_name: &str) -> Re
     let fixpoint = first.authority().fixpoint;
     for (idx, clause) in group.iter().enumerate().skip(1) {
         if clause.authority().fixpoint != fixpoint {
-            return Err(DelightQLError::validation_error_categorized(
-                crate::uri_registry::subcat::RECURSION_MIXED_BADGE,
-                format!(
+            return Err(DelightQLError::from(Recursion::MixedBadge {
+                message: format!(
                     "binding '{teaching_name}': clause {} is {} and clause 1 is {}. \
                      A fixpoint flavor is one claim about the target — every clause \
                      wears the same badge.",
@@ -1134,8 +1155,7 @@ fn agreed_badge(group: &[ast_unresolved::CteBinding], teaching_name: &str) -> Re
                     clause.authority().fixpoint.spelling(),
                     fixpoint.spelling()
                 ),
-                "mixed fixpoint badges in one binding",
-            ));
+            }));
         }
     }
     Ok(fixpoint)
@@ -1153,15 +1173,7 @@ fn resolve_lone_clause(
     resolver: &mut dyn CteResolver,
 ) -> Result<ast_resolved::CteBinding> {
     let AuthoredClause { binding, authored } = clause;
-    let (body, authority) = binding.into_resolution();
-    let origin = authority.origin;
-    let expression = resolver.resolve_cte_expression(body, authority.horizon)?;
-    let crossing = resolver.crossing_carriers().to_vec();
-    let expression = crate::pipeline::refiner::pattern_classifier::inject_crossing_carriers(
-        expression,
-        &crossing,
-        resolver.identities(),
-    )?;
+    let ResolvedClauseBody { expression, origin } = binding.resolve_clause(resolver)?;
 
     let subject = match name {
         Some(name) => transform_schema_table_names(
@@ -1230,15 +1242,7 @@ fn resolve_clause_accumulation(
 
     for (idx, clause) in group.into_iter().enumerate() {
         let AuthoredClause { binding, authored } = clause;
-        let (body, authority) = binding.into_resolution();
-        let origin = authority.origin;
-        let expression = resolver.resolve_cte_expression(body, authority.horizon)?;
-        let crossing = resolver.crossing_carriers().to_vec();
-        let expression = crate::pipeline::refiner::pattern_classifier::inject_crossing_carriers(
-            expression,
-            &crossing,
-            resolver.identities(),
-        )?;
+        let ResolvedClauseBody { expression, origin } = binding.resolve_clause(resolver)?;
         let expr_schema = expression.semantic_relation();
         if idx == 0 {
             let base_schema = transform_schema_table_names(
@@ -1334,6 +1338,15 @@ fn resolve_clause_accumulation(
     ))
 }
 
+/// ONE CLAUSE BODY, RESOLVED: the chain and the provenance its authority
+/// declared. A frontier clause's carrier produces it with the frontier's
+/// support already published; this is the only shape the fixpoint
+/// authority accumulates.
+pub(crate) struct ResolvedClauseBody {
+    pub(crate) expression: ast_resolved::Chain,
+    pub(crate) origin: crate::pipeline::asts::core::provenance::CteOrigin,
+}
+
 /// THE RECURSION DECISION, TAKEN WHERE THE SELF-REFERENCE BINDS.
 ///
 /// A binding's own scope is registered before its later clauses resolve, so
@@ -1369,6 +1382,36 @@ fn decide(
         .iter()
         .map(|clause| self_reference_count(clause, binding, identities))
         .collect::<Vec<_>>();
+    // THE SHAPED CALLER ROAD IS VERIFIED HERE, where the self-reference
+    // binds. A frontier clause was shaped to admit the caller row or to read
+    // it through the frontier by whether it mentions its own subject; the
+    // resolved reads are the fact. A clause that admitted the caller AND
+    // reads the frontier would stand the caller beside the frontier's
+    // carried actual; one shaped to read the frontier that reads none has
+    // no caller row for its formals. Neither is shaped silently.
+    for (clause, self_references) in clauses.iter().zip(recursive_clauses.iter().copied()) {
+        match (clause.authored.caller, self_references) {
+            (Some(crate::defuse::ClauseCaller::Admitted), 1..) => {
+                return Err(Internal::invariant(
+                    "pipeline::bindings",
+                    format!(
+                        "a clause of '{teaching_name}' shaped to admit the caller row reads \
+                         its own frontier"
+                    ),
+                ));
+            }
+            (Some(crate::defuse::ClauseCaller::Carried), 0) => {
+                return Err(Internal::invariant(
+                    "pipeline::bindings",
+                    format!(
+                        "a clause of '{teaching_name}' shaped to read the caller through its \
+                         frontier reads no frontier"
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
     let recursive = recursive_clauses.iter().copied().any(|count| count > 0);
     // One frontier read plus an authored set operation is the illegal
     // recursive-set shape. More frontier reads are already a stronger
@@ -1381,13 +1424,13 @@ fn decide(
             self_references == 1 && clause.authored.contains_union_family
         })
     {
-        return Err(DelightQLError::validation_error_categorized(
-            crate::uri_registry::subcat::RECURSION_SET_OPERATOR,
-            "a union-family operator appears inside a recursive clause. Clause accumulation \
+        return Err(DelightQLError::from(Recursion::SetOperator {
+            message:
+                "a union-family operator appears inside a recursive clause. Clause accumulation \
              is the fixpoint's own operation; finish the fixpoint before using a set operator. \
-             SEMANTICS/recursion-contract-law.md.",
-            "union-family operator inside a fixpoint",
-        ));
+             SEMANTICS/recursion-contract-law.md."
+                    .to_string(),
+        }));
     }
     match (recursive, authored) {
         (true, Fixpoint::Deduplicating) => Ok(RecursionState::RecursiveDeduplicating(
@@ -1395,16 +1438,14 @@ fn decide(
         )),
         (true, Fixpoint::Bag) => Ok(RecursionState::RecursiveBag),
         (false, Fixpoint::Bag) => Ok(RecursionState::NonRecursive),
-        (false, Fixpoint::Deduplicating) => Err(DelightQLError::validation_error_categorized(
-            crate::uri_registry::subcat::RECURSION_FALSE_FIXPOINT,
-            format!(
+        (false, Fixpoint::Deduplicating) => Err(DelightQLError::from(Recursion::FalseFixpoint {
+            message: format!(
                 "'{teaching_name}' wears the deduplicating fixpoint badge `%` and \
                  references nothing of itself, so there is no unfold for the badge to \
                  choose the union of. Drop the badge; to deduplicate an ordinary \
                  definition, spell the distinct view in the body (`|> %(*)`)"
             ),
-            "a fixpoint badge on a non-fixpoint",
-        )),
+        })),
     }
 }
 

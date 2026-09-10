@@ -10,6 +10,7 @@
 
 use super::{CarrierRecord, CompilerRow, ResidualCaptureSource};
 use crate::defuse::ho::RuleValueId;
+use crate::diagnostic::{Ho, Internal};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::ast_resolved;
 use crate::pipeline::ast_transform::AstTransform;
@@ -95,33 +96,34 @@ pub(in crate::defuse) fn prepare_residual_prefix(
             authored_bare.insert(param.clone(), name.to_string());
         }
     }
-    let interior = std::mem::take(&mut bindings.interior_ctes);
-    let mut carriers = super::call::resolve_carriers(fold, &mut bindings, None, interior, None)?;
-    if let Some(mut prepared) = prepared {
-        prepared.absorb(carriers);
-        carriers = prepared;
-    }
+    // THE RELATION FORMALS WERE BOUND WHERE THE ROW WAS ADMITTED: the
+    // record the prefix spend produced holds every carrier the residual
+    // owns, and the bindings already address them.
+    let mut carriers = prepared.unwrap_or_default();
     let mut values = std::collections::HashMap::new();
     let mut capture = None;
-    if !scalar_actuals.is_empty() {
+    // EVERY CONFIGURED ACTUAL IS CLASSIFIED ONCE, in the caller's own world
+    // and before anything resolves: what it depends on is a fact of the
+    // authored expression read against the frame standing here, and every
+    // later act — taking the row, resolving, staging, capturing — reads that
+    // one classification rather than judging the syntax again.
+    let classified: Vec<(String, ConfiguredActual)> = scalar_actuals
+        .into_iter()
+        .map(|(param, expr)| (param, classify_configured(expr, &*fold.env)))
+        .collect();
+    if !classified.is_empty() {
         // A CORRELATED ACTUAL SPENDS THE EVALUATION ROW. Whether one is
-        // present is a fact of the authored expressions, so the row is
-        // taken HERE — from the fold's own position, before the child that
+        // present is a fact of the classification, so the row is taken
+        // HERE — from the fold's own position, before the child that
         // resolves the actuals borrows it — and handed to the capture below.
         // A realized relation is read through a fresh ground read and
         // spends nothing; the caller row is TAKEN, and taking it is what
         // records that ordinary join assembly must not spend it too. Its
         // identity is the carrier's own, so there is nothing here to agree
         // with.
-        let reads_a_row = scalar_actuals.iter().any(|(_, expr)| {
-            !matches!(
-                expr,
-                ast_unresolved::DomainExpression::Application(
-                    ast_unresolved::FunctionApplication::Ground(_)
-                )
-            ) && !is_bare_row_reference(expr)
-                && domain_reads_a_row(expr)
-        });
+        let reads_a_row = classified
+            .iter()
+            .any(|(_, actual)| matches!(actual, ConfiguredActual::Correlated(_)));
         // A REALIZED ROW NOBODY SPENDS STILL STANDS IN VIEW: a named
         // actual keeps its occurrence, and the occurrence it keeps is the
         // realized relation's own port. A caller row stands as the frame
@@ -140,11 +142,9 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                 ),
                 ResidualEvaluationRow::Caller(row) => {
                     let Some(row) = row.absorb(&mut fold.lexical) else {
-                        return Err(DelightQLError::validation_error_categorized(
-                            "resolution/ho/residual-capture",
-                            "a configured rule-value expression reads caller data, but this construction position has no caller relation",
-                            "construct the value where its caller row stands, or configure it with a row-free expression",
-                        ));
+                        return Err(DelightQLError::from(Ho::ResidualCapture {
+    message: "a configured rule-value expression reads caller data, but this construction position has no caller relation".to_string(),
+}));
                     };
                     // THE IDENTITY IS THE CARRIER'S OWN. Nothing
                     // supplied it beside the row, so nothing can
@@ -156,7 +156,7 @@ pub(in crate::defuse) fn prepare_residual_prefix(
         } else {
             None
         };
-        let mut actual_fold = fold.child();
+        let mut actual_fold = fold.child(crate::pipeline::resolver::Correlations::InPlace);
         // THE TAKEN ROW STAYS IN VIEW while the actuals resolve — it is the
         // row they read — and comes back out below for the capture.
         let mut taken_row = taken_row;
@@ -185,11 +185,9 @@ pub(in crate::defuse) fn prepare_residual_prefix(
             .enter_carriers(&carriers, &actual_fold.core.identities)?;
         let mut staged = Vec::new();
         let mut correlated = Vec::new();
-        for (param, expr) in scalar_actuals {
-            match expr {
-                ast_unresolved::DomainExpression::Application(
-                    ast_unresolved::FunctionApplication::Ground(value),
-                ) => {
+        for (param, actual) in classified {
+            match actual {
+                ConfiguredActual::Literal(value) => {
                     bindings
                         .scalar_literals
                         .entry(param.clone())
@@ -201,16 +199,14 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                         ),
                     );
                 }
-                expr if is_bare_row_reference(&expr) => {
+                ConfiguredActual::Bare(expr) => {
                     values.insert(
                         SqlIdentifier::new(param),
                         actual_fold.transform_domain(expr)?,
                     );
                 }
-                expr if domain_reads_a_row(&expr) => {
-                    correlated.push((param, expr));
-                }
-                expr => staged.push((param, expr)),
+                ConfiguredActual::Correlated(expr) => correlated.push((param, expr)),
+                ConfiguredActual::RowFree(expr) => staged.push((param, expr)),
             }
         }
         if !correlated.is_empty() {
@@ -222,16 +218,26 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                 let (source_relation, leading, absorbs_join_input) = row_in_frame
                     .take()
                     .expect("a correlated actual is one that reads a row, judged above");
+                // EACH VALUE IS ONE JUDGED EXTENT, sealed with where it is
+                // evaluated; the capture's positions are born from the seal.
                 let resolved_values = correlated
                     .iter()
                     .map(|(_param, expr)| {
-                        let resolved = actual_fold.transform_domain(expr.clone())?;
-                        residual_expression_reads_only(
-                            &resolved,
-                            source_relation,
-                            &actual_fold.core.identities,
-                        )?;
-                        Ok(resolved)
+                        actual_fold.publication_value(None, |fold| {
+                            let resolved = fold.transform_domain(expr.clone())?;
+                            residual_expression_reads_only(
+                                &resolved,
+                                source_relation,
+                                &fold.core.identities,
+                            )?;
+                            // Anchored inside the extent: the value the
+                            // position is born from is the anchored one.
+                            anchor_capture_expression(
+                                &fold.core.identities,
+                                source_relation,
+                                resolved,
+                            )
+                        })
                     })
                     .collect::<Result<Vec<_>>>()?;
                 if carriers_framed {
@@ -242,16 +248,6 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                     &actual_fold.core.identities,
                     &source.semantic_relation(),
                 )?;
-                let resolved_values = resolved_values
-                    .into_iter()
-                    .map(|resolved| {
-                        anchor_capture_expression(
-                            &actual_fold.core.identities,
-                            source.semantic_relation(),
-                            resolved,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
                 // A closed value constructed over several standing rows is
                 // one value per row. Mint that identity while the exact
                 // evaluation relation is owned; no later phase may infer it
@@ -289,16 +285,9 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                 let mut positions: Vec<_> = source_ports
                     .iter()
                     .copied()
-                    .map(|port| crate::relation::pending::Position::Expanded {
-                        expr: ast_resolved::DomainExpression::Reference(Reference::Named(
-                            NamedReference(ColumnOccurrence::engine(port)),
-                        )),
-                        naming: None,
-                    })
+                    .map(crate::relation::pending::Position::restating_expanded)
                     .collect();
-                positions.extend(resolved_values.into_iter().map(|expr| {
-                    crate::relation::pending::Position::Authored { expr, naming: None }
-                }));
+                positions.extend(resolved_values);
                 let input = source.semantic_relation();
                 let (step, _) = actual_fold.core.identities.authority().bind(
                     crate::relation::pending::Pending::Publication {
@@ -340,7 +329,6 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                                     input: augmented_relation,
                                     why: crate::relation::form::ProjectWhy::Restate,
                                     slots: &slots,
-                                    dependencies: &[],
                                 },
                             ),
                             sources: augmented_ports,
@@ -389,6 +377,25 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                     .identities
                     .authority()
                     .mark_residual_row_token(landing_token)?;
+                // THE REFERENCE NAMES THE ROW THE BODY JOINS. The landing is
+                // the row the body's clauses stand over — the caller row it
+                // absorbed, carried once — so a configured value is read as
+                // the landing's own captured position, whichever carrier the
+                // receiver crossing later addresses. The value carrier bound
+                // below restates that row for the crossing under its own
+                // occurrence and is never a FROM entry of the body; a
+                // reference to ITS position would name an occurrence no site
+                // of the body realizes, and no relationship recorded about
+                // the landing may answer it there.
+                let entitled: Vec<_> = landing_ports
+                    .get(landing_ports.len().saturating_sub(correlated.len())..)
+                    .ok_or_else(|| {
+                        Internal::invariant(
+                            "closed residual construction",
+                            "a residual landing did not publish every configured value",
+                        )
+                    })?
+                    .to_vec();
                 let (_values_landing, value_ports, row_token) = if absorbs_join_input {
                     let read = ResolvedRelation::over(
                         CompilerRow::carrier(landing),
@@ -416,14 +423,14 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                                         input: read_relation,
                                         why: crate::relation::form::ProjectWhy::Restate,
                                         slots: &value_slots,
-                                        dependencies: &[],
                                     },
                                 ),
                                 sources: read_ports,
                             },
                         )
                     })?;
-                    let value = carriers.bind_capture_value(scalar, &actual_fold.core.identities)?;
+                    let value =
+                        carriers.bind_capture_value(scalar, &actual_fold.core.identities)?;
                     let value_ports = crate::relation::published_ports(
                         &actual_fold.core.identities,
                         &value.relation(),
@@ -447,9 +454,9 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                 let captured = ports
                     .get(ports.len().saturating_sub(correlated.len())..)
                     .ok_or_else(|| {
-                        DelightQLError::transformation_error(
-                            "a residual capture did not publish every configured value",
+                        Internal::invariant(
                             "closed residual construction",
+                            "a residual capture did not publish every configured value",
                         )
                     })?;
                 for port in captured.iter().copied() {
@@ -459,7 +466,7 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                         .authority()
                         .mark_residual_capture_value(port)?;
                 }
-                for ((param, _), port) in correlated.into_iter().zip(captured.iter().copied()) {
+                for ((param, _), port) in correlated.into_iter().zip(entitled.iter().copied()) {
                     values.insert(
                         SqlIdentifier::new(param),
                         crate::pipeline::asts::resolved::DomainExpression::Reference(
@@ -503,9 +510,9 @@ pub(in crate::defuse) fn prepare_residual_prefix(
                 &resolved.relation(),
             )?;
             if ports.len() != 1 {
-                return Err(DelightQLError::transformation_error(
-                    "a residual scalar carrier did not publish its configured value",
+                return Err(Internal::invariant(
                     "closed residual construction",
+                    "a residual scalar carrier did not publish its configured value",
                 ));
             }
             // THE STAGED CARRIER COMES INTO VIEW where its read resolves:
@@ -553,21 +560,104 @@ pub(in crate::defuse) fn prepare_residual_prefix(
     })
 }
 
-fn domain_reads_a_row(expr: &ast_unresolved::DomainExpression) -> bool {
+/// WHAT ONE CONFIGURED ACTUAL IS — the one classification every act of the
+/// prefix preparation reads.
+enum ConfiguredActual {
+    /// A literal: a value fact, bound directly.
+    Literal(crate::pipeline::asts::core::LiteralValue),
+    /// A bare name: a formal the frame answers, or an occurrence a standing
+    /// row keeps, resolved where it stands.
+    Bare(ast_unresolved::DomainExpression),
+    /// A computation that reads a row: it demands the entitled construction
+    /// row and is captured beside it.
+    Correlated(ast_unresolved::DomainExpression),
+    /// A computation over nothing a row supplies — literals, and formals
+    /// whose bound value is itself row-free — staged row-free.
+    RowFree(ast_unresolved::DomainExpression),
+}
+
+/// CLASSIFY ONE CONFIGURED ACTUAL in the caller's world.
+fn classify_configured(
+    expr: ast_unresolved::DomainExpression,
+    env: &crate::defuse::environment::Environment,
+) -> ConfiguredActual {
+    match expr {
+        ast_unresolved::DomainExpression::Application(
+            ast_unresolved::FunctionApplication::Ground(value),
+        ) => ConfiguredActual::Literal(value),
+        expr if is_bare_row_reference(&expr) => ConfiguredActual::Bare(expr),
+        expr if domain_reads_a_row(&expr, env) => ConfiguredActual::Correlated(expr),
+        expr => ConfiguredActual::RowFree(expr),
+    }
+}
+
+/// WHETHER A COMPUTED CONFIGURED EXPRESSION READS A ROW, judged in the
+/// caller's own world and FOLLOWED THROUGH EVERY BINDING. A reference the
+/// caller's formal frame answers is a bound scalar, and being bound does not
+/// erase a dependency: the frame spends the formal as the value the caller
+/// resolved it to, so the expression depends on whatever THAT VALUE depends
+/// on. A formal bound to a ground value — `wrap(10)` — contributes nothing a
+/// relation supplies, and `k + 0` is row-free; a formal bound to a column
+/// occurrence — `wrap(want)` — carries that occurrence into the computation,
+/// which must then be captured over the entitled construction row exactly
+/// as if the column had been spelled. Any other reference — a column, a
+/// qualified name, a position — is a genuine row dependency outright.
+fn domain_reads_a_row(
+    expr: &ast_unresolved::DomainExpression,
+    env: &crate::defuse::environment::Environment,
+) -> bool {
     use crate::pipeline::ast_visit::{walk_visit_domain, AstVisit, Descent};
-    struct ReadsRow(bool);
-    impl AstVisit<crate::pipeline::asts::core::Unresolved> for ReadsRow {
+    struct ReadsRow<'e> {
+        env: &'e crate::defuse::environment::Environment,
+        reads: bool,
+    }
+    impl AstVisit<crate::pipeline::asts::core::Unresolved> for ReadsRow<'_> {
         fn enter_domain(&mut self, expr: &ast_unresolved::DomainExpression) -> Result<Descent> {
-            if matches!(expr, ast_unresolved::DomainExpression::Reference(_)) {
+            if let ast_unresolved::DomainExpression::Reference(reference) = expr {
+                let bound = match reference {
+                    Reference::Named(NamedReference(AuthoredColumn {
+                        name,
+                        qualifier: None,
+                        namespace_path,
+                    })) if namespace_path.is_empty() => self.env.formal_value(name),
+                    _ => None,
+                };
+                let reads_a_row = match bound {
+                    Some(value) => resolved_reads_a_row(&value),
+                    None => true,
+                };
+                if reads_a_row {
+                    self.reads = true;
+                    return Ok(Descent::Break);
+                }
+            }
+            Ok(Descent::Continue)
+        }
+    }
+    let mut reads = ReadsRow { env, reads: false };
+    let _ = walk_visit_domain(&mut reads, expr);
+    reads.reads
+}
+
+/// WHAT A CALLER-RESOLVED VALUE DEPENDS ON: a resolved expression that
+/// holds a column occurrence denotes that occurrence and reads the row it
+/// belongs to; one that holds none — a literal, a computation over literals
+/// — is row-free.
+fn resolved_reads_a_row(value: &ast_resolved::DomainExpression) -> bool {
+    use crate::pipeline::ast_visit::{walk_visit_domain, AstVisit, Descent};
+    struct HoldsOccurrence(bool);
+    impl AstVisit<crate::pipeline::asts::core::Resolved> for HoldsOccurrence {
+        fn enter_domain(&mut self, expr: &ast_resolved::DomainExpression) -> Result<Descent> {
+            if matches!(expr, ast_resolved::DomainExpression::Reference(_)) {
                 self.0 = true;
                 return Ok(Descent::Break);
             }
             Ok(Descent::Continue)
         }
     }
-    let mut reads = ReadsRow(false);
-    let _ = walk_visit_domain(&mut reads, expr);
-    reads.0
+    let mut holds = HoldsOccurrence(false);
+    let _ = walk_visit_domain(&mut holds, value);
+    holds.0
 }
 
 fn residual_expression_reads_only(
@@ -595,11 +685,10 @@ fn residual_expression_reads_only(
     let authority = identities.authority();
     for reference in references.0 {
         if !authority.carries(&source, reference)? {
-            return Err(DelightQLError::validation_error_categorized(
-                "resolution/ho/residual-capture",
-                "a configured rule-value expression reads outside its construction row",
-                "bind the complete configured value in the caller row before constructing the residual",
-            ));
+            return Err(DelightQLError::from(Ho::ResidualCapture {
+                message: "a configured rule-value expression reads outside its construction row"
+                    .to_string(),
+            }));
         }
     }
     Ok(())
@@ -637,9 +726,9 @@ fn anchor_capture_expression(
                     .authority()
                     .port_in(&self.input, occurrence.column)
                     .map_err(|_| {
-                        DelightQLError::transformation_error(
-                            "a configured value did not land on its proved construction row",
+                        Internal::invariant(
                             "closed residual construction",
+                            "a configured value did not land on its proved construction row",
                         )
                     })?;
                 return Ok(ast_resolved::DomainExpression::Reference(Reference::Named(
@@ -686,8 +775,7 @@ pub(in crate::defuse) fn construct_effect_residual(
     // resolver's read of its plan mention is entered as a frame for exactly
     // this construction and left again after it.
     if let Some(row) = evaluation_relation {
-        let evaluation =
-            ResolvedRelation::over(CompilerRow::scratch(row), &fold.core.identities)?;
+        let evaluation = ResolvedRelation::over(CompilerRow::scratch(row), &fold.core.identities)?;
         fold.lexical
             .enter(evaluation, crate::pipeline::resolver::Reach::Row);
     }

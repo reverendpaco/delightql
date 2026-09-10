@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 use super::{Chain, DomainExpression, Phase, Unresolved};
+use crate::diagnostic::{Choe, Constraint, Ddl, DelightQLError, Internal, Resolution, Semantic};
 use crate::{lispy::ToLispy, ToLispy};
 use std::fmt;
 
@@ -304,6 +305,14 @@ impl QueryLocalNames {
         Ok(LexicalHorizon::through(position))
     }
 
+    /// Whether this block CLAIMS a spelling at all — the question a reader
+    /// asks when it needs to know that a mention is lexical rather than a
+    /// reference to something outside the query, and has no position to
+    /// judge visibility from.
+    pub fn declares(&self, name: &delightql_types::SqlIdentifier) -> bool {
+        self.claims.contains_key(name)
+    }
+
     pub(crate) fn judge(
         &self,
         name: &delightql_types::SqlIdentifier,
@@ -377,26 +386,6 @@ impl QueryLocalNames {
         Ok(offset)
     }
 
-    /// Whether this block claims the spelling at all, at any position.
-    fn claims(&self, name: &delightql_types::SqlIdentifier) -> bool {
-        self.claims.contains_key(name)
-    }
-
-    /// These claims WITHOUT the ones a nearer block makes. Positions do not
-    /// move — a shadowed declaration is gone, and the ones around it stood
-    /// where they stood.
-    fn shadowed_by(&self, nearer: &QueryLocalNames) -> Self {
-        QueryLocalNames {
-            claims: self
-                .claims
-                .iter()
-                .filter(|(name, _)| !nearer.claims(name))
-                .map(|(name, claim)| (name.clone(), claim.clone()))
-                .collect(),
-            next_position: self.next_position,
-        }
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.claims.is_empty()
     }
@@ -420,13 +409,11 @@ fn query_local_position_refusal(
             demand.description()
         )
     };
-    crate::error::DelightQLError::validation_error_categorized(
-        crate::uri_registry::subcat::RESOLUTION_CALLABLE_UNKNOWN,
-        format!(
+    DelightQLError::from(Resolution::CallableUnknown {
+        message: format!(
             "{reason}. A claimed query-local name never falls through to a consulted, catalog, or target definition"
         ),
-        "a taken query-local name is not a local miss",
-    )
+    })
 }
 
 /// A COMMON HIGHER-ORDER EXPRESSION — the query-scoped parameterized rule,
@@ -463,19 +450,15 @@ impl HoDefinition {
         let group =
             crate::pipeline::asts::ddl::DefinitionGroup::assemble(decls).map_err(|error| {
                 match error {
-                    crate::error::DelightQLError::ValidationError {
-                        subcategory: Some(sub),
-                        message,
-                        context,
-                    } if sub.starts_with("ddl/head/") => {
-                        crate::error::DelightQLError::validation_error_categorized(
-                            crate::uri_registry::subcat::RESOLUTION_CHOE_HEAD_AGREEMENT,
-                            format!(
+                    // A head-law refusal of the assembler is the CHOE's own
+                    // head-agreement identity: the clauses are query text.
+                    error @ crate::error::DelightQLError::Semantic(Semantic::Ddl(Ddl::Head(_))) => {
+                        DelightQLError::from(Choe::HeadAgreement {
+                            message: format!(
                                 "the clauses of the common higher-order expression '{name}' \
-                             do not agree: {message}"
+                                 do not agree: {error}"
                             ),
-                            context,
-                        )
+                        })
                     }
                     other => other,
                 }
@@ -637,7 +620,7 @@ impl<P: Phase> QueryLocals<P> {
             ctes: self
                 .ctes
                 .into_iter()
-                .map(|cte| walk.transform_cte_binding(cte))
+                .map(|cte| cte.folded(walk))
                 .collect::<crate::error::Result<Vec<_>>>()?,
         })
     }
@@ -692,11 +675,11 @@ impl QueryLocals<Unresolved> {
         let standing = subjects(&self.ctes);
         let spent = spend(std::mem::take(&mut self.ctes))?;
         if subjects(&spent) != standing {
-            return Err(crate::error::DelightQLError::transformation_error(
+            return Err(Internal::invariant(
+                "query_local_block",
                 "spending the heads of a query-local block's relation bindings answered with \
                  different subjects: the block's claims answer for the bindings it was minted \
                  with, and a replacement list is a second authority beside them",
-                "query_local_block",
             ));
         }
         self.ctes = spent;
@@ -713,13 +696,13 @@ impl QueryLocals<Unresolved> {
             .iter()
             .find_map(|cte| cte.subject().authored_name().cloned())
         {
-            return Err(crate::error::DelightQLError::transformation_error(
+            return Err(Internal::invariant(
+                "query_local_block",
                 format!(
                     "a compiler-built query bound the authored name '{name}': an authored \
                      spelling is claimed by the block that declares it, and a claimless \
                      binding is not a query-local name"
                 ),
-                "query_local_block",
             ));
         }
         Ok(QueryLocals {
@@ -772,11 +755,11 @@ impl QueryLocals<Unresolved> {
             let subject = cte.subject().authored_name().cloned();
             let restated = restate(cte, &reached)?;
             if restated.subject().authored_name().cloned() != subject {
-                return Err(crate::error::DelightQLError::transformation_error(
+                return Err(Internal::invariant(
+                    "query_local_block",
                     "restating a query-local block's relation binding answered with a \
                      different subject: the block's claims answer for the binding it was \
                      minted with",
-                    "query_local_block",
                 ));
             }
             reached.ctes.push(restated);
@@ -785,105 +768,17 @@ impl QueryLocals<Unresolved> {
         Ok(())
     }
 
-    /// THIS BLOCK UNDER A NEARER ONE: every spelling the nearer block
-    /// claims leaves this one, claim and manifestation together.
-    ///
-    /// Shadowing is a DELETION, not an override. Keeping the outer claim
-    /// while the nearer manifestation answers for it is the disagreement
-    /// this carrier exists to forbid — and which of two same-spelled
-    /// bindings a map happened to keep is not a scoping law.
-    pub(crate) fn shadowed_by(&self, nearer: &QueryLocals<Unresolved>) -> Self {
-        let gone = |name: Option<&delightql_types::SqlIdentifier>| {
-            name.is_some_and(|name| nearer.names.claims(name))
-        };
+    /// THE RELATION BINDINGS ALONE, with no claim ledger: the block for one
+    /// statement of a body whose claims and definitions are already declared
+    /// on the world. A binding resolves afresh in every statement — the
+    /// world it reads changes as the plan creates relations — while the
+    /// claims that judge its name stay the body's, declared once.
+    pub(crate) fn bindings_only(ctes: Vec<CteBinding<Unresolved>>) -> Self {
         QueryLocals {
-            names: self.names.shadowed_by(&nearer.names),
-            cfes: self
-                .cfes
-                .iter()
-                .filter(|cfe| !gone(Some(&cfe.name)))
-                .cloned()
-                .collect(),
-            hos: self
-                .hos
-                .iter()
-                .filter(|ho| !gone(Some(ho.name())))
-                .cloned()
-                .collect(),
-            ctes: self
-                .ctes
-                .iter()
-                .filter(|cte| !gone(cte.subject().authored_name()))
-                .cloned()
-                .collect(),
-        }
-    }
-
-    /// THIS BLOCK AS ONE HORIZON SEES IT: every relation and parameterized
-    /// manifestation the horizon does not admit is dropped, every CLAIM is
-    /// kept. The claims are what answer a name, and a claim the horizon
-    /// refuses must still refuse it — dropping the claim with the binding
-    /// would turn a not-yet-visible declaration into a local miss. Value
-    /// definitions stay whole: one spelling may hold several clauses at
-    /// several horizons, and selection already picks among them by the
-    /// horizon each was declared at.
-    pub(crate) fn visible_at(&self, horizon: LexicalHorizon) -> Self {
-        let admits = |name: &delightql_types::SqlIdentifier, demand| {
-            matches!(
-                self.names.judge(name, horizon, demand),
-                QueryLocalJudgment::Lawful(_)
-            )
-        };
-        QueryLocals {
-            names: self.names.clone(),
-            cfes: self.cfes.clone(),
-            hos: self
-                .hos
-                .iter()
-                .filter(|ho| {
-                    let demand = if ho.declares_effect() {
-                        QueryLocalDemand::Effect
-                    } else {
-                        QueryLocalDemand::HigherOrder
-                    };
-                    admits(ho.name(), demand)
-                })
-                .cloned()
-                .collect(),
-            ctes: self
-                .ctes
-                .iter()
-                .filter(|cte| {
-                    cte.subject().authored_name().is_some_and(|name| {
-                        let demand = if cte.subject().declares_effect() {
-                            QueryLocalDemand::Effect
-                        } else {
-                            QueryLocalDemand::Relation
-                        };
-                        admits(name, demand)
-                    })
-                })
-                .cloned()
-                .collect(),
-        }
-    }
-
-    /// THE PURE FACE OF THIS BLOCK: every effect-marked relation binding
-    /// dropped, every claim kept. An effect manifestation is opened by its
-    /// demand and never by a pure statement, so a pure position must read
-    /// a WRONG KIND there rather than a local miss that falls through to
-    /// the catalog.
-    pub(crate) fn pure(&self) -> Self {
-        QueryLocals {
-            names: self.names.clone(),
-            cfes: self.cfes.clone(),
-            hos: self.hos.clone(),
-            ctes: self
-                .ctes
-                .iter()
-                .filter(|cte| !cte.subject().declares_effect())
-                .cloned()
-                .collect(),
+            names: QueryLocalNames::default(),
+            cfes: Vec::new(),
+            hos: Vec::new(),
+            ctes,
         }
     }
 }
@@ -1057,6 +952,15 @@ impl<P: Phase> ToLispy for Query<P> {
             self.locals.ctes.to_lispy(),
             self.body.to_lispy(),
         )
+    }
+}
+
+impl Query<Unresolved> {
+    /// The one name fact governing this query's own bindings — the claims
+    /// that make a mention of one of them lexical rather than a reference
+    /// to something the query does not declare.
+    pub fn local_names(&self) -> &QueryLocalNames {
+        self.locals.names()
     }
 }
 
@@ -1393,47 +1297,6 @@ mod query_local_block_tests {
         assert!(QueryLocals::compiler_built(vec![authored("named")]).is_err());
     }
 
-    /// A nearer block SHADOWS an outer one: the outer spelling leaves the
-    /// block entirely, so nothing claims a name whose binding is gone and
-    /// nothing answers a name whose claim is gone.
-    #[test]
-    fn a_shadowed_spelling_leaves_claim_and_binding_together() {
-        let mut outer = QueryLocalBlock::default();
-        outer.admit_relation(authored("shared")).expect("outer");
-        outer.admit_relation(authored("kept")).expect("kept");
-        let outer = outer.seal().expect("outer seals");
-
-        let mut nearer = QueryLocalBlock::default();
-        nearer.admit_relation(authored("shared")).expect("nearer");
-        let nearer = nearer.seal().expect("nearer seals");
-
-        let under = outer.shadowed_by(&nearer);
-        assert_eq!(under.ctes().len(), 1);
-        assert_eq!(
-            under.ctes()[0]
-                .subject()
-                .authored_name()
-                .map(|n| n.as_str()),
-            Some("kept")
-        );
-        assert_eq!(
-            under.names().judge(
-                &SqlIdentifier::new("shared"),
-                LexicalHorizon::all(),
-                QueryLocalDemand::Relation,
-            ),
-            QueryLocalJudgment::Absent
-        );
-        assert_eq!(
-            under.names().judge(
-                &SqlIdentifier::new("kept"),
-                LexicalHorizon::all(),
-                QueryLocalDemand::Relation,
-            ),
-            QueryLocalJudgment::Lawful(QueryLocalKind::Relation)
-        );
-    }
-
     /// Restating the relation bindings is for spending heads and rewriting
     /// bodies. A pass that answers with a different subject list is a
     /// second authority beside the claims, and refuses.
@@ -1604,15 +1467,14 @@ impl CfeFormals {
             match formal.role {
                 CfeFormalRole::Scalar => scalar_seen = true,
                 CfeFormalRole::Callable if scalar_seen => {
-                    return Err(crate::error::DelightQLError::transformation_error(
-                        format!(
+                    return Err(DelightQLError::from(Constraint::General {
+                        message: format!(
                             "the callable formal '{}' stands after a scalar one: a call \
                              site supplies code first, so binding order is \
                              callable-then-scalar",
                             formal.name
                         ),
-                        "cfe_formals",
-                    ));
+                    }));
                 }
                 CfeFormalRole::Callable => {}
             }

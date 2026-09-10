@@ -8,8 +8,6 @@ pub mod resolver;
 pub mod sql_ast;
 pub mod transformer;
 
-use rusqlite::Connection;
-
 use crate::ddl::manifest;
 use crate::Result;
 
@@ -19,21 +17,20 @@ pub struct ManifestCreateResult {
     pub schema_rows: Vec<manifest::SchemaRow>,
 }
 
-/// Read manifest data from `_internal` namespace and produce CREATE TEMP TABLE SQL.
+/// Read an opened manifest's companions and produce CREATE TEMP TABLE SQL.
 ///
 /// Returns `Ok(Some(result))` if the entity has schema rows, `Ok(None)` if not.
 pub fn create_temp_table_from_manifest(
-    bootstrap_conn: &Connection,
-    internal_ns_id: i32,
+    companions: manifest::Manifest<'_>,
     entity_name: &str,
     bin_registry: std::sync::Arc<crate::bin_cartridge::registry::BinCartridgeRegistry>,
 ) -> Result<Option<ManifestCreateResult>> {
-    let schema_rows = manifest::read_schema(bootstrap_conn, internal_ns_id, entity_name)?;
+    let schema_rows = companions.schema(entity_name)?;
     if schema_rows.is_empty() {
         return Ok(None);
     }
-    let constraint_rows = manifest::read_constraints(bootstrap_conn, internal_ns_id, entity_name)?;
-    let default_rows = manifest::read_defaults(bootstrap_conn, internal_ns_id, entity_name)?;
+    let constraint_rows = companions.constraints(entity_name)?;
+    let default_rows = companions.defaults(entity_name)?;
     let unresolved = assemble_manifest::assemble_from_manifest(
         entity_name,
         true,

@@ -37,6 +37,7 @@
 //! map lives in another module. The wall is [`BranchLayout`]: its one
 //! producer is fenced to the file that lays branches out.
 
+use crate::diagnostic::Internal;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -984,6 +985,20 @@ impl BindingRow<'_> {
         Ok(())
     }
 
+    /// THIS PORT IS EMITTED BY NO SLOT HERE: a position the enclosing join
+    /// computes, carried toward the interior boundary unread. The site
+    /// accounts for it without placing it, so a reference answered by it
+    /// finds nothing at this level and the enclosing level answers.
+    pub(crate) fn defers(&mut self, port: PortId) -> Result<()> {
+        let Some(at) = self.owed.iter().position(|owed| *owed == port) else {
+            return Err(unbound(
+                "a deferred position claims a port the relation it realizes does not publish",
+            ));
+        };
+        self.owed.remove(at);
+        Ok(())
+    }
+
     /// THIS SLOT REALIZES A DEPENDENCY the operation still owes — a
     /// predicate's operand, a correlation carrier. It is not a position of
     /// what the relation publishes.
@@ -1021,6 +1036,11 @@ impl BindingRow<'_> {
         let direct_ports = self.ports.keys().copied().collect();
         let mut reached: HashMap<PortId, std::collections::BTreeSet<usize>> = HashMap::new();
         for (old, new) in sealed.translated_ports(&self.relation)? {
+            // A translation onto a position the enclosing join computes
+            // lands nowhere here: the position has no slot at this level.
+            if sealed.unemitted_here(new) {
+                continue;
+            }
             let position = self.ports.get(&new).copied().ok_or_else(|| {
                 unbound("a construction-owned translation targets a port absent from its site")
             })?;
@@ -1039,6 +1059,33 @@ impl BindingRow<'_> {
                 }
                 _ => {}
             }
+        }
+        // A SUPPORT SLOT ANSWERS FOR THE OCCURRENCE IT CONTINUES TOO. A
+        // hoisted correlation names an interior occurrence exactly as the
+        // correlation act read it, and the level standing here may keep
+        // that occurrence readable in a position a republication between
+        // them minted. The position's own carry record says which
+        // occurrences it continues; each reaches this slot, under the same
+        // one-column-or-none rule as a published translation.
+        let mut support_reached: HashMap<PortId, std::collections::BTreeSet<usize>> =
+            HashMap::new();
+        for (port, position) in &self.support {
+            for continued in sealed.continued_occurrences(*port) {
+                support_reached
+                    .entry(continued)
+                    .or_default()
+                    .insert(*position);
+            }
+        }
+        for (continued, at) in support_reached {
+            let mut only = at.into_iter();
+            let (Some(position), None) = (only.next(), only.next()) else {
+                continue;
+            };
+            if self.ports.contains_key(&continued) {
+                continue;
+            }
+            self.support.entry(continued).or_insert(position);
         }
         for (port, position) in &self.ports {
             self.physical.entry(port.column()).or_insert(*position);
@@ -1084,10 +1131,7 @@ fn resolve(site: &HashMap<PortId, SqlSlotId>, cell: &Contribution) -> Result<Sql
 }
 
 fn unbound(what: &str) -> DelightQLError {
-    DelightQLError::transformation_error(
-        format!("{what}: SQL lowering binds recorded ports to emitted columns and has no road to recover one it was not given"),
-        "sql binding",
-    )
+    Internal::invariant("sql binding", format!("{what}: SQL lowering binds recorded ports to emitted columns and has no road to recover one it was not given"))
 }
 
 #[cfg(test)]

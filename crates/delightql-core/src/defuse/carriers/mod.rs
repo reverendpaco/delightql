@@ -5,8 +5,10 @@
 //! and the carrier it names.
 //!
 //! Three constructions exist, and each is one operation of this module:
-//! a higher-order call binds its relation actuals, its piped source and
-//! the caller row it absorbs ([`resolve_carriers`]); a residual's
+//! a higher-order call binds its relation formals — the piped source, every
+//! admitted actual, each under the face its formal declares
+//! ([`bind_relation_formals`]) — and the caller row it absorbs
+//! ([`bind_join_input`]); a residual's
 //! construction binds the row it captured with the configured values
 //! beside it ([`prepare_residual_prefix`]); an effect's residual stands
 //! over the plan scratch that is its evaluation row
@@ -32,15 +34,23 @@
 //! stores it whole and never takes it apart.
 
 mod call;
+mod crossing;
+mod formal;
 mod residual;
 
-pub(in crate::defuse) use call::resolve_carriers;
+pub(in crate::defuse) use crossing::carry_frontier_actuals;
+pub(crate) use crossing::{inject_crossing_carriers, FrontierSupport};
+
+pub(in crate::defuse) use call::{bind_join_input, bind_relation_formals};
+pub(in crate::defuse) use formal::faced_input;
+pub use formal::RelationFormals;
 pub(in crate::defuse) use residual::{
     construct_effect_residual, prepare_residual_prefix, PreparedResidualPrefix, ResidualCapture,
     ResidualEvaluationRow,
 };
 
-use crate::error::{DelightQLError, Result};
+use crate::diagnostic::Internal;
+use crate::error::Result;
 use crate::pipeline::asts::resolved::CteBinding;
 use crate::pipeline::bindings::BoundCarrier;
 use crate::pipeline::query_features::HoParamBindings;
@@ -319,6 +329,10 @@ impl CarrierRecord {
             identities,
         )?;
         let row = definition.row();
+        // The value carrier reads the landing, so it follows it directly. It
+        // is the receiver crossing's carrier, not the body's: a configured
+        // value is referenced as the landing's own position, so nothing
+        // records this carrier as standing for the landing anywhere.
         // The value carrier reads the landing, so it follows it directly.
         let after_landing = self
             .leading
@@ -363,9 +377,9 @@ impl CarrierRecord {
             return Ok(());
         }
         let row = from.formal_row(landing).ok_or_else(|| {
-            DelightQLError::transformation_error(
-                "a forwarded relation lost its structural carrier",
+            Internal::invariant(
                 "higher-order relation forwarding",
+                "a forwarded relation lost its structural carrier",
             )
         })?;
         self.leading.push(Leading::Carrier(Carrier {
@@ -487,7 +501,10 @@ impl CarrierRecord {
     /// THE PROOF OF THE FORMAL AT A LANDING, for the world that answers a
     /// body's mention of it: what the resolver stands over, never an
     /// identity it could stand over by itself.
-    pub(in crate::defuse) fn compiler_row(&self, landing: StructuralRelation) -> Option<CompilerRow> {
+    pub(in crate::defuse) fn compiler_row(
+        &self,
+        landing: StructuralRelation,
+    ) -> Option<CompilerRow> {
         self.formal_row(landing).map(CompilerRow::carrier)
     }
 
@@ -592,9 +609,9 @@ impl CarrierRecord {
                 })
                 .count();
             if token_matches > 1 {
-                return Err(DelightQLError::transformation_error(
-                    "one receiver relation carries a residual construction token more than once",
+                return Err(Internal::invariant(
                     "closed residual crossing",
+                    "one receiver relation carries a residual construction token more than once",
                 ));
             }
             if token_matches == 1 {
@@ -618,9 +635,9 @@ impl CarrierRecord {
             ([], [landing], _) => Ok(Some(*landing)),
             ([], [], [landing]) => Ok(Some(*landing)),
             ([], [], []) | ([], [], [_, _, ..]) => Ok(None),
-            ([_, _, ..], _, _) | ([], [_, _, ..], _) => Err(DelightQLError::transformation_error(
-                "a residual construction row is carried by more than one receiver relation",
+            ([_, _, ..], _, _) | ([], [_, _, ..], _) => Err(Internal::invariant(
                 "closed residual crossing",
+                "a residual construction row is carried by more than one receiver relation",
             )),
         }
     }
@@ -676,18 +693,7 @@ impl CarrierRecord {
         }
         let mut replaced = false;
         if let Some(source) = replaceable {
-            for scope in bindings.table_scope_params.values_mut() {
-                if *scope == source {
-                    *scope = capture.landing;
-                    replaced = true;
-                }
-            }
-            if let Some((_, scope)) = &mut bindings.pipe_carrier {
-                if *scope == source {
-                    *scope = capture.landing;
-                    replaced = true;
-                }
-            }
+            replaced = bindings.formals.reland(source, capture.landing);
             if replaced {
                 self.unformal(source);
             }

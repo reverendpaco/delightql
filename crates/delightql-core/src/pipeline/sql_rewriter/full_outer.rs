@@ -12,6 +12,7 @@
 // and WHERE into both branches — because the outer query's column references
 // use the join operand aliases (u.id, o.total) which must remain in scope.
 
+use crate::diagnostic::{Constraint, Internal};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::generator::SqlDialect;
 use crate::pipeline::sql_ast::{
@@ -281,11 +282,9 @@ fn expand_full_outer_select_aggregated(
 
     let (Some(left_scope), Some(right_scope)) = (operand_scope(&left), operand_scope(&right))
     else {
-        return Err(DelightQLError::ParseError {
+        return Err(DelightQLError::from(Constraint::Join {
             message: "FULL OUTER JOIN under an aggregate: operands must carry aliases".to_string(),
-            source: None,
-            subcategory: None,
-        });
+        }));
     };
     let operand_scopes = [left_scope, right_scope];
 
@@ -375,7 +374,7 @@ fn expand_full_outer_select_aggregated(
         // own, so it goes through the authority rather than carrying evidence
         // from a statement it is not a rewrite of.
         (b).standing_at(carrier_scope)
-            .map_err(crate::error::DelightQLError::parse_error)
+            .map_err(|e| Internal::invariant("sql_rewriter::full_outer", e))
     };
     let null_check = DomainExpression::Binary {
         left: Box::new(null_check_col),
@@ -438,10 +437,11 @@ fn expand_full_outer_select_aggregated(
     builder
         .rebuilding(stmt)
         .map(|s| QueryExpression::Select(Box::new(s)))
-        .map_err(|e| DelightQLError::ParseError {
-            message: format!("sql_rewriter full_outer aggregated rebuild: {}", e),
-            source: None,
-            subcategory: None,
+        .map_err(|e| {
+            Internal::invariant(
+                "sql_rewriter::full_outer",
+                format!("sql_rewriter full_outer aggregated rebuild: {}", e),
+            )
         })
 }
 
@@ -672,13 +672,12 @@ fn rebuild_select_with_from_and_extra_where(
         builder = builder.limit_from(lim.clone());
     }
 
-    builder
-        .rebuilding(stmt)
-        .map_err(|e| DelightQLError::ParseError {
-            message: format!("sql_rewriter full_outer rebuild: {}", e),
-            source: None,
-            subcategory: None,
-        })
+    builder.rebuilding(stmt).map_err(|e| {
+        Internal::invariant(
+            "sql_rewriter::full_outer",
+            format!("sql_rewriter full_outer rebuild: {}", e),
+        )
+    })
 }
 
 /// The single alias under which a join operand is addressable. The
@@ -706,34 +705,27 @@ fn extract_null_check_column(
     identities: &crate::names::Registry,
 ) -> Result<DomainExpression> {
     match condition {
-        JoinCondition::On(expr) => {
-            find_column_of(expr, left_scope, identities).ok_or_else(|| DelightQLError::ParseError {
-                message:
-                    "FULL OUTER JOIN: no column of the preserved side found in ON condition for NULL check"
+        JoinCondition::On(expr) => find_column_of(expr, left_scope, identities).ok_or_else(|| {
+            DelightQLError::from(Constraint::Unsupported {
+    message: "FULL OUTER JOIN: no column of the preserved side found in ON condition for NULL check"
                         .to_string(),
-                source: None,
-                subcategory: None,
-            })
-        }
+})
+        }),
         JoinCondition::Merge(pairs) => {
             let Some(col) = pairs.iter().find_map(|pair| {
                 (left_scope == Some(identities.scope_of(pair.left))).then_some(pair.left)
-            })
-            else {
-                return Err(DelightQLError::ParseError {
-                    message: "FULL OUTER JOIN on merged pairs: no preserved-side column for NULL check"
-                        .to_string(),
-                    source: None,
-                    subcategory: None,
-                });
+            }) else {
+                return Err(DelightQLError::from(Constraint::Unsupported {
+                    message:
+                        "FULL OUTER JOIN on merged pairs: no preserved-side column for NULL check"
+                            .to_string(),
+                }));
             };
             Ok(DomainExpression::Column(col))
         }
-        JoinCondition::Cartesian => Err(DelightQLError::ParseError {
+        JoinCondition::Cartesian => Err(DelightQLError::from(Constraint::Unsupported {
             message: "FULL OUTER JOIN with NATURAL is not supported".to_string(),
-            source: None,
-            subcategory: None,
-        }),
+        })),
     }
 }
 

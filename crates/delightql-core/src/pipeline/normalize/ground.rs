@@ -10,7 +10,7 @@
 //! symbol extent rule cannot mean one thing in a body and another in a head.
 
 use super::Normalizer;
-use crate::error::{DelightQLError, Result};
+use crate::error::Result;
 use crate::pipeline::asts::core::{DomainExpression, LiteralValue, Unresolved};
 use crate::pipeline::syntax::cst;
 
@@ -75,13 +75,18 @@ impl<'t> Normalizer<'t> {
     /// decimal the prefix names.
     fn number(&self, text: &str) -> Result<LiteralValue> {
         if let Some(digits) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-            let value = u64::from_str_radix(digits, 16)
-                .map_err(|_| DelightQLError::parse_error(format!("invalid hex literal: {text}")))?;
+            let value = u64::from_str_radix(digits, 16).map_err(|_| {
+                crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+                    message: format!("invalid hex literal: {text}"),
+                })
+            })?;
             return Ok(LiteralValue::Number(value.to_string()));
         }
         if let Some(digits) = text.strip_prefix("0o").or_else(|| text.strip_prefix("0O")) {
             let value = u64::from_str_radix(digits, 8).map_err(|_| {
-                DelightQLError::parse_error(format!("invalid octal literal: {text}"))
+                crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+                    message: format!("invalid octal literal: {text}"),
+                })
             })?;
             return Ok(LiteralValue::Number(value.to_string()));
         }
@@ -96,11 +101,15 @@ impl<'t> Normalizer<'t> {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|error| {
-                DelightQLError::parse_error(format!("invalid base64 in b64:\"…\": {error}"))
+                crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+                    message: format!("invalid base64 in b64:\"…\": {error}"),
+                })
             })?;
         Ok(LiteralValue::String(String::from_utf8(bytes).map_err(
             |error| {
-                DelightQLError::parse_error(format!("b64:\"…\" decoded to invalid UTF-8: {error}"))
+                crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+                    message: format!("b64:\"…\" decoded to invalid UTF-8: {error}"),
+                })
             },
         )?))
     }

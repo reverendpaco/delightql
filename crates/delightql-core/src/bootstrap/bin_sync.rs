@@ -166,7 +166,7 @@ pub fn sync_bin_cartridges_to_bootstrap(
 
     // Seed per-functor dialect_form_rule rows now that bin entities have
     // entity ids (session-local, resolved by name in the seed SQL).
-    // Idempotent; covers both init and reinit_bootstrap.
+    // Idempotent via NOT EXISTS; runs once, during canonical construction.
     conn.execute_batch(FORM_RULES_SEED)?;
 
     Ok(universal_namespaces)

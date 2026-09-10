@@ -2,6 +2,7 @@
 // Copyright 2026 Daniel Eklund
 use super::operators::{BinaryOperator, UnaryOperator};
 use super::query::QueryExpression;
+use crate::diagnostic::Internal;
 use crate::pipeline::ast_refined::LiteralValue;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -659,11 +660,11 @@ impl DomainExpression {
         ) {
             return Ok(self);
         }
-        Err(crate::error::DelightQLError::transformation_error(
-            "case/anchor_needs_a_row",
+        Err(Internal::invariant(
             "a match arm spelling `null` asks its question of the anchor itself, \
              so a computed anchor must be published by the row that owns the \
              case; this one stands where no row publishes it",
+            "case/anchor_needs_a_row",
         ))
     }
 

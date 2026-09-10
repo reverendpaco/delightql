@@ -373,15 +373,27 @@ mod tests {
     #[test]
     fn test_mixed_stropped_unstropped_equal_when_canonical_matches() {
         // stropped `daniel` (canonical "daniel") == unstropped DANIEL (folds to "daniel").
-        assert_eq!(SqlIdentifier::stropped("daniel"), SqlIdentifier::new("DANIEL"));
-        assert_eq!(SqlIdentifier::new("DANIEL"), SqlIdentifier::stropped("daniel"));
+        assert_eq!(
+            SqlIdentifier::stropped("daniel"),
+            SqlIdentifier::new("DANIEL")
+        );
+        assert_eq!(
+            SqlIdentifier::new("DANIEL"),
+            SqlIdentifier::stropped("daniel")
+        );
     }
 
     #[test]
     fn test_mixed_stropped_unstropped_unequal_on_case() {
         // stropped `Daniel` (canonical "Daniel") != unstropped daniel (folds to "daniel").
-        assert_ne!(SqlIdentifier::stropped("Daniel"), SqlIdentifier::new("daniel"));
-        assert_ne!(SqlIdentifier::new("daniel"), SqlIdentifier::stropped("Daniel"));
+        assert_ne!(
+            SqlIdentifier::stropped("Daniel"),
+            SqlIdentifier::new("daniel")
+        );
+        assert_ne!(
+            SqlIdentifier::new("daniel"),
+            SqlIdentifier::stropped("Daniel")
+        );
     }
 
     #[test]

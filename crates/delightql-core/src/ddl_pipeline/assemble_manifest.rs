@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 use crate::ddl::manifest::{ConstraintRow, DefaultRow, SchemaRow};
+use crate::diagnostic::{Constraint, DelightQLError, Manifest};
 use crate::pipeline::asts::core::Unresolved;
 use crate::Result;
 
@@ -8,7 +9,9 @@ use super::asts::{ColumnDef, CreateTableDef, DdlDefault, GeneratedKind};
 use super::builder;
 
 fn db_err(msg: impl std::fmt::Display) -> crate::DelightQLError {
-    crate::DelightQLError::transpilation_error(msg.to_string(), "ddl_pipeline::assemble_manifest")
+    DelightQLError::from(Constraint::General {
+        message: msg.to_string(),
+    })
 }
 
 /// Build a `CreateTableDef<Unresolved>` from manifest data.
@@ -34,17 +37,12 @@ pub fn assemble_from_manifest(
     // first so an unwitnessed row cannot disappear between those two paths.
     for cr in constraint_rows {
         if cr.column != "_" && !schema_rows.iter().any(|sr| sr.name == cr.column) {
-            return Err(crate::DelightQLError::validation_error_categorized(
-                "imprint/manifest/constraint_column",
-                format!(
+            return Err(DelightQLError::from(Manifest::ConstraintColumn {
+                message: format!(
                     "constraint '{}' for '{}' names unknown column '{}'",
                     cr.constraint_name, table_name, cr.column
                 ),
-                format!(
-                    "declare '{}' in schema(\"{}\") or use \"_\" for a table-level constraint",
-                    cr.column, table_name
-                ),
-            ));
+            }));
         }
     }
 

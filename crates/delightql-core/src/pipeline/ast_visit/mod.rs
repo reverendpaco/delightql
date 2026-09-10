@@ -308,6 +308,9 @@ pub fn walk_visit_continuation<P: Phase, F: AstVisit<P> + ?Sized>(
         Continuation::Restrict { condition, .. } => {
             child!(walk_visit_boolean(v, condition));
         }
+        Continuation::Correlated(correlated) => {
+            child!(walk_visit_boolean(v, P::correlated(correlated).condition()));
+        }
         // A correlation names two arms by scope; there is no expression
         // beneath it to visit.
         Continuation::Bound { .. } | Continuation::Correlate { .. } => {}

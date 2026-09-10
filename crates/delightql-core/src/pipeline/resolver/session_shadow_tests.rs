@@ -19,9 +19,10 @@
 //! end-to-end through the dql binary.
 
 use super::{resolve_query_with, ResolutionConfig};
+use crate::diagnostic::{Constraint, DelightQLError, Runtime};
 use crate::pipeline::{ast_unresolved, danger_gates, generator, refiner, transformer};
 use crate::resolution::ResolverCore;
-use crate::system::DelightQLSystem;
+use crate::system::{DelightQLSystem, ReadySystem};
 use delightql_types::introspect::{DatabaseIntrospector, DiscoveredAttribute, DiscoveredEntity};
 use delightql_types::{DatabaseConnection, DbValue};
 use std::sync::{Arc, Mutex};
@@ -47,21 +48,25 @@ fn to_rusqlite(value: &DbValue) -> rusqlite::types::Value {
 
 impl DatabaseConnection for RealSqliteConnection {
     fn execute(&self, sql: &str, params: &[DbValue]) -> delightql_types::Result<usize> {
-        let conn = self.conn.lock().map_err(|e| {
-            delightql_types::DelightQLError::connection_poison_error("poisoned", e.to_string())
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Runtime::poisoned("poisoned", e.to_string()))?;
         let vals: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite).collect();
         let refs: Vec<&dyn rusqlite::ToSql> =
             vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
         conn.execute(sql, refs.as_slice()).map_err(|e| {
-            delightql_types::DelightQLError::database_error("Execute failed", e.to_string())
+            DelightQLError::from(Runtime::Execution {
+                message: format!("Execute failed: {e}"),
+            })
         })
     }
 
     fn last_insert_rowid(&self) -> delightql_types::Result<i64> {
-        let conn = self.conn.lock().map_err(|e| {
-            delightql_types::DelightQLError::connection_poison_error("poisoned", e.to_string())
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Runtime::poisoned("poisoned", e.to_string()))?;
         Ok(conn.last_insert_rowid())
     }
 
@@ -70,9 +75,10 @@ impl DatabaseConnection for RealSqliteConnection {
         sql: &str,
         params: &[DbValue],
     ) -> delightql_types::Result<Option<Vec<DbValue>>> {
-        let conn = self.conn.lock().map_err(|e| {
-            delightql_types::DelightQLError::connection_poison_error("poisoned", e.to_string())
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Runtime::poisoned("poisoned", e.to_string()))?;
         let vals: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite).collect();
         let refs: Vec<&dyn rusqlite::ToSql> =
             vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
@@ -95,10 +101,9 @@ impl DatabaseConnection for RealSqliteConnection {
         }) {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(delightql_types::DelightQLError::database_error(
-                "Query failed",
-                e.to_string(),
-            )),
+            Err(e) => Err(DelightQLError::from(Runtime::Execution {
+                message: format!("Query failed: {e}"),
+            })),
         }
     }
 
@@ -107,14 +112,17 @@ impl DatabaseConnection for RealSqliteConnection {
         sql: &str,
         params: &[DbValue],
     ) -> delightql_types::Result<(Vec<String>, Vec<Vec<DbValue>>)> {
-        let conn = self.conn.lock().map_err(|e| {
-            delightql_types::DelightQLError::connection_poison_error("poisoned", e.to_string())
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Runtime::poisoned("poisoned", e.to_string()))?;
         let vals: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite).collect();
         let refs: Vec<&dyn rusqlite::ToSql> =
             vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
         let mut stmt = conn.prepare(sql).map_err(|e| {
-            delightql_types::DelightQLError::database_error("Prepare failed", e.to_string())
+            DelightQLError::from(Runtime::Execution {
+                message: format!("Prepare failed: {e}"),
+            })
         })?;
         let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let n = cols.len();
@@ -135,11 +143,15 @@ impl DatabaseConnection for RealSqliteConnection {
                 Ok(out)
             })
             .map_err(|e| {
-                delightql_types::DelightQLError::database_error("Query failed", e.to_string())
+                DelightQLError::from(Runtime::Execution {
+                    message: format!("Query failed: {e}"),
+                })
             })?
             .collect();
         let rows = rows.map_err(|e| {
-            delightql_types::DelightQLError::database_error("Row read failed", e.to_string())
+            DelightQLError::from(Runtime::Execution {
+                message: format!("Row read failed: {e}"),
+            })
         })?;
         Ok((cols, rows))
     }
@@ -187,7 +199,7 @@ impl DatabaseIntrospector for MainIntrospector {
 /// system's user connection — temp tables created on it live in the temp
 /// schema the created-object PRAGMA read-back sees.
 fn world() -> (
-    DelightQLSystem,
+    ReadySystem,
     Arc<Mutex<rusqlite::Connection>>,
     tempfile::TempDir,
 ) {
@@ -208,7 +220,7 @@ fn world() -> (
     ));
     let adapter: Arc<Mutex<dyn DatabaseConnection>> =
         Arc::new(Mutex::new(RealSqliteConnection { conn: raw.clone() }));
-    let mut system = DelightQLSystem::new(adapter, Box::new(MainIntrospector), "sqlite")
+    let mut system = ReadySystem::new(adapter, Box::new(MainIntrospector), "sqlite")
         .expect("system should build");
     system
         .mount_database(db_path.to_str().unwrap(), "main")
@@ -236,6 +248,7 @@ fn create_and_register_temp_staged(
                 name: "staged".to_string(),
                 is_view: false,
                 connection_id: Some(2),
+                interior_positions: Vec::new(),
             }],
             &crate::system::RealCreatedObjectCatalog,
         )
@@ -289,10 +302,9 @@ fn compile_plain(source: &str, system: &DelightQLSystem) -> crate::error::Result
     generator::SqlGenerator::new(&names)
         .generate_statement(&sql_ast)
         .map_err(|e| {
-            crate::error::DelightQLError::validation_error(
-                format!("SQL generation failed: {e}"),
-                "session-shadow test chain",
-            )
+            DelightQLError::from(Constraint::General {
+                message: format!("SQL generation failed: {e}"),
+            })
         })
 }
 
@@ -420,6 +432,7 @@ fn reregistration_retires_prior_session_entry_only() {
                 name: "staged".to_string(),
                 is_view: false,
                 connection_id: Some(2),
+                interior_positions: Vec::new(),
             }],
             &crate::system::RealCreatedObjectCatalog,
         )
@@ -463,5 +476,73 @@ fn physical_registration_survives_temp_registration() {
         physical, 1,
         "registering a same-name temp must not retire the physical entity \
          (the retirement is scoped to the session cartridge)"
+    );
+}
+
+// ------------------------------------------------------------------
+// (f) A created object keeps the tree shape its plan knew.
+// ------------------------------------------------------------------
+
+/// The engine's read-back of a CTAS declares no type for a tree-group
+/// column, so the shape crosses through the registration itself: the plan
+/// says which positions are nested payloads, the catalog records them as
+/// interior entities, and the catalog read hands the fact back on the
+/// source slot. Pinned end-to-end by
+/// fable_2026_09_01/09_materialized_tree_reembeds.
+#[test]
+fn created_object_registration_carries_the_nested_payload_positions() {
+    let (mut system, raw, _dir) = world();
+    raw.lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TEMP TABLE shaped AS \
+             SELECT region, json('[{\"order_id\":101}]') AS kids FROM orders WHERE region = 'EU';",
+        )
+        .expect("create temp shaped");
+    let registered = system
+        .register_run_created_objects_with(
+            &[crate::pipeline::compiled_query::PlanCreatedObject {
+                name: "shaped".to_string(),
+                is_view: false,
+                connection_id: Some(2),
+                interior_positions: vec![1],
+            }],
+            &crate::system::RealCreatedObjectCatalog,
+        )
+        .expect("registration should not error");
+    assert!(matches!(
+        registered.as_slice(),
+        [crate::external_effects::RegistrationOutcome::Registered]
+    ));
+
+    let schema = system.get_schema().expect("schema");
+    let columns = schema
+        .get_table_columns(Some("main"), "shaped")
+        .expect("column read")
+        .expect("shaped is registered");
+    let facts: Vec<(String, bool)> = columns
+        .iter()
+        .map(|column| (column.name.to_string(), column.interior))
+        .collect();
+    assert_eq!(
+        facts,
+        vec![("region".to_string(), false), ("kids".to_string(), true)],
+        "the registered heading names exactly the nested-payload position the plan knew"
+    );
+
+    // A position the read-back heading does not have is a disagreement
+    // between the plan and the engine, refused rather than skipped.
+    let refused = system.register_run_created_objects_with(
+        &[crate::pipeline::compiled_query::PlanCreatedObject {
+            name: "shaped".to_string(),
+            is_view: false,
+            connection_id: Some(2),
+            interior_positions: vec![7],
+        }],
+        &crate::system::RealCreatedObjectCatalog,
+    );
+    assert!(
+        refused.is_err(),
+        "a nested-payload position past the heading must refuse: {refused:?}"
     );
 }

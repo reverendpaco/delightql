@@ -2,7 +2,8 @@
 // Copyright 2026 Daniel Eklund
 //! Structural scope extraction for predicate classification.
 
-use crate::error::{DelightQLError, Result};
+use crate::diagnostic::Internal;
+use crate::error::Result;
 use crate::names::ScopeId;
 use crate::pipeline::refiner::flattener::{FlatPredicate, FlatSegment};
 use std::collections::HashSet;
@@ -63,13 +64,13 @@ pub(in crate::pipeline::refiner) fn owning_tables(
             match owners.as_slice() {
                 [owner] => Ok(owner.relation.scope()),
                 [] => Ok(scope),
-                [_, _, ..] => Err(DelightQLError::validation_error(
+                [_, _, ..] => Err(Internal::invariant(
+                    "refiner::analyzer",
                     format!(
                         "{column:?} is carried by more than one relation occurrence \
                          here, so the predicate that references it belongs to no \
                          single table"
                     ),
-                    "in predicate classification",
                 )),
             }
         })
@@ -100,6 +101,7 @@ mod tests {
             position: 0,
             named: Some(registry.intern("k", false)),
             declared_type: None,
+            interior: false,
         }];
         let relation = registry
             .authority()
@@ -145,6 +147,7 @@ mod tests {
             access: resolved::Access::All,
             outer: false,
             anonymous_data: None,
+            narrowed: None,
             subquery_segment: None,
             pipe_expr: None,
             _table_filters: vec![],

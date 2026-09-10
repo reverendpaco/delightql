@@ -109,6 +109,13 @@ pub struct DefinitionFrontier {
     family: FamilyIdentity,
     name: delightql_types::SqlIdentifier,
     fixpoint: crate::pipeline::asts::vocabulary::Fixpoint,
+    /// THE CALLER'S ACTUALS THE FIXPOINT CARRIES: the exact caller-resolved
+    /// ports the scalar actuals of this instance reference. A parameter
+    /// monomorphizes into the ANCHOR; every frontier row descends from one
+    /// anchor row and carries that row's actuals as hidden support, which
+    /// is where a recursive clause's formal reads them. Empty for a literal
+    /// or unparameterized instance, whose formals name no caller row.
+    carried: Vec<crate::relation::PortId>,
 }
 
 impl DefinitionFrontier {
@@ -118,6 +125,12 @@ impl DefinitionFrontier {
 
     pub(crate) fn fixpoint(&self) -> crate::pipeline::asts::vocabulary::Fixpoint {
         self.fixpoint
+    }
+
+    /// The caller actual ports every clause of this fixpoint carries to
+    /// its frontier, in declaration order.
+    pub(crate) fn carried_actuals(&self) -> &[crate::relation::PortId] {
+        &self.carried
     }
 }
 
@@ -185,6 +198,19 @@ impl InstanceTable {
             .collect::<Vec<_>>();
         chain.push(open[position].family.display.clone());
         Some(chain)
+    }
+
+    /// Whether an instance of this family is OPEN — the use about to be
+    /// judged is a self-reference (re-entry, widening or cycle), never a
+    /// fresh expansion. Asked before a call's carriers bind, because a
+    /// self-reference admits no caller row: the frontier it reads carries
+    /// the instance's actuals, and the row standing beside it stays for
+    /// the enclosing join.
+    pub(in crate::defuse) fn is_open(&self, family: &ClosedFamilyIdentity) -> bool {
+        self.open
+            .borrow()
+            .iter()
+            .any(|instance| instance.family == family.0)
     }
 
     /// The frame-level admission for the BOUND-USE carrier: the identity
@@ -348,17 +374,29 @@ pub(crate) struct InstanceFrame {
 }
 
 impl InstanceFrame {
+    /// Whether a SELECTED family is the one this frame opens — the identity
+    /// judgment (declaring namespace and canonical name, as the catalog
+    /// stores them), never a spelling.
+    pub(in crate::defuse) fn opens(&self, family: &super::select::LinkedFamily<'_>) -> bool {
+        FamilyIdentity::of(family) == self.family
+    }
+
     /// Mint THIS instance's frontier and record it on the open entry, so a
-    /// same-key re-entry receives the same value by identity.
+    /// same-key re-entry receives the same value by identity. `carried` is
+    /// the caller actual ports the fixpoint's rows carry — minted here,
+    /// beside the instance, so no later act can attach a caller to a
+    /// frontier it did not open.
     pub(in crate::defuse) fn frontier(
         &self,
         group: &crate::pipeline::asts::ddl::DefinitionGroup,
+        carried: Vec<crate::relation::PortId>,
     ) -> DefinitionFrontier {
         let frontier = DefinitionFrontier {
             instance: DefinitionInstance(self.entry),
             family: self.family.clone(),
             name: delightql_types::SqlIdentifier::new(group.name()),
             fixpoint: group.fixpoint(),
+            carried,
         };
         for open in self.open.borrow_mut().iter_mut() {
             if open.entry == self.entry {
@@ -395,6 +433,7 @@ mod tests {
             family: family(name),
             name: name.into(),
             fixpoint: crate::pipeline::asts::vocabulary::Fixpoint::Bag,
+            carried: Vec::new(),
         }
     }
 

@@ -6,7 +6,6 @@
 // each test_run with three-path dispatch (SEF/DDL/DML), and reports results.
 
 use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -19,9 +18,11 @@ use sha2::{Digest, Sha256};
 
 use delightql_protocol::socket::SocketTransport;
 use delightql_protocol::{
-    AgreedOrientation, Cell, Client, ControlResult, FetchResponse, Orientation, Projection,
-    QueryResponse, Session, VersionResult,
+    AgreedOrientation, Cell, FetchResponse, Projection, QueryResponse, Session,
 };
+
+mod world;
+use world::{Link, World};
 
 #[derive(Parser)]
 #[command(
@@ -60,6 +61,16 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     query_timeout: u64,
 
+    /// The order tests run in: `ball` (the packed order, kinds grouped),
+    /// `reverse`, or `shuffle:<seed>`.
+    ///
+    /// Outcomes may not depend on it. Every test establishes its own world,
+    /// so the order is free to move — and an isolation defect is exactly what
+    /// makes it stop being free. This is the knob the isolation contract
+    /// checker turns.
+    #[arg(long, default_value = "ball")]
+    order: RunOrder,
+
     /// The dql binary, used to start a private server for a test that
     /// declares its own wall clock. Such a test is expected not to answer,
     /// and `dql server` gives a connection a worker until the connection
@@ -68,6 +79,66 @@ struct Args {
     /// process the runner can kill.
     #[arg(long)]
     dql: Option<PathBuf>,
+}
+
+/// The arrangement the ball's tests are run in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunOrder {
+    /// Packed order, kinds grouped: SEF, then DDL, then DML.
+    Ball,
+    /// That order, backwards.
+    Reverse,
+    /// That order, permuted by a named seed. Deterministic: the same seed
+    /// names the same arrangement, so a disagreement can be re-run.
+    Shuffle(u64),
+}
+
+impl std::str::FromStr for RunOrder {
+    type Err = String;
+
+    fn from_str(spelling: &str) -> Result<Self, Self::Err> {
+        match spelling {
+            "ball" => Ok(RunOrder::Ball),
+            "reverse" => Ok(RunOrder::Reverse),
+            "shuffle" => Ok(RunOrder::Shuffle(0)),
+            other => match other.strip_prefix("shuffle:") {
+                Some(seed) => seed
+                    .parse()
+                    .map(RunOrder::Shuffle)
+                    .map_err(|_| format!("shuffle seed must be a number, got '{seed}'")),
+                None => Err(format!(
+                    "unknown order '{other}': expected ball, reverse, or shuffle[:<seed>]"
+                )),
+            },
+        }
+    }
+}
+
+impl RunOrder {
+    /// Rearrange one already-grouped list of runs in place.
+    fn arrange<T>(self, runs: &mut [T]) {
+        match self {
+            RunOrder::Ball => {}
+            RunOrder::Reverse => runs.reverse(),
+            RunOrder::Shuffle(seed) => {
+                // A named permutation, not a random one: the checker that
+                // finds a disagreement must be able to hand the seed back.
+                // SplitMix64, inline — a dependency for four lines of
+                // arithmetic would be the larger cost.
+                let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut next = move || {
+                    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    let mut z = state;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    z ^ (z >> 31)
+                };
+                for i in (1..runs.len()).rev() {
+                    runs.swap(i, (next() % (i as u64 + 1)) as usize);
+                }
+            }
+        }
+    }
 }
 
 /// The per-process limits the whole run reads, set once from the arguments.
@@ -81,6 +152,7 @@ struct Limits {
     workers: usize,
     query_timeout: Option<std::time::Duration>,
     dql_binary: Option<PathBuf>,
+    order: RunOrder,
 }
 
 fn limits() -> Limits {
@@ -158,6 +230,12 @@ struct HashObservation {
 struct TestResultRow {
     status: String,
     ball: String,
+    /// The `test_run` row this observation answers. A test name is not an
+    /// execution identity — one test runs once per database it is linked
+    /// to, and those runs publish the same name — so a consumer counting
+    /// names cannot tell one execution omitted and another repeated from a
+    /// complete run.
+    run_id: i64,
     test_name: String,
     detail: String,
     duration_ms: f64,
@@ -170,232 +248,6 @@ struct WorkerResult {
     meh: u32,
     output: Vec<String>,
     rows: Vec<TestResultRow>,
-}
-
-// ---------------------------------------------------------------------------
-// Protocol helpers
-// ---------------------------------------------------------------------------
-
-/// Whether a failure means the SESSION is unusable, as opposed to the query
-/// having been ANSWERED with a refusal.
-///
-/// A refusal is an answer: the frame arrived and the session is in step, so
-/// the next request reads its own reply. A transport failure is not — a read
-/// deadline leaves the abandoned request's response still to come, and the
-/// next reader would take that late frame for its own. Reusing the session
-/// across one is how a single silent query took the rest of a shard with it.
-fn is_transport_failure(message: &str) -> bool {
-    !message.starts_with("query error:")
-}
-
-/// What a caller is told when the link holds no session: the reconnect that
-/// would have supplied one could not reach the server. It reads as a
-/// transport failure, so the test that follows tries the reconnect again
-/// instead of inheriting a dead link in silence.
-const SESSION_LOST: &str = "session lost: the reconnect did not reach the server";
-
-/// A session and the means to replace it.
-///
-/// Every phase holds one of these rather than a bare session, because the
-/// recovery rule is the same everywhere: on a transport failure the session
-/// is discarded, a new one is taken, and the test's required state is
-/// established again on it.
-struct Link {
-    socket: PathBuf,
-    query_timeout: Option<Duration>,
-    /// Empty exactly while a replacement is being taken, and after a
-    /// reconnect that failed. The option is what makes the poisoned session
-    /// droppable BEFORE its replacement is opened; a plain field can only be
-    /// overwritten after, which keeps the dead connection alive across the
-    /// new handshake.
-    session: Option<Session<SocketTransport>>,
-    orientation: AgreedOrientation,
-}
-
-impl Link {
-    fn connect(socket: &Path, query_timeout: Option<Duration>) -> Result<Self, String> {
-        let (session, orientation) = open_session(socket, query_timeout)?;
-        Ok(Link {
-            socket: socket.to_path_buf(),
-            query_timeout,
-            session: Some(session),
-            orientation,
-        })
-    }
-
-    /// The live session, or the reason there is none.
-    fn session(&mut self) -> Result<&mut Session<SocketTransport>, String> {
-        self.session
-            .as_mut()
-            .ok_or_else(|| SESSION_LOST.to_string())
-    }
-
-    /// Discard the poisoned session and take a fresh one.
-    ///
-    /// The old session is taken and dropped BEFORE the replacement is opened,
-    /// closing its socket first. A server serves one connection per worker
-    /// until that connection closes: hold the poisoned one open across the
-    /// replacement's connect and handshake and the worker that must service
-    /// the replacement is still owned by the connection being abandoned. The
-    /// replacement then waits behind it for another deadline, and the late
-    /// response is written into a stream that is still open to read it.
-    fn renew(&mut self) -> Result<(&mut Session<SocketTransport>, AgreedOrientation), String> {
-        drop(self.session.take());
-        let (session, orientation) = open_session(&self.socket, self.query_timeout)?;
-        self.orientation = orientation;
-        Ok((self.session.insert(session), orientation))
-    }
-
-    /// Establish a test's required session state, taking a fresh session if
-    /// the current one has been poisoned.
-    ///
-    /// Setup is where a poisoned session shows itself: a late frame is what
-    /// the next reset would read. Retrying ONCE on a new session is enough —
-    /// a second failure is the server being gone, not a stale frame, and the
-    /// caller records it against the test rather than abandoning the shard.
-    fn establish(
-        &mut self,
-        setup: &dyn Fn(&mut Session<SocketTransport>, AgreedOrientation) -> Result<(), String>,
-    ) -> Result<(), String> {
-        let orientation = self.orientation;
-        let first = match self.session.as_mut() {
-            Some(session) => setup(session, orientation),
-            None => Err(SESSION_LOST.to_string()),
-        };
-        match first {
-            Ok(()) => Ok(()),
-            Err(first) => {
-                let (session, orientation) = self
-                    .renew()
-                    .map_err(|e| format!("{}; reconnect failed: {}", first, e))?;
-                setup(session, orientation)
-                    .map_err(|e| format!("{}; after reconnect: {}", first, e))
-            }
-        }
-    }
-
-    /// Answer a test's outcome, renewing the session first when the failure
-    /// was the transport's. The row is the caller's to record — exactly one,
-    /// whether the query answered, refused, or went silent.
-    fn recover_if_poisoned(&mut self, outcome: &Result<HashObservation, String>) {
-        if let Err(message) = outcome {
-            if is_transport_failure(message) {
-                eprintln!("runner: session lost ({}), reconnecting", message);
-                if let Err(e) = self.renew() {
-                    eprintln!("runner: reconnect failed: {}", e);
-                }
-            }
-        }
-    }
-}
-
-fn open_session(
-    socket_path: &Path,
-    query_timeout: Option<Duration>,
-) -> Result<(Session<SocketTransport>, AgreedOrientation), String> {
-    let stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("connect to {}: {}", socket_path.display(), e))?;
-    // A deadline on READS, which is what a silent server looks like from
-    // here. It bounds the wait between bytes rather than the whole query, so
-    // it stops a hang without cutting a slow-but-answering stream short.
-    if let Some(timeout) = query_timeout {
-        stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| format!("set read timeout: {}", e))?;
-    }
-    let transport = SocketTransport::new(stream);
-    let client = Client::new(transport);
-
-    let session = match client
-        .version(
-            1_000_000,
-            b"relay0".to_vec(),
-            300_000,
-            vec![Orientation::Rows],
-        )
-        .map_err(|e| format!("version handshake: {}", e.message))?
-    {
-        VersionResult::Accepted(s) => s,
-        VersionResult::Rejected { message, .. } => {
-            return Err(format!(
-                "version rejected: {}",
-                String::from_utf8_lossy(&message)
-            ));
-        }
-    };
-
-    let rows_orientation = session
-        .agreed_orientation(Orientation::Rows)
-        .ok_or("server does not support Rows orientation")?;
-
-    Ok((session, rows_orientation))
-}
-
-fn send_reset(session: &mut Session<SocketTransport>) -> Result<(), String> {
-    match session
-        .reset()
-        .map_err(|e| format!("reset: {}", e.message))?
-    {
-        ControlResult::Ok => Ok(()),
-        ControlResult::Error { message } => Err(format!("reset: {}", message)),
-    }
-}
-
-fn send_cwd(session: &mut Session<SocketTransport>, path: &str) -> Result<(), String> {
-    match session
-        .cwd(path.to_string())
-        .map_err(|e| format!("cwd: {}", e.message))?
-    {
-        ControlResult::Ok => Ok(()),
-        ControlResult::Error { message } => Err(format!("cwd: {}", message)),
-    }
-}
-
-fn send_mount(
-    session: &mut Session<SocketTransport>,
-    db_filename: &str,
-    rows_orientation: AgreedOrientation,
-) -> Result<(), String> {
-    let mount_query = format!("mount!(\"{}\",\"main\")(*)", db_filename);
-    let handle = match session
-        .query(mount_query.as_bytes().to_vec())
-        .map_err(|e| format!("mount: {}", e.message))?
-    {
-        QueryResponse::Header { handle, .. } => handle,
-        QueryResponse::Error { message, .. } => {
-            return Err(format!(
-                "mount error: {}",
-                String::from_utf8_lossy(&message)
-            ));
-        }
-    };
-    loop {
-        match session
-            .fetch(&handle, Projection::All, 10000, rows_orientation)
-            .map_err(|e| format!("mount fetch: {}", e.message))?
-        {
-            FetchResponse::Data { .. } => continue,
-            FetchResponse::End => break,
-            FetchResponse::Error { message, .. } => {
-                return Err(format!(
-                    "mount fetch error: {}",
-                    String::from_utf8_lossy(&message)
-                ));
-            }
-        }
-    }
-    let _ = session.close(handle);
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn reset_and_mount(
-    session: &mut Session<SocketTransport>,
-    db_filename: &str,
-    rows_orientation: AgreedOrientation,
-) -> Result<(), String> {
-    send_reset(session)?;
-    send_mount(session, db_filename, rows_orientation)
 }
 
 // ---------------------------------------------------------------------------
@@ -431,8 +283,7 @@ fn hex2hash(hex: &str) -> String {
 // Inline base64 encoder (no external dep)
 mod base64 {
     use std::io::{self, Write};
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     pub struct Base64Encoder<'a> {
         out: &'a mut Vec<u8>,
@@ -572,10 +423,8 @@ fn send_query_and_hash(
         .map_err(|e| deadline.attribute(format!("query: {}", e.message)))?
     {
         QueryResponse::Header { handle, dimensions } => (handle, dimensions.len()),
-        QueryResponse::Error {
-            identity, message, ..
-        } => {
-            return Err(query_error(&identity, &message));
+        QueryResponse::Error(error) => {
+            return Err(query_error(error.identity(), error.message()));
         }
     };
     let mut all_rows: Vec<Vec<Cell>> = Vec::new();
@@ -590,10 +439,10 @@ fn send_query_and_hash(
         {
             FetchResponse::Data { cells } => all_rows.extend(cells),
             FetchResponse::End => break,
-            FetchResponse::Error { message, .. } => {
+            FetchResponse::Error(error) => {
                 return Err(format!(
                     "fetch error: {}",
-                    String::from_utf8_lossy(&message)
+                    String::from_utf8_lossy(error.message())
                 ));
             }
         }
@@ -617,10 +466,8 @@ fn send_query_and_bhash(
         .map_err(|e| deadline.attribute(format!("query: {}", e.message)))?
     {
         QueryResponse::Header { handle, dimensions } => (handle, dimensions.len()),
-        QueryResponse::Error {
-            identity, message, ..
-        } => {
-            return Err(query_error(&identity, &message));
+        QueryResponse::Error(error) => {
+            return Err(query_error(error.identity(), error.message()));
         }
     };
     let mut all_rows: Vec<Vec<Cell>> = Vec::new();
@@ -635,10 +482,10 @@ fn send_query_and_bhash(
         {
             FetchResponse::Data { cells } => all_rows.extend(cells),
             FetchResponse::End => break,
-            FetchResponse::Error { message, .. } => {
+            FetchResponse::Error(error) => {
                 return Err(format!(
                     "fetch error: {}",
-                    String::from_utf8_lossy(&message)
+                    String::from_utf8_lossy(error.message())
                 ));
             }
         }
@@ -776,6 +623,7 @@ fn observed_baseline(
 
 fn judge(
     ball_name: &str,
+    run_id: i64,
     test_name: &str,
     exec_result: Result<HashObservation, String>,
     expected_hash: &Option<String>,
@@ -816,8 +664,7 @@ fn judge(
         match &exec_result {
             Ok(actual_hex) => match expected_hash {
                 None => {
-                    let actual_short =
-                        observed_baseline(actual_hex, hashtype.as_deref(), false);
+                    let actual_short = observed_baseline(actual_hex, hashtype.as_deref(), false);
                     ("MEH", actual_short)
                 }
                 Some(expected) => {
@@ -829,7 +676,10 @@ fn judge(
                     if *expected == actual_short {
                         ("PASS", String::new())
                     } else {
-                        ("FAIL", format!("expected:{} actual:{}", expected, actual_short))
+                        (
+                            "FAIL",
+                            format!("expected:{} actual:{}", expected, actual_short),
+                        )
                     }
                 }
             },
@@ -843,14 +693,21 @@ fn judge(
     let detail = detail.replace('\n', " ");
 
     if detail.is_empty() {
-        result.output.push(format!("[{}]\t{}\t{}\t\t{}", status, ball_name, test_name, dur));
+        result.output.push(format!(
+            "[{}]\t{}\t{}\t\t{}",
+            status, ball_name, test_name, dur
+        ));
     } else {
-        result.output.push(format!("[{}]\t{}\t{}\t{}\t{}", status, ball_name, test_name, detail, dur));
+        result.output.push(format!(
+            "[{}]\t{}\t{}\t{}\t{}",
+            status, ball_name, test_name, detail, dur
+        ));
     }
 
     result.rows.push(TestResultRow {
         status: status.to_string(),
         ball: ball_name.to_string(),
+        run_id,
         test_name: test_name.to_string(),
         detail,
         duration_ms,
@@ -926,6 +783,108 @@ impl Drop for PrivateServer {
     }
 }
 
+/// The filesystem and session state one test is given, and the lifetime of
+/// both.
+///
+/// The directory belongs to the test: it is removed when the workspace is
+/// dropped, so a road that forgets to clean up does not exist. The world is
+/// what the link must establish before the test's first statement.
+struct Workspace {
+    dir: Option<PathBuf>,
+    world: World,
+}
+
+impl Workspace {
+    fn world(&self) -> &World {
+        &self.world
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// What one test may see, decided by its KIND and by nothing else.
+///
+/// The one site that answers that question, for the shared server and for a
+/// private one alike: a wall clock changes when a test is abandoned, never
+/// what it can see.
+fn prepare_workspace(
+    run: &BallTestRun,
+    db_paths: &std::collections::HashMap<i64, PathBuf>,
+    ddl_map: &std::collections::HashMap<i64, Vec<(String, String)>>,
+    init_map: &std::collections::HashMap<i64, Vec<(String, String, String)>>,
+    ball_tmpdir: &Path,
+) -> Result<Workspace, String> {
+    let mount_path = db_paths
+        .get(&run.db_id)
+        .ok_or_else(|| format!("no path for db_id {}", run.db_id))?;
+
+    match run.kind.as_str() {
+        // Side-effect-free: no files of its own, and no session directory —
+        // a relative path it never writes is a path it never resolves.
+        "sef" => Ok(Workspace {
+            dir: None,
+            world: World {
+                cwd: None,
+                mount: mount_path.to_string_lossy().into_owned(),
+            },
+        }),
+        "ddl" => {
+            let dir = prepare_ddl_workspace(run.code_id, ddl_map, db_paths)?;
+            let cwd = dir
+                .as_deref()
+                .unwrap_or(ball_tmpdir)
+                .to_string_lossy()
+                .into_owned();
+            Ok(Workspace {
+                dir,
+                world: World {
+                    cwd: Some(cwd),
+                    mount: mount_path.to_string_lossy().into_owned(),
+                },
+            })
+        }
+        "dml" => {
+            let (dir, mount) = prepare_dml_workspace(run, ddl_map, init_map, db_paths)?;
+            let cwd = dir.to_string_lossy().into_owned();
+            Ok(Workspace {
+                dir: Some(dir),
+                world: World {
+                    cwd: Some(cwd),
+                    mount,
+                },
+            })
+        }
+        other => Err(format!("unknown test kind: {}", other)),
+    }
+}
+
+/// Run one test's statements on a session whose world is already established.
+///
+/// Its only caller is a `Link::in_world` closure, which is what makes the
+/// establishment unskippable.
+fn execute(
+    session: &mut Session<SocketTransport>,
+    run: &BallTestRun,
+    orientation: AgreedOrientation,
+    deadline: Deadline,
+) -> Result<HashObservation, String> {
+    let mode = match run.hashtype.as_deref() {
+        Some("bhash") => HashMode::Byte,
+        _ => HashMode::String,
+    };
+    if run.sequential {
+        send_sequential_and_hash(session, &run.dql, orientation, mode, deadline)
+    } else {
+        send_query_and_hash_dispatch(session, &run.dql, orientation, mode, deadline)
+    }
+}
+
 /// Run one test that declared its own wall clock, alone, on a server of its
 /// own, and end that server whatever the outcome.
 fn run_isolated(
@@ -942,81 +901,22 @@ fn run_isolated(
             .to_string()
     })?;
 
-    let mount_path = db_paths
-        .get(&run.db_id)
-        .ok_or_else(|| format!("no path for db_id {}", run.db_id))?;
+    let workspace = prepare_workspace(run, db_paths, ddl_map, init_map, ball_tmpdir)?;
 
-    // The same workspace the test's kind gets in the ordinary phases — the
-    // wall clock changes when a test is abandoned, never what it can see.
-    let mut owned_dir: Option<PathBuf> = None;
-    let (cwd, mount): (Option<String>, String) = match run.kind.as_str() {
-        "sef" => (None, mount_path.to_string_lossy().into_owned()),
-        "ddl" => {
-            let dir = prepare_ddl_workspace(run.code_id, ddl_map, db_paths)?;
-            let cwd = dir
-                .as_deref()
-                .unwrap_or(ball_tmpdir)
-                .to_string_lossy()
-                .into_owned();
-            owned_dir = dir;
-            (Some(cwd), mount_path.to_string_lossy().into_owned())
-        }
-        _ => {
-            let (dir, mount_db) = prepare_dml_workspace(run, ddl_map, init_map, db_paths)?;
-            let cwd = dir.to_string_lossy().into_owned();
-            owned_dir = Some(dir);
-            (Some(cwd), mount_db)
-        }
-    };
-
-    let outcome = (|| -> Result<HashObservation, String> {
-        let mut server = PrivateServer::start(&dql)?;
-        let mut link = Link::connect(&server.socket, Some(budget))?;
-        let orientation = link.orientation;
-        let hash_mode = match run.hashtype.as_deref() {
-            Some("bhash") => HashMode::Byte,
-            _ => HashMode::String,
-        };
-        // The clock starts at the FIRST request, not at spawn: the server's
-        // startup is the harness's cost, not the test's.
-        let deadline = Deadline::starting_now(Some(budget));
-        let cwd = cwd.clone();
-        let mount = mount.clone();
-        let setup = link.establish(&move |session, orientation| {
-            send_reset(session)?;
-            if let Some(ref cwd) = cwd {
-                send_cwd(session, cwd)?;
-            }
-            send_mount(session, &mount, orientation)
-        });
-        let exec = match setup {
-            Ok(()) => link.session().and_then(|session| {
-                if run.sequential {
-                    send_sequential_and_hash(session, &run.dql, orientation, hash_mode, deadline)
-                } else {
-                    send_query_and_hash_dispatch(
-                        session,
-                        &run.dql,
-                        orientation,
-                        hash_mode,
-                        deadline,
-                    )
-                }
-            }),
-            Err(e) => Err(format!("session setup: {}", e)),
-        };
-        // The connection closes before the process is ended, in that order:
-        // the server is mid-request and will never read the close, but a
-        // half-open socket outliving the kill is one more thing to explain.
-        drop(link);
-        server.stop();
-        exec
-    })();
-
-    if let Some(dir) = owned_dir {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-    outcome
+    let mut server = PrivateServer::start(&dql)?;
+    let mut link = Link::connect(&server.socket, Some(budget))?;
+    // The clock starts at the FIRST request, not at spawn: the server's
+    // startup is the harness's cost, not the test's.
+    let deadline = Deadline::starting_now(Some(budget));
+    let exec = link.in_world(workspace.world(), |session, orientation| {
+        execute(session, run, orientation, deadline)
+    });
+    // The connection closes before the process is ended, in that order:
+    // the server is mid-request and will never read the close, but a
+    // half-open socket outliving the kill is one more thing to explain.
+    drop(link);
+    server.stop();
+    exec
 }
 
 /// Distinguishes the private directories of tests running at the same time.
@@ -1121,16 +1021,15 @@ fn copy_databases_to_work_dir(
         let filename = path.file_name().unwrap_or_default();
         let dest = databases_dir.join(filename);
         if !dest.exists() {
-            std::fs::copy(path, &dest)
-                .map_err(|e| format!("copy db {}: {}", dest.display(), e))?;
+            std::fs::copy(path, &dest).map_err(|e| format!("copy db {}: {}", dest.display(), e))?;
         }
     }
     Ok(())
 }
 
 fn write_results_db(path: &Path, rows: &[TestResultRow]) -> Result<(), String> {
-    let conn = Connection::open(path)
-        .map_err(|e| format!("open results db {}: {}", path.display(), e))?;
+    let conn =
+        Connection::open(path).map_err(|e| format!("open results db {}: {}", path.display(), e))?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| format!("set WAL: {}", e))?;
     conn.execute_batch(
@@ -1141,27 +1040,57 @@ fn write_results_db(path: &Path, rows: &[TestResultRow]) -> Result<(), String> {
             ball TEXT NOT NULL,
             test_name TEXT NOT NULL,
             detail TEXT NOT NULL DEFAULT '',
-            duration_ms REAL NOT NULL
-        )"
-    ).map_err(|e| format!("create table: {}", e))?;
+            duration_ms REAL NOT NULL,
+            run_id INTEGER NOT NULL DEFAULT -1
+        )",
+    )
+    .map_err(|e| format!("create table: {}", e))?;
 
-    let tx = conn.unchecked_transaction()
+    // The shared results database outlives any one schema — reviews cite
+    // row ranges in it going back months — so a database written before run
+    // identity existed is migrated in place rather than refused. The column
+    // is looked up rather than added-and-ignored: swallowing every ALTER
+    // error would swallow the ones that matter too.
+    let has_run_id = conn
+        .prepare("SELECT 1 FROM pragma_table_info('test_result') WHERE name = 'run_id'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .map_err(|e| format!("inspect results schema: {}", e))?;
+    if !has_run_id {
+        conn.execute_batch(
+            "ALTER TABLE test_result ADD COLUMN run_id INTEGER NOT NULL DEFAULT -1",
+        )
+        .map_err(|e| format!("add run_id: {}", e))?;
+    }
+
+    let tx = conn
+        .unchecked_transaction()
         .map_err(|e| format!("begin transaction: {}", e))?;
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO test_result (status, ball, test_name, detail, duration_ms) VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT INTO test_result (status, ball, test_name, detail, duration_ms, run_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         ).map_err(|e| format!("prepare insert: {}", e))?;
         for row in rows {
             stmt.execute(rusqlite::params![
-                row.status, row.ball, row.test_name, row.detail, row.duration_ms
-            ]).map_err(|e| format!("insert: {}", e))?;
+                row.status,
+                row.ball,
+                row.test_name,
+                row.detail,
+                row.duration_ms,
+                row.run_id
+            ])
+            .map_err(|e| format!("insert: {}", e))?;
         }
     }
     tx.commit().map_err(|e| format!("commit: {}", e))?;
     Ok(())
 }
 
-fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> Result<bool, String> {
+fn run_ball(
+    ball_path: &Path,
+    socket_path: &Path,
+    results_db: Option<&Path>,
+) -> Result<bool, String> {
     let ball_name = ball_path
         .file_stem()
         .unwrap_or_default()
@@ -1266,8 +1195,7 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
             })
             .map_err(|e| format!("query test_ddl: {}", e))?
         {
-            let (code_id, filename, content) =
-                row.map_err(|e| format!("read test_ddl: {}", e))?;
+            let (code_id, filename, content) = row.map_err(|e| format!("read test_ddl: {}", e))?;
             ddl_map
                 .entry(code_id)
                 .or_default()
@@ -1304,14 +1232,17 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
         }
     }
 
-    // Phase 3: Partition by kind, and take the isolated tests out first.
+    // Phase 3: take the isolated tests out, and arrange the rest.
     //
     // A test that declared a wall clock is a test that may not answer, and a
     // worker it wedges is a worker the rest of the ball never gets back. It
-    // therefore leaves the shared server's phases entirely.
-    let mut sef_runs = Vec::new();
-    let mut ddl_runs = Vec::new();
-    let mut dml_runs = Vec::new();
+    // therefore leaves the shared server entirely and runs last, on a server
+    // of its own.
+    //
+    // Everything else runs on one shared server through one loop. There is no
+    // per-kind loop any more: a kind decides what a test's workspace holds
+    // (`prepare_workspace`), never whether that workspace is established.
+    let mut shared_runs = Vec::new();
     let mut isolated_runs = Vec::new();
 
     for run in all_runs {
@@ -1320,18 +1251,27 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
         }
         if run.timeout_secs.is_some() {
             isolated_runs.push(run);
-            continue;
-        }
-        match run.kind.as_str() {
-            "sef" => sef_runs.push(run),
-            "ddl" => ddl_runs.push(run),
-            _ => dml_runs.push(run),
+        } else {
+            shared_runs.push(run);
         }
     }
 
+    // The packed order with kinds grouped — SEF, then DDL, then DML — is the
+    // arrangement the corpus has always been read in, so it stays the
+    // default. It is a default and not a requirement: outcomes may not depend
+    // on it, and `--order` is how that is checked.
+    let kind_rank = |kind: &str| match kind {
+        "sef" => 0,
+        "ddl" => 1,
+        _ => 2,
+    };
+    shared_runs.sort_by_key(|r| (kind_rank(&r.kind), r.run_id));
+    isolated_runs.sort_by_key(|r| (kind_rank(&r.kind), r.run_id));
+    let order = limits().order;
+    order.arrange(&mut shared_runs);
+    order.arrange(&mut isolated_runs);
 
-    // Phase 4: Run three phases sequentially (SEF → DDL → DML), like pack-man.
-    // Each phase spawns its own workers. No mixing of work unit types on a connection.
+    // Phase 4: run them.
     let db_paths = Arc::new(db_paths);
     let ddl_map = Arc::new(ddl_map);
     let init_map = Arc::new(init_map);
@@ -1377,203 +1317,15 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
         }
     };
 
-    // ---- Phase 4a: SEF ----
-    if !sef_runs.is_empty() {
-        sef_runs.sort_by_key(|r| r.db_id);
-        let mut sef_batches: Vec<Vec<usize>> = Vec::new();
-        {
-            let mut i = 0;
-            while i < sef_runs.len() {
-                let db_id = sef_runs[i].db_id;
-                let mut batch = Vec::new();
-                while i < sef_runs.len() && sef_runs[i].db_id == db_id {
-                    batch.push(i);
-                    i += 1;
-                }
-                sef_batches.push(batch);
-            }
-        }
-
-        let num_workers = max_workers.min(sef_batches.len()).max(1);
-        let mut shards: Vec<Vec<Vec<usize>>> = (0..num_workers).map(|_| Vec::new()).collect();
-        for (i, batch) in sef_batches.into_iter().enumerate() {
-            shards[i % num_workers].push(batch);
-        }
-
-        let sef_runs = Arc::new(sef_runs);
-        let handles: Vec<_> = shards
-            .into_iter()
-            .map(|shard| {
-                let socket = socket_owned.clone();
-                let ball_name = ball_name.clone();
-                let db_paths = Arc::clone(&db_paths);
-                let sef_runs = Arc::clone(&sef_runs);
-
-                std::thread::spawn(move || -> Result<WorkerResult, String> {
-                    let mut link = Link::connect(&socket, limits().query_timeout)?;
-                    let rows_orientation = link.orientation;
-                    let mut result = WorkerResult {
-                        passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
-                    };
-                    let mut needs_remount = true;
-                    let mut current_mount_path: Option<String> = None;
-
-                    for batch in shard {
-                        if let Some(&first) = batch.first() {
-                            let run = &sef_runs[first];
-                            let mount_path = db_paths
-                                .get(&run.db_id)
-                                .ok_or_else(|| format!("no path for db_id {}", run.db_id))?;
-                            current_mount_path = Some(mount_path.to_string_lossy().to_string());
-                            needs_remount = true;
-                        }
-                        for &idx in &batch {
-                            let run = &sef_runs[idx];
-                            let t0 = Instant::now();
-
-                            // (Re)mount if needed (start of batch or after reconnect)
-                            if needs_remount {
-                                if let Some(ref mp) = current_mount_path {
-                                    let mp = mp.clone();
-                                    if let Err(e) = link.establish(&move |session, orientation| {
-                                        send_reset(session)?;
-                                        send_mount(session, &mp, orientation)
-                                    }) {
-                                        // The test still answers for itself:
-                                        // a setup that could not be made to
-                                        // hold is this test's error, not a
-                                        // reason to drop the rest of the shard.
-                                        judge(&ball_name, &run.name, Err(format!("session setup: {}", e)),
-                                              &run.hash, &run.hashtype, t0.elapsed(), &mut result);
-                                        continue;
-                                    }
-                                }
-                                needs_remount = false;
-                            }
-
-                            let hash_mode = match run.hashtype.as_deref() {
-                                Some("bhash") => HashMode::Byte,
-                                _ => HashMode::String,
-                            };
-                            let deadline = Deadline::starting_now(limits().query_timeout);
-                            let exec = if run.sequential {
-                                link.session().and_then(|session| {
-                                    send_sequential_and_hash(session, &run.dql, rows_orientation, hash_mode, deadline)
-                                })
-                            } else {
-                                link.session().and_then(|session| {
-                                    send_query_and_hash_dispatch(session, &run.dql, rows_orientation, hash_mode, deadline)
-                                })
-                            };
-                            let elapsed = t0.elapsed();
-
-                            link.recover_if_poisoned(&exec);
-                            if exec.as_ref().err().is_some_and(|e| is_transport_failure(e)) {
-                                needs_remount = true;
-                            }
-
-                            judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, elapsed, &mut result);
-                        }
-                    }
-
-                    Ok(result)
-                })
-            })
-            .collect();
-
-        collect(handles);
-    }
-
-    // ---- Phase 4b: DDL ----
-    if !ddl_runs.is_empty() {
-        let num_workers = max_workers.min(ddl_runs.len()).max(1);
+    // ---- Phase 4a: the shared server ----
+    if !shared_runs.is_empty() {
+        let num_workers = max_workers.min(shared_runs.len()).max(1);
         let mut shards: Vec<Vec<usize>> = (0..num_workers).map(|_| Vec::new()).collect();
-        for i in 0..ddl_runs.len() {
+        for i in 0..shared_runs.len() {
             shards[i % num_workers].push(i);
         }
 
-        let ddl_runs = Arc::new(ddl_runs);
-        let handles: Vec<_> = shards
-            .into_iter()
-            .map(|shard| {
-                let socket = socket_owned.clone();
-                let ball_name = ball_name.clone();
-                let db_paths = Arc::clone(&db_paths);
-                let ddl_map = Arc::clone(&ddl_map);
-                let ddl_runs = Arc::clone(&ddl_runs);
-                let tmpdir = Arc::clone(&tmpdir);
-
-                std::thread::spawn(move || -> Result<WorkerResult, String> {
-                    let mut link = Link::connect(&socket, limits().query_timeout)?;
-                    let rows_orientation = link.orientation;
-                    let mut result = WorkerResult {
-                        passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
-                    };
-
-                    for &idx in &shard {
-                        let run = &ddl_runs[idx];
-                        let work_dir = prepare_ddl_workspace(run.code_id, &ddl_map, &db_paths)?;
-
-                        let cwd = match work_dir {
-                            Some(ref dir) => dir.to_string_lossy().into_owned(),
-                            None => tmpdir.to_string_lossy().into_owned(),
-                        };
-                        let mount_path = db_paths
-                            .get(&run.db_id)
-                            .ok_or_else(|| format!("no path for db_id {}", run.db_id))?
-                            .to_string_lossy()
-                            .into_owned();
-
-                        let hash_mode = match run.hashtype.as_deref() {
-                            Some("bhash") => HashMode::Byte,
-                            _ => HashMode::String,
-                        };
-                        let t0 = Instant::now();
-
-                        // Reset, CWD and mount are this test's required state.
-                        // A failure to establish them is the TEST's error —
-                        // it was once a `?` that took every remaining test in
-                        // the shard out of the reported totals with it.
-                        let setup = link.establish(&move |session, orientation| {
-                            send_reset(session)?;
-                            send_cwd(session, &cwd)?;
-                            send_mount(session, &mount_path, orientation)
-                        });
-                        let deadline = Deadline::starting_now(limits().query_timeout);
-                        let exec = match setup {
-                            Ok(()) => link.session().and_then(|session| {
-                                send_sequential_and_hash(
-                                    session, &run.dql, rows_orientation, hash_mode, deadline,
-                                )
-                            }),
-                            Err(e) => Err(format!("session setup: {}", e)),
-                        };
-                        let elapsed = t0.elapsed();
-                        link.recover_if_poisoned(&exec);
-                        judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, elapsed, &mut result);
-
-                        if let Some(ref dir) = work_dir {
-                            let _ = std::fs::remove_dir_all(dir);
-                        }
-                    }
-
-                    Ok(result)
-                })
-            })
-            .collect();
-
-        collect(handles);
-    }
-
-    // ---- Phase 4c: DML ----
-    if !dml_runs.is_empty() {
-        let num_workers = max_workers.min(dml_runs.len()).max(1);
-        let mut shards: Vec<Vec<usize>> = (0..num_workers).map(|_| Vec::new()).collect();
-        for i in 0..dml_runs.len() {
-            shards[i % num_workers].push(i);
-        }
-
-        let dml_runs = Arc::new(dml_runs);
+        let shared_runs = Arc::new(shared_runs);
         let handles: Vec<_> = shards
             .into_iter()
             .map(|shard| {
@@ -1582,50 +1334,52 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
                 let db_paths = Arc::clone(&db_paths);
                 let ddl_map = Arc::clone(&ddl_map);
                 let init_map = Arc::clone(&init_map);
-                let dml_runs = Arc::clone(&dml_runs);
+                let shared_runs = Arc::clone(&shared_runs);
+                let tmpdir = Arc::clone(&tmpdir);
 
                 std::thread::spawn(move || -> Result<WorkerResult, String> {
                     let mut link = Link::connect(&socket, limits().query_timeout)?;
-                    let rows_orientation = link.orientation;
                     let mut result = WorkerResult {
-                        passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
+                        passed: 0,
+                        failed: 0,
+                        errors: 0,
+                        meh: 0,
+                        output: Vec::new(),
+                        rows: Vec::new(),
                     };
 
                     for &idx in &shard {
-                        let run = &dml_runs[idx];
-                        let (isolate_dir, mount_db) =
-                            prepare_dml_workspace(run, &ddl_map, &init_map, &db_paths)?;
-
-                        let hash_mode = match run.hashtype.as_deref() {
-                            Some("bhash") => HashMode::Byte,
-                            _ => HashMode::String,
-                        };
-                        let cwd = isolate_dir.to_string_lossy().into_owned();
-                        let mount_db = mount_db.clone();
+                        let run = &shared_runs[idx];
                         let t0 = Instant::now();
 
-                        // Same law as DDL: the state this test needs is this
-                        // test's to answer for, on a session that is replaced
-                        // when its transport has failed.
-                        let setup = link.establish(&move |session, orientation| {
-                            send_reset(session)?;
-                            send_cwd(session, &cwd)?;
-                            send_mount(session, &mount_db, orientation)
-                        });
-                        let deadline = Deadline::starting_now(limits().query_timeout);
-                        let exec = match setup {
-                            Ok(()) => link.session().and_then(|session| {
-                                send_sequential_and_hash(
-                                    session, &run.dql, rows_orientation, hash_mode, deadline,
-                                )
-                            }),
-                            Err(e) => Err(format!("session setup: {}", e)),
-                        };
-                        let elapsed = t0.elapsed();
-                        link.recover_if_poisoned(&exec);
-                        judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype, elapsed, &mut result);
+                        // The workspace lives exactly as long as the test:
+                        // built here, dropped at the end of this arm. The
+                        // world inside it is established by `in_world` and
+                        // cannot be inherited by the next test.
+                        let exec =
+                            match prepare_workspace(run, &db_paths, &ddl_map, &init_map, &tmpdir) {
+                                Ok(workspace) => {
+                                    let deadline = Deadline::starting_now(limits().query_timeout);
+                                    link.in_world(workspace.world(), |session, orientation| {
+                                        execute(session, run, orientation, deadline)
+                                    })
+                                }
+                                // A workspace that could not be built is this
+                                // test's error, not a reason to drop the rest of
+                                // the shard.
+                                Err(e) => Err(format!("workspace: {}", e)),
+                            };
 
-                        let _ = std::fs::remove_dir_all(&isolate_dir);
+                        judge(
+                            &ball_name,
+                            run.run_id,
+                            &run.name,
+                            exec,
+                            &run.hash,
+                            &run.hashtype,
+                            t0.elapsed(),
+                            &mut result,
+                        );
                     }
 
                     Ok(result)
@@ -1636,7 +1390,7 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
         collect(handles);
     }
 
-    // ---- Phase 4d: isolated ----
+    // ---- Phase 4b: isolated ----
     // Last, and each on a server of its own. These are the tests that declared
     // they might not answer; nothing that expects an answer is still waiting on
     // a worker when they run.
@@ -1660,19 +1414,32 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
 
                 std::thread::spawn(move || -> Result<WorkerResult, String> {
                     let mut result = WorkerResult {
-                        passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
+                        passed: 0,
+                        failed: 0,
+                        errors: 0,
+                        meh: 0,
+                        output: Vec::new(),
+                        rows: Vec::new(),
                     };
                     for &idx in &shard {
                         let run = &isolated_runs[idx];
                         let budget = Duration::from_secs(
-                            run.timeout_secs.expect("isolated runs declare a wall clock"),
+                            run.timeout_secs
+                                .expect("isolated runs declare a wall clock"),
                         );
                         let t0 = Instant::now();
-                        let exec = run_isolated(
-                            run, &db_paths, &ddl_map, &init_map, &tmpdir, budget,
+                        let exec =
+                            run_isolated(run, &db_paths, &ddl_map, &init_map, &tmpdir, budget);
+                        judge(
+                            &ball_name,
+                            run.run_id,
+                            &run.name,
+                            exec,
+                            &run.hash,
+                            &run.hashtype,
+                            t0.elapsed(),
+                            &mut result,
                         );
-                        judge(&ball_name, &run.name, exec, &run.hash, &run.hashtype,
-                              t0.elapsed(), &mut result);
                     }
                     Ok(result)
                 })
@@ -1700,39 +1467,10 @@ fn run_ball(ball_path: &Path, socket_path: &Path, results_db: Option<&Path>) -> 
     Ok(!any_worker_error)
 }
 
-fn send_shutdown(socket_path: &Path) -> Result<(), String> {
-    let stream = UnixStream::connect(socket_path).map_err(|e| format!("connect: {}", e))?;
-    // Shutdown must not become the wait the query deadline just removed. A
-    // server still working through a request the client abandoned answers
-    // this handshake late or not at all, and the runner's last act would
-    // otherwise be to block on it forever.
-    if let Some(timeout) = limits().query_timeout {
-        let _ = stream.set_read_timeout(Some(timeout));
-        let _ = stream.set_write_timeout(Some(timeout));
-    }
-    let transport = SocketTransport::new(stream);
-    let client = Client::new(transport);
-    let mut session = match client
-        .version(
-            1_000_000,
-            b"relay0".to_vec(),
-            300_000,
-            vec![Orientation::Rows],
-        )
-        .map_err(|e| format!("version: {}", e.message))?
-    {
-        VersionResult::Accepted(s) => s,
-        VersionResult::Rejected { message, .. } => {
-            return Err(format!("rejected: {}", String::from_utf8_lossy(&message)));
-        }
-    };
-    let _ = session.shutdown();
-    Ok(())
-}
-
-/// A server with ONE bounded worker: it answers the handshake, goes SILENT on
-/// the first connection's query, and cannot service the next connection until
-/// the first one is CLOSED.
+/// A server with ONE bounded worker: it answers the handshake, answers
+/// `answers_before_silence` queries on the first connection, then goes SILENT
+/// on that connection and cannot service the next connection until the first
+/// one is CLOSED.
 ///
 /// That bound is the topology under test, not an incidental simplification.
 /// `dql server` gives a connection a worker until the connection closes, so a
@@ -1741,8 +1479,15 @@ fn send_shutdown(socket_path: &Path) -> Result<(), String> {
 /// A stub that spawns a thread per connection cannot show this — every
 /// replacement handshake succeeds there regardless of what the client still
 /// holds open.
+///
+/// The allowance is what decides WHICH request meets the silence: zero puts
+/// it on the mount a world is established with, one puts it on the test's own
+/// query. Both roads must release the bounded worker.
 #[cfg(test)]
-fn spawn_bounded_worker_server(socket: &Path) -> std::thread::JoinHandle<()> {
+fn spawn_bounded_worker_server(
+    socket: &Path,
+    answers_before_silence: usize,
+) -> std::thread::JoinHandle<()> {
     use std::os::unix::net::UnixListener;
 
     let listener = UnixListener::bind(socket).expect("bind stub socket");
@@ -1751,17 +1496,24 @@ fn spawn_bounded_worker_server(socket: &Path) -> std::thread::JoinHandle<()> {
         // sit in the listen backlog — connected, as far as the client can
         // tell, and unserved.
         for (connection, stream) in listener.incoming().flatten().enumerate() {
-            serve_stub_connection(connection, stream);
+            serve_stub_connection(connection, stream, answers_before_silence);
         }
     })
 }
 
 #[cfg(test)]
-fn serve_stub_connection(connection: usize, mut stream: UnixStream) {
+fn serve_stub_connection(
+    connection: usize,
+    mut stream: std::os::unix::net::UnixStream,
+    answers_before_silence: usize,
+) {
     use delightql_protocol::socket::{read_client_message, write_server_message};
-    use delightql_protocol::{ClientMessage, ClientTerm, Dimension, ServerMessage, ServerTerm};
+    use delightql_protocol::{
+        ClientMessage, ClientTerm, Dimension, Orientation, ServerMessage, ServerTerm,
+    };
 
     let mut buf = Vec::new();
+    let mut answered = 0usize;
     loop {
         let Ok(message) = read_client_message(&mut stream, &mut buf) else {
             return;
@@ -1782,7 +1534,7 @@ fn serve_stub_connection(connection: usize, mut stream: UnixStream) {
                 lease_ms: 300_000,
                 orientations: vec![Orientation::Rows],
             },
-            ClientTerm::Query { .. } if connection == 0 => {
+            ClientTerm::Query { .. } if connection == 0 && answered >= answers_before_silence => {
                 // The silence under test. A worker inside a query that
                 // outlives the client's deadline answers nothing else on that
                 // connection either — the reset the next test sends is read by
@@ -1794,14 +1546,17 @@ fn serve_stub_connection(connection: usize, mut stream: UnixStream) {
                 while read_client_message(&mut stream, &mut buf).is_ok() {}
                 return;
             }
-            ClientTerm::Query { .. } => ServerTerm::Header {
-                handle: b"h1".to_vec(),
-                dimensions: vec![Dimension {
-                    position: 1,
-                    name: b"k".to_vec(),
-                    descriptor: b"INTEGER".to_vec(),
-                }],
-            },
+            ClientTerm::Query { .. } => {
+                answered += 1;
+                ServerTerm::Header {
+                    handle: b"h1".to_vec(),
+                    dimensions: vec![Dimension {
+                        position: 1,
+                        name: b"k".to_vec(),
+                        descriptor: b"INTEGER".to_vec(),
+                    }],
+                }
+            }
             ClientTerm::Fetch { .. } => ServerTerm::End,
             _ => ServerTerm::Ok { count_hint: 0 },
         };
@@ -1813,11 +1568,12 @@ fn serve_stub_connection(connection: usize, mut stream: UnixStream) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     use super::{
-        compute_data_hash, judge, observed_baseline, query_error, Deadline, HashObservation,
-        WorkerResult,
+        compute_data_hash, judge, observed_baseline, query_error, send_query_and_hash, Deadline,
+        HashObservation, Link, RunOrder, WorkerResult, World,
     };
 
     fn empty(columns: usize) -> HashObservation {
@@ -1838,35 +1594,58 @@ mod tests {
         }
     }
 
-    /// A link whose silent query has just answered as a transport failure,
-    /// against a server with one bounded worker still owned by that
-    /// connection. The elapsed wait is returned with it: it is the deadline,
-    /// and what follows must not spend another.
-    fn poisoned_link_against_a_bounded_worker(
-        socket: &std::path::Path,
-        deadline: Duration,
-    ) -> (super::Link, Duration, String) {
-        use super::{is_transport_failure, send_query_and_hash, spawn_bounded_worker_server, Link};
+    fn a_world() -> World {
+        World {
+            cwd: None,
+            mount: "stub.sqlite".to_string(),
+        }
+    }
 
-        let _ = std::fs::remove_file(socket);
+    fn stub_socket(line: u32) -> PathBuf {
+        PathBuf::from(format!(
+            "/tmp/dql-runner-recovery-{}-{}.sock",
+            std::process::id(),
+            line
+        ))
+    }
+
+    /// One test on a link, through the one road a test has.
+    fn run_test_on(link: &mut Link) -> Result<HashObservation, String> {
+        link.in_world(&a_world(), |session, orientation| {
+            send_query_and_hash(session, "k(*)", orientation, Deadline::starting_now(None))
+        })
+    }
+
+    /// A silent TEST is reported once and the shard keeps going.
+    ///
+    /// The server's one worker is still owned by the poisoned connection, so
+    /// the replacement is serviced only because the recovery drops that
+    /// connection before opening it. Opening first queues the replacement
+    /// behind the very connection it replaces, and it waits there for a second
+    /// deadline: that is what the timing assertion catches.
+    #[test]
+    fn a_silent_test_releases_the_bounded_worker_before_the_next_one_runs() {
+        let socket = stub_socket(line!());
+        let deadline = Duration::from_millis(300);
+        let _ = std::fs::remove_file(&socket);
         // The handle is dropped: the worker thread outlives the test by
         // design, blocked on an accept nothing will answer.
-        let _server = spawn_bounded_worker_server(socket);
+        // One answer allowance: the world is established, the TEST goes silent.
+        let _server = super::spawn_bounded_worker_server(&socket, 1);
 
-        let mut link = Link::connect(socket, Some(deadline)).expect("connect to stub");
-        let orientation = link.orientation;
+        let mut link = Link::connect(&socket, Some(deadline)).expect("connect to stub");
+        let mut result = worker_result();
 
-        let started = std::time::Instant::now();
-        let first = send_query_and_hash(
-            link.session().expect("a fresh link holds a session"),
-            "k(*)",
-            orientation,
-            Deadline::starting_now(None),
-        );
+        let started = Instant::now();
+        let silent = run_test_on(&mut link);
         let waited = started.elapsed();
-        let message = first.expect_err("a silent server cannot produce a hash");
+        let message = silent
+            .as_ref()
+            .err()
+            .expect("a silent server cannot produce a hash")
+            .clone();
         assert!(
-            is_transport_failure(&message),
+            crate::world::is_transport_failure(&message),
             "a silent server is a transport failure, not a refusal: {message}"
         );
         assert!(
@@ -1874,55 +1653,15 @@ mod tests {
             "the deadline must bound the wait, waited {waited:?}"
         );
 
-        (link, waited, message)
-    }
-
-    /// A silent request is reported ONCE and the shard keeps going, through
-    /// the immediate road every phase loop takes after a query answers.
-    ///
-    /// The server's one worker is still owned by the poisoned connection, so
-    /// the replacement is serviced only because `renew` drops that connection
-    /// before opening it. Opening first queues the replacement behind the very
-    /// connection it replaces, and it waits there for a second deadline: that
-    /// is what the timing assertion catches.
-    #[test]
-    fn recovery_releases_the_bounded_worker_before_taking_a_replacement() {
-        use super::send_query_and_hash;
-        use std::path::PathBuf;
-
-        let socket = PathBuf::from(format!(
-            "/tmp/dql-runner-recovery-{}-{}.sock",
-            std::process::id(),
-            line!()
-        ));
-        let deadline = Duration::from_millis(300);
-        let (mut link, waited, message) =
-            poisoned_link_against_a_bounded_worker(&socket, deadline);
-
-        let mut result = super::WorkerResult {
-            passed: 0, failed: 0, errors: 0, meh: 0, output: Vec::new(), rows: Vec::new(),
-        };
-        let outcome: Result<super::HashObservation, String> = Err(message);
-
-        // The road all three phase loops take once a query has answered:
-        // recover, record the row, run the next test.
-        let recovery = std::time::Instant::now();
-        link.recover_if_poisoned(&outcome);
-
         // Exactly one row for that test, and it is an error.
-        judge("ball", "silent", outcome, &None, &None, waited, &mut result);
+        judge("ball", 1, "silent", silent, &None, &None, waited, &mut result);
         assert_eq!(result.rows.len(), 1, "the timed-out test reports one row");
         assert_eq!(result.rows[0].status, "ERROR");
         assert_eq!(result.errors, 1);
 
-        let orientation = link.orientation;
-        let second = send_query_and_hash(
-            link.session()
-                .expect("recovery leaves a session to run the next test on"),
-            "k(*)",
-            orientation,
-            Deadline::starting_now(None),
-        );
+        // The next test, through the same road, on the replacement.
+        let recovery = Instant::now();
+        let second = run_test_on(&mut link);
         let recovered_in = recovery.elapsed();
         assert!(
             second.is_ok(),
@@ -1933,62 +1672,93 @@ mod tests {
             "the replacement must not wait on a second deadline, took {recovered_in:?}"
         );
 
-        judge("ball", "after", second, &None, &None, Duration::from_millis(1), &mut result);
-        assert_eq!(result.rows.len(), 2, "the following test reports its own row");
+        judge(
+            "ball",
+            2,
+            "after",
+            second,
+            &None,
+            &None,
+            Duration::from_millis(1),
+            &mut result,
+        );
+        assert_eq!(
+            result.rows.len(),
+            2,
+            "the following test reports its own row"
+        );
         assert_eq!(result.errors, 1, "recovery adds no second error");
 
         drop(link);
         let _ = std::fs::remove_file(&socket);
     }
 
-    /// The same release, through the setup road the DDL and DML loops take.
+    /// The same release, through the ESTABLISHMENT road.
     ///
-    /// `establish` finds the poisoned session under it when the reset it
-    /// sends goes unanswered, and the fresh session it takes must be one the
-    /// bounded worker can actually serve. Carrying the poisoned session into
-    /// the retry is how a `?` on the next reset takes every remaining test in
-    /// the shard out of the reported totals.
+    /// The mount a world is established with is the silent request here, so
+    /// `in_world` finds the poisoned session under it before the test runs at
+    /// all. The fresh session it takes must be one the bounded worker can
+    /// actually serve: carrying the poisoned session into the retry is how a
+    /// `?` on the next setup took every remaining test in the shard out of the
+    /// reported totals.
     #[test]
-    fn established_state_lands_on_a_session_the_bounded_worker_can_serve() {
-        use super::send_query_and_hash;
-        use std::path::PathBuf;
-
-        let socket = PathBuf::from(format!(
-            "/tmp/dql-runner-recovery-{}-{}.sock",
-            std::process::id(),
-            line!()
-        ));
+    fn an_unestablishable_world_lands_on_a_session_the_bounded_worker_can_serve() {
+        let socket = stub_socket(line!());
         let deadline = Duration::from_millis(300);
-        let (mut link, _waited, _message) =
-            poisoned_link_against_a_bounded_worker(&socket, deadline);
+        let _ = std::fs::remove_file(&socket);
+        // No answer allowance: the establishment's own mount meets the silence.
+        let _server = super::spawn_bounded_worker_server(&socket, 0);
 
-        // The reset probe spends one deadline on the poisoned session before
-        // `establish` gives up on it; the reconnect and retry after that must
-        // spend none.
-        let started = std::time::Instant::now();
-        link.establish(&|session, _| super::send_reset(session))
-            .expect("required state is re-established on a fresh session");
+        let mut link = Link::connect(&socket, Some(deadline)).expect("connect to stub");
+
+        // The setup probe spends one deadline on the poisoned session before
+        // the retry gives up on it; the reconnect and retry after that spend
+        // none, and the test itself then runs.
+        let started = Instant::now();
+        let outcome = run_test_on(&mut link);
         let established_in = started.elapsed();
+        assert!(
+            outcome.is_ok(),
+            "the test runs once its world is established on a fresh session: {outcome:?}"
+        );
         assert!(
             established_in < deadline * 2,
             "only the probe may wait on a deadline, took {established_in:?}"
         );
 
-        let orientation = link.orientation;
-        let next = send_query_and_hash(
-            link.session()
-                .expect("establish leaves a session to run the test on"),
-            "k(*)",
-            orientation,
-            Deadline::starting_now(None),
-        );
-        assert!(
-            next.is_ok(),
-            "the test must run on the fresh session: {next:?}"
-        );
-
         drop(link);
         let _ = std::fs::remove_file(&socket);
+    }
+
+    /// A named shuffle is a NAME: the same seed is the same arrangement, so a
+    /// disagreement the checker finds can be handed back and re-run.
+    #[test]
+    fn a_shuffle_seed_names_one_arrangement() {
+        let source: Vec<u32> = (0..64).collect();
+
+        let mut once = source.clone();
+        RunOrder::Shuffle(7).arrange(&mut once);
+        let mut again = source.clone();
+        RunOrder::Shuffle(7).arrange(&mut again);
+        assert_eq!(once, again, "one seed, one arrangement");
+
+        let mut other = source.clone();
+        RunOrder::Shuffle(8).arrange(&mut other);
+        assert_ne!(once, other, "a different seed is a different arrangement");
+
+        let mut sorted = once.clone();
+        sorted.sort();
+        assert_eq!(sorted, source, "a shuffle is a permutation, not a filter");
+    }
+
+    #[test]
+    fn an_order_spelling_that_is_not_one_refuses() {
+        assert_eq!("ball".parse(), Ok(RunOrder::Ball));
+        assert_eq!("reverse".parse(), Ok(RunOrder::Reverse));
+        assert_eq!("shuffle".parse(), Ok(RunOrder::Shuffle(0)));
+        assert_eq!("shuffle:12".parse(), Ok(RunOrder::Shuffle(12)));
+        assert!("sideways".parse::<RunOrder>().is_err());
+        assert!("shuffle:soon".parse::<RunOrder>().is_err());
     }
 
     #[test]
@@ -2022,6 +1792,7 @@ mod tests {
         let mut result = worker_result();
         judge(
             "ball",
+            1,
             "empty-error-baseline",
             Err("an unrelated refusal".to_string()),
             &Some(" \n".to_string()),
@@ -2042,6 +1813,7 @@ mod tests {
         let mut result = worker_result();
         judge(
             "ball",
+            1,
             "specific-error-baseline",
             Err("prefix: named refusal".to_string()),
             &Some("named refusal".to_string()),
@@ -2065,6 +1837,7 @@ fn main() {
             query_timeout: (args.query_timeout > 0)
                 .then(|| std::time::Duration::from_secs(args.query_timeout)),
             dql_binary: args.dql.clone(),
+            order: args.order,
         })
         .unwrap_or_else(|_| unreachable!("limits are set once, before any ball runs"));
 
@@ -2089,7 +1862,7 @@ fn main() {
     }
 
     if args.shutdown {
-        match send_shutdown(&args.socket) {
+        match world::send_shutdown(&args.socket, limits().query_timeout) {
             Ok(()) => {}
             Err(e) => eprintln!("dql-test-ball-runner: shutdown error: {}", e),
         }

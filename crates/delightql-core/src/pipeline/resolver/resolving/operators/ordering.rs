@@ -17,14 +17,18 @@ pub(in crate::pipeline::resolver) fn resolve_tuple_ordering_via_fold(
     Vec<crate::relation::PortId>,
 )> {
     // Resolve ORDER BY specs
+    // AN ORDERING IS EVALUATED WHERE IT STANDS: a spec reading past the
+    // interior boundary the enclosing join evaluates refuses.
     let resolved_specs = specs
         .into_iter()
         .map(|spec| {
-            super::super::domain_expressions::projection::resolve_expressions_via_fold(
-                fold,
-                vec![spec.column],
-                available,
-            )
+            fold.judged_here("an ordering inside the interior", |fold| {
+                super::super::domain_expressions::projection::resolve_expressions_via_fold(
+                    fold,
+                    vec![spec.column],
+                    available,
+                )
+            })
             .map(|mut exprs| ast_resolved::OrderingSpec {
                 column: exprs
                     .pop()
