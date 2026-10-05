@@ -190,16 +190,18 @@ dist-linux: ensure-cargo ensure-uv ensure-tree-sitter ensure-zig ensure-zigbuild
 	done
 
 ifeq ($(HOST_OS),Darwin)
+# One tarball per architecture, as for Linux: a universal binary carries both
+# and doubles every download. Each is ad-hoc signed, since an arm64 Mac runs
+# no unsigned code.
 dist-macos: ensure-cargo ensure-uv ensure-tree-sitter ensure-dist-targets
-	@mkdir -p $(DIST_DIR) $(DIST_TARGET_DIR)/universal
+	@mkdir -p $(DIST_DIR)
 	@set -e; for t in $(DIST_MACOS); do \
 		echo "--- $$t"; \
 		CARGO_TARGET_DIR=$(DIST_TARGET_DIR) cargo build --profile $(DIST_PROFILE) --bin dql --target $$t; \
+		codesign --force --sign - $(DIST_TARGET_DIR)/$$t/$(DIST_PROFILE)/dql; \
+		$(MAKE) --no-print-directory dist-pack BIN=$(DIST_TARGET_DIR)/$$t/$(DIST_PROFILE)/dql \
+			PLATFORM=$$(echo $$t | sed 's/-apple-darwin/-macos/'); \
 	done
-	lipo -create -output $(DIST_TARGET_DIR)/universal/dql \
-		$(foreach t,$(DIST_MACOS),$(DIST_TARGET_DIR)/$(t)/$(DIST_PROFILE)/dql)
-	codesign --force --sign - $(DIST_TARGET_DIR)/universal/dql
-	@$(MAKE) --no-print-directory dist-pack BIN=$(DIST_TARGET_DIR)/universal/dql PLATFORM=macos-universal
 else
 dist-macos:
 	@echo "--- macOS: skipped (needs a Mac: linking requires Apple's SDK)"
@@ -257,7 +259,7 @@ help::
 	@echo "  make dist              - Release tarballs for every platform this host can build -> dist/"
 	@echo "  make dist-setup        - Install the pinned zig + cargo-zigbuild into $(TOOLS_ROOT)/ and add the Rust targets (dist does this too)"
 	@echo "  make dist-linux        - Only the three Linux tarballs (x86_64/aarch64 musl, aarch64 glibc)"
-	@echo "  make dist-macos        - Only the macOS universal tarball (skipped off macOS)"
+	@echo "  make dist-macos        - Only the two macOS tarballs (aarch64, x86_64; skipped off macOS)"
 	@echo "  make setup             - Ensure all build dependencies are installed"
 	@echo "  make ensure-tree-sitter - Install the pinned tree-sitter CLI $(TREE_SITTER_EXPECTED_VERSION) into $(TOOLS_ROOT)/"
 	@echo "  make generate-grammar  - Generate the parser from grammar.js (derived, ignored)"

@@ -28,9 +28,10 @@ symbols make panics less legible, so it is for producing a deliverable
 rather than for working on one.
 
 `make dist` cross-builds release tarballs into `dist/`: three Linux builds
-from any host, plus a universal macOS build on a Mac. On first use it
-installs its pinned zig and cargo-zigbuild into `.tools/` (about 350 MB)
-and adds the Rust targets it needs; a zig already on your PATH is not used.
+from any host, plus two macOS builds (Apple silicon, Intel) on a Mac. On
+first use it installs its pinned zig and cargo-zigbuild into `.tools/`
+(about 350 MB) and adds the Rust targets it needs; a zig already on your
+PATH is not used.
 
 `make setup` is the dependency doctor for the wider toolchain (libduckdb
 for the DuckDB engine, node for the Node.js binding).
