@@ -8,7 +8,8 @@ See delightql.org
 
 # Building
 
-Requirements: **rustc/cargo** ([rustup.rs](https://rustup.rs)), **make**,
+Requirements: **rustup** ([rustup.rs](https://rustup.rs); it reads
+`rust-toolchain.toml` and installs the pinned Rust on first use), **make**,
 and **uv** ([docs.astral.sh/uv](https://docs.astral.sh/uv/)) — build.rs
 bundles the embedded documentation databases from `assets/`, and the
 bundler runs under uv (it declares its own python dependencies). Then:

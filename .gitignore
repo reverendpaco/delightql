@@ -28,6 +28,7 @@
 !assets/man/man1/*.1
 !Cargo.toml
 !Cargo.lock
+!rust-toolchain.toml
 !Makefile
 !LICENSE
 !README.md
