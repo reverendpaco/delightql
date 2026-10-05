@@ -23,6 +23,12 @@
 TREE_SITTER_EXPECTED_VERSION := 0.27.0
 TOOLS_ROOT := .tools
 TREE_SITTER = $(TOOLS_ROOT)/bin/tree-sitter
+# cargo install advises putting its root's bin on PATH unless it is there;
+# nothing here needs it on PATH, so the install commands carry it.
+TOOLS_ON_PATH = PATH="$(CURDIR)/$(TOOLS_ROOT)/bin:$$PATH"
+# A literal `#` for use inside a function call: make before 4.3 (macOS ships
+# 3.81) reads an unescaped `#` there as the start of a comment.
+HASH := \#
 
 .DEFAULT_GOAL := build
 
@@ -114,7 +120,7 @@ ensure-tree-sitter:
 	@INSTALLED_VERSION=$$($(TREE_SITTER) --version 2>/dev/null | awk '{print $$2}'); \
 	if [ "$$INSTALLED_VERSION" != "$(TREE_SITTER_EXPECTED_VERSION)" ]; then \
 		echo "Installing tree-sitter CLI $(TREE_SITTER_EXPECTED_VERSION) into $(TOOLS_ROOT)/ (one compile, a few minutes)..."; \
-		cargo install --locked --force --root $(TOOLS_ROOT) tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION) || exit 1; \
+		$(TOOLS_ON_PATH) cargo install --locked --force --root $(TOOLS_ROOT) tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION) || exit 1; \
 	fi; \
 	echo "✓ tree-sitter CLI $(TREE_SITTER_EXPECTED_VERSION) at $(TREE_SITTER)"
 
@@ -151,7 +157,7 @@ DIST_TARGET_DIR := target/dist
 DIST_PROFILE    := release-ship
 DIST_LINUX      := x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-unknown-linux-gnu
 DIST_MACOS      := aarch64-apple-darwin x86_64-apple-darwin
-DIST_VERSION     = $(shell cargo pkgid -p delightql-cli | sed 's/.*[#@]//')
+DIST_VERSION     = $(shell cargo pkgid -p delightql-cli | sed 's/.*[$(HASH)@]//')
 HOST_OS         := $(shell uname -s)
 DIST_TARGETS    := $(DIST_LINUX) $(if $(filter Darwin,$(HOST_OS)),$(DIST_MACOS))
 
@@ -227,7 +233,7 @@ ensure-zigbuild: ensure-cargo
 	@if [ ! -x "$(CARGO_ZIGBUILD)" ] \
 		|| ! grep -q '^"cargo-zigbuild $(CARGO_ZIGBUILD_VERSION) ' "$(TOOLS_ROOT)/.crates.toml" 2>/dev/null; then \
 		echo "Installing cargo-zigbuild $(CARGO_ZIGBUILD_VERSION) into $(TOOLS_ROOT)/..."; \
-		cargo install --locked --force --root $(TOOLS_ROOT) cargo-zigbuild --version $(CARGO_ZIGBUILD_VERSION) || exit 1; \
+		$(TOOLS_ON_PATH) cargo install --locked --force --root $(TOOLS_ROOT) cargo-zigbuild --version $(CARGO_ZIGBUILD_VERSION) || exit 1; \
 	fi; \
 	echo "✓ cargo-zigbuild $(CARGO_ZIGBUILD_VERSION) at $(CARGO_ZIGBUILD)"
 
