@@ -11,7 +11,7 @@
 //! version it prints then says nothing about the tables it writes. No check
 //! of a binary can see how it was installed, so this script runs only the
 //! one `make ensure-tree-sitter` installs `--locked` under the Makefile's
-//! TREE_SITTER_ROOT — never a `tree-sitter` found on PATH.
+//! TOOLS_ROOT — never a `tree-sitter` found on PATH.
 //!
 //! EVERYTHING THIS WRITES IS DERIVED, and generation is the only way it
 //! exists. `parser.c`, `grammar.json` and `node-types.json` land in the
@@ -41,7 +41,7 @@ fn makefile_value(workspace_root: &Path, name: &str) -> String {
 /// Where `cargo install --root` puts the CLI under the Makefile's root.
 fn pinned_cli(workspace_root: &Path) -> PathBuf {
     workspace_root
-        .join(makefile_value(workspace_root, "TREE_SITTER_ROOT"))
+        .join(makefile_value(workspace_root, "TOOLS_ROOT"))
         .join("bin")
         .join(format!("tree-sitter{}", std::env::consts::EXE_SUFFIX))
 }

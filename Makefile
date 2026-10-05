@@ -15,13 +15,14 @@
 # runtime and generator the registry resolves that day, and the version the
 # binary prints is then not the version that generated the parser.
 #
-# It is installed under TREE_SITTER_ROOT, and delightql-cst's build.rs reads
-# both assignments here and runs exactly $(TREE_SITTER). A `tree-sitter`
-# found on PATH is never used: it may be any version, or an unlocked build
-# that prints the pinned one.
+# It is installed under TOOLS_ROOT, where every pinned tool this Makefile
+# installs lives, and delightql-cst's build.rs reads both assignments here
+# and runs exactly $(TREE_SITTER). A `tree-sitter` found on PATH is never
+# used: it may be any version, or an unlocked build that prints the pinned
+# one.
 TREE_SITTER_EXPECTED_VERSION := 0.27.0
-TREE_SITTER_ROOT := .tools
-TREE_SITTER = $(TREE_SITTER_ROOT)/bin/tree-sitter
+TOOLS_ROOT := .tools
+TREE_SITTER = $(TOOLS_ROOT)/bin/tree-sitter
 
 .DEFAULT_GOAL := build
 
@@ -112,8 +113,8 @@ ensure-node:
 ensure-tree-sitter:
 	@INSTALLED_VERSION=$$($(TREE_SITTER) --version 2>/dev/null | awk '{print $$2}'); \
 	if [ "$$INSTALLED_VERSION" != "$(TREE_SITTER_EXPECTED_VERSION)" ]; then \
-		echo "Installing tree-sitter CLI $(TREE_SITTER_EXPECTED_VERSION) into $(TREE_SITTER_ROOT)/ (one compile, a few minutes)..."; \
-		cargo install --locked --force --root $(TREE_SITTER_ROOT) tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION) || exit 1; \
+		echo "Installing tree-sitter CLI $(TREE_SITTER_EXPECTED_VERSION) into $(TOOLS_ROOT)/ (one compile, a few minutes)..."; \
+		cargo install --locked --force --root $(TOOLS_ROOT) tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION) || exit 1; \
 	fi; \
 	echo "✓ tree-sitter CLI $(TREE_SITTER_EXPECTED_VERSION) at $(TREE_SITTER)"
 
@@ -139,6 +140,12 @@ generate-grammar: ensure-tree-sitter
 # The musl builds are fully static and run on any Linux distribution. The
 # glibc build targets glibc 2.17 (zig selects the version from the suffix),
 # so it runs on anything newer.
+#
+# Both cross tools are pinned and installed under TOOLS_ROOT on first use:
+# cargo-zigbuild with `cargo install --locked`, and zig as the PyPI ziglang
+# wheel in a uv venv. cargo-zigbuild asks `python -m ziglang` before any
+# `zig` on PATH, and CARGO_ZIGBUILD_PYTHON_PATH names the venv's python, so
+# a system zig — any version, or a broken install — is never consulted.
 DIST_DIR        := dist
 DIST_TARGET_DIR := target/dist
 DIST_PROFILE    := release-ship
@@ -146,8 +153,15 @@ DIST_LINUX      := x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-
 DIST_MACOS      := aarch64-apple-darwin x86_64-apple-darwin
 DIST_VERSION     = $(shell cargo pkgid -p delightql-cli | sed 's/.*[#@]//')
 HOST_OS         := $(shell uname -s)
+DIST_TARGETS    := $(DIST_LINUX) $(if $(filter Darwin,$(HOST_OS)),$(DIST_MACOS))
 
-.PHONY: dist dist-setup dist-linux dist-macos dist-clean ensure-zig ensure-zigbuild
+CARGO_ZIGBUILD_VERSION := 0.23.4
+CARGO_ZIGBUILD          = $(TOOLS_ROOT)/bin/cargo-zigbuild
+ZIG_VERSION            := 0.14.1
+ZIG_VENV                = $(TOOLS_ROOT)/zig
+ZIG_PYTHON              = $(ZIG_VENV)/bin/python
+
+.PHONY: dist dist-setup dist-linux dist-macos dist-clean ensure-zig ensure-zigbuild ensure-dist-targets
 
 dist: dist-linux dist-macos
 	@cd $(DIST_DIR) && (command -v sha256sum >/dev/null 2>&1 && sha256sum dql-*.tar.gz || shasum -a 256 dql-*.tar.gz) > SHA256SUMS
@@ -155,24 +169,22 @@ dist: dist-linux dist-macos
 	@echo "✓ $(DIST_DIR)/:"
 	@cat $(DIST_DIR)/SHA256SUMS
 
-# One-time: the Rust targets and cargo-zigbuild. zig itself comes from the
-# system package manager or `pip install ziglang`.
-dist-setup: ensure-cargo ensure-zig
-	rustup target add $(DIST_LINUX) $(if $(filter Darwin,$(HOST_OS)),$(DIST_MACOS))
-	@command -v cargo-zigbuild >/dev/null 2>&1 || cargo install --locked cargo-zigbuild
+# Everything `make dist` installs, without building; `make dist` does it too.
+dist-setup: ensure-zig ensure-zigbuild ensure-dist-targets
 
-dist-linux: ensure-cargo ensure-uv ensure-tree-sitter ensure-zig ensure-zigbuild
+dist-linux: ensure-cargo ensure-uv ensure-tree-sitter ensure-zig ensure-zigbuild ensure-dist-targets
 	@mkdir -p $(DIST_DIR)
 	@set -e; for t in $(DIST_LINUX); do \
 		zt=$$t; [ $$t = aarch64-unknown-linux-gnu ] && zt=$$t.2.17; \
 		echo "--- $$t"; \
-		CARGO_TARGET_DIR=$(DIST_TARGET_DIR) cargo zigbuild --profile $(DIST_PROFILE) --bin dql --target $$zt; \
+		CARGO_TARGET_DIR=$(DIST_TARGET_DIR) CARGO_ZIGBUILD_PYTHON_PATH=$(CURDIR)/$(ZIG_PYTHON) \
+			$(CURDIR)/$(CARGO_ZIGBUILD) zigbuild --profile $(DIST_PROFILE) --bin dql --target $$zt; \
 		$(MAKE) --no-print-directory dist-pack BIN=$(DIST_TARGET_DIR)/$$t/$(DIST_PROFILE)/dql \
 			PLATFORM=$$(echo $$t | sed 's/-unknown//'); \
 	done
 
 ifeq ($(HOST_OS),Darwin)
-dist-macos: ensure-cargo ensure-uv ensure-tree-sitter
+dist-macos: ensure-cargo ensure-uv ensure-tree-sitter ensure-dist-targets
 	@mkdir -p $(DIST_DIR) $(DIST_TARGET_DIR)/universal
 	@set -e; for t in $(DIST_MACOS); do \
 		echo "--- $$t"; \
@@ -199,30 +211,33 @@ dist-pack:
 dist-clean:
 	rm -rf $(DIST_DIR) $(DIST_TARGET_DIR)
 
-# cargo-zigbuild takes the first of `python3 -m ziglang version` and
-# `zig version` that prints a version, so this asks the same two. A `zig`
-# that merely exists proves nothing: a version manager's shim prints no
-# version for a directory it has no usable zig for.
-ensure-zig:
-	@if v=$$(python3 -m ziglang version 2>/dev/null) && [ -n "$$v" ]; then \
-		echo "✓ zig $$v (python ziglang)"; \
-	elif v=$$(zig version 2>/dev/null) && [ -n "$$v" ]; then \
-		echo "✓ zig $$v"; \
-	else \
-		echo "❌ no working zig (cargo-zigbuild uses it to cross-compile the Linux targets)."; \
-		if command -v zig >/dev/null 2>&1; then \
-			echo "   $$(command -v zig) prints no version for 'zig version':"; \
-			zig version 2>&1 | head -3 | sed 's/^/     /'; \
-		fi; \
-		echo "   Install: your package manager (e.g. brew install zig)   or   pip install ziglang"; \
-		exit 1; \
-	fi
+# Installs on first use, and again whenever the pin moves or the venv stops
+# answering (a venv breaks when the python it was made from goes away).
+ensure-zig: ensure-uv
+	@INSTALLED=$$($(ZIG_PYTHON) -m ziglang version 2>/dev/null); \
+	if [ "$$INSTALLED" != "$(ZIG_VERSION)" ]; then \
+		echo "Installing zig $(ZIG_VERSION) into $(ZIG_VENV)/ (the PyPI ziglang wheel, about 340 MB unpacked)..."; \
+		rm -rf "$(ZIG_VENV)" && uv venv -q "$(ZIG_VENV)" \
+			&& uv pip install -q --python "$(ZIG_PYTHON)" ziglang==$(ZIG_VERSION) || exit 1; \
+	fi; \
+	echo "✓ zig $(ZIG_VERSION) at $(ZIG_VENV)/"
 
-ensure-zigbuild:
-	@if ! command -v cargo-zigbuild >/dev/null 2>&1; then \
-		echo "❌ cargo-zigbuild not found. Run: make dist-setup"; \
-		exit 1; \
-	fi
+# cargo-zigbuild prints no version, so cargo's own install record answers.
+ensure-zigbuild: ensure-cargo
+	@if [ ! -x "$(CARGO_ZIGBUILD)" ] \
+		|| ! grep -q '^"cargo-zigbuild $(CARGO_ZIGBUILD_VERSION) ' "$(TOOLS_ROOT)/.crates.toml" 2>/dev/null; then \
+		echo "Installing cargo-zigbuild $(CARGO_ZIGBUILD_VERSION) into $(TOOLS_ROOT)/..."; \
+		cargo install --locked --force --root $(TOOLS_ROOT) cargo-zigbuild --version $(CARGO_ZIGBUILD_VERSION) || exit 1; \
+	fi; \
+	echo "✓ cargo-zigbuild $(CARGO_ZIGBUILD_VERSION) at $(CARGO_ZIGBUILD)"
+
+# rustup keeps targets per toolchain, so these cannot live in the checkout;
+# they are added to the pinned toolchain whenever one is missing.
+ensure-dist-targets: ensure-cargo
+	@MISSING=$$(INSTALLED=$$(rustup target list --installed); \
+		for t in $(DIST_TARGETS); do echo "$$INSTALLED" | grep -qx $$t || echo $$t; done); \
+	if [ -n "$$MISSING" ]; then rustup target add $$MISSING || exit 1; fi; \
+	echo "✓ Rust targets for $$(rustc --version | awk '{print $$2}'): $(DIST_TARGETS)"
 
 
 # A double-colon rule: a file included below may add its own `help::` lines.
@@ -234,11 +249,11 @@ help::
 	@echo "  make [build]           - Check cargo+uv, build dql -> target/debug/dql"
 	@echo "  make ship              - Optimized build (fat LTO, stripped) -> target/release-ship/dql"
 	@echo "  make dist              - Release tarballs for every platform this host can build -> dist/"
-	@echo "  make dist-setup        - One-time: Rust targets + cargo-zigbuild (zig itself: package manager or pip)"
+	@echo "  make dist-setup        - Install the pinned zig + cargo-zigbuild into $(TOOLS_ROOT)/ and add the Rust targets (dist does this too)"
 	@echo "  make dist-linux        - Only the three Linux tarballs (x86_64/aarch64 musl, aarch64 glibc)"
 	@echo "  make dist-macos        - Only the macOS universal tarball (skipped off macOS)"
 	@echo "  make setup             - Ensure all build dependencies are installed"
-	@echo "  make ensure-tree-sitter - Install the pinned tree-sitter CLI $(TREE_SITTER_EXPECTED_VERSION) into $(TREE_SITTER_ROOT)/"
+	@echo "  make ensure-tree-sitter - Install the pinned tree-sitter CLI $(TREE_SITTER_EXPECTED_VERSION) into $(TOOLS_ROOT)/"
 	@echo "  make generate-grammar  - Generate the parser from grammar.js (derived, ignored)"
 	@echo "  make help              - Show this help"
 	@echo ""

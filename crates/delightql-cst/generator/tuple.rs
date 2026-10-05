@@ -169,16 +169,18 @@ mod falsifiers {
 
     #[test]
     fn the_makefile_reader_reads_one_literal_assignment() {
-        let mk = "TREE_SITTER_EXPECTED_VERSION := 0.27.0\nTREE_SITTER_ROOT := .tools\n\
-                  TREE_SITTER = $(TREE_SITTER_ROOT)/bin/tree-sitter\nDIST_DIR ?= dist\n\
-                  build:\n\techo TREE_SITTER_ROOT=elsewhere\n";
+        let mk = "TREE_SITTER_EXPECTED_VERSION := 0.27.0\nTOOLS_ROOT := .tools\n\
+                  TREE_SITTER = $(TOOLS_ROOT)/bin/tree-sitter\nDIST_DIR ?= dist\n\
+                  build:\n\techo TOOLS_ROOT=elsewhere\n";
         assert_eq!(makefile_assignment(mk, "TREE_SITTER_EXPECTED_VERSION").as_deref(), Some("0.27.0"));
-        // A longer name sharing the prefix, and the recipe line, are not it.
-        assert_eq!(makefile_assignment(mk, "TREE_SITTER_ROOT").as_deref(), Some(".tools"));
+        // The recipe line assigns nothing, and a longer name sharing the
+        // prefix is another variable.
+        assert_eq!(makefile_assignment(mk, "TOOLS_ROOT").as_deref(), Some(".tools"));
+        assert_eq!(makefile_assignment(mk, "TOOLS"), None);
         assert_eq!(makefile_assignment(mk, "DIST_DIR").as_deref(), Some("dist"));
         assert_eq!(makefile_assignment(mk, "TREE_SITTER"), None, "a reference is not a literal");
         assert_eq!(makefile_assignment(mk, "MISSING"), None);
-        let twice = "TREE_SITTER_ROOT := .tools\nTREE_SITTER_ROOT := other\n";
-        assert_eq!(makefile_assignment(twice, "TREE_SITTER_ROOT"), None, "two values are no one value");
+        let twice = "TOOLS_ROOT := .tools\nTOOLS_ROOT := other\n";
+        assert_eq!(makefile_assignment(twice, "TOOLS_ROOT"), None, "two values are no one value");
     }
 }
