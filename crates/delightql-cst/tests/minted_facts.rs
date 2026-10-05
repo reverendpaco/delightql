@@ -80,11 +80,7 @@ fn parser_runtime_names_the_linked_runtime() {
         .unwrap_or_else(|| panic!("unexpected runtime spelling: {}", delightql_cst::PARSER_RUNTIME));
     let root = workspace_root();
     let makefile = std::fs::read_to_string(root.join("Makefile")).expect("the Makefile");
-    let pin = makefile
-        .lines()
-        .find_map(|l| l.strip_prefix("TREE_SITTER_EXPECTED_VERSION"))
-        .and_then(|l| l.split_once('='))
-        .map(|(_, v)| v.trim().to_string())
+    let pin = tuple::makefile_assignment(&makefile, "TREE_SITTER_EXPECTED_VERSION")
         .expect("the Makefile pins the generator");
     let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("the lockfile");
     let facts = tuple::TupleFacts {

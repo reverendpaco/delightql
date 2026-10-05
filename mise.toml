@@ -10,8 +10,8 @@
 
 # Tool requirements
 # The tree-sitter CLI is not listed here: `make ensure-tree-sitter` installs
-# the version pinned in the Makefile (cargo install --locked), and
-# delightql-cst's build.rs refuses any other version.
+# the version pinned in the Makefile (cargo install --locked) into .tools/,
+# and delightql-cst's build.rs runs that binary and no other.
 # uv runs the asset bundler that delightql-cli's build.rs invokes.
 [tools]
 rust = "1.99"

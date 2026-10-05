@@ -85,6 +85,25 @@ pub fn manifest_exact_pin(manifest: &str, package: &str) -> Option<String> {
         })
 }
 
+/// The literal value a Makefile assigns to one variable: its name at column
+/// 0 before `:=`, `::=`, `?=` or `=` (a recipe line sits behind a tab and
+/// assigns nothing). A value that references another variable is not a
+/// literal, and a variable assigned twice has no one value; both read as
+/// absent rather than as a guess.
+pub fn makefile_assignment(makefile: &str, name: &str) -> Option<String> {
+    let mut values = makefile
+        .lines()
+        .filter(|l| !l.starts_with('\t'))
+        .filter_map(|l| l.split_once('='))
+        .filter(|(lhs, _)| lhs.trim_end().trim_end_matches([':', '?']).trim_end() == name)
+        .map(|(_, v)| v.trim().to_string());
+    let value = values.next()?;
+    if values.next().is_some() || value.is_empty() || value.contains("$(") {
+        return None;
+    }
+    Some(value)
+}
+
 #[cfg(test)]
 mod falsifiers {
     use super::*;
@@ -146,5 +165,20 @@ mod falsifiers {
         let manifest = "tree-sitter = \"=0.27.0\"\ntree-sitter-highlight = { version = \"=0.27.0\", optional = true }\n";
         assert_eq!(manifest_exact_pin(manifest, "tree-sitter").as_deref(), Some("0.27.0"));
         assert_eq!(manifest_exact_pin(manifest, "tree-sitter-highlight").as_deref(), Some("0.27.0"));
+    }
+
+    #[test]
+    fn the_makefile_reader_reads_one_literal_assignment() {
+        let mk = "TREE_SITTER_EXPECTED_VERSION := 0.27.0\nTREE_SITTER_ROOT := .tools\n\
+                  TREE_SITTER = $(TREE_SITTER_ROOT)/bin/tree-sitter\nDIST_DIR ?= dist\n\
+                  build:\n\techo TREE_SITTER_ROOT=elsewhere\n";
+        assert_eq!(makefile_assignment(mk, "TREE_SITTER_EXPECTED_VERSION").as_deref(), Some("0.27.0"));
+        // A longer name sharing the prefix, and the recipe line, are not it.
+        assert_eq!(makefile_assignment(mk, "TREE_SITTER_ROOT").as_deref(), Some(".tools"));
+        assert_eq!(makefile_assignment(mk, "DIST_DIR").as_deref(), Some("dist"));
+        assert_eq!(makefile_assignment(mk, "TREE_SITTER"), None, "a reference is not a literal");
+        assert_eq!(makefile_assignment(mk, "MISSING"), None);
+        let twice = "TREE_SITTER_ROOT := .tools\nTREE_SITTER_ROOT := other\n";
+        assert_eq!(makefile_assignment(twice, "TREE_SITTER_ROOT"), None, "two values are no one value");
     }
 }
