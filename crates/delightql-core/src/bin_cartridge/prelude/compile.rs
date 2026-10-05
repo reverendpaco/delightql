@@ -69,16 +69,16 @@ impl BinEntity for CompilePredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        false
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for CompilePredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Pure
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],
@@ -139,7 +139,11 @@ impl EffectExecutable for CompilePredicate {
             );
             let lit = |n: &str| {
                 Box::new(DomainExpression::Application(FunctionApplication::Ground(
-                    LiteralValue::Number(n.to_string()),
+                    LiteralValue::Number(
+                        crate::pipeline::asts::core::NumericLiteral::from_decimal_spelling(
+                            n.to_string(),
+                        ),
+                    ),
                 )))
             };
             let empty = Chain::authored(GroundForm::Literal(source)).then(Step::authored(
@@ -165,30 +169,30 @@ impl EffectExecutable for CompilePredicate {
                         subquery: Box::new(empty),
                     },
                 alias: alias.map(Into::into),
-                outer: false,
             })));
         }
         let mut all_rows = Vec::new();
         let mut headers = None;
         for row in rows {
             let EntityResult::Relation(head) = self.execute(row, alias.clone(), system)?;
-            if let GroundForm::Literal(AnonRelation { table, .. }) = head {
+            if let GroundForm::Literal(head) = head {
+                let table = head.into_combined_table(super::compile_result_combination_authority());
                 if headers.is_none() {
                     headers = table.body.header;
                 }
                 all_rows.extend(table.body.rows.into_vec());
             }
         }
-        Ok(EntityResult::Relation(GroundForm::Literal(AnonRelation {
-            table: AnonTable {
-                body: TabularBody {
-                    header: headers,
-                    rows: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(all_rows)
-                        .expect("a nonempty lift produces a row per input"),
-                },
+        let table = AnonTable {
+            body: TabularBody {
+                header: headers,
+                rows: crate::pipeline::asts::vocabulary::Vec1::try_from_vec(all_rows)
+                    .expect("a nonempty lift produces a row per input"),
             },
-            alias: alias.map(|s| s.into()),
-            outer: false,
+        };
+        Ok(EntityResult::Relation(GroundForm::Literal(match alias {
+            Some(alias) => AnonRelation::authored(table, alias.into()),
+            None => AnonRelation::plain(table),
         })))
     }
 }
@@ -198,14 +202,13 @@ fn compile_to_stage(
     stage: &str,
     source: &str,
 ) -> Result<String> {
-    // Compile purity: rendering "cst" or "ast-unresolved" never enters
-    // the effect executor, so any source may be inspected shallowly. Every deeper
-    // stage would run the effect executor
-    // (and inline-DDL processing) against the SHARED system — compiling a
-    // consult!/run!/enlist! must not consult, run, or enlist. Walk the
-    // unresolved AST first and refuse executing demands cleanly; the
-    // refusal surfaces through compile's ordinary error columns.
-    let registry = system.bin_registry();
+    // Compile purity: rendering "cst" or "ast-unresolved" executes nothing,
+    // so any source may be inspected shallowly. A deeper stage is the
+    // middle's inspection against the SHARED system — compiling a
+    // consult!/run!/enlist! must not consult, run, or enlist, and an inline
+    // DDL block must not register. Walk the unresolved AST first and refuse
+    // a directive cleanly; the refusal surfaces through compile's ordinary
+    // error columns.
     let mut pipeline = Pipeline::new(source, system);
     if !matches!(stage, "cst" | "ast-unresolved") {
         pipeline.execute_to_query_unresolved()?;
@@ -223,11 +226,48 @@ fn compile_to_stage(
         let query = pipeline
             .query_unresolved()
             .expect("execute_to_query_unresolved populates the unresolved query");
-        crate::pipeline::effect_executor::refuse_executing_demands_for_inspection(
-            query, &registry, stage,
-        )?;
+        refuse_executing_demands(query, stage)?;
+        // Every inspection past the front end is the new middle's.
+        drop(pipeline);
+        return crate::pipeline::middle::api::inspect(system, stage, source);
     }
     pipeline.render_stage(stage)
+}
+
+/// COMPILE PURITY: a directive (a `!` callee, by the grammar) acts when its
+/// statement runs, so it refuses a pure inspection past the front end before
+/// anything compiles. A DML terminal lowers to SQL and acts only when the
+/// compiled query runs, so inspecting it is pure, and it is refused here too
+/// only by its `!`. A relation the runtime executes is the new middle's to
+/// judge: the inspection refuses it where it judges what the text reads.
+fn refuse_executing_demands(query: &Query, stage: &str) -> Result<()> {
+    use crate::pipeline::ast_visit::{walk_visit_query, AstVisit, Descent};
+    use crate::pipeline::asts::core::Unresolved;
+    struct Guard<'a> {
+        stage: &'a str,
+    }
+    impl AstVisit<Unresolved> for Guard<'_> {
+        fn enter_relation(&mut self, relation: &Relation) -> Result<Descent> {
+            match relation {
+                Relation::FunctorCall { call, .. } if call.call().callee.name_text().ends_with('!') => {
+                    Err(DelightQLError::from(Effect::CompilePurity {
+                        message: format!(
+                            "sys::execution.compile is pure: compiling to stage '{}' would \
+                             execute '{}' — inspection must never mutate the namespace, \
+                             database, filesystem, output, or session. Compile to 'cst' or \
+                             'ast-unresolved' to inspect this source, or run it as a query \
+                             to execute it.",
+                            self.stage,
+                            call.call().callee.name_text()
+                        ),
+                    }))
+                }
+                _ => Ok(Descent::Continue),
+            }
+        }
+    }
+    walk_visit_query(&mut Guard { stage }, query)?;
+    Ok(())
 }
 
 fn extract_string_literal(expr: &DomainExpression, arg_name: &str) -> Result<String> {
@@ -284,18 +324,18 @@ fn build_compile_result(
             None => null_literal(),
         },
     ];
-    GroundForm::Literal(AnonRelation {
-        table: AnonTable::from_values(Some(headers), vec![row])
-            .expect("compile publishes one nonempty row"),
-        alias: alias.map(|s| s.into()),
-        outer: false,
+    let table = AnonTable::from_values(Some(headers), vec![row])
+        .expect("compile publishes one nonempty row");
+    GroundForm::Literal(match alias {
+        Some(alias) => AnonRelation::authored(table, alias.into()),
+        None => AnonRelation::plain(table),
     })
 }
 
 #[cfg(test)]
 mod purity_tests {
-    //! Compile purity: inspecting source must never enter the effect executor
-    //! execution against the shared system. Executing demands refuse
+    //! Compile purity: inspecting source must never execute against the
+    //! shared system. Executing demands refuse
     //! cleanly at deep stages, stay inspectable at shallow stages, and
     //! DML remains compilable because it lowers to SQL without effect
     //! execution.
@@ -350,61 +390,7 @@ mod purity_tests {
             "ast-unresolved",
             r#"enlist!("std::string")(*)"#,
         )
-        .expect("ast-unresolved never enters the effect executor");
+        .expect("ast-unresolved executes nothing");
         assert!(repr.contains("enlist"), "{repr}");
-    }
-
-    /// EXECUTION IS JUDGED BY THE COMPILATION THAT CAUSED IT.
-    ///
-    /// Through the PRODUCTION road: a DQL query pipes a source into the
-    /// runtime-served relation, the effect executor reaches it, and the body
-    /// it is handed is compiled inside the outer compilation. Policy moves
-    /// after the outer arena is armed and before the query runs, so a nested
-    /// arena that re-read policy instead of inheriting would answer with the
-    /// moved number and this would see it.
-    ///
-    /// The probe is SHALLOW on purpose: the armed depth is small and the body
-    /// is just past it, so nothing here walks near either real ceiling.
-    #[test]
-    fn the_served_compilation_inherits_the_causing_one_s_budget() {
-        use crate::compiler_limits::{ProcessLimitLease, NESTING};
-
-        const ARMED: usize = 20;
-        const MOVED_TO: usize = 900;
-        let depth = ARMED * 2;
-
-        let _lease = ProcessLimitLease::take();
-        NESTING.set(ARMED);
-
-        let body = format!(
-            "_(x @ 1) |> ({}x{} as v)",
-            "(".repeat(depth),
-            ")".repeat(depth)
-        );
-        let query = format!(r#"_("sql", "{body}") |> sys::execution.compile(*)"#);
-
-        let mut system = fresh_system();
-        // ARMED here, by the pipeline the query belongs to.
-        let mut pipeline = Pipeline::new(&query, &mut system);
-        // The host moves policy while that compilation is in flight.
-        NESTING.set(MOVED_TO);
-
-        let sql = pipeline
-            .execute_to_sql()
-            .expect("compile reports the inner refusal in its own columns")
-            .to_string();
-
-        assert!(
-            sql.contains("operational/resource/nesting"),
-            "the served body must refuse on depth: {sql}"
-        );
-        assert!(
-            sql.contains(&format!("budget is {ARMED}")),
-            "the served compilation must answer to its caller's arming: {sql}"
-        );
-        assert!(
-            !sql.contains(&format!("budget is {MOVED_TO}")),
-            "and not to the policy that moved under it: {sql}"
-        );
     }
 }

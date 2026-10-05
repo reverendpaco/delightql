@@ -7,24 +7,24 @@ postfixing its name with `:`{.delightql .sigil} and using interior notation.
 **Uncorrelated**. The subquery is independent of the outer query:
 
 ```{.delightql .numberLines}
-employee(*)
-    |> (FirstName,
-        LastName,
-        Salary,
-        employee:( ~> avg:(Salary)) as AvgSalary)
+invoice(*)
+    |> (invoice_id,
+        billing_country,
+        total,
+        invoice:( ~> avg:(total)) as avg_total)
 ```
 
 ```sql
 select
-  FirstName,
-  LastName,
-  Salary,
-  (select avg(Salary) from employee) as AvgSalary
-from employee;
+  invoice_id,
+  billing_country,
+  total,
+  (select avg(total) from invoice) as avg_total
+from invoice;
 ```
 
 The F-COLON sigil `:`{.delightql .sigil} after the relation name signals a scalar subquery. The
-interior notation--here `~> avg:(Salary)`{.delightql} -- must produce exactly one row and one
+interior notation--here `~> avg:(total)`{.delightql} -- must produce exactly one row and one
 column.
 
 **Correlated**. The subquery references values from the outer query. Use an explicit condition to correlate on a column:
@@ -32,12 +32,12 @@ column.
 :::::{.widen}
 `tpt:#numbering_on()`
 ```{.delightql .numberLines}
-employee(*) as e
-    |> (FirstName,
-        LastName,
-        Salary,
-        employee:( ~> avg:(Salary)) as AvgSalary,
-        employee:( , DepartmentName = e.DepartmentName ~> avg:(Salary)) as AvgSalaryInDept)
+invoice(*) as i
+    |> (invoice_id,
+        billing_country,
+        total,
+        invoice:( ~> avg:(total)) as avg_total,
+        invoice:( , billing_country = i.billing_country ~> avg:(total)) as avg_total_in_country)
 ```
 `tpt:#numbering_off()`
 :::::::
@@ -45,11 +45,11 @@ employee(*) as e
 
 ```sql
 select
-  FirstName,
-  LastName,
-  Salary,
-  (select avg(Salary) from employee) as AvgSalary,
-  (select avg(Salary) from employee
-      where DepartmentName = e.DepartmentName) as AvgSalaryInDept
-from employee e;
+  invoice_id,
+  billing_country,
+  total,
+  (select avg(total) from invoice) as avg_total,
+  (select avg(total) from invoice
+      where billing_country = i.billing_country) as avg_total_in_country
+from invoice i;
 ```

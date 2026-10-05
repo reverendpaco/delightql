@@ -148,6 +148,9 @@ fn enrich_option_values(surface: &mut Surface) {
         let (class, grade) = match *fmt {
             "table" | "box" | "list" => (Some("porcelain"), None),
             "raw" => (Some("plumbing"), Some("frozen")),
+            // The digests: the same frozen plumbing as the `--to` stages
+            // that print them for a pure statement.
+            "hash" | "totalhash" | "fingerprint" => (Some("plumbing"), Some("frozen")),
             _ => (Some("plumbing"), Some("versioned")), // json, jsonl, csv, tsv
         };
         surface.option_values.push((
@@ -183,7 +186,7 @@ fn enrich_option_values(surface: &mut Surface) {
     for v in surface.option_values.iter_mut() {
         if v.1 == "--to" {
             match v.2.as_str() {
-                "hash" | "bhash" | "totalhash" | "fingerprint" => {
+                "hash" | "totalhash" | "fingerprint" => {
                     v.4 = Some("plumbing".to_string());
                     v.5 = Some("frozen".to_string());
                 }
@@ -211,13 +214,6 @@ fn seed_envs(surface: &mut Surface) {
         (
             "DQL_FATBOY_DIR",
             "Hard-pins the adapter binary directory (only this directory is searched)",
-            None,
-        ),
-        (
-            "DQL_NAME_POLICY",
-            "How a name the compiler invented is spelled: 'poison' (default, \
-             drawn fresh each compilation) or 'canonical' (<mint:N>, for a \
-             contract lane); unknown values refuse",
             None,
         ),
         (

@@ -241,9 +241,7 @@ mod tests {
         let ground = Access::from_terms(vec![
             lvar("a"),
             DomainExpression::Application(
-                crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::Number(
-                    "30".into(),
-                )),
+                crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::integer(30)),
             ),
         ]);
         assert!(ground.binders().is_none());
@@ -262,9 +260,7 @@ mod tests {
                 crate::pipeline::asts::core::DomainHole::Disregarded,
             )),
             DomainExpression::Application(
-                crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::Number(
-                    "30".into(),
-                )),
+                crate::pipeline::asts::core::FunctionApplication::Ground(LiteralValue::integer(30)),
             ),
         ] {
             assert_eq!(Slot::classify(term.clone()).term(), Some(term));

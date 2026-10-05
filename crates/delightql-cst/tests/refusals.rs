@@ -25,7 +25,7 @@ use support::refuses;
 #[test]
 fn there_is_one_pipe_glyph_per_composition_family() {
     refuses("users(*) |>> (a)");
-    refuses("users(*) |> (a /->> f:(@))");
+    refuses("users(*) |> (a >>> f:(@))");
 }
 
 /// THE ONE ACCESSOR takes exactly one path, spelled with its steps: `:[1]`
@@ -163,6 +163,17 @@ fn the_two_curly_sides_do_not_accept_each_others_members() {
     refuses("users(*) |> ({.a.b} as g)");
     // A keyed VALUE is construction-side; a pattern binds a name there.
     refuses("users(*), doc ~= {\"k\": 1 + 2}");
+}
+
+/// A scalar-array binder is the target of an iteration, not a positional
+/// array pattern. Without `~>` there is no cardinality-changing operation to
+/// give the binder one value per element, at the root or under an object key.
+#[test]
+fn a_scalar_array_binder_requires_its_iteration() {
+    refuses("_(doc @ \"\"\"[1,2]\"\"\"), doc ~= [item]");
+    refuses(
+        "_(doc @ \"\"\"{\"roles\":[1,2]}\"\"\"), doc ~= {\"roles\": [role]}",
+    );
 }
 
 /// A bare relex is not a definition file entry: every query in the canonical

@@ -40,6 +40,22 @@ pub enum Parse {
     #[error("Parse error: multi-query input rejected: found {count} queries in one submission (send each query separately, or run the file through the sequential entrance)")]
     MultiQuery { count: usize },
 
+    /// A submission declared definitions beside the goal it runs. A
+    /// submission either runs one goal or declares definitions, so a
+    /// definition written after a query would otherwise have nowhere to go.
+    /// Send the definitions as a submission of their own, or in a
+    /// `(~~ddl ~~)` block beside the query.
+    #[leaf("definitions_beside_goal", class = Syntax, summary = "Definitions stood beside a goal in one submission.")]
+    #[error("Parse error: this submission declares {count} definition clause(s) beside its query; send the definitions as a submission of their own, or in a (~~ddl ~~) block")]
+    DefinitionsBesideGoal { count: usize },
+
+    /// A file that declares the query-sequence entrance was supplied where
+    /// a definition library is required. Query sequences are executable
+    /// programs, not consultable definitions.
+    #[leaf("file_category", class = Syntax, summary = "A source file declares a category the consuming entrance cannot accept.")]
+    #[error("Parse error: a query-sequence file cannot be consulted as a definition file")]
+    FileCategory,
+
     /// One goal declares one expected error. A second `(~~error … ~~)` on
     /// the same goal leaves the runner unable to say which was meant.
     #[leaf("error_hook/repeated", class = Syntax, summary = "One goal declared two expected errors.")]
@@ -205,6 +221,15 @@ pub enum Parse {
     #[error("Parse error: {message}")]
     DirectivePosition { message: String },
 
+    /// `$.x` reads the scalar formal `x` of an enclosing relational or
+    /// effect higher-order clause. It is one glued form — the sigil and the
+    /// formal's name, no space between — and it is a value: a formal is
+    /// declared bare in its head, and a reference names, declares and
+    /// addresses no column. A bound or an ordinal reads a formal as `$.n`.
+    #[leaf("parameter_reference", class = Syntax, summary = "A `$.x` parameter reference is malformed or out of place.")]
+    #[error("Parse error: {message}")]
+    ParameterReference { message: String },
+
     /// A label ASSERTS what its body is. A binding whose body demands a
     /// directive is an effect binding, so its label carries the mark: write
     /// `: name!`.
@@ -249,9 +274,11 @@ pub enum Parse {
     /// `&` bounds arguments only in a two-group call, where the lifted rows
     /// follow it and dissolve into an anonymous-table argument
     /// (`f(users(*) & 1, 2)(*)`). A one-group call's parentheses are its
-    /// arguments alone, so a `&` tail there has no meaning. The projection
-    /// the tail reaches for belongs to the ACCESS group:
-    /// `json_each(doc, path)(value, type)`.
+    /// arguments alone, so a `&` tail there has no meaning. The message
+    /// rewrites the call: a tail of bare names is a projection, which
+    /// belongs to the ACCESS group (`json_each(doc, path)(value, type)`);
+    /// a tail of values is lifted rows, and the call needs its access group
+    /// after them (`like_any(x & "a"; "b")(*)`).
     #[leaf("lift_tail", class = Syntax, summary = "A lift tail stood in a one-group call.")]
     #[error("Parse error: {message}")]
     LiftTail { message: String },
@@ -280,6 +307,19 @@ pub enum Parse {
     #[leaf("pattern_qualified", class = Syntax, summary = "A pattern member cannot be qualified.")]
     #[error("Parse error: {message}")]
     PatternQualified { message: String },
+
+    /// A column regex ignores case by default, as a column reference does,
+    /// so `i` restates it: one spelling per meaning. The one flag is `c`,
+    /// which makes the match case-sensitive: `/Date/c`.
+    #[leaf("regex_ignore_case", class = Syntax, summary = "A column regex was flagged `i`, which is already its default.")]
+    #[error("Parse error: {message}")]
+    RegexIgnoreCase { message: String },
+
+    /// A column regex takes one flag, `c`, glued to its closing slash; any
+    /// other letter there is not a flag.
+    #[leaf("regex_flag", class = Syntax, summary = "A column regex carried an unknown flag.")]
+    #[error("Parse error: {message}")]
+    RegexFlag { message: String },
 
     /// The mixed argument list does not embed the relation grammar: a set
     /// expression, a pipeline, or a join has no derivation inside `f(…)`.
@@ -311,20 +351,29 @@ pub enum ParseAnon {
     #[leaf("empty", class = Syntax, summary = "There is no empty anonymous table.")]
     #[error("Parse error: {message}")]
     Empty { message: String },
-}
 
-impl Parse {
-    /// Whether this refusal says only that the text failed to parse. The
-    /// generic refusals carry a position and the parser's expectation, and
-    /// nothing an author is being taught; every other member is a TEACHING
-    /// whose identity is what it publishes. A consulted file's generic parse
-    /// failure is a consult failure and is wrapped as one; a teaching keeps
-    /// its identity through that wrapper, because re-badging it would bury
-    /// the identity the teaching exists to publish.
-    pub fn is_generic(&self) -> bool {
-        matches!(
-            self,
-            Parse::General { .. } | Parse::Ddl { .. } | Parse::Sigil { .. }
-        )
-    }
+    /// A bare singleton `name@value` is the anonymous table of ONE row and
+    /// one column, so it has no second row to separate. Several rows are
+    /// the wrapped form: `_(a @ 1; 2)`. The grammar recognizes the extra
+    /// rows as a refusal witness, so the whole statement is the one refused.
+    #[leaf("singleton_rows", class = Syntax, summary = "A bare singleton was given several rows.")]
+    #[error("Parse error: {message}")]
+    SingletonRows { message: String },
+
+    /// The name left of a bare singleton's `@` is the column it publishes,
+    /// and a published column carries no qualifier. Name the singleton's
+    /// table with `as`: `a@2 as g` publishes `g.a`. To test an existing
+    /// qualified position, compare it: `g.a = 2`.
+    #[leaf("singleton_qualified", class = Syntax, summary = "A bare singleton named a qualified column.")]
+    #[error("Parse error: {message}")]
+    SingletonQualified { message: String },
+
+    /// The word left of a bare singleton's `@` is the column it publishes.
+    /// `true`, `false` and `null` are literals there, as they are in a
+    /// written header, where `_(true @ 2)` is a row that must equal the
+    /// value rather than a column named `true`. Strop the word to publish a
+    /// column of that name: `` `true`@2 ``.
+    #[leaf("singleton_literal", class = Syntax, summary = "A bare singleton's column was a literal word.")]
+    #[error("Parse error: {message}")]
+    SingletonLiteral { message: String },
 }

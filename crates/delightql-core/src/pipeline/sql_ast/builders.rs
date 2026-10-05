@@ -2,7 +2,7 @@
 // Copyright 2026 Daniel Eklund
 use super::expressions::DomainExpression;
 use super::ordering::{Limit, OrderTerm};
-use super::query::{QueryExpression, SelectStatement};
+use super::query::SelectStatement;
 use super::select_items::SelectItem;
 use super::table::TableExpression;
 
@@ -18,6 +18,11 @@ pub struct SelectBuilder {
 }
 
 impl SelectBuilder {
+    #[cfg(test)]
+    pub fn select(mut self, item: SelectItem) -> Self {
+        self.select_list.push(item);
+        self
+    }
     pub fn new() -> Self {
         SelectBuilder {
             distinct: false,
@@ -36,23 +41,8 @@ impl SelectBuilder {
         self
     }
 
-    pub fn select(mut self, item: SelectItem) -> Self {
-        self.select_list.push(item);
-        self
-    }
-
     pub fn select_all(mut self, items: Vec<SelectItem>) -> Self {
         self.select_list.extend(items);
-        self
-    }
-
-    pub fn set_select(mut self, items: Vec<SelectItem>) -> Self {
-        self.select_list = items;
-        self
-    }
-
-    pub fn from_subquery(mut self, query: QueryExpression, alias: crate::names::ScopeId) -> Self {
-        self.from = Some(vec![TableExpression::subquery(query, alias)]);
         self
     }
 
@@ -63,16 +53,6 @@ impl SelectBuilder {
 
     pub fn where_clause(mut self, expr: DomainExpression) -> Self {
         self.where_clause = Some(expr);
-        self
-    }
-
-    /// Add an AND condition to WHERE clause
-    /// If no WHERE exists, sets it. If WHERE exists, combines with AND.
-    pub fn and_where(mut self, expr: DomainExpression) -> Self {
-        self.where_clause = match self.where_clause {
-            None => Some(expr),
-            Some(existing) => Some(DomainExpression::and(vec![existing, expr])),
-        };
         self
     }
 
@@ -97,13 +77,6 @@ impl SelectBuilder {
     pub(in crate::pipeline) fn limit_from(mut self, limit: Limit) -> Self {
         self.limit = Some(limit);
         self
-    }
-
-    /// The row clause already standing on this select. A caller adding one
-    /// asks first, because a second clause is a bound over the FIRST one's
-    /// result and cannot replace it.
-    pub(in crate::pipeline) fn limit_clause(&self) -> Option<&Limit> {
-        self.limit.as_ref()
     }
 
     pub(in crate::pipeline) fn rebuilding(

@@ -265,10 +265,10 @@ fn collect_extras(tree: &SyntaxTree) -> Vec<Extra> {
         .filter_map(|node| {
             let kind = node.typed_kind()?;
             // The grammar's own `extras` set. `comment` is the one that runs
-            // to end of line; the session tools are delimited.
+            // to end of line; a smart comment is delimited.
             let runs_to_end_of_line = match kind {
                 cst::Kind::Comment => true,
-                cst::Kind::SmartComment | cst::Kind::StopPoint | cst::Kind::DebugPoint => false,
+                cst::Kind::SmartComment => false,
                 _ => return None,
             };
             let range = tree.byte_range(node)?;

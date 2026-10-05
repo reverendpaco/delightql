@@ -1,0 +1,3 @@
+// `option` is a reserved word, stropped in both positions: the admission law
+// refuses a reserved word bare in every naming position, qualified or not.
+`option`(*) :- repl::data.`option`(*)

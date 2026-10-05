@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 delightql-core = { path = "../delightql-core" }
 delightql-types = { path = "../delightql-types" }
 delightql-protocol = { path = "../delightql-protocol" }
+delightql-cst = { path = "../delightql-cst" }
 
 # WASM bindings
 wasm-bindgen = "0.2"
@@ -29,8 +30,10 @@ serde-wasm-bindgen = "0.6"
 # Better panic messages in browser console (optional)
 console_error_panic_hook = { version = "0.1", optional = true }
 
-# Allocators for WASM (fixes tree-sitter memory corruption)
-# dlmalloc is more robust than wee_alloc for complex allocations like tree-sitter
+# The module's one allocator. The Tree-sitter runtime's C allocation calls
+# are served by Rust's global allocator on this target, so the parser and
+# the host share this heap; a second allocator in the module is the
+# historical corruption.
 dlmalloc = { version = "0.2", features = ["global"] }
 
 [features]

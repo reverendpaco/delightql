@@ -5,9 +5,9 @@
 
 Individual facts define point mappings:
 ```delightql
-department_kind:("engineering" -> "tech")
-department_kind:("data science" -> "tech")
-department_kind:(_ -> "other")
+title_kind:("IT Manager" -> "tech")
+title_kind:("IT Staff" -> "tech")
+title_kind:(_ -> "other")
 ```
 
 This is equivalent to the stacked form but spread across statements. Use it when mappings are added incrementally or loaded from external sources.

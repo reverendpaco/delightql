@@ -11,12 +11,13 @@ from ctypes import (
     c_char_p,
     c_int32,
     c_size_t,
+    c_uint8,
     c_uint64,
     c_void_p,
 )
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
-__all__ = ["Database", "DqlError", "split_queries"]
+__all__ = ["Database", "DqlError", "digest_rows", "digest_version", "split_queries"]
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,7 @@ class _DqlColumnInfo(ctypes.Structure):
         ("name", c_char_p),
         ("position", c_size_t),
         ("type_name", c_char_p),
+        ("minted", c_uint8),
     ]
 
 
@@ -129,6 +131,17 @@ _lib.dql_split_queries.argtypes = [c_char_p, POINTER(c_void_p)]
 _lib.dql_free_split_result.restype = None
 _lib.dql_free_split_result.argtypes = [POINTER(_DqlSplitResult)]
 
+# dql_digest_version() -> static const char * (never freed)
+_lib.dql_digest_version.restype = c_char_p
+_lib.dql_digest_version.argtypes = []
+
+# dql_digest_rows(data, data_len, cell_lens, num_rows, num_cols, error_out)
+#   -> char * (free with dql_free_string; c_void_p keeps the raw pointer)
+_lib.dql_digest_rows.restype = c_void_p
+_lib.dql_digest_rows.argtypes = [
+    c_void_p, c_size_t, POINTER(ctypes.c_int64), c_size_t, c_size_t, POINTER(c_void_p)
+]
+
 
 # ---------------------------------------------------------------------------
 # Error handling
@@ -156,16 +169,24 @@ def _check_error(error_out: ctypes.Array) -> None:
 
 
 class QueryResult:
-    """Thin wrapper around a pending query's metadata."""
+    """Thin wrapper around a pending query's metadata.
 
-    __slots__ = ("query_id", "columns")
+    ``minted[i]`` is True when the compiler minted ``columns[i]``: its
+    spelling moves between compilations, so do not key on it.
+    """
 
-    def __init__(self, query_id: int, columns: List[str]) -> None:
+    __slots__ = ("query_id", "columns", "minted")
+
+    def __init__(self, query_id: int, columns: List[str], minted: List[bool]) -> None:
         self.query_id = query_id
         self.columns = columns
+        self.minted = minted
 
     def __repr__(self) -> str:
-        return f"QueryResult(query_id={self.query_id}, columns={self.columns!r})"
+        return (
+            f"QueryResult(query_id={self.query_id}, columns={self.columns!r}, "
+            f"minted={self.minted!r})"
+        )
 
 
 class Database:
@@ -201,20 +222,26 @@ class Database:
         result = _lib.dql_query(self._handle, dql.encode("utf-8"), error_out)
         _check_error(error_out)
         columns: List[str] = []
+        minted: List[bool] = []
         for i in range(result.num_columns):
             col = result.columns[i]
             columns.append(col.name.decode("utf-8") if col.name else "")
+            minted.append(bool(col.minted))
         qid = result.query_id
         _lib.dql_free_query_result(ctypes.byref(result))
-        return QueryResult(query_id=qid, columns=columns)
+        return QueryResult(query_id=qid, columns=columns, minted=minted)
 
-    # Cell = str | None (raw UTF-8 from the protocol, no type coercion)
+    # Cell = str | None: a protocol cell decoded as UTF-8 (lossy for bytes
+    # that are not UTF-8), None being SQL NULL.
     CellValue = Optional[str]
+    # RawCell = bytes | None: the protocol cell itself.
+    RawCell = Optional[bytes]
 
-    def fetch(
+    def fetch_raw(
         self, query_id: int, count: int = 256
-    ) -> Tuple[List[List["Database.CellValue"]], bool]:
-        """Fetch up to *count* rows.  Returns ``(rows, finished)``."""
+    ) -> Tuple[List[List["Database.RawCell"]], bool]:
+        """Fetch up to *count* rows as the protocol delivered them: each cell
+        its bytes, or None for SQL NULL.  Returns ``(rows, finished)``."""
         self._ensure_open()
         error_out = (c_void_p * 1)()
         result = _lib.dql_fetch(self._handle, query_id, count, error_out)
@@ -227,8 +254,7 @@ class Database:
                 for c in range(ncols):
                     cell = result.cells[r * ncols + c]
                     if cell.data:
-                        raw = ctypes.string_at(cell.data, cell.len)
-                        row.append(raw.decode("utf-8", errors="replace"))
+                        row.append(ctypes.string_at(cell.data, cell.len))
                     else:
                         row.append(None)
                 rows.append(row)
@@ -236,6 +262,13 @@ class Database:
         finally:
             _lib.dql_free_fetch_result(ctypes.byref(result))
         return rows, finished
+
+    def fetch(
+        self, query_id: int, count: int = 256
+    ) -> Tuple[List[List["Database.CellValue"]], bool]:
+        """Fetch up to *count* rows, cells decoded.  Returns ``(rows, finished)``."""
+        rows, finished = self.fetch_raw(query_id, count)
+        return [[_decode(cell) for cell in row] for row in rows], finished
 
     def close_query(self, query_id: int) -> None:
         """Release server-side resources for a query."""
@@ -246,19 +279,26 @@ class Database:
         if rc != 0:
             raise DqlError(f"dql_close_query returned {rc}")
 
-    def execute(
+    def execute_raw(
         self, dql: str
-    ) -> Tuple[List[str], List[List["Database.CellValue"]]]:
-        """Convenience: query → fetch all → close.  Returns ``(columns, rows)``."""
+    ) -> Tuple[List[str], List[List["Database.RawCell"]]]:
+        """Query → fetch all raw → close.  Returns ``(columns, rows)``."""
         qr = self.query(dql)
         all_rows: list = []
         while True:
-            batch, finished = self.fetch(qr.query_id)
+            batch, finished = self.fetch_raw(qr.query_id)
             all_rows.extend(batch)
             if finished:
                 break
         self.close_query(qr.query_id)
         return qr.columns, all_rows
+
+    def execute(
+        self, dql: str
+    ) -> Tuple[List[str], List[List["Database.CellValue"]]]:
+        """Convenience: query → fetch all → close.  Returns ``(columns, rows)``."""
+        columns, rows = self.execute_raw(dql)
+        return columns, [[_decode(cell) for cell in row] for row in rows]
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -279,6 +319,51 @@ class Database:
 # ---------------------------------------------------------------------------
 # Standalone functions
 # ---------------------------------------------------------------------------
+
+
+def _decode(cell: Optional[bytes]) -> Optional[str]:
+    return None if cell is None else cell.decode("utf-8", errors="replace")
+
+
+def digest_version() -> str:
+    """The name of the digest framing ``digest_rows`` computes."""
+    return _lib.dql_digest_version().decode("ascii")
+
+
+def digest_rows(rows: Sequence[Sequence[Optional[bytes]]], num_cols: int) -> str:
+    """The result digest of *rows* — raw cells, None being SQL NULL — as
+    lowercase hex: the digest the CLI's ``-f hash`` prints.  It is computed
+    by the library, never here; pass the bytes ``fetch_raw`` returned."""
+    lens: List[int] = []
+    chunks: List[bytes] = []
+    for row in rows:
+        if len(row) != num_cols:
+            raise DqlError(f"a row of {len(row)} cells in a {num_cols}-column result")
+        for cell in row:
+            if cell is None:
+                lens.append(-1)
+            else:
+                lens.append(len(cell))
+                chunks.append(cell)
+    data = b"".join(chunks)
+    data_buf = ctypes.create_string_buffer(data, len(data)) if data else None
+    lens_buf = (ctypes.c_int64 * len(lens))(*lens) if lens else None
+    error_out = (c_void_p * 1)()
+    ptr = _lib.dql_digest_rows(
+        ctypes.cast(data_buf, c_void_p) if data_buf is not None else None,
+        len(data),
+        lens_buf,
+        len(rows),
+        num_cols,
+        error_out,
+    )
+    _check_error(error_out)
+    if not ptr:
+        raise DqlError("dql_digest_rows returned NULL without setting an error")
+    try:
+        return ctypes.string_at(ptr).decode("ascii")
+    finally:
+        _lib.dql_free_string(ptr)
 
 
 def split_queries(dql: str) -> List[str]:

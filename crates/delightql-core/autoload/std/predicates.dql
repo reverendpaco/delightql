@@ -1,0 +1,13 @@
+like_any(x, P(pattern))(*) :-
+  (~~docs
+    The patterns in P that x is like, one row each. Under existence it is
+    a test: +like_any(x & "a%"; "b%")(*) holds when x matches at least one
+    pattern, and \+like_any(...)(*) when it matches none. Matching is
+    like's: % stands for any run of characters and _ for one, and case
+    follows the target's own LIKE. P's one column is read by position, so
+    any single-column relation serves: +like_any(name, prefixes(*))(*).
+    Without the mark it joins instead, and each row gains the pattern it
+    matched, once per match. A NULL x matches no pattern, so \+like_any
+    holds for it.
+  ~~)
+  P(*), +like($.x, pattern)

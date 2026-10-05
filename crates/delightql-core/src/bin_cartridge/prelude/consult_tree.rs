@@ -54,16 +54,16 @@ impl BinEntity for ConsultTreePredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for ConsultTreePredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],
@@ -82,75 +82,84 @@ impl EffectExecutable for ConsultTreePredicate {
         let dir_path = super::consult::extract_string_literal(&arguments[0], "dir_path")?;
         let root_namespace =
             super::consult::extract_string_literal(&arguments[1], "root_namespace")?;
-
-        if root_namespace.is_empty() {
-            return Err(DelightQLError::from(DirectiveBinding::Value {
-                message: "consult_tree!() root_namespace cannot be empty".to_string(),
-            }));
-        }
-
-        // Resolve relative path against session CWD (for test isolation).
-        let resolved_dir = crate::session_cwd::resolve_path(&dir_path);
-        let dir = resolved_dir.as_path();
-        if !dir.exists() || !dir.is_dir() {
-            return Err(DelightQLError::from(Runtime::Io {
-                message: format!(
-                    "consult_tree!() directory '{}' does not exist or is not a directory",
-                    dir_path
-                ),
-            }));
-        }
-
-        // Collect all .dql files recursively
-        let mut dql_files = Vec::new();
-        collect_dql_files(dir, &mut dql_files)?;
-        dql_files.sort();
-
-        // Consult each file; the collection becomes the receipt's
-        // `returned` tree (EFFECT-ALGEBRA §3/§8): one interior row
-        // per consulted file,
-        // cardinality back to zero-or-one.
-        let mut returned_rows: Vec<Vec<Option<String>>> = Vec::new();
-        for file_path in &dql_files {
-            let relative = file_path.strip_prefix(dir).unwrap_or(file_path.as_path());
-            let stem = relative
-                .to_string_lossy()
-                .strip_suffix(".dql")
-                .unwrap_or(&relative.to_string_lossy())
-                .to_string();
-            let ns_suffix = stem.replace('/', "::");
-            let namespace = format!("{}::{}", root_namespace, ns_suffix);
-
-            let file_path_str = file_path.to_string_lossy().to_string();
-            let count = super::consult::execute_consult(
-                system,
-                &file_path_str,
-                &namespace,
-                Some(&root_namespace),
-            )?;
-
-            returned_rows.push(vec![
-                Some(file_path_str),
-                Some(namespace),
-                Some(count.to_string()),
-            ]);
-        }
-
-        if returned_rows.is_empty() {
-            return Err(DelightQLError::from(Runtime::General {
-                message: format!("consult_tree!() found no .dql files in '{}'", dir_path),
-                details: "Empty directory tree".to_string(),
-            }));
-        }
+        let returned_rows = consult_tree_act(system, &dir_path, &root_namespace)?;
 
         Ok(EntityResult::Relation(super::descriptor_tree_receipt(
             "consult_tree",
             &[Some(dir_path.clone()), Some(root_namespace.clone())],
-            &["path", "namespace", "definitions"],
+            crate::pipeline::asts::effects::ReceiptPayload::ConsultedFiles.heading().unwrap_or_default(),
             &returned_rows,
             alias,
         )))
     }
+}
+
+/// THE ACT: consult every `.dql` file under `dir_path`, each into its path's
+/// namespace beneath `root_namespace`, and answer one row per consulted file
+/// (`⟦path, namespace, definitions⟧`).
+pub(crate) fn consult_tree_act(
+    system: &mut crate::system::DelightQLSystem,
+    dir_path: &str,
+    root_namespace: &str,
+) -> Result<Vec<Vec<Option<String>>>> {
+    if root_namespace.is_empty() {
+        return Err(DelightQLError::from(DirectiveBinding::Value {
+            message: "consult_tree!() root_namespace cannot be empty".to_string(),
+        }));
+    }
+
+    // A relative path resolves against the base directory in force; there is
+    // no fallback to the process directory.
+    let resolved_dir = system.resolve_path(dir_path)?;
+    let dir = resolved_dir.as_path();
+    if !dir.exists() || !dir.is_dir() {
+        return Err(DelightQLError::from(Runtime::Io {
+            message: format!(
+                "consult_tree!() directory '{}' does not exist or is not a directory",
+                dir_path
+            ),
+        }));
+    }
+
+    // Collect all .dql files recursively
+    let mut dql_files = Vec::new();
+    collect_dql_files(dir, &mut dql_files)?;
+    dql_files.sort();
+
+    // Consult each file: one reported row per consulted file.
+    let mut returned_rows: Vec<Vec<Option<String>>> = Vec::new();
+    for file_path in &dql_files {
+        let relative = file_path.strip_prefix(dir).unwrap_or(file_path.as_path());
+        let stem = relative
+            .to_string_lossy()
+            .strip_suffix(".dql")
+            .unwrap_or(&relative.to_string_lossy())
+            .to_string();
+        let ns_suffix = stem.replace('/', "::");
+        let namespace = format!("{}::{}", root_namespace, ns_suffix);
+
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let count = super::consult::execute_consult(
+            system,
+            &file_path_str,
+            &namespace,
+            Some(root_namespace),
+        )?;
+
+        returned_rows.push(vec![
+            Some(file_path_str),
+            Some(namespace),
+            Some(count.to_string()),
+        ]);
+    }
+
+    if returned_rows.is_empty() {
+        return Err(DelightQLError::from(Runtime::General {
+            message: format!("consult_tree!() found no .dql files in '{}'", dir_path),
+            details: "Empty directory tree".to_string(),
+        }));
+    }
+    Ok(returned_rows)
 }
 
 /// Recursively collect all `.dql` files under a directory.

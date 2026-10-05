@@ -58,16 +58,16 @@ impl BinEntity for ImprintPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for ImprintPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],
@@ -113,16 +113,16 @@ impl BinEntity for ImprintReplacePredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for ImprintReplacePredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],
@@ -153,35 +153,16 @@ fn run_imprint(
 
     let source_ns = extract_string_literal(&arguments[0], "source_ns")?;
     let target_ns = extract_string_literal(&arguments[1], "target_ns")?;
+    let results = imprint_act(system, &source_ns, &target_ns, replace, verb)?;
 
-    if source_ns.is_empty() || target_ns.is_empty() {
-        return Err(DelightQLError::from(DirectiveBinding::Value {
-            message: format!("{}() arguments cannot be empty", verb),
-        }));
-    }
-
-    let mode = if replace {
-        crate::system::ImprintMode::Replace
-    } else {
-        crate::system::ImprintMode::Strict
-    };
-    let results = system.imprint_namespace(&source_ns, &target_ns, mode)?;
-
-    // The manifest enumeration is the receipt's `returned` tree
+    // The manifest enumeration is the receipt's `returned` payload
     // (EFFECT-ALGEBRA §3): one
     // interior row per materialized entity, cardinality back to
-    // zero-or-one. An empty manifest ships the all-NULL contributor
-    // row, which elides to `[]`.
-    let returned_rows: Vec<Vec<Option<String>>> = if results.is_empty() {
-        vec![vec![None, None]]
-    } else {
-        results
-            .iter()
-            .map(|(entity_name, status, _sql)| {
-                vec![Some(entity_name.clone()), Some(status.clone())]
-            })
-            .collect()
-    };
+    // zero-or-one. An empty manifest is the empty `[]`.
+    let returned_rows: Vec<Vec<Option<String>>> = results
+        .iter()
+        .map(|(entity_name, status, _sql)| vec![Some(entity_name.clone()), Some(status.clone())])
+        .collect();
     Ok(EntityResult::Relation(super::descriptor_tree_receipt(
         verb.trim_end_matches('!'),
         &[Some(source_ns.clone()), Some(target_ns.clone())],
@@ -189,6 +170,28 @@ fn run_imprint(
         &returned_rows,
         alias,
     )))
+}
+
+/// THE IMPRINT ACT: materialize `source_ns`'s manifest into `target_ns`,
+/// answering each materialized entity with its status (and its DDL).
+pub(crate) fn imprint_act(
+    system: &mut crate::system::DelightQLSystem,
+    source_ns: &str,
+    target_ns: &str,
+    replace: bool,
+    verb: &str,
+) -> Result<Vec<(String, String, String)>> {
+    if source_ns.is_empty() || target_ns.is_empty() {
+        return Err(DelightQLError::from(DirectiveBinding::Value {
+            message: format!("{}() arguments cannot be empty", verb),
+        }));
+    }
+    let mode = if replace {
+        crate::system::ImprintMode::Replace
+    } else {
+        crate::system::ImprintMode::Strict
+    };
+    system.imprint_namespace(source_ns, target_ns, mode)
 }
 
 /// Extract a string literal value from a DomainExpression

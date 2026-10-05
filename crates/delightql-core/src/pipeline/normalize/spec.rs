@@ -15,7 +15,7 @@
 //! spelled here rather than remembered downstream.
 
 use super::{gap, Deferred, Normalizer};
-use crate::diagnostic::{Expansion, Internal, Narrowing};
+use crate::diagnostic::{Expansion, Internal, Narrowing, Semantic};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::operators::{ColumnAlias, ColumnNameTemplate};
 use crate::pipeline::asts::core::operators::{EmbedMapCover, MapCover};
@@ -23,8 +23,8 @@ use crate::pipeline::asts::core::Reference;
 use crate::pipeline::asts::core::{
     DelegateSpec, DomainExpression, FunctionApplication, Glob, GroupSpec, MetadataGroup,
     MetadataOut, MetadataTarget, NameTarget, NamedOutItem, OneOut, OrderDirection, OrderingSpec,
-    OutItem, PipeOp, ReductionItem, RegexSelector, RenameSource, RenameSpec, RepositionSpec,
-    SelectorItem, Spread, TupleOrdinalClause, TupleOrdinalOperator, Unresolved,
+    OutItem, PipeOp, ReductionItem, RenameSource, RenameSpec, RepositionSpec, SelectorItem, Spread,
+    TupleOrdinalClause, TupleOrdinalOperator, Unresolved,
 };
 use crate::pipeline::syntax::cst;
 use delightql_types::SqlIdentifier;
@@ -179,9 +179,7 @@ impl<'t> Normalizer<'t> {
                 RenameSource::Reference(self.column_reference(reference)?)
             }
             cst::RenameSource::Glob(glob) => RenameSource::Glob(self.glob(glob)?),
-            cst::RenameSource::Regex(regex) => RenameSource::Regex(RegexSelector::new(
-                super::value::regex_interior(self.text(regex)).to_string(),
-            )),
+            cst::RenameSource::Regex(regex) => RenameSource::Regex(self.regex_selector(regex)?),
         };
         let target = self.require(node.target(), "a rename names its target")?;
         let to = match target {
@@ -528,7 +526,6 @@ impl<'t> Normalizer<'t> {
                     form: StructuralForm::Narrow {
                         nest: self.column_reference(nest)?,
                         pattern,
-                        schema: (),
                     },
                     named: Default::default(),
                 })])
@@ -652,7 +649,7 @@ impl<'t> Normalizer<'t> {
                                 return Err(interior_slot_refusal(&column));
                             };
                             columns.push("_".to_string());
-                            groundings.push((position.to_string(), value));
+                            groundings.push((position, value));
                         }
                         cst::Slot::RenamedSlot(renamed) => {
                             return Err(self.renamed_slot_refusal(renamed))
@@ -753,8 +750,7 @@ impl<'t> Normalizer<'t> {
                     )
                 })?;
                 Reference::Ordinal(crate::pipeline::asts::core::ColumnOrdinal {
-                    position: value.unsigned_abs() as u16,
-                    reverse: value < 0,
+                    position: crate::pipeline::asts::core::CompileTimeInteger::Number(value),
                     qualifier: None,
                     namespace_path: crate::pipeline::asts::core::NamespacePath::empty(),
                     glob: false,
@@ -799,6 +795,11 @@ impl<'t> Normalizer<'t> {
         };
         let value = self.require(value, "a bound has a count")?;
         let value = self.compile_time_integer(value, "a row bound")?;
+        if matches!(value, crate::pipeline::asts::core::CompileTimeInteger::Number(n) if n < 0) {
+            return Err(DelightQLError::from(Semantic::LimitValue {
+                message: "a row bound takes a nonnegative integer".to_string(),
+            }));
+        }
         Ok(TupleOrdinalClause {
             operator,
             value,
@@ -865,10 +866,10 @@ fn interior_slot_refusal(column: &str) -> DelightQLError {
 
 /// The constant a ground interior slot fixes its position to. Parens are
 /// admission, so a parenthesized constant is the same constant.
-fn ground_value(term: &Domex) -> Option<String> {
+fn ground_value(term: &Domex) -> Option<crate::pipeline::asts::core::LiteralValue> {
     match term {
         DomainExpression::Application(FunctionApplication::Ground(value)) => {
-            Some(value.to_string())
+            Some(value.clone())
         }
         _ => None,
     }

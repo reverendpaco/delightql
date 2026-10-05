@@ -18,7 +18,7 @@ pub use effect::{
 };
 pub use grounding::{Er, Ground, Grounding};
 pub use recursion::Recursion;
-pub use resolution::{AnonBinding, Choe, Ho, Pipe, Resolution, ResolutionSetop};
+pub use resolution::{AnonBinding, Ho, Pipe, Resolution, ResolutionSetop};
 pub use shapes::{
     Anon, Cfe, Compression, Constraint, Cte, Expansion, FactFunction, HoDefinition, Identifier,
     Interior, Join, Landing, Limitation, Mention, Mode, Narrowing, Set, SetOperation, Setop,
@@ -156,8 +156,8 @@ pub enum Semantic {
     /// environment answer to the same canonical name — two members aliased
     /// `q`, or one table accessed twice bare — a qualified reference could
     /// name either, so the activation refuses before any consumer can
-    /// choose. Give one of them its own name with `as`, or acknowledge
-    /// delightql-danger://scope/duplicate to admit the ambiguity.
+    /// choose. Give one of them its own name with `as`; no gate admits the
+    /// shape.
     #[leaf("scope/duplicate", class = Syntax, summary = "Two live scopes share one answering name.")]
     #[error("Validation error: {message}")]
     ScopeDuplicate { message: String },
@@ -208,11 +208,11 @@ pub enum Semantic {
     #[error(transparent)]
     Directive(Directive),
 
-    /// The effect algebra's discipline: what an effect rule may contain,
+    /// The receipt algebra's discipline: what an effect rule may contain,
     /// where a directive may stand, how a plan may be realized. Effect
     /// discipline IS a semantic error, so (~~error://semantic ~~) matches
     /// these too.
-    #[family("effect", summary = "The effect algebra's discipline was violated.")]
+    #[family("effect", summary = "The receipt algebra's discipline was violated.")]
     #[error(transparent)]
     Effect(Effect),
 

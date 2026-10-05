@@ -95,6 +95,44 @@ impl DatabaseIntrospector for DuckDBIntrospector {
 
         Ok(entities)
     }
+
+    /// A DuckDB base table enforces its columns' declared types; a view
+    /// computes its rows.
+    fn storage_guarantees_declared_types(
+        &self,
+        schema: Option<&str>,
+        relation_name: &str,
+    ) -> Result<Option<bool>> {
+        let conn = self.connection.lock().map_err(|e| {
+            Runtime::poisoned(
+                "Failed to acquire lock on DuckDB connection",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT table_type FROM information_schema.tables \
+                 WHERE table_schema = ? AND table_name = ?",
+            )
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to prepare DuckDB storage query: {}", e),
+                })
+            })?;
+        let kinds: Vec<String> = stmt
+            .query_map([schema.unwrap_or("main"), relation_name], |row| row.get::<_, String>(0))
+            .and_then(|rows| rows.collect())
+            .map_err(|e| {
+                DelightQLError::from(DuckDb::Engine {
+                    message: format!("Failed to read DuckDB storage: {}", e),
+                })
+            })?;
+        Ok(match kinds.as_slice() {
+            [kind] if kind == "BASE TABLE" => Some(true),
+            [kind] if kind == "VIEW" => Some(false),
+            _ => None,
+        })
+    }
 }
 
 /// Introspect columns for a specific table using information_schema.columns

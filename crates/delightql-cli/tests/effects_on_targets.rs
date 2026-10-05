@@ -531,6 +531,191 @@ fn duckdb_aborting_plan_rolls_back_and_surfaces_the_true_error() {
     assert_eq!(duckdb_query(&db, "SELECT count(*) FROM guarded"), "0");
 }
 
+/// DuckDB keeps a session object in schema `main` of catalog `temp`, so its
+/// unqualified default schema cannot spell a durable object past a
+/// same-named session one. The pair refuses before execution in either
+/// order, and the file holds only what the first creation wrote, under its
+/// own heading.
+#[test]
+fn duckdb_a_same_name_durable_and_session_pair_refuses_before_execution() {
+    if !duckdb_env_or_skip("duckdb_a_same_name_durable_and_session_pair_refuses_before_execution") {
+        return;
+    }
+    for (first, second, durable_heading) in [
+        ("table", "temp_table", "durable|INTEGER"),
+        ("temp_table", "table", ""),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pair.duckdb");
+        duckdb_exec(&db, "CREATE TABLE anchor (v INTEGER);");
+        let (ok, stdout, stderr) = run_dql(
+            dir.path(),
+            db.to_str().unwrap(),
+            &format!(
+                "_(durable @ 1) |> {first}!(t(*))(*)\n\n\
+                 _(session_value @ \"x\") |> {second}!(t(*))(*)"
+            ),
+            true,
+        );
+        assert!(!ok, "{first} then {second} must refuse.\nstdout:\n{stdout}");
+        assert!(
+            stderr.contains("semantic/effect/ddl/unaddressable_durable"),
+            "{first} then {second}: stderr:\n{stderr}"
+        );
+        assert_eq!(
+            duckdb_query(
+                &db,
+                "SELECT column_name || '|' || data_type FROM information_schema.columns \
+                 WHERE table_name = 't'"
+            ),
+            durable_heading,
+            "{first} then {second}: the file's durable t"
+        );
+    }
+}
+
+/// A spelled `main` is no exact DuckDB address: `main.t` searches the temp
+/// catalog first. A `#main` mount and `mount_tree!`'s `main` child refuse
+/// the same-name pair in both orders and over a durable object the file
+/// already holds, and leave the file's `main` without the refused object. A
+/// schema outside the temp catalog reads its durable rows exactly past a
+/// session object of the same name.
+#[test]
+fn duckdb_a_main_schema_pair_refuses_and_another_schema_reads_exactly() {
+    if !duckdb_env_or_skip("duckdb_a_main_schema_pair_refuses_and_another_schema_reads_exactly") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.sqlite");
+    rusqlite::Connection::open(&main)
+        .unwrap()
+        .execute_batch("CREATE TABLE anchor (v INTEGER);")
+        .unwrap();
+    let file = dir.path().join("w.duckdb");
+    let fresh = || {
+        let _ = std::fs::remove_file(&file);
+        duckdb_exec(
+            &file,
+            "CREATE SCHEMA sales; CREATE TABLE main.pre (v INTEGER); \
+             CREATE TABLE sales.pre (v INTEGER); INSERT INTO sales.pre VALUES (5);",
+        );
+    };
+    let at_main = format!("mount!(\"file://{}#main\", \"dm\")(*)", file.display());
+    let tree = format!("mount_tree!(\"{}\", \"duck\")(*)", file.display());
+    let durable = |ns: &str, name: &str| format!("_(durable @ 1) |> table!({ns}.{name}(*))(*)");
+    let session = |ns: &str, name: &str| format!("_(s @ \"x\") |> temp_table!({ns}.{name}(*))(*)");
+    for (mount, statements) in [
+        (&at_main, vec![durable("dm", "t"), session("dm", "t")]),
+        (&at_main, vec![session("dm", "t"), durable("dm", "t")]),
+        (&at_main, vec![session("dm", "pre")]),
+        (
+            &tree,
+            vec![durable("duck::main", "t"), session("duck::main", "t")],
+        ),
+        (
+            &tree,
+            vec![session("duck::main", "t"), durable("duck::main", "t")],
+        ),
+    ] {
+        fresh();
+        let query = format!("{mount}\n\n{}", statements.join("\n\n"));
+        let (ok, stdout, stderr) = run_dql(dir.path(), main.to_str().unwrap(), &query, true);
+        assert!(!ok, "{query}\nmust refuse.\nstdout:\n{stdout}");
+        assert!(
+            stderr.contains("semantic/effect/ddl/unaddressable_durable"),
+            "{query}\nstderr:\n{stderr}"
+        );
+        let expected = if statements[0].contains("|> table!") {
+            "durable"
+        } else {
+            ""
+        };
+        assert_eq!(
+            duckdb_query(
+                &file,
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_schema = 'main' AND table_name = 't'"
+            ),
+            expected,
+            "{query}\nthe file's main.t"
+        );
+    }
+
+    fresh();
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        main.to_str().unwrap(),
+        &format!(
+            "mount!(\"file://{}#sales\", \"ds\")(*)\n\n\
+             _(v @ 9) |> temp_table!(ds.pre(*))(*)\n\n\
+             ds.pre(*)",
+            file.display()
+        ),
+        true,
+    );
+    assert!(
+        ok,
+        "sales.pre stays addressable.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "v\n5",
+        "the exact read answers the durable rows"
+    );
+}
+
+/// Unmounting the last namespace on a DuckDB connection retires the
+/// connection, and its session objects with it: their exact shadow read is
+/// a resolution miss, never a dead connection, and a remount of the same
+/// file takes the name afresh.
+#[test]
+fn duckdb_last_unmount_retires_the_session_pool() {
+    if !duckdb_env_or_skip("duckdb_last_unmount_retires_the_session_pool") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.sqlite");
+    rusqlite::Connection::open(&main)
+        .unwrap()
+        .execute_batch("CREATE TABLE anchor (v INTEGER);")
+        .unwrap();
+    duckdb_exec(
+        &dir.path().join("w.duckdb"),
+        "CREATE TABLE seed (v INTEGER); INSERT INTO seed VALUES (7);",
+    );
+    let prefix = "mount!(\"w.duckdb\", \"wh\")(*)\n\n\
+                  wh.seed(*) |> temp_table!(wh.t(*))(*)\n\n\
+                  unmount!(\"wh\")(*)\n\n";
+
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        main.to_str().unwrap(),
+        &format!("{prefix}sys::shadow::wh.t(*)"),
+        true,
+    );
+    assert!(!ok, "the retired object must not read.\nstdout:\n{stdout}");
+    assert!(
+        stderr.contains("semantic/resolution/table"),
+        "a resolution miss, not a dead connection.\nstderr:\n{stderr}"
+    );
+
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        main.to_str().unwrap(),
+        &format!(
+            "{prefix}mount!(\"w.duckdb\", \"wh\")(*)\n\n\
+             _(v @ 2) |> temp_table!(wh.t(*))(*)\n\n\
+             sys::shadow::wh.t(*)"
+        ),
+        true,
+    );
+    assert!(
+        ok,
+        "the remount takes the name afresh.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(stdout.trim(), "v\n2", "stdout:\n{stdout}");
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Postgres — effect directives against a live mount, plus the capstone
 // ════════════════════════════════════════════════════════════════════════
@@ -608,6 +793,175 @@ fn pg_adhoc_dml_receipts_and_post_state() {
         "YES receipt expected.\nstdout:\n{stdout}"
     );
     assert_eq!(db.sql("SELECT count(*) FROM orders"), "1");
+}
+
+/// THE LOCATOR IS `tableoid` AND `ctid`, NOT `ctid` ALONE. Two partitions of
+/// one parent hold their rows at the same physical offset; a mutation
+/// through the parent that selects one partition's row must leave the other
+/// partition's row, at the same `ctid`, untouched. Verified on the persisted
+/// data through psql, for both verbs.
+#[test]
+fn pg_partitioned_mutation_reaches_one_child_only() {
+    if !pg_env_or_skip("pg_partitioned_mutation_reaches_one_child_only") {
+        return;
+    }
+    let db = ScratchDb::create("probe_locator_partition");
+    db.sql(
+        "CREATE TABLE part (region TEXT, amount INTEGER) PARTITION BY LIST (region); \
+         CREATE TABLE part_eu PARTITION OF part FOR VALUES IN ('EU'); \
+         CREATE TABLE part_us PARTITION OF part FOR VALUES IN ('US'); \
+         INSERT INTO part VALUES ('EU', 10), ('US', 10);",
+    );
+    // The same physical offset in both children: the one-part locator would
+    // have reached both rows.
+    assert_eq!(
+        db.sql("SELECT ctid FROM part_eu"),
+        db.sql("SELECT ctid FROM part_us")
+    );
+    let dir = tempfile::tempdir().unwrap();
+
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        &db.uri(),
+        r#"part!!(*), region = "EU" |> $$(99 as amount) |> update!(part(*))(*)"#,
+        false,
+    );
+    assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(db.sql("SELECT amount FROM part WHERE region = 'EU'"), "99");
+    assert_eq!(
+        db.sql("SELECT amount FROM part WHERE region = 'US'"),
+        "10",
+        "the US row at the same ctid must be untouched"
+    );
+
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        &db.uri(),
+        r#"part!!(*), region = "EU" |> delete!(part(*))(*)"#,
+        false,
+    );
+    assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(db.sql("SELECT count(*) FROM part"), "1");
+    assert_eq!(db.sql("SELECT region FROM part"), "US");
+}
+
+/// THE LOCATOR IS VALID FOR THE BRACKET. `update!` stages its source, then
+/// updates in a later statement; a `ctid` captured while staging names a
+/// row VERSION, and a concurrent writer replaces it. Under Read Committed
+/// the later UPDATE would see the newer snapshot, match nothing, and report
+/// a no-op over a row the source selected. The bracket opens REPEATABLE
+/// READ, so the effect fails with a serialization error instead, and the
+/// concurrent writer's value is what persists.
+///
+/// Session B locks the selected row before the effect starts and commits a
+/// change while the effect is blocked on that lock, so the schedule is
+/// deterministic: stage (snapshot taken) → B commits → the terminal UPDATE.
+#[test]
+fn pg_concurrent_change_to_a_selected_row_fails_the_effect() {
+    use std::io::Write;
+    if !pg_env_or_skip("pg_concurrent_change_to_a_selected_row_fails_the_effect") {
+        return;
+    }
+    let db = ScratchDb::create("probe_locator_lifetime");
+    db.sql("CREATE TABLE t (k INTEGER, v INTEGER); INSERT INTO t VALUES (1, 10), (2, 20);");
+    let dir = tempfile::tempdir().unwrap();
+
+    // Session B: hold a row lock on the selected row in an open transaction.
+    let mut b = Command::new("psql")
+        .arg(pg_uri(&db.name))
+        .arg("-v")
+        .arg("ON_ERROR_STOP=1")
+        .arg("-tA")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn psql session B");
+    let mut b_in = b.stdin.take().expect("psql stdin");
+    writeln!(
+        b_in,
+        "BEGIN; SELECT k FROM t WHERE k = 1 FOR UPDATE; \\echo locked"
+    )
+    .unwrap();
+    b_in.flush().unwrap();
+    // Wait until B holds the lock before the effect starts.
+    let started = std::time::Instant::now();
+    loop {
+        let waiting = db.sql(
+            "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+             WHERE c.relname = 't' AND l.mode = 'RowShareLock' AND l.granted",
+        );
+        if waiting != "0" {
+            break;
+        }
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "session B never took its row lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Session A: the effect stages (snapshot taken), then blocks on B's lock
+    // at the terminal UPDATE.
+    let uri = db.uri();
+    let dir_path = dir.path().to_path_buf();
+    let a = std::thread::spawn(move || {
+        run_dql(
+            &dir_path,
+            &uri,
+            r#"t!!(*), k = 1 |> $$(99 as v) |> update!(t(*))(*)"#,
+            false,
+        )
+    });
+    // Let A reach the UPDATE and block on the lock: a backend of this
+    // database waiting on a lock while B still holds it.
+    let started = std::time::Instant::now();
+    loop {
+        let blocked = db.sql(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+             AND wait_event_type = 'Lock'",
+        );
+        if blocked != "0" {
+            break;
+        }
+        assert!(
+            !a.is_finished(),
+            "the effect finished before blocking on the row lock: {:?}",
+            a.join().expect("session A thread")
+        );
+        assert!(
+            started.elapsed().as_secs() < 20,
+            "the effect never blocked on the row lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Session B replaces the selected row version and commits.
+    writeln!(b_in, "UPDATE t SET v = 11 WHERE k = 1; COMMIT;").unwrap();
+    b_in.flush().unwrap();
+    drop(b_in);
+    let b_out = b.wait_with_output().expect("psql session B");
+    assert!(
+        b_out.status.success(),
+        "session B failed: {}",
+        String::from_utf8_lossy(&b_out.stderr)
+    );
+
+    let (ok, stdout, stderr) = a.join().expect("session A thread");
+    assert!(
+        !ok,
+        "the effect must fail rather than silently miss the selected row.\nstdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("serialize") || stderr.contains("40001"),
+        "the failure is the target's serialization refusal.\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        db.sql("SELECT v FROM t WHERE k = 1"),
+        "11",
+        "the concurrent writer's version persists; nothing of the effect landed"
+    );
+    assert_eq!(db.sql("SELECT v FROM t WHERE k = 2"), "20");
 }
 
 /// The anon-source object lands on the TARGET session (in-session read

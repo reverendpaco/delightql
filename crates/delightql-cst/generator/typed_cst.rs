@@ -513,7 +513,7 @@ impl<'t> TypedNode<'t> for AnyNode<'t> {
 fn field_children<'t, T: TypedNode<'t>>(node: Node<'t>, field: &'static str) -> impl Iterator<Item = T> + 't {
     (0..node.child_count()).filter_map(move |i| {
         if node.field_name_for_child(i as u32) != Some(field) { return None; }
-        node.child(i).and_then(T::cast)
+        node.child(i as u32).and_then(T::cast)
     })
 }
 
@@ -521,7 +521,7 @@ fn field_children<'t, T: TypedNode<'t>>(node: Node<'t>, field: &'static str) -> 
 fn unfielded_children<'t, T: TypedNode<'t>>(node: Node<'t>) -> impl Iterator<Item = T> + 't {
     (0..node.child_count()).filter_map(move |i| {
         if node.field_name_for_child(i as u32).is_some() { return None; }
-        let c = node.child(i)?;
+        let c = node.child(i as u32)?;
         if !c.is_named() { return None; }
         T::cast(c)
     })

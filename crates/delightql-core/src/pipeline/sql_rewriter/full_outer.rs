@@ -19,6 +19,7 @@ use crate::pipeline::sql_ast::{
     BinaryOperator, DomainExpression, JoinCondition, JoinType, QueryExpression, SelectItem,
     SelectStatement, SetOperator, SqlStatement, TableExpression,
 };
+use std::collections::BTreeSet;
 
 /// Should we expand FULL OUTER JOIN for this dialect?
 pub fn needs_expansion(dialect: SqlDialect) -> bool {
@@ -32,10 +33,11 @@ pub fn needs_expansion(dialect: SqlDialect) -> bool {
 pub fn expand_full_outer_joins(
     stmt: SqlStatement,
     identities: &crate::names::Registry,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
 ) -> Result<SqlStatement> {
     match stmt {
         SqlStatement::Query { with_clause, query } => {
-            let rewritten = rewrite_query(query, identities)?;
+            let rewritten = rewrite_query(query, identities, target)?;
             Ok(SqlStatement::Query {
                 with_clause,
                 query: rewritten,
@@ -49,23 +51,15 @@ pub fn expand_full_outer_joins(
 fn rewrite_query(
     query: QueryExpression,
     identities: &crate::names::Registry,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
 ) -> Result<QueryExpression> {
     match query {
-        QueryExpression::Select(select) => rewrite_select_query(*select, identities),
+        QueryExpression::Select(select) => rewrite_select_query(*select, identities, target),
         QueryExpression::SetOperation { op, left, right } => {
-            let left = Box::new(rewrite_query(*left, identities)?);
-            let right = Box::new(rewrite_query(*right, identities)?);
+            let left = Box::new(rewrite_query(*left, identities, target)?);
+            let right = Box::new(rewrite_query(*right, identities, target)?);
             Ok(QueryExpression::SetOperation { op, left, right })
         }
-        QueryExpression::WithCte { ctes, query } => {
-            let ctes = ctes
-                .into_iter()
-                .map(|cte| cte.rewrite_parts(|part| rewrite_query(part, identities)))
-                .collect::<Result<Vec<_>>>()?;
-            let query = Box::new(rewrite_query(*query, identities)?);
-            Ok(QueryExpression::WithCte { ctes, query })
-        }
-        other => Ok(other),
     }
 }
 
@@ -75,6 +69,7 @@ fn rewrite_query(
 fn rewrite_select_query(
     stmt: SelectStatement,
     identities: &crate::names::Registry,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
 ) -> Result<QueryExpression> {
     let Some(from) = stmt.from() else {
         return Ok(QueryExpression::Select(Box::new(stmt)));
@@ -94,23 +89,31 @@ fn rewrite_select_query(
             // GROUP BY, window) must push the union UNDER that
             // computation; duplicating it per branch computes it once
             // per part and yields two rows where a scalar is promised.
-            if computes_over_whole_relation(&stmt) {
+            if computes_over_whole_relation(&stmt, target) {
                 return expand_full_outer_select_aggregated(
                     &stmt,
                     left,
                     right,
                     join_condition,
                     identities,
+                    target,
                 );
             }
-            return expand_full_outer_select(&stmt, left, right, join_condition, identities);
+            return expand_full_outer_select(
+                &stmt,
+                left,
+                right,
+                join_condition,
+                identities,
+                target,
+            );
         }
     }
 
     // No top-level FULL OUTER — recurse into subqueries within FROM
     let new_from: Vec<TableExpression> = from
         .iter()
-        .map(|t| rewrite_table_subqueries(t.clone(), identities))
+        .map(|t| rewrite_table_subqueries(t.clone(), identities, target))
         .collect::<Result<Vec<_>>>()?;
 
     rebuild_select_with_from(stmt, new_from).map(|s| QueryExpression::Select(Box::new(s)))
@@ -129,10 +132,11 @@ fn expand_full_outer_select(
     right: &TableExpression,
     condition: &JoinCondition,
     identities: &crate::names::Registry,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
 ) -> Result<QueryExpression> {
     // First, recursively expand any FULL OUTERs in the children
-    let left = rewrite_table_subqueries(left.clone(), identities)?;
-    let right = rewrite_table_subqueries(right.clone(), identities)?;
+    let left = rewrite_table_subqueries(left.clone(), identities, target)?;
+    let right = rewrite_table_subqueries(right.clone(), identities, target)?;
 
     let null_check_col = extract_null_check_column(condition, operand_scope(&left), identities)?;
 
@@ -156,7 +160,7 @@ fn expand_full_outer_select(
         left: Box::new(null_check_col),
         op: BinaryOperator::Is,
         right: Box::new(DomainExpression::Literal(
-            crate::pipeline::ast_refined::LiteralValue::Null,
+            crate::pipeline::asts::core::LiteralValue::Null,
         )),
     };
     let branch2 =
@@ -170,84 +174,53 @@ fn expand_full_outer_select(
     })
 }
 
-/// SQL group-aggregate function names (lowercase). Detection keys the
-/// aggregated expansion; a name missing here silently reverts that
-/// query to the per-branch (per-part) computation.
-const AGGREGATE_FNS: &[&str] = &[
-    "count",
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "total",
-    "group_concat",
-    "string_agg",
-    "array_agg",
-    "listagg",
-    "json_group_array",
-    "json_group_object",
-    "jsonb_group_array",
-    "jsonb_group_object",
-    "every",
-    "some",
-    "bool_and",
-    "bool_or",
-    "bit_and",
-    "bit_or",
-    "bit_xor",
-    "var_pop",
-    "var_samp",
-    "variance",
-    "stddev",
-    "stddev_pop",
-    "stddev_samp",
-    "median",
-    "mode",
-];
-
 /// Does this SELECT compute something over the WHOLE relation — an
 /// aggregate, DISTINCT, GROUP BY/HAVING, or a window function — such
 /// that computing it once per expansion branch would be wrong?
-fn computes_over_whole_relation(stmt: &SelectStatement) -> bool {
+fn computes_over_whole_relation(
+    stmt: &SelectStatement,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
+) -> bool {
     stmt.is_distinct()
         || stmt.group_by().is_some()
         || stmt.having().is_some()
-        || stmt
-            .select_list()
-            .iter()
-            .any(|item| item.expr().is_some_and(contains_whole_relation_fn))
+        || stmt.select_list().iter().any(|item| {
+            item.expr()
+                .is_some_and(|expr| contains_whole_relation_fn(expr, target))
+        })
 }
 
-fn contains_whole_relation_fn(expr: &DomainExpression) -> bool {
+fn contains_whole_relation_fn(
+    expr: &DomainExpression,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
+) -> bool {
+    let contains = |expr: &DomainExpression| contains_whole_relation_fn(expr, target);
     match expr {
+        // THE GRADE IS THE CALL'S, judged with its arity against what the
+        // target reduces: `max(v, 0)` computes per row of each part, never
+        // over the whole relation.
         DomainExpression::Function { name, args, .. } => {
             name.user()
-                .is_some_and(|name| AGGREGATE_FNS.contains(&name.to_lowercase().as_str()))
-                || args.iter().any(contains_whole_relation_fn)
+                .is_some_and(|name| target.reduces(name, args.len()))
+                || args.iter().any(contains)
         }
         DomainExpression::WindowFunction { .. } => true,
-        DomainExpression::Binary { left, right, .. } => {
-            contains_whole_relation_fn(left) || contains_whole_relation_fn(right)
-        }
+        DomainExpression::Binary { left, right, .. } => contains(left) || contains(right),
         DomainExpression::Unary { expr, .. }
         | DomainExpression::Parens(expr)
-        | DomainExpression::Cast { expr, .. } => contains_whole_relation_fn(expr),
+        | DomainExpression::Cast { expr, .. } => contains(expr),
         DomainExpression::Case {
             expr,
             when_clauses,
             else_clause,
         } => {
-            expr.as_deref().is_some_and(contains_whole_relation_fn)
-                || when_clauses.iter().any(|w| {
-                    contains_whole_relation_fn(w.when()) || contains_whole_relation_fn(w.then())
-                })
-                || else_clause
-                    .as_deref()
-                    .is_some_and(contains_whole_relation_fn)
+            expr.as_deref().is_some_and(contains)
+                || when_clauses
+                    .iter()
+                    .any(|w| contains(w.when()) || contains(w.then()))
+                || else_clause.as_deref().is_some_and(contains)
         }
-        DomainExpression::PredicateRewrite { args, .. } => {
-            args.iter().any(contains_whole_relation_fn)
-        }
+        DomainExpression::PredicateRewrite { args, .. } => args.iter().any(contains),
         // Subquery bodies aggregate over their OWN relation.
         _ => false,
     }
@@ -275,10 +248,11 @@ fn expand_full_outer_select_aggregated(
     right: &TableExpression,
     condition: &JoinCondition,
     identities: &crate::names::Registry,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
 ) -> Result<QueryExpression> {
     // Recursively expand any FULL OUTERs in the children first.
-    let left = rewrite_table_subqueries(left.clone(), identities)?;
-    let right = rewrite_table_subqueries(right.clone(), identities)?;
+    let left = rewrite_table_subqueries(left.clone(), identities, target)?;
+    let right = rewrite_table_subqueries(right.clone(), identities, target)?;
 
     let (Some(left_scope), Some(right_scope)) = (operand_scope(&left), operand_scope(&right))
     else {
@@ -319,9 +293,7 @@ fn expand_full_outer_select_aggregated(
         // produce one column per row.
         let output = identities.sql_column(carrier_scope, None, crate::names::Addressing::Hygienic);
         vec![SelectItem::Publishing {
-            expr: DomainExpression::Literal(crate::pipeline::ast_refined::LiteralValue::Number(
-                "1".to_string(),
-            )),
+            expr: DomainExpression::Literal(crate::pipeline::asts::core::LiteralValue::integer(1)),
             slot: output,
             printed: true,
         }]
@@ -380,7 +352,7 @@ fn expand_full_outer_select_aggregated(
         left: Box::new(null_check_col),
         op: BinaryOperator::Is,
         right: Box::new(DomainExpression::Literal(
-            crate::pipeline::ast_refined::LiteralValue::Null,
+            crate::pipeline::asts::core::LiteralValue::Null,
         )),
     };
     let branch1 = branch(&left, &right, None)?;
@@ -591,10 +563,11 @@ fn rewrite_operand_refs(
 fn rewrite_table_subqueries(
     table: TableExpression,
     identities: &crate::names::Registry,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
 ) -> Result<TableExpression> {
     match table {
         TableExpression::Subquery { query, alias } => {
-            let rewritten = rewrite_query((*query).into_inner(), identities)?;
+            let rewritten = rewrite_query((*query).into_inner(), identities, target)?;
             Ok(TableExpression::Subquery {
                 query: Box::new(stacksafe::StackSafe::new(rewritten)),
                 alias,
@@ -606,8 +579,8 @@ fn rewrite_table_subqueries(
             right,
             join_condition,
         } => {
-            let left = Box::new(rewrite_table_subqueries(*left, identities)?);
-            let right = Box::new(rewrite_table_subqueries(*right, identities)?);
+            let left = Box::new(rewrite_table_subqueries(*left, identities, target)?);
+            let right = Box::new(rewrite_table_subqueries(*right, identities, target)?);
             Ok(TableExpression::Join {
                 left,
                 join_type,
@@ -693,35 +666,27 @@ fn operand_scope(table: &TableExpression) -> Option<crate::names::ScopeId> {
     }
 }
 
-/// Extract a column for branch 2's unmatched-row test. The column MUST
-/// belong to the preserved (left) operand of the original join: in
-/// `B LEFT JOIN A`, only A's columns are NULL exactly on the rows the
-/// first branch missed. A right-side column — the USING-coalesced name
-/// resolves to the right side — always has a value there, which makes
-/// branch 2 return zero rows and silently drops left-side orphans.
+/// Extract a preserved-side column proven non-NULL whenever ON is TRUE.
+/// In `B LEFT JOIN A`, that column is NULL on a padded A and non-NULL on
+/// every matched A. An arbitrary referenced column cannot serve as this
+/// witness: a null-accepting condition may match a real row with it NULL.
 fn extract_null_check_column(
     condition: &JoinCondition,
     left_scope: Option<crate::names::ScopeId>,
     identities: &crate::names::Registry,
 ) -> Result<DomainExpression> {
     match condition {
-        JoinCondition::On(expr) => find_column_of(expr, left_scope, identities).ok_or_else(|| {
-            DelightQLError::from(Constraint::Unsupported {
-    message: "FULL OUTER JOIN: no column of the preserved side found in ON condition for NULL check"
-                        .to_string(),
-})
-        }),
-        JoinCondition::Merge(pairs) => {
-            let Some(col) = pairs.iter().find_map(|pair| {
-                (left_scope == Some(identities.scope_of(pair.left))).then_some(pair.left)
-            }) else {
-                return Err(DelightQLError::from(Constraint::Unsupported {
-                    message:
-                        "FULL OUTER JOIN on merged pairs: no preserved-side column for NULL check"
+        JoinCondition::On(expr) => {
+            let column = null_rejecting_witnesses(expr, left_scope, identities)
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    DelightQLError::from(Constraint::Unsupported {
+                        message: "FULL OUTER JOIN: no null-rejecting preserved-side column in ON condition for unmatched-row check"
                             .to_string(),
-                }));
-            };
-            Ok(DomainExpression::Column(col))
+                    })
+                })?;
+            Ok(DomainExpression::Column(column))
         }
         JoinCondition::Cartesian => Err(DelightQLError::from(Constraint::Unsupported {
             message: "FULL OUTER JOIN with NATURAL is not supported".to_string(),
@@ -729,23 +694,306 @@ fn extract_null_check_column(
     }
 }
 
-/// First qualified column whose qualifier names `of_alias` (any
-/// qualified column when no alias is known).
-fn find_column_of(
+/// Every returned column is non-NULL whenever this truth is TRUE. Retain all
+/// candidates while composing: AND unions proofs, OR intersects them. Only
+/// after the complete truth is judged may the expansion choose one sentinel.
+fn null_rejecting_witnesses(
     expr: &DomainExpression,
     of_scope: Option<crate::names::ScopeId>,
     identities: &crate::names::Registry,
-) -> Option<DomainExpression> {
+) -> BTreeSet<crate::names::ColId> {
+    match expr {
+        DomainExpression::Binary { left, op, right } => match op {
+            BinaryOperator::And => {
+                let mut proven = null_rejecting_witnesses(left, of_scope, identities);
+                proven.extend(null_rejecting_witnesses(right, of_scope, identities));
+                proven
+            }
+            BinaryOperator::Or => {
+                let left = null_rejecting_witnesses(left, of_scope, identities);
+                let right = null_rejecting_witnesses(right, of_scope, identities);
+                left.intersection(&right).copied().collect()
+            }
+            BinaryOperator::Equal
+            | BinaryOperator::NotEqual
+            | BinaryOperator::LessThan
+            | BinaryOperator::LessThanOrEqual
+            | BinaryOperator::GreaterThan
+            | BinaryOperator::GreaterThanOrEqual
+            | BinaryOperator::Like
+            | BinaryOperator::NotLike => {
+                let mut proven = strict_operand_columns(left, of_scope, identities);
+                proven.extend(strict_operand_columns(right, of_scope, identities));
+                proven
+            }
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+            | BinaryOperator::Concatenate
+            | BinaryOperator::Is
+            | BinaryOperator::IsNot
+            | BinaryOperator::IsNotDistinctFrom
+            | BinaryOperator::IsDistinctFrom => BTreeSet::new(),
+        },
+        DomainExpression::PredicateRewrite {
+            name,
+            namespace,
+            args,
+            ..
+        } => {
+            if let Some((left, right)) =
+                crate::bin_cartridge::prelude::strict_comparison_operands(namespace, name, args)
+            {
+                let mut proven = strict_operand_columns(left, of_scope, identities);
+                proven.extend(strict_operand_columns(right, of_scope, identities));
+                proven
+            } else {
+                BTreeSet::new()
+            }
+        }
+        DomainExpression::Observation {
+            expr,
+            positive: true,
+        }
+        | DomainExpression::Parens(expr) => null_rejecting_witnesses(expr, of_scope, identities),
+        DomainExpression::Column(_)
+        | DomainExpression::Literal(_)
+        | DomainExpression::PublishedNameLiteral(_)
+        | DomainExpression::PublishedJsonPathLiteral(_)
+        | DomainExpression::JsonPathLiteral(_)
+        | DomainExpression::ScopeNameLiteral(_)
+        | DomainExpression::Cast { .. }
+        | DomainExpression::Unary { .. }
+        | DomainExpression::Function { .. }
+        | DomainExpression::Star
+        | DomainExpression::Case { .. }
+        | DomainExpression::Exists { .. }
+        | DomainExpression::Subquery(_)
+        | DomainExpression::WindowFunction { .. }
+        | DomainExpression::Observation {
+            positive: false, ..
+        } => BTreeSet::new(),
+    }
+}
+
+/// A non-NULL value of a known NULL-propagating expression proves every
+/// operand below it non-NULL. A general function makes no such promise: it
+/// may replace NULL with a value.
+fn strict_operand_columns(
+    expr: &DomainExpression,
+    of_scope: Option<crate::names::ScopeId>,
+    identities: &crate::names::Registry,
+) -> BTreeSet<crate::names::ColId> {
     match expr {
         DomainExpression::Column(column)
-            if of_scope.is_none_or(|scope| identities.scope_of(*column) == scope) =>
+            if of_scope.is_some_and(|scope| identities.scope_of(*column) == scope) =>
         {
-            Some(DomainExpression::Column(*column))
+            BTreeSet::from([*column])
         }
-        DomainExpression::Binary { left, right, .. } => find_column_of(left, of_scope, identities)
-            .or_else(|| find_column_of(right, of_scope, identities)),
-        DomainExpression::Parens(inner) => find_column_of(inner, of_scope, identities),
-        DomainExpression::Cast { expr, .. } => find_column_of(expr, of_scope, identities),
-        _ => None,
+        DomainExpression::Parens(expr)
+        | DomainExpression::Cast { expr, .. }
+        | DomainExpression::Unary { expr, .. } => {
+            strict_operand_columns(expr, of_scope, identities)
+        }
+        // The exact operand is its value under another comparison: NULL
+        // exactly where its argument is.
+        DomainExpression::Function {
+            name: crate::pipeline::sql_ast::FunctionName::Intrinsic(crate::names::Intrinsic::Exact),
+            args,
+            ..
+        } => args
+            .iter()
+            .flat_map(|arg| strict_operand_columns(arg, of_scope, identities))
+            .collect(),
+        DomainExpression::Binary { left, op, right } => match op {
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+            | BinaryOperator::Concatenate => {
+                let mut proven = strict_operand_columns(left, of_scope, identities);
+                proven.extend(strict_operand_columns(right, of_scope, identities));
+                proven
+            }
+            BinaryOperator::Equal
+            | BinaryOperator::NotEqual
+            | BinaryOperator::LessThan
+            | BinaryOperator::LessThanOrEqual
+            | BinaryOperator::GreaterThan
+            | BinaryOperator::GreaterThanOrEqual
+            | BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::Like
+            | BinaryOperator::NotLike
+            | BinaryOperator::Is
+            | BinaryOperator::IsNot
+            | BinaryOperator::IsNotDistinctFrom
+            | BinaryOperator::IsDistinctFrom => BTreeSet::new(),
+        },
+        DomainExpression::Column(_)
+        | DomainExpression::Literal(_)
+        | DomainExpression::PublishedNameLiteral(_)
+        | DomainExpression::PublishedJsonPathLiteral(_)
+        | DomainExpression::JsonPathLiteral(_)
+        | DomainExpression::ScopeNameLiteral(_)
+        | DomainExpression::Function { .. }
+        | DomainExpression::Star
+        | DomainExpression::Case { .. }
+        | DomainExpression::Exists { .. }
+        | DomainExpression::Subquery(_)
+        | DomainExpression::WindowFunction { .. }
+        | DomainExpression::PredicateRewrite { .. }
+        | DomainExpression::Observation { .. } => BTreeSet::new(),
+    }
+}
+
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+    use crate::names::{Addressing, Registry};
+    use crate::pipeline::sql_ast::FunctionName;
+
+    #[test]
+    fn a_full_join_witness_is_entailed_by_every_true_match() {
+        let names = Registry::new(&[]);
+        let left = names.anonymous_scope(None);
+        let right = names.anonymous_scope(None);
+        let left_key = names.sql_column(left, None, Addressing::Published);
+        let left_other = names.sql_column(left, None, Addressing::Published);
+        let right_key = names.sql_column(right, None, Addressing::Published);
+        let eq = |column| DomainExpression::Binary {
+            left: Box::new(DomainExpression::Column(column)),
+            op: BinaryOperator::Equal,
+            right: Box::new(DomainExpression::Column(right_key)),
+        };
+        let proofs = |expr: &DomainExpression| null_rejecting_witnesses(expr, Some(left), &names);
+        let proof = |expr: &DomainExpression| proofs(expr).into_iter().next();
+
+        assert_eq!(proof(&eq(left_key)), Some(left_key));
+        assert_eq!(
+            proof(&DomainExpression::Observation {
+                expr: Box::new(eq(left_key)),
+                positive: true,
+            }),
+            Some(left_key)
+        );
+        assert_eq!(
+            proof(&DomainExpression::Binary {
+                left: Box::new(eq(left_key)),
+                op: BinaryOperator::And,
+                right: Box::new(DomainExpression::Column(left_other)),
+            }),
+            Some(left_key)
+        );
+        assert_eq!(
+            proof(&DomainExpression::Binary {
+                left: Box::new(eq(left_key)),
+                op: BinaryOperator::Or,
+                right: Box::new(eq(left_key)),
+            }),
+            Some(left_key)
+        );
+        let both = |first, second| DomainExpression::Binary {
+            left: Box::new(eq(first)),
+            op: BinaryOperator::And,
+            right: Box::new(eq(second)),
+        };
+        let reordered = DomainExpression::Binary {
+            left: Box::new(both(left_key, left_other)),
+            op: BinaryOperator::Or,
+            right: Box::new(both(left_other, left_key)),
+        };
+        assert_eq!(proofs(&reordered), BTreeSet::from([left_key, left_other]));
+        for op in [
+            BinaryOperator::Add,
+            BinaryOperator::Subtract,
+            BinaryOperator::Multiply,
+            BinaryOperator::Divide,
+            BinaryOperator::Modulo,
+            BinaryOperator::Concatenate,
+        ] {
+            assert_eq!(
+                proof(&DomainExpression::Binary {
+                    left: Box::new(DomainExpression::Binary {
+                        left: Box::new(DomainExpression::Column(left_key)),
+                        op,
+                        right: Box::new(DomainExpression::Literal(
+                            crate::pipeline::asts::core::LiteralValue::integer(1),
+                        )),
+                    }),
+                    op: BinaryOperator::Equal,
+                    right: Box::new(DomainExpression::Column(right_key)),
+                }),
+                Some(left_key)
+            );
+        }
+        assert_eq!(
+            proof(&DomainExpression::PredicateRewrite {
+                name: "sql_eq".to_string(),
+                namespace: vec!["std".to_string(), "prelude".to_string()],
+                args: vec![
+                    DomainExpression::Column(left_key),
+                    DomainExpression::Column(right_key)
+                ],
+                negated: false,
+            }),
+            Some(left_key)
+        );
+
+        assert_eq!(
+            proof(&DomainExpression::Observation {
+                expr: Box::new(eq(left_key)),
+                positive: false,
+            }),
+            None
+        );
+        assert_eq!(
+            proof(&DomainExpression::Binary {
+                left: Box::new(eq(left_key)),
+                op: BinaryOperator::Or,
+                right: Box::new(eq(left_other)),
+            }),
+            None
+        );
+        assert_eq!(
+            proof(&DomainExpression::Binary {
+                left: Box::new(DomainExpression::Column(left_key)),
+                op: BinaryOperator::IsNotDistinctFrom,
+                right: Box::new(DomainExpression::Column(right_key)),
+            }),
+            None
+        );
+        assert_eq!(
+            proof(&DomainExpression::Binary {
+                left: Box::new(DomainExpression::Function {
+                    name: FunctionName::from("coalesce"),
+                    args: vec![
+                        DomainExpression::Column(left_key),
+                        DomainExpression::Literal(
+                            crate::pipeline::asts::core::LiteralValue::integer(1),
+                        ),
+                    ],
+                    distinct: false,
+                }),
+                op: BinaryOperator::Equal,
+                right: Box::new(DomainExpression::Column(right_key)),
+            }),
+            None
+        );
+        assert_eq!(
+            proof(&DomainExpression::PredicateRewrite {
+                name: "sql_eq".to_string(),
+                namespace: vec!["caller".to_string()],
+                args: vec![
+                    DomainExpression::Column(left_key),
+                    DomainExpression::Column(right_key)
+                ],
+                negated: false,
+            }),
+            None
+        );
     }
 }

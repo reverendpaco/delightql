@@ -37,7 +37,7 @@ use crate::pipeline::asts::core::specs::{GroupSpec, OneOut, OutItem, ReductionIt
 use crate::pipeline::asts::core::FunctionApplication;
 use crate::pipeline::asts::core::RecordMember;
 use crate::pipeline::asts::unresolved::*;
-use crate::pipeline::compiled_query::{EffectStep, TypedEffectPlan};
+use crate::pipeline::compiled_query::{Scheduled, TypedEffectPlan};
 
 pub struct ExplainRunPredicate;
 
@@ -78,18 +78,16 @@ impl BinEntity for ExplainRunPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        // Consulting the file shapes the session (exactly as run! does);
-        // the PLAN itself executes nothing.
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for ExplainRunPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],
@@ -120,14 +118,14 @@ impl EffectExecutable for ExplainRunPredicate {
         // Consult-then-compile, mirroring run!'s consult_for_run: a fresh
         // namespace consults; an existing one reconsults (lib/scratch
         // reload; other kinds surface reconsult's own curated refusal).
-        let namespace = namespace_from_path(&path);
+        let namespace = crate::system::run_namespace_of(&path);
         if let Err(consult_err) = super::consult::execute_consult(system, &path, &namespace, None) {
             system
                 .reconsult_namespace(&namespace, Some(&path))
                 .map_err(|_| consult_err)?;
         }
 
-        let plan = crate::pipeline::effect_transformer::compile_namespace_main(system, &namespace)?;
+        let plan = crate::pipeline::middle::api::explain_main(system, &namespace)?;
         let typed = plan.typed.as_ref().ok_or_else(|| {
             Internal::invariant(
                 "bin_cartridge::prelude::explain_run",
@@ -141,30 +139,6 @@ impl EffectExecutable for ExplainRunPredicate {
         system.materialize_effect_plan(typed)?;
 
         Ok(EntityResult::Relation(build_explained_plan(typed, alias)))
-    }
-}
-
-/// `run!`'s namespace convention (relay/entry.rs `namespace_from_path`),
-/// mirrored for the Phase-1.X path.
-fn namespace_from_path(path: &str) -> String {
-    let stem = std::path::Path::new(path)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let sanitized: String = stem
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "script".to_string()
-    } else {
-        sanitized
     }
 }
 
@@ -183,7 +157,7 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Groun
         }))
     };
 
-    let step_expr = |ordinal: usize, step: &EffectStep| -> Chain {
+    let step_expr = |ordinal: usize, step: &Scheduled<'_>| -> Chain {
         let (step_kind, action_kind) = step.kind().projection_kinds();
         let s = |v: &str| {
             DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(
@@ -191,8 +165,8 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Groun
             )))
         };
         let n = |v: usize| {
-            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Number(
-                v.to_string(),
+            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::integer(
+                v as i64,
             )))
         };
         let flat_headers: Vec<DomainExpression> = [
@@ -210,9 +184,9 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Groun
         .map(|h| DomainExpression::lvar_builder(h.to_string()).build())
         .collect();
         let sql_display = step.sql_display();
-        let route = match step.route {
+        let route = match step.route() {
             Some(c) => DomainExpression::Application(FunctionApplication::Ground(
-                LiteralValue::Number(c.to_string()),
+                LiteralValue::integer(c as i64),
             )),
             None => DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null)),
         };
@@ -222,10 +196,10 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Groun
                 n(1),
                 n(ordinal),
                 n(ordinal),
-                s(&step.occurrence),
+                s(step.occurrence()),
                 s(step_kind),
                 s(action_kind),
-                s(&step.operation),
+                s(step.operation()),
                 route,
                 s(&sql_display),
             ]],
@@ -236,7 +210,7 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Groun
             .iter()
             .map(|h| DomainExpression::lvar_builder(h.to_string()).build())
             .collect();
-        let req_rows: Vec<Vec<DomainExpression>> = if step.requirements.is_empty() {
+        let req_rows: Vec<Vec<DomainExpression>> = if step.requirements().is_empty() {
             // One all-NULL contributor row: the tree-group constructor
             // elides it into the empty interior `[]` — `always` is the
             // absence of edges, kept schema-known.
@@ -246,7 +220,7 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Groun
                 })
                 .collect()]
         } else {
-            step.requirements
+            step.requirements()
                 .iter()
                 .map(|r| {
                     vec![
@@ -272,15 +246,13 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Groun
                     OutItem::One(OneOut::authored(
                         DomainExpression::Application(FunctionApplication::Enclyph(
                             crate::pipeline::asts::core::Enclyph::Record(
-                                crate::pipeline::asts::core::Record::plain(
-                                    crate::pipeline::asts::vocabulary::Vec1::new(
-                                        RecordMember::Spread(
-                                            crate::pipeline::asts::core::Spread::Glob(
-                                                crate::pipeline::asts::core::Glob::whole(),
-                                            ),
+                                crate::pipeline::asts::core::Record::plain(vec![
+                                    RecordMember::Spread(
+                                        crate::pipeline::asts::core::Spread::Glob(
+                                            crate::pipeline::asts::core::Glob::whole(),
                                         ),
                                     ),
-                                ),
+                                ]),
                             ),
                         )),
                         Some("requires".into()),
@@ -292,13 +264,13 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Groun
             Continuation::Member {
                 rhs: grouped,
                 correlation: None,
-                join_type: None,
+                join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
             },
         ))
     };
 
     let arms: Vec<Chain> = typed
-        .steps
+        .schedule()
         .iter()
         .enumerate()
         .map(|(i, step)| step_expr(i, step))
@@ -323,6 +295,5 @@ fn build_explained_plan(typed: &TypedEffectPlan, alias: Option<String>) -> Groun
             subquery: Box::new(unioned),
         },
         alias: alias.map(Into::into),
-        outer: false,
     })
 }

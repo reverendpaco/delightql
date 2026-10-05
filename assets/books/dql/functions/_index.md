@@ -27,8 +27,8 @@ functions -- mappings that return exactly one value per input.]{.sidenote}
 
 ```{.delightql .numberLines}
 employee(*),
-  length:(LastName) > 5
-  |> +( trim:(upper:(LastName)) as CapitalizedLastName)
+  length:(last_name) > 5
+  |> +( trim:(upper:(last_name)) as capitalized_last_name)
 ```
 
 Three functions appear in two contexts:
@@ -41,41 +41,41 @@ The colon signals to both compiler and programmer that the functor returns a dom
 
 ## Function Pipe Composition {.dqlh}
 
-The F-PIPE sigil `/->`{.delightql .sigil} composes functions left to right:
+The F-PIPE sigil `>>`{.delightql .sigil} composes functions left to right:
 
 ```delightql
-employee(*), length:(LastName) > 5
-  |> +( LastName /-> upper:() /-> trim:() as CapitalizedLastName)
+employee(*), length:(last_name) > 5
+  |> +( last_name >> upper:() >> trim:() as capitalized_last_name)
 ```
 
 
 The pipe begins with a domain expression (a column, literal, or function call).
-Each subsequent function is in curried form -- the piped value fills the first
-argument.
+Each subsequent function is in curried form. The piped value fills the final
+argument unless an explicit `@` places it elsewhere.
 
 When the value belongs in a different argument position, use the F-PARAM sigil `@`:
 
 ```delightql
-employee(*), length:(LastName) > 5
-  |> +(  BirthDate /-> strftime:("%Y",@) as BirthYear )
+employee(*), length:(last_name) > 5
+  |> +(  birth_date >> strftime:("%Y",@) as birth_year )
 ```
 
 
 The LAMBDA sigil `:( )`{.delightql .sigil} creates an inline function. The `@` marks where the piped value is placed.
 
 ```delightql
-employee(*), length:(LastName) > 5
-    |> +(  BirthDate /-> strftime:("%Y",@) /-> :( @ + 2) as BirthYearPlusTwo,
-           BirthDate /-> strftime:("%Y",@) /-> sqrt:() as SqrtOfBirthYear)
+employee(*), length:(last_name) > 5
+    |> +(  birth_date >> strftime:("%Y",@) >> :( @ + 2) as birth_year_plus_two,
+           birth_date >> strftime:("%Y",@) >> abs:() as abs_of_birth_year)
 ```
 
 
 A lambda has an alternate spelling where a programmer may name the parameter coming in:
 
 ```delightql
-employee(*), length:(LastName) > 5
-    |> +(  BirthDate /-> strftime:("%Y") /-> :(|bday| bday + 2) as BirthYearPlusTwo,
-           BirthDate /-> strftime:("%Y") /-> sqrt:() as SqrtOfBirthYear)
+employee(*), length:(last_name) > 5
+    |> +(  birth_date >> strftime:("%Y") >> :(|bday| bday + 2) as birth_year_plus_two,
+           birth_date >> strftime:("%Y") >> abs:() as abs_of_birth_year)
 ```
 
 Use the **LAMBDA-PARAM** `|  |` to capture and name the input variable as the named parameter.

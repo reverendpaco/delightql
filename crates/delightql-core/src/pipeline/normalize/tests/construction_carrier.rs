@@ -52,7 +52,7 @@ fn record_of(source: &str) -> Vec<RecordMember<Unresolved>> {
 }
 
 /// The pattern a destructure declares.
-fn pattern(source: &str) -> TreePattern<Unresolved> {
+fn pattern(source: &str) -> DestructurePattern<Unresolved> {
     chain(source)
         .continuations()
         .iter()
@@ -65,7 +65,10 @@ fn pattern(source: &str) -> TreePattern<Unresolved> {
 
 fn pattern_members(source: &str) -> Vec<RecordPatternMember<Unresolved>> {
     match pattern(source) {
-        TreePattern::Record(record) => record.members.iter().cloned().collect(),
+        DestructurePattern::Scalar(TreePattern::Record(record))
+        | DestructurePattern::Iterate(IterationPattern::Tree(TreePattern::Record(record))) => {
+            record.members.iter().cloned().collect()
+        }
         other => panic!("expected a record pattern in {source:?}, got {other:?}"),
     }
 }
@@ -86,12 +89,10 @@ fn pattern_kind(member: &RecordPatternMember<Unresolved>) -> &'static str {
     match member {
         RecordPatternMember::Binder(_) => "binder",
         RecordPatternMember::Keyed { .. } => "keyed",
-        RecordPatternMember::Nested {
-            iteration: false, ..
-        } => "nested",
-        RecordPatternMember::Nested {
-            iteration: true, ..
-        } => "iteration",
+        RecordPatternMember::Nested { target, .. } => match target.as_ref() {
+            NestedPattern::Navigate(_) => "nested",
+            NestedPattern::Iterate(_) => "iteration",
+        },
         RecordPatternMember::Path(_) => "path",
         RecordPatternMember::Metadata { .. } => "metadata",
         RecordPatternMember::Disregarded => "disregarded",
@@ -128,6 +129,40 @@ fn an_induced_member_carries_an_enclyph() {
 
 /// A tuple is by POSITION: its elements are ordinary values, and no key
 /// stands among them.
+/// `{}` is the empty record and `[]` the empty tuple: constructors with no
+/// members, admitted as values rather than refused as incomplete syntax.
+#[test]
+fn the_empty_constructors_are_values_with_no_members() {
+    assert!(record_of("users(*) |> ({} as value)").is_empty());
+    match constructed("users(*) |> ([] as value)") {
+        Enclyph::Tuple(tuple) => assert!(tuple.elements.is_empty()),
+        other => panic!("expected a tuple, got {other:?}"),
+    }
+    let members = record_of(r#"users(*) |> ({"array": [], "object": {}} as value)"#);
+    assert_eq!(members.len(), 2);
+    for member in &members {
+        let RecordMember::Keyed { value, .. } = member else {
+            panic!("expected keyed members, got {member:?}");
+        };
+        match value.as_ref() {
+            DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Record(r))) => {
+                assert!(r.members.is_empty())
+            }
+            DomainExpression::Application(FunctionApplication::Enclyph(Enclyph::Tuple(t))) => {
+                assert!(t.elements.is_empty())
+            }
+            other => panic!("expected a nested empty constructor, got {other:?}"),
+        }
+    }
+}
+
+/// The pattern curlies keep their heading: an empty pattern binds nothing.
+#[test]
+fn an_empty_pattern_is_refused() {
+    let message = refusal("users(*), j ~= {} |> (j)");
+    assert!(!message.is_empty(), "an empty record pattern must refuse");
+}
+
 #[test]
 fn a_tuple_holds_values_by_position() {
     let Enclyph::Tuple(tuple) = constructed("t(*) |> ([a, b, c])") else {
@@ -162,7 +197,8 @@ fn a_record_pattern_admits_its_members() {
 #[test]
 fn a_metadata_binding_is_a_pattern_member() {
     let members = pattern_members("t(*), d ~= ~> {g:~> {v}}");
-    let [RecordPatternMember::Metadata { key, target }] = members.as_slice() else {
+    let [RecordPatternMember::Metadata(MetadataBinding { key, target })] = members.as_slice()
+    else {
         panic!("expected one metadata member, got {members:?}");
     };
     assert_eq!(key.name.as_str(), "g");
@@ -170,17 +206,63 @@ fn a_metadata_binding_is_a_pattern_member() {
 
     // `g:~> _` binds the keys and disregards what stands under them.
     let members = pattern_members("t(*), d ~= ~> {g:~> _}");
-    let [RecordPatternMember::Metadata { target, .. }] = members.as_slice() else {
+    let [RecordPatternMember::Metadata(MetadataBinding { target, .. })] = members.as_slice() else {
         panic!("expected one metadata member, got {members:?}");
     };
     assert!(matches!(target, PatternTarget::Disregarded));
+}
+
+/// A CHAINED METADATA BINDING IS A CHAIN OF LEVELS, the mirror of the
+/// construction's `g:~> k:~> h:~> {…}`: under each key stands ANOTHER
+/// LEVEL, never a sequence — the construction put none there — and the
+/// collector pattern stands at the bottom. Depth is not a special case:
+/// three levels nest exactly as two do.
+#[test]
+fn a_chained_metadata_binding_nests_a_level_under_a_level() {
+    fn level(binding: &MetadataBinding) -> (&str, &PatternTarget) {
+        (binding.key.name.as_str(), &binding.target)
+    }
+
+    let members = pattern_members("t(*), d ~= g:~> k:~> h:~> {x}");
+    let [RecordPatternMember::Metadata(outer)] = members.as_slice() else {
+        panic!("expected one metadata member, got {members:?}");
+    };
+    let ("g", PatternTarget::Binding(middle)) = level(outer) else {
+        panic!("expected `g` over a nested level, got {outer:?}");
+    };
+    let ("k", PatternTarget::Binding(inner)) = level(middle) else {
+        panic!("expected `k` over a nested level, got {middle:?}");
+    };
+    let ("h", PatternTarget::Pattern(collector)) = level(inner) else {
+        panic!("expected `h` over a collector pattern, got {inner:?}");
+    };
+    let IterationPattern::Tree(TreePattern::Record(record)) = collector.as_ref() else {
+        panic!("expected a record collector, got {collector:?}");
+    };
+    assert!(matches!(
+        record.members.iter().collect::<Vec<_>>().as_slice(),
+        [RecordPatternMember::Binder(binder)] if binder.name.as_str() == "x"
+    ));
+
+    // The chain ends in nothing the same way: `g:~> k:~> _` binds two key
+    // columns and reads nothing under the second.
+    let members = pattern_members("t(*), d ~= g:~> k:~> _");
+    let [RecordPatternMember::Metadata(outer)] = members.as_slice() else {
+        panic!("expected one metadata member, got {members:?}");
+    };
+    let ("g", PatternTarget::Binding(inner)) = level(outer) else {
+        panic!("expected `g` over a nested level, got {outer:?}");
+    };
+    assert!(matches!(level(inner), ("k", PatternTarget::Disregarded)));
 }
 
 /// ARRAY DESTRUCTURING binds by INDEX, and a reach after the index continues
 /// the same path.
 #[test]
 fn an_array_pattern_binds_by_index() {
-    let TreePattern::Array(array) = pattern("t(*), d ~= [.0 as x, .1.name]") else {
+    let DestructurePattern::Scalar(TreePattern::Array(array)) =
+        pattern("t(*), d ~= [.0 as x, .1.name]")
+    else {
         panic!("expected an array pattern");
     };
     let members: Vec<_> = array.members.iter().cloned().collect();
@@ -199,6 +281,44 @@ fn an_array_pattern_binds_by_index() {
     // A member that REACHES publishes the flattened spelling of what it
     // reached, the same law the record side's path binding follows.
     assert_eq!(second.published_name(), "1_name");
+}
+
+/// The wrapped scalar-array form has its own binder carrier; it is neither a
+/// synthetic index nor an object-pattern member.
+#[test]
+fn a_scalar_array_pattern_carries_its_binder() {
+    let DestructurePattern::Iterate(IterationPattern::ScalarArray(binder)) =
+        pattern("t(*), d ~= ~> [item]")
+    else {
+        panic!("expected a scalar array binder");
+    };
+    assert_eq!(binder.name.as_str(), "item");
+}
+
+/// The other two construction sites carry the same proof: a keyed nested
+/// binder sits in the iterating arm, and a metadata target is licensed by
+/// the metadata level's own iteration.
+#[test]
+fn scalar_array_binders_are_owned_by_every_iteration_site() {
+    let members = pattern_members(r#"t(*), d ~= {"items": ~> [item]}"#);
+    let [RecordPatternMember::Nested { target, .. }] = members.as_slice() else {
+        panic!("expected one nested pattern, got {members:?}");
+    };
+    assert!(matches!(
+        target.as_ref(),
+        NestedPattern::Iterate(IterationPattern::ScalarArray(binder))
+            if binder.name.as_str() == "item"
+    ));
+
+    let members = pattern_members("t(*), d ~= group:~> [item]");
+    let [RecordPatternMember::Metadata(MetadataBinding { target, .. })] = members.as_slice() else {
+        panic!("expected one metadata pattern, got {members:?}");
+    };
+    assert!(matches!(
+        target,
+        PatternTarget::Pattern(pattern)
+            if matches!(pattern.as_ref(), IterationPattern::ScalarArray(binder) if binder.name.as_str() == "item")
+    ));
 }
 
 /// A path binding publishes the underscore-flattened spelling unless `as`

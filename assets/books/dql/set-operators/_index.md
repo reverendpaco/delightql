@@ -26,7 +26,7 @@ but opens up the door to other functionality by
 To make this more concrete, consider delightql's **UNION CORRESPONDING**:
 
 ```delightql
-  users(*) ; users_2024(*)
+  customer(*) ; employee(*)
 ```
 
 The semicolon sigil `;`{.delightql .sigil} of **UNION CORRESPONDING** separates

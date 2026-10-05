@@ -3,21 +3,21 @@
 Columns can be transformed during projection using domain functions:
 
 ```delightql
-employee(*)
-    |>  ( upper:(FirstName) as f,
-          upper:(LastName) as LastName,
-          3 + Salary as salary_plus_three)
+track(*)
+    |>  ( upper:(name) as n,
+          upper:(composer) as composer,
+          milliseconds / 1000 as seconds)
 ```
 
 ```sql
 select
-  upper(FirstName) as f,
-  upper(LastName) as LastName,
-  3 + Salary as salary_plus_three
-from employee;
+  upper(name) as n,
+  upper(composer) as composer,
+  milliseconds / 1000 as seconds
+from track;
 ```
 
-Note the colon in `upper:(FirstName).` This distinguishes functions from
+Note the colon in `upper:(name).` This distinguishes functions from
 relations -- `foo(A,B)` is a relation; `foo:(A)` is a function.
 
 > Aggregate functions are not permitted in projection. See the sections on

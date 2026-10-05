@@ -3,14 +3,14 @@
 Limit the number of tuples returned using the **TUPLE-ORDINAL** sigil `#`{.delightql .sigil} in a predicate position:
 
 ```delightql
-employee(*) , # < 20
+customer(*) , # < 20
 ```
 
-```Sql
-select * from employee limit 20;
+```sql
+select * from customer limit 20;
 ```
 
-Read this as: "all columns of employee where the implicit row ordinal is less
+Read this as: "all columns of customer where the implicit row ordinal is less
 than 20."
 
 Limit affects only cardinality, not schema.
@@ -19,23 +19,23 @@ Limit affects only cardinality, not schema.
 **Order of operations matters**. Delightql evaluates left to right, so these two queries differ:
 
 ```delightql
-employee(*), department(*.(DepartmentName)), #<20
+customer(*), invoice(*.(customer_id)), #<20
 ```
 
 ```sql
 select
   *
-from employee join department using(DepartmentName)
+from customer join invoice using(customer_id)
   limit 20;
 ```
 
 ```delightql
-employee(*), #<20, department(*.(DepartmentName))
+customer(*), #<20, invoice(*.(customer_id))
 ```
 
 ```sql
 select
   *
-from (select * from employee limit 20)
-  join department using(DepartmentName);
+from (select * from customer limit 20)
+  join invoice using(customer_id);
 ```

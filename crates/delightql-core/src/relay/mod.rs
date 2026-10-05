@@ -11,18 +11,16 @@
 
 use std::collections::HashMap;
 
+use crate::{
+    diagnostic::{DelightQLError, ErrorSelector, Runtime},
+    host::CompilerHost,
+    pipeline::{self, verdict},
+    system::ReadySystem,
+};
 use delightql_protocol::{
     ByteSeq, Cell, ClientTerm, CloseResponse, Dimension, FetchResponse, Handle, Handler, MetaItem,
     Orientation, Projection, QueryHandle, QueryResponse, ReceivedError, ServerTerm, Session,
     Transport, WireError,
-};
-#[cfg(not(target_arch = "wasm32"))]
-use rusqlite;
-
-use crate::{
-    diagnostic::{DelightQLError, ErrorSelector, Runtime, Sqlite, SqliteNative},
-    pipeline::{self, resolver::ResolutionConfig, verdict, Pipeline},
-    system::ReadySystem,
 };
 
 /// What an execution can fail with: a diagnostic this process minted, or a
@@ -67,31 +65,168 @@ pub(crate) fn error_term(diagnostic: &DelightQLError) -> ServerTerm {
     ServerTerm::Error(WireError::of(diagnostic))
 }
 
-/// The bootstrap engine's refusal, as its own identity, with the DQL-side
-/// teaching appended where the message has one.
-#[cfg(not(target_arch = "wasm32"))]
-fn bootstrap_engine_error(operation: &str, error: rusqlite::Error) -> DelightQLError {
-    match error {
-        rusqlite::Error::SqliteFailure(code, message) => {
-            let text = teach_runtime_message(message.unwrap_or_else(|| code.to_string()));
-            let message = format!("{operation}: {text}");
-            match SqliteNative::new(code.extended_code, message.clone()) {
-                Some(native) => Sqlite::Native(native).into(),
-                None => Sqlite::Engine { message }.into(),
+/// ONE EXECUTED RESULT, BUFFERED WHOLE: the dimensions the engine elected
+/// and the cells they describe, produced together by the road that ran the
+/// statement. There is no entrance that takes a name list and rebuilds the
+/// descriptors, so a result cannot be re-emitted under a heading its cells
+/// were never read under.
+pub(crate) struct BufferedResult {
+    dimensions: Vec<Dimension>,
+    rows: Vec<Vec<Cell>>,
+}
+
+impl BufferedResult {
+    /// A result no statement produced: the empty relation with no heading.
+    fn empty() -> Self {
+        BufferedResult {
+            dimensions: Vec::new(),
+            rows: Vec::new(),
+        }
+    }
+
+    /// A result the relay COMPOSES rather than reads — a receipt. Every
+    /// field's descriptor is stated by the composer beside its name; nothing
+    /// is inferred from the cells.
+    fn composed(columns: Vec<(String, &'static str)>, rows: Vec<Vec<Cell>>) -> Self {
+        let dimensions = columns
+            .into_iter()
+            .enumerate()
+            .map(|(position, (name, descriptor))| Dimension {
+                position: position as u64,
+                name: name.into_bytes(),
+                descriptor: descriptor.as_bytes().to_vec(),
+                naming: delightql_protocol::Naming::Authored,
+            })
+            .collect();
+        BufferedResult { dimensions, rows }
+    }
+
+    /// A result read on a connection that answers with typed values and no
+    /// declared heading: the descriptors are elected from the cells by the
+    /// same law the streaming party applies — each column takes the storage
+    /// class of its first non-NULL value, and a column with none declares
+    /// nothing. A declared type, where the engine reports one, wins.
+    fn elected(
+        columns: Vec<String>,
+        declared: Vec<Option<String>>,
+        rows: Vec<Vec<delightql_types::DbValue>>,
+    ) -> Self {
+        let mut descriptors: Vec<String> = declared
+            .into_iter()
+            .map(|declared| declared.unwrap_or_default())
+            .collect();
+        descriptors.resize(columns.len(), String::new());
+        for row in &rows {
+            for (index, value) in row.iter().enumerate() {
+                if descriptors[index].is_empty() {
+                    descriptors[index] = value.storage_class().to_string();
+                }
+            }
+            if descriptors.iter().all(|descriptor| !descriptor.is_empty()) {
+                break;
             }
         }
-        other => Sqlite::Engine {
-            message: format!("{operation}: {other}"),
-        }
-        .into(),
+        let dimensions = columns
+            .into_iter()
+            .zip(descriptors)
+            .enumerate()
+            .map(|(position, (name, descriptor))| Dimension {
+                position: position as u64,
+                name: name.into_bytes(),
+                descriptor: descriptor.into_bytes(),
+                naming: delightql_protocol::Naming::Authored,
+            })
+            .collect();
+        let rows = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(|v| v.into_wire_bytes()).collect())
+            .collect();
+        BufferedResult { dimensions, rows }
     }
+
+    /// The column names, for a consumer that speaks names alone.
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.dimensions
+            .iter()
+            .map(|d| String::from_utf8_lossy(&d.name).into_owned())
+            .collect()
+    }
+
+    pub(crate) fn rows(&self) -> &[Vec<Cell>] {
+        &self.rows
+    }
+
+    /// Every row's cells as text, a NULL as `None`.
+    pub(crate) fn text_rows(&self) -> Vec<Vec<Option<String>>> {
+        self.rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.as_ref().map(|bytes| String::from_utf8_lossy(bytes).into_owned()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The first row, for a probe that reads one cell.
+    fn first_row(&self) -> Option<&Vec<Cell>> {
+        self.rows.first()
+    }
+
+    /// This result under the naming its compilation recorded.
+    pub(crate) fn named(
+        mut self,
+        naming: Option<&[delightql_protocol::Naming]>,
+    ) -> Result<Self, DelightQLError> {
+        stamp_naming(&mut self.dimensions, naming)?;
+        Ok(self)
+    }
+}
+
+/// Say, per column, what the compilation recorded about who chose its name.
+///
+/// A party reading an engine sees only the characters the engine answered,
+/// so it states every column `Authored`; the compilation is what knows which
+/// of them the mint drew, and it answers by position. `None` means the
+/// compilation saw no heading, and the party's statement stands. A heading
+/// whose width the engine does not match cannot be laid over it, and is
+/// refused rather than guessed at.
+pub(crate) fn stamp_naming(
+    dimensions: &mut [Dimension],
+    naming: Option<&[delightql_protocol::Naming]>,
+) -> Result<(), DelightQLError> {
+    let Some(naming) = naming else {
+        return Ok(());
+    };
+    if naming.len() != dimensions.len() {
+        return Err(crate::diagnostic::Internal::invariant(
+            "relay heading naming",
+            format!(
+                "the compiled heading has {} columns; the engine answered {}",
+                naming.len(),
+                dimensions.len()
+            ),
+        ));
+    }
+    for (dimension, naming) in dimensions.iter_mut().zip(naming) {
+        dimension.naming = *naming;
+    }
+    Ok(())
 }
 
 /// Buffered eager results for non-streaming connections (bootstrap, imported).
 struct EagerBuffer {
-    dimensions: Vec<Dimension>,
     rows: Vec<Vec<Cell>>,
     cursor: usize,
+}
+
+impl EagerBuffer {
+    fn buffered(result: BufferedResult) -> Self {
+        EagerBuffer {
+            rows: result.rows,
+            cursor: 0,
+        }
+    }
 }
 
 /// Compiler-created relations one statement's execution staged, and the
@@ -109,6 +244,10 @@ struct Staged {
 mod tests;
 
 mod entry;
+#[cfg(test)]
+mod exact_receipt_tests;
+#[cfg(test)]
+mod linear_admission_tests;
 mod pump;
 #[cfg(test)]
 mod pump_tests;
@@ -136,23 +275,6 @@ pub struct RelayHooks {
     /// Delivery order pinned by
     /// `pump_tests::non_final_shipped_deliver_via_on_ship_in_order`.
     pub on_ship: Option<Box<dyn FnMut(&[String], &[Vec<Cell>])>>,
-}
-
-/// The engine's `rusqlite` vocabulary read into the shared one. The
-/// bootstrap store is a raw rusqlite connection rather than a
-/// `DatabaseConnection`, and core cannot reach `delightql-backends`, so
-/// this is where the bootstrap road joins the carrier every other road
-/// already speaks.
-#[cfg(not(target_arch = "wasm32"))]
-fn bootstrap_value(value: rusqlite::types::Value) -> delightql_types::DbValue {
-    use delightql_types::DbValue;
-    match value {
-        rusqlite::types::Value::Null => DbValue::Null,
-        rusqlite::types::Value::Integer(i) => DbValue::Integer(i),
-        rusqlite::types::Value::Real(f) => DbValue::Real(f),
-        rusqlite::types::Value::Text(s) => DbValue::Text(s),
-        rusqlite::types::Value::Blob(b) => DbValue::Blob(b),
-    }
 }
 
 /// Whether a check's one cell says yes. An absent cell is not a yes: a
@@ -202,11 +324,11 @@ pub struct RelayParty<'a, T: Transport> {
     next_effect_run_id: u64,
     danger_overrides: Vec<pipeline::ast_unresolved::DangerSpec>,
     option_overrides: Vec<pipeline::ast_unresolved::OptionSpec>,
-    sql_optimization_level: pipeline::sql_optimizer::OptimizationLevel,
-    /// Whether the most recent typed-plan run took its exit! latch —
-    /// read by the F5 receipt binder (a NO run ships the empty receipt).
-    last_run_exited: bool,
     hooks: RelayHooks,
+    /// What this session may do to the world, fixed at construction: an
+    /// observing session mints observing compilations, and its every
+    /// statement is judged by the admission they carry.
+    admission: crate::compiler_limits::Admission,
 }
 
 /// A refusal weighed against what the submission DECLARED it expects.
@@ -285,10 +407,28 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             next_effect_run_id: 1,
             danger_overrides: Vec::new(),
             option_overrides: Vec::new(),
-            sql_optimization_level: pipeline::sql_optimizer::OptimizationLevel::Basic,
-            last_run_exited: false,
             hooks: RelayHooks::default(),
+            admission: crate::compiler_limits::Admission::Execute,
         }
+    }
+
+    /// A session that OBSERVES: a pure statement runs and answers exactly as
+    /// it would under `new`; a statement that would execute an effect is
+    /// refused before any dispatcher runs. The admission is fixed here and
+    /// has no setter — an observing session cannot be talked into executing.
+    pub fn observing(system: &'a mut ReadySystem, sql_session: Session<T>) -> Self {
+        RelayParty {
+            admission: crate::compiler_limits::Admission::Observe,
+            ..RelayParty::new(system, sql_session)
+        }
+    }
+
+    /// One compilation's registry, armed with this session's admission.
+    fn mint_registry(&self) -> std::rc::Rc<crate::names::Registry> {
+        std::rc::Rc::new(match self.admission {
+            crate::compiler_limits::Admission::Execute => crate::names::Registry::new(&[]),
+            crate::compiler_limits::Admission::Observe => crate::names::Registry::observing(&[]),
+        })
     }
 
     /// Install the side-channel hooks (verdicts, shipped sets).
@@ -327,16 +467,16 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// that is why the parse failed, the sequence entrance is asked — not to
     /// run the text, but so the refusal can say "send each query as its own
     /// term" instead of pointing at a syntax error the author did not make.
-    fn read_one_goal(
+    fn read_submission(
         &self,
         dql: &str,
         registry: &std::rc::Rc<crate::names::Registry>,
-    ) -> std::result::Result<crate::pipeline::normalize::Goal, GoalRefusal> {
+    ) -> std::result::Result<pipeline::Submission, GoalRefusal> {
         let syntax_error = |error: crate::error::DelightQLError| error_term(&error);
         let tree = match pipeline::parse::submission_attributed(dql, registry.limits().nesting()) {
             Ok(tree) => tree,
             Err(refusal) => {
-                if let Some(count) = query_count_if_a_sequence(dql) {
+                if let Some(count) = query_count_if_a_sequence(&refusal.tree) {
                     if count > 1 {
                         return Err(GoalRefusal::Reported(error_term(
                             &crate::diagnostic::Parse::MultiQuery { count }.into(),
@@ -371,7 +511,52 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         };
         let normalized =
             pipeline::normalize::submission(&tree, std::rc::Rc::clone(registry)).map_err(judged)?;
-        pipeline::one_goal(normalized).map_err(|error| GoalRefusal::Reported(syntax_error(error)))
+        pipeline::one_submission(normalized)
+            .map_err(|error| GoalRefusal::Reported(syntax_error(error)))
+    }
+
+    /// A submission of definitions and no goal: admitted as the unnamed
+    /// prompt block it is — into `home`, with a block's replacement of an
+    /// earlier definition — and answered with what it defined.
+    fn admit_definitions(
+        &mut self,
+        block: crate::pipeline::ast_unresolved::InlineDdlSpec,
+    ) -> ServerTerm {
+        if let Err(error) = self.admission.admit(
+            "a submission of definitions",
+            crate::bin_cartridge::ExecutionClass::Effect,
+        ) {
+            return error_term(&error);
+        }
+        let defined = crate::pipeline::inline_ddl::prompt_block_entities(&block);
+        if let Err(error) =
+            crate::pipeline::inline_ddl::register_prompt_blocks([block], self.system)
+        {
+            return error_term(&error);
+        }
+        let rows = defined
+            .into_iter()
+            .map(|(namespace, entity)| {
+                vec![Some(namespace.into_bytes()), Some(entity.into_bytes())]
+            })
+            .collect();
+        self.eager_header(BufferedResult::composed(
+            vec![
+                ("namespace".to_string(), "TEXT"),
+                ("entity".to_string(), "TEXT"),
+            ],
+            rows,
+        ))
+    }
+
+    /// The runtime's consultation of the file a whole-statement `run!`
+    /// runs, under the session's admission.
+    fn consult_for_run(&mut self, goal: &crate::pipeline::normalize::Goal) -> crate::error::Result<()> {
+        let Some(path) = crate::pipeline::middle::api::run_file(goal) else {
+            return Ok(());
+        };
+        self.admission.admit("run!", crate::bin_cartridge::ExecutionClass::Effect)?;
+        self.system.consult_for_run(&path).map(|_| ())
     }
 
     fn handle_query(&mut self, text: ByteSeq) -> ServerTerm {
@@ -395,9 +580,10 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // classification and the compilation all ask questions about the same
         // goal, and asking the parser three times is how they come to
         // disagree.
-        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
-        let goal = match self.read_one_goal(&dql, registry.shared()) {
-            Ok(goal) => goal,
+        let registry = self.mint_registry();
+        let goal = match self.read_submission(&dql, &registry) {
+            Ok(pipeline::Submission::Goal(goal)) => goal,
+            Ok(pipeline::Submission::Definitions(block)) => return self.admit_definitions(block),
             Err(GoalRefusal::Reported(term)) => return term,
             Err(GoalRefusal::AsDeclared { declared, detail }) => {
                 if let Some(ref mut hook) = self.hooks.on_error_hook {
@@ -416,50 +602,27 @@ impl<'a, T: Transport> RelayParty<'a, T> {
 
         // Error hook path: handle both compile-time and runtime error hooks
         if let Some(expected) = goal.declared.expected_error.clone() {
-            return self.handle_error_hook_query(&dql, goal, expected, registry);
+            return self.handle_error_hook_query(&dql, goal, expected);
         }
 
-        // The effect-chain entry points: run!/run_namespace!/query-position
-        // directives take the transformer → pump road. The classifier
-        // declines annotated statements, and DML/DDL statements under CLI
-        // danger/option overrides keep the ordinary compilation path (the
-        // plan compiler applies default gates only) — see relay/entry.rs.
-        let allow_adhoc = self.danger_overrides.is_empty() && self.option_overrides.is_empty();
-        let goal = match entry::classify_effect_entry(goal, allow_adhoc) {
-            Ok(entry::Classified::Effect(effect_entry)) => {
-                return self.handle_effect_entry(effect_entry)
+        // Every goal is compiled by the new middle and nowhere else.
+        use crate::pipeline::middle::api::{statement, Route};
+        let overridden = !self.danger_overrides.is_empty() || !self.option_overrides.is_empty();
+        // `run!` consults its file before its statement is compiled.
+        if let Err(error) = self.consult_for_run(&goal) {
+            return error_term(&error);
+        }
+        match statement(&mut *self.system, &dql, goal, self.admission, overridden) {
+            Route::Query(compiled) => {
+                let (term, staged) = self.execute_compiled(compiled);
+                self.settle_staged(term, staged)
             }
-            Ok(entry::Classified::Ordinary(goal)) => goal,
-            Err(error) => return error_term(&error),
-        };
-
-        // Normal single-query path: compile DQL → SQL via the pipeline
-        let mut pipeline = Pipeline::from_goal(
-            goal,
-            &dql,
-            &mut *self.system,
-            ResolutionConfig::default(),
-            self.sql_optimization_level,
-            registry,
-        );
-
-        // Apply CLI-level overrides
-        if let Err(e) = pipeline.set_cli_danger_overrides(self.danger_overrides.clone()) {
-            return error_term(&e);
+            Route::Program(plan, trailing) => {
+                let term = self.play_plan(&plan);
+                self.admit_trailing(term, trailing)
+            }
+            Route::Refused(error) => error_term(&error),
         }
-        pipeline.set_cli_option_overrides(self.option_overrides.clone());
-
-        let compiled = match pipeline.compile() {
-            Ok(c) => c,
-            Err(e) => return error_term(&e),
-        };
-
-        let compiled = compiled;
-        // Drop pipeline to release borrow on self.system
-        drop(pipeline);
-
-        let (term, staged) = self.execute_compiled(compiled);
-        self.settle_staged(term, staged)
     }
 
     /// Run one compiled statement: its authored preconditions, the staging
@@ -475,11 +638,16 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         &mut self,
         compiled: crate::pipeline::compiled_query::CompiledQuery,
     ) -> (ServerTerm, Staged) {
-        let obligations = compiled.obligations;
-        let prepare_sqls = compiled.prepare_sqls;
-        let connection_id = compiled.connection_id;
-        let primary_sql = compiled.primary_sql;
-        let compiled_cleanup = compiled.cleanup_sqls;
+        let crate::pipeline::compiled_query::CompiledQuery {
+            primary_sql,
+            kind: _,
+            obligations,
+            prepare_sqls,
+            cleanup_sqls: compiled_cleanup,
+            connection_id,
+            naming,
+            trailing,
+        } = compiled;
         let mut staged = Staged {
             drops: Vec::new(),
             connection_id,
@@ -506,38 +674,61 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             match self.sql_session.query(sql_bytes) {
                 Ok(QueryResponse::Header {
                     handle: backend_handle,
-                    dimensions,
-                }) => {
-                    let frontend_handle = self.next_handle();
-                    self.handles.insert(frontend_handle.clone(), backend_handle);
-                    ServerTerm::Header {
-                        handle: frontend_handle,
-                        dimensions,
+                    mut dimensions,
+                }) => match stamp_naming(&mut dimensions, naming.as_deref()) {
+                    Ok(()) => {
+                        let frontend_handle = self.next_handle();
+                        self.handles.insert(frontend_handle.clone(), backend_handle);
+                        ServerTerm::Header {
+                            handle: frontend_handle,
+                            dimensions,
+                        }
                     }
-                }
+                    Err(refusal) => {
+                        let _ = self.sql_session.close(backend_handle);
+                        error_term(&refusal)
+                    }
+                },
                 Ok(QueryResponse::Error(received)) => error_term(&admitted(received)),
                 Err(e) => error_term(&Runtime::Transport { message: e.message }.into()),
             }
         } else {
             // Eager path: execute on bootstrap or imported connection, buffer results
-            match self.execute_sql_routed(&primary_sql, connection_id) {
-                Ok((columns, rows)) => {
-                    let dimensions = Self::eager_dimensions(&columns);
-                    let handle = self.next_handle();
-                    self.eager_buffers.insert(
-                        handle.clone(),
-                        EagerBuffer {
-                            dimensions: dimensions.clone(),
-                            rows,
-                            cursor: 0,
-                        },
-                    );
-                    ServerTerm::Header { handle, dimensions }
-                }
+            match self
+                .execute_sql_routed(&primary_sql, connection_id)
+                .and_then(|result| result.named(naming.as_deref()))
+            {
+                Ok(result) => self.eager_header(result),
                 Err(failure) => error_term(&failure),
             }
         };
-        (term, staged)
+        (self.admit_trailing(term, trailing), staged)
+    }
+
+    /// The statement has run: admit the blocks written after it.
+    ///
+    /// A refused statement admits none — its program stops at the refusal.
+    /// A block that cannot be admitted after a statement that succeeded
+    /// is the call's answer, and the statement's handle is closed; the
+    /// statement's effects stand, as they would had the block been the
+    /// next call.
+    pub(super) fn admit_trailing(
+        &mut self,
+        term: ServerTerm,
+        trailing: crate::pipeline::inline_ddl::Trailing,
+    ) -> ServerTerm {
+        if trailing.is_empty() || matches!(term, ServerTerm::Error(_)) {
+            return term;
+        }
+        match trailing.admit(self.system) {
+            Ok(()) => term,
+            Err(error) => {
+                if let ServerTerm::Header { handle, .. } = &term {
+                    let _ = self.handle_close(handle.clone());
+                }
+                error_term(&error)
+            }
+        }
     }
 
     /// Stage what a statement reads. `Err` is the refusal to return.
@@ -567,8 +758,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     ) -> Option<ServerTerm> {
         for obligation in obligations {
             match self.execute_sql_routed(&obligation.sql, connection_id) {
-                Ok((_cols, rows)) => {
-                    let held = cell_says_yes(rows.first());
+                Ok(result) => {
+                    let held = cell_says_yes(result.first_row());
                     if !held {
                         return Some(error_term(&obligation.refusal));
                     }
@@ -722,91 +913,33 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         dql: &str,
         goal: crate::pipeline::normalize::Goal,
         expected: ErrorSelector,
-        registry: crate::relation::Planning,
     ) -> ServerTerm {
         let identity = verdict::VerdictIdentity {
             name: None,
             body_text: expected.display(),
         };
 
-        // ANNOTATION TRANSPARENCY: an error hook must not change
-        // how a statement EXECUTES — only how its outcome is judged. A
-        // statement the effect chain would own (a directive tail) takes the
-        // effect chain here too, so its diagnostic class is the same with
-        // and without the annotation. Its error (or unexpected success) is
-        // matched against the expected URI exactly like the pipeline path.
-        let allow_adhoc = self.danger_overrides.is_empty() && self.option_overrides.is_empty();
-        let goal = match entry::classify_effect_entry(goal, allow_adhoc) {
-            Ok(entry::Classified::Ordinary(goal)) => goal,
-            Err(error) => return error_term(&error),
-            Ok(entry::Classified::Effect(effect_entry)) => {
-                let term = self.handle_effect_entry(effect_entry);
-                return match term {
-                    ServerTerm::Error(wire) => {
-                        let (matched, detail) = judge_wire(&expected, &wire);
-                        let v = verdict::Verdict {
-                            outcome: if matched {
-                                verdict::VerdictOutcome::Pass
-                            } else {
-                                verdict::VerdictOutcome::Fail
-                            },
-                            identity,
-                            detail: Some(detail.clone()),
-                        };
-                        if let Some(ref mut hook) = self.hooks.on_error_hook {
-                            hook(&v);
-                        }
-                        match v.outcome {
-                            verdict::VerdictOutcome::Pass => self.empty_header_response(),
-                            _ => error_term(&unmet_expectation(
-                                &expected,
-                                format!(
-                                    "expected error {} but got: {}",
-                                    expected.display(),
-                                    detail
-                                ),
-                            )),
-                        }
-                    }
-                    other => {
-                        // The statement succeeded where an error was expected.
-                        let v = verdict::Verdict {
-                            outcome: verdict::VerdictOutcome::Fail,
-                            identity,
-                            detail: Some("statement succeeded; expected an error".to_string()),
-                        };
-                        if let Some(ref mut hook) = self.hooks.on_error_hook {
-                            hook(&v);
-                        }
-                        let _ = other;
-                        error_term(&unmet_expectation(
-                            &expected,
-                            "statement succeeded; expected an error".to_string(),
-                        ))
-                    }
-                };
+        // Every goal is compiled by the new middle and nowhere else; the hook
+        // judges its outcome as it judges any other.
+        use crate::pipeline::middle::api::{statement, Route};
+        let overridden = !self.danger_overrides.is_empty() || !self.option_overrides.is_empty();
+        // `run!` consults its file before its statement is compiled; a
+        // refused consultation is the statement's outcome.
+        let consulted = self.consult_for_run(&goal);
+        let term = match consulted.map(|()| statement(&mut *self.system, dql, goal, self.admission, overridden)) {
+            Err(error) | Ok(Route::Refused(error)) => Err(error),
+            Ok(Route::Query(compiled)) => {
+                let (term, staged) = self.execute_compiled(compiled);
+                Ok(self.settle_staged(term, staged))
+            }
+            Ok(Route::Program(plan, trailing)) => {
+                let term = self.play_plan(&plan);
+                Ok(self.admit_trailing(term, trailing))
             }
         };
-
-        // Try to compile the query
-        let mut pipeline = Pipeline::from_goal(
-            goal,
-            dql,
-            &mut *self.system,
-            ResolutionConfig::default(),
-            self.sql_optimization_level,
-            registry,
-        );
-        if let Err(e) = pipeline.set_cli_danger_overrides(self.danger_overrides.clone()) {
-            return error_term(&e);
-        }
-        pipeline.set_cli_option_overrides(self.option_overrides.clone());
-
-        let compiled = match pipeline.compile() {
-            Err(e) => {
-                // A compile refusal is judged typed: the selector against
-                // the identity this process minted.
-                let actual = e.id();
+        match term {
+            Err(error) => {
+                let actual = error.id();
                 let v = verdict::Verdict {
                     outcome: if expected.matches(&actual) {
                         verdict::VerdictOutcome::Pass
@@ -814,24 +947,17 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         verdict::VerdictOutcome::Fail
                     },
                     identity,
-                    detail: Some(format!("{}: {}", actual, e)),
+                    detail: Some(format!("{}: {}", actual, error)),
                 };
                 if let Some(ref mut hook) = self.hooks.on_error_hook {
                     hook(&v);
                 }
-                return self.verdict_response(&expected, &v);
+                self.verdict_response(&expected, &v)
             }
-            Ok(c) => c,
-        };
-
-        // The annotation judges; it does not execute. The statement runs
-        // through the one execution authority, exactly as an unannotated one
-        // does, and the hook compares the outcome with what was expected.
-        let (term, staged) = self.execute_compiled(compiled);
-        let term = self.settle_staged(term, staged);
-        match self.judge_against_hook(term, &expected, identity) {
-            Ok(()) => self.empty_header_response(),
-            Err(refusal) => refusal,
+            Ok(term) => match self.judge_against_hook(term, &expected, identity) {
+                Ok(()) => self.empty_header_response(),
+                Err(refusal) => refusal,
+            },
         }
     }
 
@@ -980,52 +1106,19 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     }
 
     fn empty_header_response(&mut self) -> ServerTerm {
-        let handle = self.next_handle();
-        self.eager_buffers.insert(
-            handle.clone(),
-            EagerBuffer {
-                dimensions: vec![],
-                rows: vec![],
-                cursor: 0,
-            },
-        );
-        ServerTerm::Header {
-            handle,
-            dimensions: vec![],
-        }
+        self.eager_header(BufferedResult::empty())
     }
 
     // --- Connection routing ---
 
-    /// Execute SQL eagerly on the bootstrap connection (connection_id=1).
-    #[cfg(not(target_arch = "wasm32"))]
-    fn execute_eager_on_bootstrap(
-        &self,
-        sql: &str,
-    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), ExecutionFailure> {
-        let conn = self.system.get_bootstrap_connection();
-        let conn_guard = conn
-            .lock()
-            .map_err(|e| Runtime::poisoned("Bootstrap lock", e))?;
-        let mut stmt = conn_guard
-            .prepare(sql)
-            .map_err(|e| bootstrap_engine_error("Bootstrap prepare", e))?;
-        let col_count = stmt.column_count();
-        let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-        let rows_result = stmt
-            .query_map([], |row| {
-                let mut values = Vec::with_capacity(col_count);
-                for idx in 0..col_count {
-                    values.push(bootstrap_value(row.get(idx)?).into_wire_bytes());
-                }
-                Ok(values)
-            })
-            .map_err(|e| bootstrap_engine_error("Bootstrap query", e))?;
-        let mut result_rows = Vec::new();
-        for r in rows_result {
-            result_rows.push(r.map_err(|e| bootstrap_engine_error("Bootstrap fetch", e))?);
-        }
-        Ok((column_names, result_rows))
+    /// Execute SQL eagerly through the host's session-catalog capability.
+    fn execute_eager_on_bootstrap(&self, sql: &str) -> Result<BufferedResult, ExecutionFailure> {
+        let result = self.system.query_session_catalog(sql)?;
+        Ok(BufferedResult::elected(
+            result.columns,
+            result.declared,
+            result.rows,
+        ))
     }
 
     /// Execute SQL eagerly on an imported connection (connection_id >= 3).
@@ -1033,18 +1126,16 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         &self,
         sql: &str,
         connection_id: i64,
-    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), ExecutionFailure> {
+    ) -> Result<BufferedResult, ExecutionFailure> {
         let conn_arc = self.system.get_connection(connection_id)?;
         let conn_guard = conn_arc
             .lock()
             .map_err(|e| Runtime::poisoned(format!("Connection {} lock", connection_id), e))?;
         let (columns, rows) = conn_guard.query_all_rows(sql, &[])?;
-        Ok((
-            columns,
-            rows.into_iter()
-                .map(|row| row.into_iter().map(|v| v.into_wire_bytes()).collect())
-                .collect(),
-        ))
+        // The connection trait reports names and typed values, never a
+        // declared heading: every column elects.
+        let declared = vec![None; columns.len()];
+        Ok(BufferedResult::elected(columns, declared, rows))
     }
 
     /// Execute SQL on the appropriate connection based on connection_id.
@@ -1056,48 +1147,20 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         &mut self,
         sql: &str,
         connection_id: Option<i64>,
-    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), ExecutionFailure> {
+    ) -> Result<BufferedResult, ExecutionFailure> {
         match connection_id.unwrap_or(2) {
             2 => self.execute_eager_through_protocol(sql),
-            1 => {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    self.execute_eager_on_bootstrap(sql)
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let _ = sql;
-                    Err(Runtime::Unsupported {
-                        message: "bootstrap queries not supported on wasm32".to_string(),
-                    }
-                    .into())
-                }
-            }
+            1 => self.execute_eager_on_bootstrap(sql),
             id => self.execute_eager_on_imported(sql, id),
         }
     }
 
-    /// The heading an eagerly-buffered result answers with.
-    ///
-    /// The cells are already the engine's own answer — an eager result is
-    /// buffered, never re-read — so only the heading is built here.
-    fn eager_dimensions(columns: &[String]) -> Vec<Dimension> {
-        columns
-            .iter()
-            .enumerate()
-            .map(|(i, name)| Dimension {
-                position: i as u64,
-                name: name.as_bytes().to_vec(),
-                descriptor: b"TEXT".to_vec(),
-            })
-            .collect()
-    }
-
-    /// Execute SQL through the backend protocol and return (columns, rows).
+    /// Execute SQL through the backend protocol and buffer the whole result
+    /// under the dimensions the party elected for it.
     fn execute_eager_through_protocol(
         &mut self,
         sql: &str,
-    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), ExecutionFailure> {
+    ) -> Result<BufferedResult, ExecutionFailure> {
         let rows_orient = self
             .sql_session
             .agreed_orientation(Orientation::Rows)
@@ -1116,11 +1179,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             QueryResponse::Header { handle, dimensions } => (handle, dimensions),
             QueryResponse::Error(received) => return Err(admitted(received)),
         };
-
-        let columns: Vec<String> = dimensions
-            .iter()
-            .map(|d| String::from_utf8_lossy(&d.name).to_string())
-            .collect();
 
         let mut all_rows = Vec::new();
         loop {
@@ -1147,13 +1205,24 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         }
 
         let _ = self.sql_session.close(handle);
-        Ok((columns, all_rows))
+        Ok(BufferedResult {
+            dimensions,
+            rows: all_rows,
+        })
     }
 }
 
 impl<'a, T: Transport> crate::api::ServerRelay for RelayParty<'a, T> {
     fn handle_reset(&mut self) -> Result<(), crate::error::DelightQLError> {
         RelayParty::handle_reset(self)
+    }
+
+    fn set_session_setting(
+        &mut self,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), crate::error::DelightQLError> {
+        self.system.set_session_setting(key, value)
     }
 }
 
@@ -1166,6 +1235,9 @@ impl<'a, T: Transport> Handler for RelayParty<'a, T> {
                 lease_ms,
                 orientations,
             } => {
+                if let Some(refusal) = delightql_protocol::version_refusal(&protocol_version) {
+                    return ServerTerm::Error(delightql_protocol::WireError::of(&refusal));
+                }
                 let supported = vec![Orientation::Rows];
                 let agreed: Vec<Orientation> = orientations
                     .iter()
@@ -1235,8 +1307,6 @@ impl<'a, T: Transport> Handler for RelayParty<'a, T> {
     }
 }
 
-pub(crate) use delightql_types::teach_runtime_message;
-
 /// The relay's own "no such handle": the client named a result this session
 /// does not hold, which is a protocol fault of the conversation.
 fn unknown_handle() -> DelightQLError {
@@ -1262,10 +1332,27 @@ fn judge_bytes(expected: &ErrorSelector, identity: &[u8], message: &[u8]) -> (bo
     )
 }
 
-/// How many statements the text holds when read as a SEQUENCE — `None` when
-/// it is not a well-formed one. A diagnostic only: it runs on the failure
-/// path, after the term's own entrance has already refused.
-fn query_count_if_a_sequence(dql: &str) -> Option<usize> {
-    let tree = pipeline::parse::query_sequence(dql).ok()?;
+/// How many statements a refused submission's goal text holds when read as a
+/// SEQUENCE — `None` when it is not a well-formed one. A diagnostic only: it
+/// runs on the failure path, after the term's own entrance has already
+/// refused.
+///
+/// The goal text is what follows the submission's leading goal marker: a host
+/// that wraps what a user typed at a prompt writes ONE marker, in front of
+/// everything typed, so two queries typed together stand behind one marker.
+fn query_count_if_a_sequence(refused: &crate::pipeline::syntax::SyntaxTree) -> Option<usize> {
+    let source = refused.source();
+    let goal_text = match refused.entrance() {
+        crate::pipeline::syntax::Root::QuerySequence => source,
+        crate::pipeline::syntax::Root::DefinitionFile
+        | crate::pipeline::syntax::Root::CompanionCell => {
+            let marker = refused.tokens().into_iter().find(|token| !token.extra)?;
+            if marker.text != "?-" {
+                return None;
+            }
+            &source[marker.end..]
+        }
+    };
+    let tree = pipeline::parse::query_sequence(goal_text).ok()?;
     Some(pipeline::parse::query_spans(&tree).len())
 }

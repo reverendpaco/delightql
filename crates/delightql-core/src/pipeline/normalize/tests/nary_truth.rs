@@ -44,7 +44,7 @@ fn restriction(source: &str) -> Truth {
 
 fn ground(n: &str) -> DomainExpression<Unresolved> {
     DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(
-        LiteralValue::Number(n.to_string()),
+        LiteralValue::Number(crate::pipeline::asts::core::NumericLiteral::from_decimal_spelling(n.to_string())),
     ))
 }
 
@@ -146,7 +146,7 @@ fn a_negation_stays_one_member() {
 
 /// The truth a sigma definition states.
 fn sigma_truth(source: &str) -> Truth {
-    match definition(source).body {
+    match definition(source).into_body() {
         DdlBody::Truth(truth) => truth,
         other => panic!("expected a sigma body from {source:?}, got {other:?}"),
     }

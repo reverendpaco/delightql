@@ -11,20 +11,21 @@ Delightql infers placement from column references:
 - **Condition references multiple tables** → `ON`
 - **Condition references one table** → `WHERE`
 ```delightql
-employee(*), department?(*),
-  employee.DepartmentId = department.DepartmentId,   -- two tables → ON
-  department.Status = "active"                        -- one table → WHERE
+artist(*), album?(*),
+  artist.artist_id = album.artist_id,   // two tables → ON
+  album.title = "Greatest Hits"       // one table → WHERE
 ```
 ```sql
-SELECT * FROM employee
-  LEFT OUTER JOIN department
-    ON employee.DepartmentId = department.DepartmentId
-WHERE department.Status = 'active';
+SELECT * FROM artist
+  LEFT OUTER JOIN album
+    ON artist.artist_id = album.artist_id
+WHERE album.title = 'Greatest Hits';
 ```
 
-The multi-table condition (`employee.DepartmentId = department.DepartmentId`) becomes the
-join's `ON` clause. The single-table condition (`department.Status = 'active'`)
-becomes a `WHERE` filter -- employees with null or inactive departments are
-excluded.
+The multi-table condition (`artist.artist_id = album.artist_id`) becomes the
+join's `ON` clause. The single-table condition (`album.title = 'Greatest Hits'`)
+becomes a `WHERE` filter -- artists with no albums, or with no album of that
+title, are excluded.
 
 
+**TODO**:  ensure that named sigma-rules also obey this rule.

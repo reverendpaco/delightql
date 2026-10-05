@@ -133,10 +133,11 @@ pub(in crate::defuse) fn judge(
             ast_unresolved::Continuation::Member {
                 rhs,
                 correlation,
-                join_type,
+                join,
             } => {
                 let spelling = member_reads.next().and_then(|read| read.as_deref());
-                if correlation.is_some() || join_type.is_some() {
+                if correlation.is_some() || join != crate::pipeline::asts::core::JoinRoles::REQUIRED
+                {
                     return Err(refuse(pair, marked_read(&rhs, left, right)));
                 }
                 if super::is_bare_read(&rhs) && spelling == Some(other.spelling()) {
@@ -274,21 +275,17 @@ fn not_an_endpoint_read(read: &ast_unresolved::Chain, left: &ErTerm, right: &ErT
                 ast_unresolved::GroundMention::Named {
                     identifier, alias, ..
                 },
-            outer,
-        }) => Some((identifier.name.clone(), alias.is_some(), *outer)),
+        }) => Some((identifier.name.clone(), alias.is_some())),
         Some(ast_unresolved::Relation::InnerRelation {
             pattern: ast_unresolved::InnerRelationPattern::Indeterminate { identifier, .. },
             alias,
-            outer,
-        }) => Some((identifier.name.clone(), alias.is_some(), *outer)),
+        }) => Some((identifier.name.clone(), alias.is_some())),
         _ => None,
     };
     match named {
-        Some((name, aliased, outer)) if name == *left.name() || name == *right.name() => {
+        Some((name, aliased)) if name == *left.name() || name == *right.name() => {
             let how = if aliased {
                 "under an alias"
-            } else if outer {
-                "under an outer mark"
             } else {
                 "with a different access"
             };
@@ -376,7 +373,7 @@ fn simple(condition: &ast_unresolved::TruthExpression, pair: &str) -> Result<()>
         fn enter_domain(&mut self, e: &ast_unresolved::DomainExpression) -> Result<Descent> {
             match e {
                 ast_unresolved::DomainExpression::Reference(reference) => match reference {
-                    Reference::Named(_) => Ok(Descent::Continue),
+                    Reference::Named(_) | Reference::Argument(_) => Ok(Descent::Continue),
                     Reference::Ordinal(_) | Reference::Physical(_) => {
                         self.stop("a positional reference")
                     }
@@ -488,7 +485,7 @@ mod tests {
             crate::pipeline::normalize::query_sequence(&tree, registry).expect("a body normalizes");
         let mut queries = normalized.into_queries();
         assert_eq!(queries.len(), 1);
-        queries.remove(0).query
+        queries.remove(0).into_query()
     }
 
     fn term(spelling: &str) -> ErTerm {

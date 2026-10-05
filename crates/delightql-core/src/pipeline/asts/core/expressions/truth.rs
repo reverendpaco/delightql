@@ -58,48 +58,6 @@ impl Polarity {
     }
 }
 
-/// WHO CONSUMES A TRUTH — the one judgment, made by the POSITION.
-///
-/// Polarity says which way a proof is read; this says what the position does
-/// with the answer, and the two are distinct. Truth has exactly three
-/// consumers and each has its own acceptance law:
-///
-/// | consumer | law | UNKNOWN |
-/// |---|---|---|
-/// | value crossing | preserve the truth value | carried as null |
-/// | query filter | admit only TRUE | rejected |
-/// | database CHECK | reject only FALSE | admitted |
-///
-/// Only a filter PARTITIONS its input, so only a filter collapses a positive
-/// proof to a definite answer. A value carries the proof because the crossing
-/// preserves the denotation; a CHECK carries it because SQL's own CHECK rule
-/// already says what to do with UNKNOWN. Negative polarity is defined as "not
-/// TRUE" and is already two-valued, so every consumer spells it the same way.
-///
-/// The consumer is named by the POSITION that consumes, once, at the entrance
-/// — never rediscovered from the clause a lowering happened to emit into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TruthConsumer {
-    /// A value crossing: the truth becomes data and nothing observes it.
-    Value,
-    /// `WHERE`, `HAVING`, a filtering `ON`: the position admits only TRUE.
-    Filter,
-    /// A database CHECK: the row is refused exactly when the truth is FALSE.
-    Constraint,
-}
-
-impl TruthConsumer {
-    /// Whether a POSITIVE proof is collapsed to a definite answer here.
-    ///
-    /// The collapse is what makes the two polarities equipartition an input,
-    /// and only a filter needs it. Wrapping a CHECK's positive proof in
-    /// `IS TRUE` refuses every row the property is UNKNOWN about — the rows
-    /// SQL's CHECK rule admits.
-    pub fn observes_positive_proof(self) -> bool {
-        matches!(self, TruthConsumer::Filter)
-    }
-}
-
 /// A comparison of two VALUES. Both operands are domain expressions, so a
 /// truth cannot stand in one: the operand type says so, and no consumer has
 /// to re-check it.
@@ -214,6 +172,8 @@ pub struct Membership<P: Phase = Unresolved> {
     pub negated: bool,
     pub rows: Vec1<ValueRow<P>>,
     pub source: MembershipSource,
+    /// Holds nothing in every phase.
+    pub matching: (),
 }
 
 /// The syntax that authored a membership predicate.
@@ -254,6 +214,8 @@ pub struct RelationalMembership<P: Phase = Unresolved> {
     /// after. There is no resolved TWIN of this form — the phase changes
     /// what the field holds, not which variant exists.
     pub addressing: P::ProbeAddressing,
+    /// Holds nothing in every phase, as [`Membership::matching`].
+    pub matching: (),
 }
 
 /// `+rel(, …)` / `\+rel(, …)` — existence, which IS truth.

@@ -31,12 +31,46 @@ pub type Nat = u64;
 
 // --- Compound types ---
 
-/// A single column in a result: ordinal position, name, and backend type descriptor.
+/// The protocol version every party speaks. A server refuses a peer that
+/// proposes anything else: echoing an unknown proposal back would let two
+/// parties that frame a `Dimension` differently agree to talk.
+pub const PROTOCOL_VERSION: &[u8] = b"relay1";
+
+/// The refusal a server answers a foreign version proposal with, or `None`
+/// when the peer speaks [`PROTOCOL_VERSION`].
+pub fn version_refusal(proposed: &[u8]) -> Option<DelightQLError> {
+    (proposed != PROTOCOL_VERSION).then(|| {
+        Runtime::Protocol {
+            message: format!(
+                "protocol version mismatch: this party speaks {}, the peer proposed {}",
+                String::from_utf8_lossy(PROTOCOL_VERSION),
+                String::from_utf8_lossy(proposed),
+            ),
+        }
+        .into()
+    })
+}
+
+/// A single column in a result: ordinal position, name, backend type
+/// descriptor, and whether the name was authored or minted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dimension {
     pub position: Nat,
     pub name: Name,
     pub descriptor: Descriptor,
+    pub naming: Naming,
+}
+
+/// Whether anyone chose a column's name. The only question a party can
+/// answer for every column it describes, so the only one this field answers:
+/// it promises nothing about a name beyond who chose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Naming {
+    /// Someone chose it: an `as`, a rule head, a table's own column.
+    Authored,
+    /// The compiler drew it. Output only: the spelling moves between
+    /// compilations, so a client must not key on it.
+    Minted,
 }
 
 // --- Sum types ---
@@ -756,6 +790,39 @@ mod tests {
         WireError::of(&diagnostic)
     }
 
+    /// A Header says, per column, whether its name was authored or minted,
+    /// and the wire carries that beside the name rather than in it.
+    #[test]
+    fn a_header_carries_each_column_naming_across_the_wire() {
+        let term = ServerTerm::Header {
+            handle: b("h"),
+            dimensions: vec![
+                Dimension {
+                    position: 0,
+                    name: b("a"),
+                    descriptor: b("INTEGER"),
+                    naming: Naming::Authored,
+                },
+                Dimension {
+                    position: 1,
+                    name: "⊥expr_0b8b55a1dc6ca500".as_bytes().to_vec(),
+                    descriptor: b("INTEGER"),
+                    naming: Naming::Minted,
+                },
+            ],
+        };
+        let raw = rmp_serde::to_vec(&term).unwrap();
+        let back: ServerTerm = rmp_serde::from_slice(&raw).unwrap();
+        assert_eq!(back, term);
+    }
+
+    #[test]
+    fn a_server_refuses_a_foreign_version_and_accepts_its_own() {
+        assert!(version_refusal(PROTOCOL_VERSION).is_none());
+        let refusal = version_refusal(b"relay0").expect("relay0 is not this version");
+        assert!(refusal.to_string().contains("relay0"), "{refusal}");
+    }
+
     /// The serialized shape of an error term is unchanged by the sealed
     /// carrier: `{"Error": [kind, identity, message]}`, byte for byte what
     /// the loose triple produced.
@@ -822,6 +889,7 @@ mod tests {
             position: pos,
             name: b(name),
             descriptor: b(desc),
+            naming: Naming::Authored,
         }
     }
 
@@ -836,7 +904,7 @@ mod tests {
     fn version_ok() -> ServerTerm {
         ServerTerm::Version {
             max_message_size: 1_000_000,
-            protocol_version: b("relay0"),
+            protocol_version: PROTOCOL_VERSION.to_vec(),
             lease_ms: 300_000,
             orientations: vec![Orientation::Rows, Orientation::Columns],
         }
@@ -847,7 +915,7 @@ mod tests {
         match client
             .version(
                 1_000_000,
-                b("relay0"),
+                PROTOCOL_VERSION.to_vec(),
                 300_000,
                 vec![Orientation::Rows, Orientation::Columns],
             )
@@ -975,7 +1043,7 @@ mod tests {
 
         let client = Client::new(mock);
         let result = client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Columns])
+            .version(1_000_000, PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Columns])
             .unwrap();
         match result {
             VersionResult::Rejected(error) => {
@@ -1122,7 +1190,7 @@ mod tests {
         let client = Client::new(mock);
 
         let err = client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .version(1_000_000, PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
             .unwrap_err();
         assert_eq!(err.message, "mock exhausted");
     }

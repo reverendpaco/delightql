@@ -28,8 +28,7 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
     /// answers `Known` or `Opaque`; the tree carries no heading cache.
     type Scope: Clone + Debug + PartialEq + ToLispy;
     /// WHAT A CTE BINDING'S BODY IS at this phase: one authored clause
-    /// before the clauses of a definition are grouped, and the decided
-    /// [`crate::pipeline::bindings::DefinitionBody`] after.
+    /// before the clauses of a definition are grouped.
     ///
     /// THE DECISION IS THE BODY. There is no recursion slot beside a chain,
     /// because a decision stored beside a body is a second description of
@@ -54,9 +53,6 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
     /// and the answer is stored HERE. Nothing before resolution has an
     /// occurrence to hold, and nothing after may lack one.
     type ScalarOutput: Clone + Debug + PartialEq + ToLispy;
-    /// The columns a destructuring pattern produces, decided where the
-    /// pattern binds.
-    type Destructure: Clone + Debug + PartialEq + ToLispy;
     /// The interior drill's payload: authored names before binding, bound
     /// occurrences after.
     type Drill: Clone + Debug + PartialEq + ToLispy;
@@ -89,6 +85,12 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
     /// existing at the boundary, so a missing decision cannot travel into
     /// lowering and surface as an unconditioned join.
     type MemberCorr: Clone + Debug + PartialEq + ToLispy;
+    /// WHAT A MEMBER STEP SAYS ABOUT ITS JOIN. Before refinement: the roles
+    /// its syntax fixed — the member's `?`, and whether it completes an
+    /// optional lead. After: the join type the rebuild decided over the
+    /// whole run from those same roles. No phase holds both, so a decided
+    /// type cannot drift from the roles it was decided from.
+    type MemberJoin: Clone + Debug + PartialEq + ToLispy;
     /// The witness that a member's Cartesian arm was DECIDED: uninhabited
     /// before resolution, so no authored tree can state "this crosses"
     /// before the live bare interface was enumerated.
@@ -97,6 +99,13 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
     /// A positional column reference — `|2|`, `|-1|` — and its authored
     /// qualification.
     type ColumnOrdinal: Clone + Debug + PartialEq + ToLispy;
+    /// A definition-owned scalar reference — an authored `$.x` or a
+    /// ground-head dispatch — uninhabited after resolution.
+    type FormalSelector: Clone + Debug + PartialEq + ToLispy;
+    fn into_argument(selector: Self::FormalSelector) -> super::definitions::FormalSelector;
+    fn admit_argument(
+        selector: super::definitions::FormalSelector,
+    ) -> crate::error::Result<Self::FormalSelector>;
 
     /// A physical slot introduced after semantic construction has sealed.
     /// Uninhabited before refinement, so no parser, resolver, or refiner can
@@ -105,26 +114,8 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
     fn into_physical(column: Self::PhysicalColumn) -> crate::error::Result<crate::names::ColId>;
     fn admit_physical(column: crate::names::ColId) -> crate::error::Result<Self::PhysicalColumn>;
 
-    /// THE TWO SHAPES A CTE BINDING EVER TAKES, admitted per phase.
-    ///
-    /// A phase accepts the one it has and REFUSES the other, so a fold
-    /// crossing into a phase cannot hand it a binding of the wrong kind: an
-    /// authored clause cannot arrive already decided, and a decided
-    /// definition cannot be demoted back to a single undecided clause with
-    /// its head and provenance restored.
-    ///
-    /// THE WHOLE BINDING CROSSES, AND THE PIECES ARE NOT ARGUMENTS A WALK
-    /// SUPPLIES. A crossing hands over exactly what the source binding held
-    /// — its own body and its own subject — and the bound form takes no
-    /// authority at all, because resolution spent it.
     fn cte_binding_of_authored(
         binding: crate::pipeline::bindings::AuthoredBinding<Self>,
-    ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>>;
-    fn cte_binding_of_frontier(
-        binding: crate::defuse::FrontierCrossing<Self>,
-    ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>>;
-    fn cte_binding_of_bound(
-        binding: crate::pipeline::bindings::BoundBinding<Self>,
     ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>>;
     /// A positional column RANGE — `|1:3|` — in projection position.
     type ColumnRange: Clone + Debug + PartialEq + ToLispy;
@@ -149,6 +140,15 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
     /// slot that binds — a phase change selects the payload, never the
     /// variant.
     type Binder: Clone + Debug + PartialEq + ToLispy;
+    /// A pattern member that binds the like-named key (`{first_name}`):
+    /// the written name before resolution. Binding spends the name into the
+    /// key the member reads and the occurrence it publishes — a keyed
+    /// member — so a bound phase has no such member at all.
+    type PatternBinder: Clone + Debug + PartialEq + ToLispy;
+    /// What a pattern's reach publishes under: the authored name (or none)
+    /// before resolution, the occurrence its destructure or narrowing minted
+    /// for it after.
+    type ReachBinder: Clone + Debug + PartialEq + ToLispy;
     /// The name a rename asks its target to answer to. Authored, it is a
     /// literal or a template; resolution expands it against the matched
     /// column and what survives is the minted spelling — a phase change
@@ -196,6 +196,14 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
     /// dropping what it was handed.
     type Correlated: Clone + Debug + PartialEq + ToLispy;
 
+    /// A CORRELATED INTERIOR — a join-position body that reads the
+    /// enclosing row, still standing on its source population.
+    ///
+    /// Admitted in the resolved phase alone: nothing is correlated before
+    /// names resolve, and the refiner's classification refuses one before
+    /// the refined phase.
+    type CorrelatedInterior: Clone + Debug + PartialEq + ToLispy;
+
     /// The DECLARATION a field select picked from, once resolution has read
     /// the catalog.
     ///
@@ -228,6 +236,11 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
     /// same law as `CfeBindings`: authored before resolution, spent at the
     /// call sites, and no slot at all afterwards.
     type HoBindings: Clone + Debug + PartialEq + ToLispy;
+
+    /// The query-scoped sigma families a query still carries: authored
+    /// before resolution and spent at their observation sites, just like
+    /// the other local definition families.
+    type SigmaBindings: Clone + Debug + PartialEq + ToLispy;
 
     /// The construction-owned query-local name fact, present only while the
     /// authored definitions it judges are present.
@@ -394,14 +407,15 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
     /// refuses an answered relation.
     fn admit_correlation_arm(arm: CorrelationArm) -> crate::error::Result<Self::CorrelationArm>;
 
-    /// THE ORIENTATION A MEMBER CROSSES WITH. A comma with no decided
-    /// orientation is an inner join; the refined phase works with a decided
-    /// one and narrows here, the phases before it keep what was written.
-    /// One door, asked by every member that crosses, so no walk narrows or
-    /// widens an orientation on its own.
-    fn join_orientation(
-        join_type: Option<super::operators::JoinType>,
-    ) -> Option<super::operators::JoinType>;
+    /// A member's join, read out of this phase's slot.
+    fn into_member_join(join: Self::MemberJoin) -> MemberJoinPayload;
+
+    /// Put a member's join into this phase's slot. THE ONE DOOR a member's
+    /// join crosses through: the phases before refinement admit roles and
+    /// refuse a decided type; the refined phase admits a decided type and
+    /// refuses roles, because a join type is decided over a whole RUN by the
+    /// rebuild, never by a walk crossing one member at a time.
+    fn admit_member_join(join: MemberJoinPayload) -> crate::error::Result<Self::MemberJoin>;
 
     /// The correlated restriction this phase is holding, read as the value
     /// it is.
@@ -418,12 +432,42 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
         correlated: crate::relation::Correlated<Self>,
     ) -> crate::error::Result<Self::Correlated>;
 
+    /// JUDGE A CORRELATED RESTRICTION'S CONDITION: every comparison leaf's
+    /// equality role, against the join the restriction makes between the
+    /// `interior` occurrences its act derived and the enclosing row. A
+    /// correlated value is made only with a condition that came back from
+    /// here — at the correlation act and at every rewrite of the condition —
+    /// so no value holds an unjudged one. A phase that holds no correlated
+    /// restriction refuses, as its admission does.
+    fn judge_correlated_condition(
+        condition: super::expressions::truth::TruthExpression<Self>,
+        interior: &[crate::relation::PortId],
+    ) -> crate::error::Result<super::expressions::truth::TruthExpression<Self>>;
+
     /// Whether this correlated restriction's OWNER is the relation a step
     /// publishes. Every step assembly asks, so a walk cannot pair one
     /// step's correlation with another step's result: the owner travels in
     /// the value, and a result that is not it is refused where the step is
     /// built.
     fn correlated_stands_on(payload: &Self::Correlated, result: &Self::Scope) -> bool;
+
+    /// The correlated interior this phase is holding, read as the value it is.
+    fn correlated_interior(
+        carried: &Self::CorrelatedInterior,
+    ) -> &super::expressions::relational::CorrelatedInterior<Self>;
+
+    /// The same, by value.
+    fn into_correlated_interior(
+        carried: Self::CorrelatedInterior,
+    ) -> super::expressions::relational::CorrelatedInterior<Self>;
+
+    /// Put a correlated interior into this phase's slot. A phase that admits
+    /// none refuses: the authored phase has nothing resolved to correlate,
+    /// and one reaching the refined phase walked past the classification
+    /// that refuses it.
+    fn admit_correlated_interior(
+        interior: super::expressions::relational::CorrelatedInterior<Self>,
+    ) -> crate::error::Result<Self::CorrelatedInterior>;
 
     /// THE OCCURRENCES A CONDITION READS in this phase, at its own level —
     /// what a correlated restriction's crossing re-reads to prove a rewrite
@@ -548,6 +592,16 @@ pub trait Phase: Clone + Debug + PartialEq + Sized + 'static {
         hos: Vec<super::queries::HoDefinition>,
     ) -> crate::error::Result<Self::HoBindings>;
 
+    fn no_sigma_bindings() -> Self::SigmaBindings;
+
+    fn sigma_bindings(carried: &Self::SigmaBindings) -> &[super::queries::SigmaDefinition];
+
+    fn into_sigma_bindings(carried: Self::SigmaBindings) -> Vec<super::queries::SigmaDefinition>;
+
+    fn admit_sigma_bindings(
+        sigmas: Vec<super::queries::SigmaDefinition>,
+    ) -> crate::error::Result<Self::SigmaBindings>;
+
     fn no_query_local_names() -> Self::QueryLocalNames;
 
     fn query_local_names_is_empty(carried: &Self::QueryLocalNames) -> bool;
@@ -581,6 +635,14 @@ pub fn carry_ho_bindings<P: Phase, Q: Phase>(
     carried: P::HoBindings,
 ) -> crate::error::Result<Q::HoBindings> {
     Q::admit_ho_bindings(P::into_ho_bindings(carried))
+}
+
+/// Carry query-local sigma families across a phase change through the phase
+/// boundary, so spent definitions cannot survive as an untracked payload.
+pub fn carry_sigma_bindings<P: Phase, Q: Phase>(
+    carried: P::SigmaBindings,
+) -> crate::error::Result<Q::SigmaBindings> {
+    Q::admit_sigma_bindings(P::into_sigma_bindings(carried))
 }
 
 /// Carry a pipe stage's name across a phase change.
@@ -630,20 +692,11 @@ pub fn carry_correlation_arm<P: Phase, Q: Phase>(
     Q::admit_correlation_arm(P::into_correlation_arm(arm))
 }
 
-/// A PHASE CROSSING: the one step forward a bound tree takes. The roads
-/// that reland a chain's steps over a crossed operand — where the operand
-/// may lawfully come back as the authority's REBUILD of itself — are bounded
-/// to an actual crossing, so no same-phase rewrite can reach for them to
-/// hand a step a different operand under the name of a crossing.
-pub trait PhaseCrossing<Q: Phase>: Phase {}
-impl PhaseCrossing<Resolved> for Unresolved {}
-impl PhaseCrossing<Refined> for Resolved {}
-
 /// Carry a correlated restriction across a phase change. One door: the walk
 /// rewrites the condition inside the value the act minted — never a
-/// condition beside a separately held occurrence list — and whether the
-/// destination phase may hold the result is the phases' answer, not the
-/// walker's.
+/// condition beside a separately held occurrence list — the value judges the
+/// rewrite before holding it, and whether the destination phase may hold the
+/// result is the phases' answer, not the walker's.
 pub fn carry_correlated<P: Phase, Q: Phase>(
     carried: P::Correlated,
     condition: impl FnOnce(
@@ -651,6 +704,14 @@ pub fn carry_correlated<P: Phase, Q: Phase>(
     ) -> crate::error::Result<super::expressions::truth::TruthExpression<Q>>,
 ) -> crate::error::Result<Q::Correlated> {
     Q::admit_correlated(P::into_correlated(carried).crossing(condition)?)
+}
+
+fn authored_phase_holds_no_correlation() -> crate::error::DelightQLError {
+    Internal::invariant(
+        "correlated",
+        "a correlated restriction is minted where the relation it stands on is resolved; the \
+         authored phase holds none",
+    )
 }
 
 /// Carry a truth probe's authored addressing across a phase change. One
@@ -685,403 +746,21 @@ pub fn carry_mention<P: Phase, Q: Phase>(carried: P::Mention) -> crate::error::R
     Q::admit_mention(P::into_mention(carried))
 }
 
-/// Past resolution the slot is uninhabited by an authored spelling: `()`
-/// holds nothing to read, so no lowering can reach one and no widening of
-/// these types can happen without this stopping compiling.
-const _: () = {
-    fn spent<P: Phase<StageName = (), Mention = ()>>() {}
-    let _ = spent::<Resolved>;
-    let _ = spent::<Refined>;
-};
-
-/// A query-scoped CFE definition is a BINDING consumed during resolution:
-/// the authored phase carries the definitions and a bound phase carries no
-/// slot for them — `()` holds nothing to read — so no resolved or refined
-/// query can hold a definition, and no consumer needs an arm for one.
-const _: () = {
-    fn authored<P: Phase<CfeBindings = Vec<super::queries::CfeDefinition>>>() {}
-    let _ = authored::<Unresolved>;
-    fn spent<P: Phase<CfeBindings = ()>>() {}
-    let _ = spent::<Resolved>;
-    let _ = spent::<Refined>;
-};
-
-/// THE DECLARATION IS THE CATALOG'S, AND A BOUND PHASE HAS IT.
-///
-/// `()` before resolution: the authored pick names an output without having
-/// read anything, so there is no proof to hold and none to fabricate. A
-/// witness after, and not an optional one: a field select that survived
-/// resolution HAS the declaration that licensed it, so no consumer needs an
-/// arm for one that does not and no lowering can be reached without it.
-const _: () = {
-    fn authored<P: Phase<FunctionalDependency = ()>>() {}
-    let _ = authored::<Unresolved>;
-    fn bound<
-        P: Phase<
-            FunctionalDependency = Box<super::expressions::functions::ModeWitness<P>>,
-            Col = super::columns::ColumnOccurrence,
-        >,
-    >() {
-    }
-    let _ = bound::<Resolved>;
-    let _ = bound::<Refined>;
-};
-
-/// A zero-width record is likewise a resolver product, never authored
-/// syntax. It remains inhabited through the phases that consume resolution.
-const _: () = {
-    fn authored<P: Phase<EmptyRecord = crate::pipeline::asts::vocabulary::Never>>() {}
-    let _ = authored::<Unresolved>;
-};
-
-/// And the enumeration is spent by being UNINHABITED: `Spread` has three
-/// arms and every one of their payloads is `Never` after resolution, so a
-/// resolved or refined tree cannot hold a spread anywhere — not in a
-/// publication item, a selector, a rename source, a record member, or an
-/// argument row.
-const _: () = {
-    fn expanded<P: Phase<Enumeration = crate::pipeline::asts::vocabulary::Never>>() {}
-    let _ = expanded::<Resolved>;
-    let _ = expanded::<Refined>;
-};
-
 /// The authored phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unresolved;
-/// After name resolution: handles, not spellings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Resolved;
-/// After refinement: correlations settled, strategies chosen — the shape a
-/// lowering plan consumes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Refined;
-
-// After resolution a column IS an occurrence, and no slot offers a name:
-// binding is the resolver's act and it finishes there. `Never` is not "no
-// binder was found" — it is the absence of the form, so a slot that offers
-// a name cannot be built and no consumer needs an arm for one.
-macro_rules! bound_columns {
-    () => {
-        type Col = super::columns::ColumnOccurrence;
-        type Binder = crate::relation::PortId;
-        // A bound phase's references are occurrences: the one reference
-        // walk reads them.
-        fn occurrences_read(
-            condition: &super::expressions::truth::TruthExpression<Self>,
-        ) -> Vec<crate::relation::PortId> {
-            crate::relation::support::ports_read_by(condition)
-        }
-        // A resolved CTE binding IS its relation. The authored spelling and
-        // the effect declaration were spent where that relation was built,
-        // so a bound phase holds the result and nothing beside it — no name
-        // to disagree with it, no "maybe bound" state to match on.
-        // The head was grouped and spent, and the provenance judgments were
-        // taken, where the binding's scope was minted. Nothing survives —
-        // not a constant glob, not a copied provenance tag.
-        type CteAuthority = ();
-        type CteBindingState = crate::pipeline::bindings::BoundBindingState<Self>;
-        // A position and a range of positions are SPELLINGS. Resolution
-        // answers them against a heading and what comes back is the
-        // occurrence, so after resolution there is no ordinal left to carry
-        // — not an ordinal that failed to resolve, none.
-        type ColumnOrdinal = crate::pipeline::asts::vocabulary::Never;
-        type ColumnRange = crate::pipeline::asts::vocabulary::Never;
-        // A spread is expanded where its container resolves it. After that
-        // there is no enumeration left to carry — not an expanded one,
-        // none — so no arm of `Spread` can be built.
-        type Enumeration = crate::pipeline::asts::vocabulary::Never;
-        type EmptyRecord = ();
-        // Resolution expands a rename target against the matched column;
-        // the spelling it minted is what a bound phase carries.
-        type RenameTarget = crate::names::Spelling;
-        // The cover applied its callable per cell at resolution: the
-        // callable is SPENT, and what a bound phase carries is the applied
-        // cells beside this absence.
-        type CoverCallable = ();
-        // A landing is consumed where the invocation that reads it is built.
-        // What survives is the argument role, not the mark.
-        type Placeholder = crate::pipeline::asts::vocabulary::Never;
-        // The context marker is consumed where the call instantiates. A
-        // resolved argument row carries the captured context as ordinary
-        // arguments, never the mark.
-        type ContextMarker = crate::pipeline::asts::vocabulary::Never;
-        // The landing was judged against the formals and spent: the source
-        // stands as an ordinary member or carrier, and nothing downstream
-        // can tell a piped call from a direct one.
-        // The resolver expands `&`/`&&` into ordinary members. A resolved
-        // chain standing on an edge was a runtime panic in six walks; it is
-        // now a shape nobody can build.
-        type ErJoin = crate::pipeline::asts::vocabulary::Never;
-        // Spent at resolution, where the stage's scope was minted answering
-        // to it. What a later phase would do with the spelling is nothing —
-        // it addresses scopes — so it is not carried as an absence either.
-        type StageName = ();
-        // Likewise the mention: which relation a ground read names was
-        // answered at resolution and recorded on the occurrence. A resolved
-        // ground is addressed by scope and by nothing else.
-        type Mention = ();
-        // A query-scoped definition is spent at its call sites during
-        // resolution. A bound query has no slot for one — not an empty
-        // list, none.
-        type CfeBindings = ();
-        type HoBindings = ();
-        type QueryLocalNames = ();
-        // The probe's addressing is spent where the probe is resolved.
-        type ProbeAddressing = ();
-        type SigmaBody = Box<super::expressions::truth::TruthExpression<Self>>;
-        // The declaration ANSWERED: which entity declared the mode, the mode
-        // itself resolved, and the position the picked output occupies.
-        type FunctionalDependency = Box<super::expressions::functions::ModeWitness<Self>>;
-
-        fn admit_empty_record() -> crate::error::Result<Self::EmptyRecord> {
-            Ok(())
-        }
-
-        fn mode_witness(
-            carried: &Self::FunctionalDependency,
-        ) -> Option<&super::expressions::functions::ModeWitness<Self>> {
-            Some(carried)
-        }
-
-        fn into_mode_witness(
-            carried: Self::FunctionalDependency,
-        ) -> Option<super::expressions::functions::ModeWitness<Self>> {
-            Some(*carried)
-        }
-
-        fn admit_mode_witness(
-            witness: Option<super::expressions::functions::ModeWitness<Self>>,
-        ) -> crate::error::Result<Self::FunctionalDependency> {
-            witness.map(Box::new).ok_or_else(|| {
-                Internal::invariant("functional_dependency", "a field select reached a bound phase with no declaration to pick from: \
-                     the declared mode is what licenses the pick, and carrying the pick \
-                     without it would leave lowering nothing to select by")
-            })
-        }
-
-        fn sigma_body(
-            carried: &Self::SigmaBody,
-        ) -> &super::expressions::truth::TruthExpression<Self> {
-            carried
-        }
-
-        fn sigma_body_mut(
-            carried: &mut Self::SigmaBody,
-        ) -> &mut super::expressions::truth::TruthExpression<Self> {
-            carried.as_mut()
-        }
-
-        fn into_sigma_body(
-            carried: Self::SigmaBody,
-        ) -> super::expressions::truth::TruthExpression<Self> {
-            *carried
-        }
-
-        fn admit_sigma_body(
-            body: super::expressions::truth::TruthExpression<Self>,
-        ) -> crate::error::Result<Self::SigmaBody> {
-            Ok(Box::new(body))
-        }
-
-        fn into_probe_addressing(
-            _: Self::ProbeAddressing,
-        ) -> Option<super::expressions::truth::ProbeAddressing> {
-            None
-        }
-
-        fn admit_probe_addressing(
-            addressing: Option<super::expressions::truth::ProbeAddressing>,
-        ) -> crate::error::Result<Self::ProbeAddressing> {
-            match addressing {
-                None => Ok(()),
-                Some(_) => Err(Internal::invariant("probe_addressing", "a truth probe's authored addressing reached a phase that has already \
-                     spent it: the probe's relation is resolved and its correlation \
-                     synthesized, and a second carrier beside those is free to disagree")),
-            }
-        }
-
-        fn into_mention(_: Self::Mention) -> Option<super::expressions::GroundMention> {
-            None
-        }
-
-        fn admit_mention(
-            mention: Option<super::expressions::GroundMention>,
-        ) -> crate::error::Result<Self::Mention> {
-            match mention {
-                None => Ok(()),
-                Some(_) => Err(Internal::invariant("mention", "a ground read's authored mention reached a phase that has already \
-                     spent it: the read's scope answers for the relation, and a second \
-                     carrier beside that scope is free to disagree with it")),
-            }
-        }
-
-        fn admit_enumeration() -> crate::error::Result<Self::Enumeration> {
-            Err(Internal::invariant("enumeration", "a spread is expanded where its container resolves it, and this \
-                 fold walked past a container still holding one"))
-        }
-
-        fn no_cfe_bindings() -> Self::CfeBindings {}
-
-        fn cfe_bindings(carried: &Self::CfeBindings) -> &[super::queries::CfeDefinition] {
-            let () = carried;
-            &[]
-        }
-
-        fn into_cfe_bindings(_: Self::CfeBindings) -> Vec<super::queries::CfeDefinition> {
-            Vec::new()
-        }
-
-        fn admit_cfe_bindings(
-            cfes: Vec<super::queries::CfeDefinition>,
-        ) -> crate::error::Result<Self::CfeBindings> {
-            if cfes.is_empty() {
-                Ok(())
-            } else {
-                Err(Internal::invariant("cfe_bindings", "a query-scoped definition reached a phase that has already spent it: \
-                     the resolver spends each definition at its call sites, and a fold \
-                     still carrying one walked past the place that spends it"))
-            }
-        }
-
-        fn no_ho_bindings() -> Self::HoBindings {}
-
-        fn ho_bindings(carried: &Self::HoBindings) -> &[super::queries::HoDefinition] {
-            let () = carried;
-            &[]
-        }
-
-        fn into_ho_bindings(_: Self::HoBindings) -> Vec<super::queries::HoDefinition> {
-            Vec::new()
-        }
-
-        fn admit_ho_bindings(
-            hos: Vec<super::queries::HoDefinition>,
-        ) -> crate::error::Result<Self::HoBindings> {
-            if hos.is_empty() {
-                Ok(())
-            } else {
-                Err(Internal::invariant("ho_bindings", "a query-scoped higher-order definition reached a phase that has \
-                     already spent it: the resolver spends each definition at its call \
-                     sites, and a fold still carrying one walked past the place that \
-                     spends it"))
-            }
-        }
-
-        fn no_query_local_names() -> Self::QueryLocalNames {}
-
-        fn query_local_names_is_empty(_: &Self::QueryLocalNames) -> bool {
-            true
-        }
-
-        fn into_query_local_names(_: Self::QueryLocalNames) -> Option<super::queries::QueryLocalNames> {
-            None
-        }
-
-        fn admit_query_local_names(
-            names: Option<super::queries::QueryLocalNames>,
-        ) -> crate::error::Result<Self::QueryLocalNames> {
-            match names {
-                None => Ok(()),
-                Some(names) if names.is_empty() => Ok(()),
-                Some(_) => Err(Internal::invariant("query_local_names", "a query-local name fact reached a phase that has spent the definitions it judges")),
-            }
-        }
-
-        fn no_stage_name() -> Self::StageName {}
-
-        fn into_stage_name(_: Self::StageName) -> Option<delightql_types::SqlIdentifier> {
-            None
-        }
-
-        fn admit_stage_name(
-            name: Option<delightql_types::SqlIdentifier>,
-        ) -> crate::error::Result<Self::StageName> {
-            match name {
-                None => Ok(()),
-                Some(name) => Err(Internal::invariant("stage_name", format!(
-                        "a pipe's authored name '{name}' reached a phase that has already \
-                         spent it: the stage's scope answers to it, and a second carrier \
-                         beside that scope is free to disagree with it"
-                    ))),
-            }
-        }
-
-        // A bound node's identity is the relation the authority derived
-        // for it. It crosses as itself; a crossing arriving with none
-        // walked past a node nobody resolved.
-        fn into_scope(scope: Self::Scope) -> Option<crate::relation::SemanticRelation> {
-            Some(scope)
-        }
-
-        fn admit_scope(
-            scope: Option<crate::relation::SemanticRelation>,
-        ) -> crate::error::Result<Self::Scope> {
-            scope.ok_or_else(|| {
-                Internal::invariant(
-                    "result",
-                    "a relation's scope is minted where the relation is resolved, and this \
-                     fold walked past a relation nobody resolved",
-                )
-            })
-        }
-
-        fn into_correlation_arm(arm: Self::CorrelationArm) -> CorrelationArm {
-            CorrelationArm::Answered(arm)
-        }
-
-        fn admit_correlation_arm(arm: CorrelationArm) -> crate::error::Result<Self::CorrelationArm> {
-            match arm {
-                CorrelationArm::Answered(relation) => Ok(relation),
-                CorrelationArm::Spelled(_) => Err(Internal::invariant(
-                    "correlation_arm",
-                    "a whole-heading correlation's arm is answered where the correlation is \
-                     resolved, and this fold walked past one nobody resolved",
-                )),
-            }
-        }
-
-        fn er_join(carried: &Self::ErJoin) -> &super::ErJoinStep<Self> {
-            match *carried {}
-        }
-
-        fn into_er_join(carried: Self::ErJoin) -> super::ErJoinStep<Self> {
-            match carried {}
-        }
-
-        fn admit_er_join(_: super::ErJoinStep<Self>) -> crate::error::Result<Self::ErJoin> {
-            Err(Internal::invariant("er_join", "an ER edge is expanded where the relation is resolved, and this \
-                 fold walked past a chain still standing on one"))
-        }
-
-        // A resolved column reference read as a slot is a TERM. Whether the
-        // slot it came from bound a name is not a property of the occurrence
-        // — the site that resolved the pattern knows, and builds `Bind`
-        // itself. Reading it back off the column would be a guess.
-        fn classify_column(column: Self::Col) -> super::Slot<Self> {
-            super::Slot::Reuse(super::expressions::NamedReference(column))
-        }
-
-        fn cover_callable(callable: &Self::CoverCallable) -> Option<&super::Callable<Self>> {
-            let () = callable;
-            None
-        }
-
-        fn anon_slot_term() -> Option<super::DomainExpression<Self>> {
-            None
-        }
-
-        fn binder_column(binder: Self::Binder) -> Self::Col {
-            super::columns::ColumnOccurrence::engine(binder)
-        }
-
-        fn bound_binder(binder: &Self::Binder) -> Option<crate::relation::PortId> {
-            Some(*binder)
-        }
-    };
-}
 
 impl Phase for Unresolved {
     type ColumnOrdinal = super::ColumnOrdinal;
+    type FormalSelector = super::definitions::FormalSelector;
+    fn into_argument(selector: Self::FormalSelector) -> super::definitions::FormalSelector {
+        selector
+    }
+    fn admit_argument(
+        selector: super::definitions::FormalSelector,
+    ) -> crate::error::Result<Self::FormalSelector> {
+        Ok(selector)
+    }
     type PhysicalColumn = crate::pipeline::asts::vocabulary::Never;
     fn into_physical(column: Self::PhysicalColumn) -> crate::error::Result<crate::names::ColId> {
         match column {}
@@ -1090,23 +769,6 @@ impl Phase for Unresolved {
         binding: crate::pipeline::bindings::AuthoredBinding<Self>,
     ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>> {
         Ok(binding.into_binding())
-    }
-    fn cte_binding_of_frontier(
-        binding: crate::defuse::FrontierCrossing<Self>,
-    ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>> {
-        Ok(crate::pipeline::bindings::CteBinding::frontier(
-            binding.into_frontier(),
-        ))
-    }
-    fn cte_binding_of_bound(
-        _: crate::pipeline::bindings::BoundBinding<Self>,
-    ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>> {
-        Err(Internal::invariant(
-            "cte",
-            "a decided binding cannot enter an authored tree: before resolution \
-             a binding is ONE clause, no recursion question has been asked of \
-             it, and its head and provenance have not been spent",
-        ))
     }
     fn admit_physical(_: crate::names::ColId) -> crate::error::Result<Self::PhysicalColumn> {
         Err(Internal::invariant(
@@ -1141,9 +803,6 @@ impl Phase for Unresolved {
     // Nothing has been resolved, so there is no occurrence a scalarized
     // relation could publish.
     type ScalarOutput = ();
-    // Likewise the columns a destructuring pattern produces: the pattern is
-    // written here, its columns are minted where it binds.
-    type Destructure = ();
     type Drill = super::operators::AuthoredDrill;
     // Nothing has been resolved, so there is no relation to name. A phantom
     // schema standing here would be a fabricated answer to a question no one
@@ -1160,10 +819,15 @@ impl Phase for Unresolved {
     // to build and `Correspond` has no inhabitant before resolution.
     type Correspondence = crate::pipeline::asts::vocabulary::Never;
     type MemberCorr = Option<super::MemberCorrelation<Self>>;
+    type MemberJoin = super::operators::JoinRoles;
     type Decided = crate::pipeline::asts::vocabulary::Never;
     type Entity = crate::pipeline::asts::vocabulary::Ref;
     type Col = super::columns::AuthoredColumn;
     type Binder = super::columns::WrittenBinder;
+    // A pattern member is written here; the occurrence it publishes is
+    // minted where its destructure or narrowing binds.
+    type PatternBinder = super::columns::WrittenBinder;
+    type ReachBinder = Option<delightql_types::SqlIdentifier>;
     type RenameTarget = super::specs::NameTarget;
     type OpenLeaf = super::expressions::DomainHole;
     type CoverCallable = super::expressions::Callable<Self>;
@@ -1175,12 +839,14 @@ impl Phase for Unresolved {
     type ProbeAddressing = super::expressions::truth::ProbeAddressing;
     /// Nothing is correlated before names resolve.
     type Correlated = crate::pipeline::asts::vocabulary::Never;
+    type CorrelatedInterior = crate::pipeline::asts::vocabulary::Never;
     // A DQL truth rule's body is fetched where its NAME is resolved, so an
     // authored sigma application observes a call and nothing else.
     type SigmaBody = crate::pipeline::asts::vocabulary::Never;
     // The authored definitions, in authored order, still unspent.
     type CfeBindings = Vec<super::queries::CfeDefinition>;
     type HoBindings = Vec<super::queries::HoDefinition>;
+    type SigmaBindings = Vec<super::queries::SigmaDefinition>;
     type QueryLocalNames = super::queries::QueryLocalNames;
     // The declaration a pick names lives in the catalog, and the authored
     // phase has not read it. Nothing here — not an absent witness, none.
@@ -1263,15 +929,37 @@ impl Phase for Unresolved {
     fn admit_correlated(
         _: crate::relation::Correlated<Self>,
     ) -> crate::error::Result<Self::Correlated> {
-        Err(Internal::invariant(
-            "correlated",
-            "a correlated restriction is minted where the relation it stands on is resolved; \
-             the authored phase holds none",
-        ))
+        Err(authored_phase_holds_no_correlation())
+    }
+
+    fn judge_correlated_condition(
+        _: super::expressions::truth::TruthExpression<Self>,
+        _: &[crate::relation::PortId],
+    ) -> crate::error::Result<super::expressions::truth::TruthExpression<Self>> {
+        Err(authored_phase_holds_no_correlation())
     }
 
     fn correlated_stands_on(payload: &Self::Correlated, _: &Self::Scope) -> bool {
         match *payload {}
+    }
+    fn correlated_interior(
+        carried: &Self::CorrelatedInterior,
+    ) -> &super::expressions::relational::CorrelatedInterior<Self> {
+        match *carried {}
+    }
+    fn into_correlated_interior(
+        carried: Self::CorrelatedInterior,
+    ) -> super::expressions::relational::CorrelatedInterior<Self> {
+        match carried {}
+    }
+    fn admit_correlated_interior(
+        _: super::expressions::relational::CorrelatedInterior<Self>,
+    ) -> crate::error::Result<Self::CorrelatedInterior> {
+        Err(Internal::invariant(
+            "correlated interior",
+            "a correlated interior reached a phase that holds none: its classification in \
+             the resolved phase refuses it before anything crosses",
+        ))
     }
 
     fn occurrences_read(
@@ -1348,6 +1036,24 @@ impl Phase for Unresolved {
         Ok(hos)
     }
 
+    fn no_sigma_bindings() -> Self::SigmaBindings {
+        Vec::new()
+    }
+
+    fn sigma_bindings(carried: &Self::SigmaBindings) -> &[super::queries::SigmaDefinition] {
+        carried
+    }
+
+    fn into_sigma_bindings(carried: Self::SigmaBindings) -> Vec<super::queries::SigmaDefinition> {
+        carried
+    }
+
+    fn admit_sigma_bindings(
+        sigmas: Vec<super::queries::SigmaDefinition>,
+    ) -> crate::error::Result<Self::SigmaBindings> {
+        Ok(sigmas)
+    }
+
     fn no_query_local_names() -> Self::QueryLocalNames {
         super::queries::QueryLocalNames::default()
     }
@@ -1408,10 +1114,12 @@ impl Phase for Unresolved {
         CorrelationArm::Spelled(arm)
     }
 
-    fn join_orientation(
-        join_type: Option<super::operators::JoinType>,
-    ) -> Option<super::operators::JoinType> {
-        join_type
+    fn into_member_join(join: Self::MemberJoin) -> MemberJoinPayload {
+        MemberJoinPayload::Roles(join)
+    }
+
+    fn admit_member_join(join: MemberJoinPayload) -> crate::error::Result<Self::MemberJoin> {
+        join.roles()
     }
 
     fn admit_correlation_arm(arm: CorrelationArm) -> crate::error::Result<Self::CorrelationArm> {
@@ -1556,279 +1264,6 @@ impl Phase for Unresolved {
     }
 }
 
-impl Phase for Resolved {
-    fn join_orientation(
-        join_type: Option<super::operators::JoinType>,
-    ) -> Option<super::operators::JoinType> {
-        join_type
-    }
-    /// The one phase a correlated restriction inhabits: minted by the
-    /// resolver's correlation act, spent by the refiner's classification.
-    type Correlated = crate::relation::Correlated<Self>;
-    fn correlated(carried: &Self::Correlated) -> &crate::relation::Correlated<Self> {
-        carried
-    }
-    fn into_correlated(carried: Self::Correlated) -> crate::relation::Correlated<Self> {
-        carried
-    }
-    fn admit_correlated(
-        correlated: crate::relation::Correlated<Self>,
-    ) -> crate::error::Result<Self::Correlated> {
-        Ok(correlated)
-    }
-    fn correlated_stands_on(payload: &Self::Correlated, result: &Self::Scope) -> bool {
-        payload.standing() == *result
-    }
-    /// A CLOSED CALLABLE ACTUAL'S SLOT: the one resolved carrier of a
-    /// deliberately open input. Minted only where the caller closes code
-    /// for a formal; substituted where the formal is invoked; refused at
-    /// refinement if one survives.
-    type OpenLeaf = super::expressions::FormalHole;
-
-    fn classify_open_slot(leaf: Self::OpenLeaf) -> super::Slot<Self> {
-        super::Slot::Constraint(Box::new(super::DomainExpression::Application(
-            super::FunctionApplication::Open(leaf),
-        )))
-    }
-
-    type PhysicalColumn = crate::pipeline::asts::vocabulary::Never;
-    fn into_physical(column: Self::PhysicalColumn) -> crate::error::Result<crate::names::ColId> {
-        match column {}
-    }
-    fn admit_physical(_: crate::names::ColId) -> crate::error::Result<Self::PhysicalColumn> {
-        Err(Internal::invariant(
-            "reference",
-            "a physical SQL slot cannot enter a resolved semantic tree",
-        ))
-    }
-    bound_columns!();
-    type Scope = crate::relation::SemanticRelation;
-    type CteBody = crate::pipeline::bindings::DefinitionBody<Self>;
-    type Output = crate::relation::PortId;
-    fn cte_binding_of_authored(
-        _: crate::pipeline::bindings::AuthoredBinding<Self>,
-    ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>> {
-        Err(Internal::invariant(
-            "cte",
-            "a bound CTE binding is built by the binding authority, which spends \
-             the authored subject where it mints the bound one; a lone clause \
-             cannot become one by crossing a phase",
-        ))
-    }
-    fn cte_binding_of_frontier(
-        _: crate::defuse::FrontierCrossing<Self>,
-    ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>> {
-        Err(Internal::invariant("cte", "a recursive frontier is resolved by the binding authority and cannot cross as an authored binding"))
-    }
-    fn cte_binding_of_bound(
-        binding: crate::pipeline::bindings::BoundBinding<Self>,
-    ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>> {
-        Ok(binding.into_binding())
-    }
-
-    // The sole column the degree judgment answered with, taken once at
-    // the value admission. Not optional: a scalarized relation that
-    // published none did not cross that boundary.
-    type ScalarOutput = crate::relation::PortId;
-    type Destructure = Vec<super::expressions::pipes::DestructureMapping>;
-    type Drill = super::operators::BoundDrill;
-    type Corr = Option<super::expressions::chain::BagCorrelation<Self>>;
-    type CorrelationArm = crate::relation::SemanticRelation;
-    type Correspondence = super::Correspondence;
-    type MemberCorr = super::MemberCorrelation<Self>;
-    type Decided = ();
-    type Entity = crate::names::CallableId;
-
-    fn correlation(carried: &Self::Corr) -> Option<&super::BagCorrelation<Self>> {
-        carried.as_ref()
-    }
-
-    fn into_correlation(carried: Self::Corr) -> Option<super::BagCorrelation<Self>> {
-        carried
-    }
-
-    fn admit_correlation(
-        correlation: Option<super::BagCorrelation<Self>>,
-    ) -> crate::error::Result<Self::Corr> {
-        Ok(correlation)
-    }
-
-    fn correspondence(carried: &Self::Correspondence) -> &super::Correspondence {
-        carried
-    }
-
-    fn into_correspondence(carried: Self::Correspondence) -> super::Correspondence {
-        carried
-    }
-
-    fn admit_correspondence(
-        correspondence: super::Correspondence,
-    ) -> crate::error::Result<Self::Correspondence> {
-        Ok(correspondence)
-    }
-
-    fn member_correlation(carried: &Self::MemberCorr) -> Option<&super::MemberCorrelation<Self>> {
-        Some(carried)
-    }
-
-    fn into_member_correlation(
-        carried: Self::MemberCorr,
-    ) -> Option<super::MemberCorrelation<Self>> {
-        Some(carried)
-    }
-
-    fn admit_member_correlation(
-        correlation: Option<super::MemberCorrelation<Self>>,
-    ) -> crate::error::Result<Self::MemberCorr> {
-        correlation.ok_or_else(|| {
-            Internal::invariant(
-                "member",
-                "a decided member carries a total relationship: a correspondence, \
-                 a condition, or a deliberate Cartesian — never nothing",
-            )
-        })
-    }
-
-    fn admit_decided() -> crate::error::Result<Self::Decided> {
-        Ok(())
-    }
-}
-
-impl Phase for Refined {
-    fn join_orientation(
-        join_type: Option<super::operators::JoinType>,
-    ) -> Option<super::operators::JoinType> {
-        Some(join_type.unwrap_or(super::operators::JoinType::Inner))
-    }
-    /// Classification spends every correlated restriction at the interior
-    /// boundary before a chain is refined: one crossing into this phase was
-    /// never hoisted, and the phase has no slot to hold it.
-    type Correlated = crate::pipeline::asts::vocabulary::Never;
-    fn correlated(carried: &Self::Correlated) -> &crate::relation::Correlated<Self> {
-        match *carried {}
-    }
-    fn into_correlated(carried: Self::Correlated) -> crate::relation::Correlated<Self> {
-        match carried {}
-    }
-    fn admit_correlated(
-        _: crate::relation::Correlated<Self>,
-    ) -> crate::error::Result<Self::Correlated> {
-        Err(Internal::invariant(
-            "correlated",
-            "a correlated restriction reached the refined phase unhoisted: classification \
-             takes every one out of a join-position interior and spends it at the boundary",
-        ))
-    }
-    fn correlated_stands_on(payload: &Self::Correlated, _: &Self::Scope) -> bool {
-        match *payload {}
-    }
-    /// No open slot crosses refinement: the resolver substitutes every
-    /// formal hole where a closed callable is applied, and the refiner
-    /// refuses a survivor before this phase is minted.
-    type OpenLeaf = crate::pipeline::asts::vocabulary::Never;
-    fn classify_open_slot(leaf: Self::OpenLeaf) -> super::Slot<Self> {
-        match leaf {}
-    }
-    type PhysicalColumn = crate::names::ColId;
-    fn into_physical(column: Self::PhysicalColumn) -> crate::error::Result<crate::names::ColId> {
-        Ok(column)
-    }
-    fn admit_physical(column: crate::names::ColId) -> crate::error::Result<Self::PhysicalColumn> {
-        Ok(column)
-    }
-    bound_columns!();
-    type Scope = crate::relation::SemanticRelation;
-    type CteBody = crate::pipeline::bindings::DefinitionBody<Self>;
-    type Output = crate::relation::PortId;
-    fn cte_binding_of_authored(
-        _: crate::pipeline::bindings::AuthoredBinding<Self>,
-    ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>> {
-        Err(Internal::invariant(
-            "cte",
-            "a bound CTE binding is built by the binding authority, which spends \
-             the authored subject where it mints the bound one; a lone clause \
-             cannot become one by crossing a phase",
-        ))
-    }
-    fn cte_binding_of_frontier(
-        _: crate::defuse::FrontierCrossing<Self>,
-    ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>> {
-        Err(Internal::invariant("cte", "a recursive frontier is resolved by the binding authority and cannot cross as an authored binding"))
-    }
-    fn cte_binding_of_bound(
-        binding: crate::pipeline::bindings::BoundBinding<Self>,
-    ) -> crate::error::Result<crate::pipeline::bindings::CteBinding<Self>> {
-        Ok(binding.into_binding())
-    }
-
-    // The sole column the degree judgment answered with, taken once at
-    // the value admission. Not optional: a scalarized relation that
-    // published none did not cross that boundary.
-    type ScalarOutput = crate::relation::PortId;
-    type Destructure = Vec<super::expressions::pipes::DestructureMapping>;
-    type Drill = super::operators::BoundDrill;
-    type Corr = Option<super::expressions::chain::BagCorrelation<Self>>;
-    type CorrelationArm = crate::relation::SemanticRelation;
-    type Correspondence = super::Correspondence;
-    type MemberCorr = super::MemberCorrelation<Self>;
-    type Decided = ();
-    type Entity = crate::names::CallableId;
-
-    fn correlation(carried: &Self::Corr) -> Option<&super::BagCorrelation<Self>> {
-        carried.as_ref()
-    }
-
-    fn into_correlation(carried: Self::Corr) -> Option<super::BagCorrelation<Self>> {
-        carried
-    }
-
-    fn admit_correlation(
-        correlation: Option<super::BagCorrelation<Self>>,
-    ) -> crate::error::Result<Self::Corr> {
-        Ok(correlation)
-    }
-
-    fn correspondence(carried: &Self::Correspondence) -> &super::Correspondence {
-        carried
-    }
-
-    fn into_correspondence(carried: Self::Correspondence) -> super::Correspondence {
-        carried
-    }
-
-    fn admit_correspondence(
-        correspondence: super::Correspondence,
-    ) -> crate::error::Result<Self::Correspondence> {
-        Ok(correspondence)
-    }
-
-    fn member_correlation(carried: &Self::MemberCorr) -> Option<&super::MemberCorrelation<Self>> {
-        Some(carried)
-    }
-
-    fn into_member_correlation(
-        carried: Self::MemberCorr,
-    ) -> Option<super::MemberCorrelation<Self>> {
-        Some(carried)
-    }
-
-    fn admit_member_correlation(
-        correlation: Option<super::MemberCorrelation<Self>>,
-    ) -> crate::error::Result<Self::MemberCorr> {
-        correlation.ok_or_else(|| {
-            Internal::invariant(
-                "member",
-                "a decided member carries a total relationship: a correspondence, \
-                 a condition, or a deliberate Cartesian — never nothing",
-            )
-        })
-    }
-
-    fn admit_decided() -> crate::error::Result<Self::Decided> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::expressions::GroundMention;
@@ -1841,45 +1276,6 @@ mod tests {
             namespace_path: NamespacePath::empty(),
             name: name.into(),
         })
-    }
-
-    /// The types say a resolved ground read holds `()`. They cannot say what
-    /// happens when a fold that still HAS a spelling tries to cross into a
-    /// phase that has spent one — the door has to refuse rather than drop it,
-    /// because dropping it silently would let a walk written past the
-    /// resolver look like it had resolved something.
-    #[test]
-    fn a_phase_that_spent_the_mention_refuses_to_receive_one() {
-        assert!(carry_mention::<Unresolved, Resolved>(mention("users")).is_err());
-        assert!(carry_mention::<Unresolved, Refined>(mention("users")).is_err());
-    }
-
-    /// The identity doors refuse the crossing out of the authored phase:
-    /// a node's relation and a correlation's arm are answered where the
-    /// node is resolved, and a fold arriving there with a spelling, or
-    /// with nothing, walked past that place. No walk method stands beside
-    /// these doors to answer instead.
-    #[test]
-    fn the_identity_doors_refuse_to_mint_out_of_the_authored_phase() {
-        assert!(carry_scope::<Unresolved, Resolved>(()).is_err());
-        assert!(carry_scope::<Unresolved, Refined>(()).is_err());
-        assert!(carry_scope::<Unresolved, Unresolved>(()).is_ok());
-        let arm = delightql_types::SqlIdentifier::new("x");
-        assert!(carry_correlation_arm::<Unresolved, Resolved>(arm.clone()).is_err());
-        assert!(carry_correlation_arm::<Unresolved, Refined>(arm.clone()).is_err());
-        assert_eq!(
-            carry_correlation_arm::<Unresolved, Unresolved>(arm.clone()).expect("carried"),
-            arm
-        );
-    }
-
-    /// And the other direction: there is no ground read nobody addressed, so
-    /// arriving in the authored phase with nothing to say is a lost mention,
-    /// not an anonymous relation.
-    #[test]
-    fn the_authored_phase_refuses_a_mention_it_was_not_given() {
-        assert!(carry_mention::<Resolved, Unresolved>(()).is_err());
-        assert!(carry_mention::<Refined, Unresolved>(()).is_err());
     }
 
     /// The declaration is the CATALOG's. An authored tree carrying one is
@@ -1915,42 +1311,34 @@ mod tests {
         };
         assert!(Unresolved::admit_mode_witness(Some(witness)).is_err());
         assert!(Unresolved::admit_mode_witness(None).is_ok());
-        assert!(Resolved::admit_mode_witness(None).is_err());
-        assert!(Refined::admit_mode_witness(None).is_err());
-    }
-
-    /// A query-scoped definition is a binding consumed during resolution.
-    /// The types make a resolved query's slot uninhabited by definitions;
-    /// the DOOR is what refuses a fold that walked past the resolver still
-    /// carrying some — dropping them there would silently unbind every call
-    /// site they were written for.
-    #[test]
-    fn a_phase_that_spent_the_definitions_refuses_to_receive_them() {
-        let definition = super::super::queries::CfeDefinition::unbounded(
-            delightql_types::SqlIdentifier::new("f"),
-            super::super::queries::CfeFormals::from_role_groups(
-                [],
-                [delightql_types::SqlIdentifier::new("x")],
-            ),
-            super::super::queries::ContextMode::None,
-            super::super::DomainExpression::Application(super::super::FunctionApplication::Ground(
-                crate::pipeline::asts::core::LiteralValue::Null,
-            )),
-        );
-        assert!(carry_cfe_bindings::<Unresolved, Resolved>(vec![definition.clone()]).is_err());
-        assert!(carry_cfe_bindings::<Unresolved, Refined>(vec![definition]).is_err());
-        // No definitions cross freely, in every direction the pipeline takes.
-        assert!(carry_cfe_bindings::<Unresolved, Resolved>(Vec::new()).is_ok());
-        assert!(carry_cfe_bindings::<Resolved, Refined>(()).is_ok());
     }
 
     /// The carries the pipeline actually makes.
     #[test]
     fn the_two_live_carries_pass() {
-        assert_eq!(carry_mention::<Resolved, Refined>(()).expect("spent"), ());
         assert_eq!(
             carry_mention::<Unresolved, Unresolved>(mention("users")).expect("authored"),
             mention("users")
         );
+    }
+}
+
+/// A member's join as it crosses between phases: the roles its syntax fixed,
+/// or the type a rebuild decided over its run.
+pub enum MemberJoinPayload {
+    Roles(super::operators::JoinRoles),
+    Decided(super::operators::JoinType),
+}
+
+impl MemberJoinPayload {
+    fn roles(self) -> crate::error::Result<super::operators::JoinRoles> {
+        match self {
+            MemberJoinPayload::Roles(roles) => Ok(roles),
+            MemberJoinPayload::Decided(_) => Err(Internal::invariant(
+                "member join",
+                "a decided join type reached a phase that holds member roles: roles are never \
+                 recovered from a join type",
+            )),
+        }
     }
 }

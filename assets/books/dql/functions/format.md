@@ -5,30 +5,23 @@ Format strings interpolate column values into text. The F-STRING sigil `:`{.deli
 `tpt:#numbering_on()`
 
 ```{.delightql .numberLines }
-employee(*)
-  |> +( :"{LastName}, {FirstName} making ${Salary}" as readable)
+invoice(*)
+  |> +( :"{billing_city}, {billing_country} billed ${total}" as readable)
 ```
 
 ```sql
 select
-    EmployeeId,
-    LastName,
-    FirstName,
-    Title,
-    ReportsTo,
-    BirthDate,
-    HireDate,
-    Salary,
-    Address,
-    City,
-    State,
-    Country,
-    PostalCode,
-    Phone,
-    Fax,
-    Email,
-    LatName || ', ' || FirstName || ' making $' || Salary as readable
-from employee;
+    invoice_id,
+    customer_id,
+    invoice_date,
+    billing_address,
+    billing_city,
+    billing_state,
+    billing_country,
+    billing_postal_code,
+    total,
+    billing_city || ', ' || billing_country || ' billed $' || total as readable
+from invoice;
 ```
 
 Braces `{ }` enclose column names.  Format strings also permit the

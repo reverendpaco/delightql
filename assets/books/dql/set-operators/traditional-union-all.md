@@ -6,7 +6,7 @@ example uses interior relations to shape each relation prior to the `UNION
 ALL`.]{.sidenote}:
 
 ```delightql
-users_2024(|> (last_name,first_name,age))
+invoice(|> (billing_address,billing_city,billing_country))
   ||
-users_2023(|> (LastName,First,Age))
+customer(|> (address,city,country))
 ```

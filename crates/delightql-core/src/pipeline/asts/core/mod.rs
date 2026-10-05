@@ -12,36 +12,36 @@ pub mod queries;
 pub mod smart_constructors;
 pub mod specs;
 
-pub use columns::{AtSign, AuthoredColumn, ColumnOccurrence, ContextMarker, WrittenBinder};
-pub use expressions::functions::{ClauseArm, ClauseSelection};
+pub use columns::{AtSign, AuthoredColumn, ContextMarker, WrittenBinder};
+pub use expressions::functions::{judge_clause_order, ClauseArm, ClauseCrossing, ClauseSelection};
 pub use expressions::truth::NamedProof;
 pub use expressions::{
     Access, AnonRelation, AnonTable, ArgumentValue, ArrayPattern, ArrayPatternMember,
-    BagCorrelation, Callable, CaseExpression, Chain, Comparison, Continuation, CorrPred,
-    Correspondence, Crossing, Datum, DestructureMapping, DestructureMode, DomainExpression,
-    DomainHole, Enclyph, ErJoinStep, Existence, FactFunctionArm, FactFunctionDefinition,
-    FactFunctionMode, FieldSelect, FilterOrigin, FormalHole, FunctionApplication, FunctorCall,
-    Glob, Grelex, GroundForm, GroundMention, HeaderItem, InfixApplication, JsonAccess, Lambda,
-    MatchArm, MemberCorrelation, Membership, MembershipSource, MetadataGroup, MetadataTarget,
-    ModeWitness, NamedReference, Path, PathBinding, PathStep, PatternTarget, Peel, Polarity, Probe,
-    ProbeAddressing, PureCall, QualifiedName, Record, RecordMember, RecordPattern,
-    RecordPatternMember, ReductionPlan, Reference, RegexSelector, Relation, RelationalMembership,
-    RenameSource, RunForm, ScalarRelation, Scalarization, ScalarizedRelation, SealedCall,
-    SearchedArm, SelectorItem, SetOperator, SigmaApplication, Slot, Spread, StandardApplication,
-    Standing, Step, StructuralForm, StructuralStep, TabularBody, TabularRow, Transparent,
-    TreeGroupLocation, TreeGroupPlan, TreePattern, TruthConsumer, TruthExpression, Tuple,
-    TupleElement, ValueRow, ValueTemplate, ValueTemplatePart, WholeHeading, WindowSpec,
+    BagCorrelation, Callable, CaseExpression, Chain, Collection, Comparison, Continuation,
+    CorrPred, Correspondence, Crossing, Datum, DestructurePattern, DomainExpression, DomainHole,
+    Enclyph, ErJoinStep, Existence, FactFunctionArm, FactFunctionDefinition, FactFunctionMode,
+    FieldSelect, FilterOrigin, FunctionApplication, FunctorCall, Glob, Grelex,
+    GroundForm, GroundMention, HeaderItem, InfixApplication, IterationPattern, JsonAccess, Lambda,
+    MatchArm, MemberCorrelation, Membership, MembershipSource, MetadataBinding, MetadataGroup,
+    MetadataTarget, ModeWitness, NamedReference, NestedPattern, Path, PathBinding, PathStep,
+    PatternTarget, Peel, Polarity, Probe, ProbeAddressing, PureCall, QualifiedName, Record,
+    RecordMember, RecordPattern, RecordPatternMember, ReductionPlan, Reference, RegexCase,
+    RegexSelector, Relation, RelationalMembership, RenameSource, ScalarRelation,
+    Scalarization, ScalarizedRelation, SealedCall, SearchedArm, SelectorItem, SetOperator,
+    SigmaApplication, Slot, Spread, StandardApplication, Step, StructuralForm,
+    StructuralStep, TabularBody, TabularRow, Transparent, TreeGroupPlan,
+    TreePattern, TruthExpression, Tuple, TupleElement, ValueRow, ValueTemplate,
+    ValueTemplatePart, WholeHeading, WindowSpec,
 };
-pub use literals::{ColumnOrdinal, ColumnRange, LiteralValue};
-pub use metadata::{ColumnMetadata, NamespacePath};
-pub use operators::{FrameBound, JoinType, PipeOp, WindowFrame};
-pub use phases::{Phase, Refined, Resolved, Unresolved};
-pub use provenance::CteOrigin;
+pub use literals::{ColumnOrdinal, ColumnRange, CompileTimeInteger, LiteralValue, NumericCategory, NumericLiteral};
+pub use metadata::NamespacePath;
+pub use operators::{FrameBound, JoinRoles, PipeOp, WindowFrame};
+pub use phases::{Phase, Unresolved};
 pub use queries::{
-    AuthoredCteSubject, CfeDefinition, CfeFormal, CfeFormals, ContextMode, CteAuthority,
-    CteBinding, CteEffectDeclaration, CteSubjectView, DangerSpec, DangerState, ErContextSpec,
+    AuthoredCteSubject, CfeClause, CfeDefinition, CfeFormals, ContextMode, CteAuthority,
+    CteBinding, CteEffectDeclaration, CteSubjectView, DangerSpec, DangerState,
     HoDefinition, InlineDdlBody, InlineDdlSpec, LexicalHorizon, OptionSpec, OptionState, Query,
-    QueryLocalBlock, QueryLocalNames, QueryLocals,
+    QueryLocalBlock, QueryLocalNames, QueryLocals, SigmaDefinition, StatementBlocks,
 };
 pub(crate) use queries::{QueryLocalDemand, QueryLocalKind};
 pub use specs::{

@@ -344,6 +344,7 @@ impl Ref {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn synthetic_with_display(
         registry: &Rc<Registry>,
         reason: SyntheticReason,
@@ -356,6 +357,7 @@ impl Ref {
             registry.intern(name, false),
         )
     }
+
     pub fn origin(&self) -> &RefOrigin {
         &self.origin
     }
@@ -386,24 +388,25 @@ impl Ref {
         text
     }
 
-    pub(crate) fn namespace_texts(&self) -> Vec<String> {
-        match &self.ns {
-            Namespace::Ambient => Vec::new(),
-            Namespace::Path(path) => path
-                .iter()
+    /// The written qualifier, as text with its route; `None` when nothing
+    /// was written. A world resolves it; nothing else reads its segments
+    /// as a namespace.
+    pub(crate) fn qualifier(&self) -> Option<Qualifier> {
+        let segments = |path: &Vec1<Spelling>| -> Vec<String> {
+            path.iter()
                 .map(|spelling| {
                     let mut text = String::new();
                     self.registry
                         .write(*spelling, &mut crate::names::sink::Teaching(&mut text));
                     text
                 })
-                .collect(),
+                .collect()
+        };
+        match &self.ns {
+            Namespace::Ambient => None,
+            Namespace::Path(path) => Some(Qualifier::exact(segments(path))),
+            Namespace::SelfRelative(path) => Some(Qualifier::self_relative(segments(path))),
         }
-    }
-
-    pub(crate) fn namespace_fq(&self) -> Option<String> {
-        let namespace = self.namespace_texts();
-        (!namespace.is_empty()).then(|| namespace.join("::"))
     }
 }
 
@@ -421,7 +424,8 @@ impl PartialEq for Ref {
 fn namespace_eq(registry: &Registry, left: &Namespace, right: &Namespace) -> bool {
     match (left, right) {
         (Namespace::Ambient, Namespace::Ambient) => true,
-        (Namespace::Path(left), Namespace::Path(right)) => {
+        (Namespace::Path(left), Namespace::Path(right))
+        | (Namespace::SelfRelative(left), Namespace::SelfRelative(right)) => {
             left.len() == right.len()
                 && left
                     .iter()
@@ -448,9 +452,9 @@ impl std::fmt::Debug for Ref {
 impl crate::lispy::ToLispy for Ref {
     fn to_lispy(&self) -> String {
         let name = self.name_text();
-        let qualified = match &self.ns {
-            Namespace::Ambient => name,
-            Namespace::Path(_) => format!("{}.{name}", self.namespace_texts().join("::")),
+        let qualified = match self.qualifier() {
+            None => name,
+            Some(qualifier) => format!("{}.{name}", qualifier.spelled()),
         };
         format!(
             "(ref {} {:?} {:?})",
@@ -480,11 +484,100 @@ pub enum SyntheticReason {
 /// non-empty. Segments are ordinary identifiers, classic or stropped —
 /// stroppedness is spelling, never meaning. There is no `Rooted` variant:
 /// the leading `::` is not a namespace root; the light mention owns that
-/// spelling.
+/// spelling. `Path` is EXACT — a top-level namespace or an explicit alias,
+/// descended by `::`, never searched for under `home`, the primary
+/// namespace, or an enlisted namespace. `SelfRelative` is the one relative
+/// spelling, `.::child`, whose base is the primary definition context of the
+/// world the mention stands in; only that world can say what it names.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Namespace {
     Ambient,
     Path(Vec1<Spelling>),
+    SelfRelative(Vec1<Spelling>),
+}
+
+/// How a written qualifier reaches its namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualifierRoute {
+    /// The exact top-level path, or an explicit `alias!` shorthand.
+    Exact,
+    /// `.::child`: the path descends from the primary definition context.
+    SelfRelative,
+}
+
+/// A written qualifier as text: its route and its segments in path order.
+/// A qualifier is not yet a namespace — only a lexical world can say which
+/// namespace a self-relative spelling names, and only the selection
+/// authority asks it. `exact_fq` answers for the exact route alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qualifier {
+    route: QualifierRoute,
+    segments: Vec<String>,
+}
+
+impl Qualifier {
+    pub fn exact(segments: Vec<String>) -> Self {
+        Qualifier {
+            route: QualifierRoute::Exact,
+            segments,
+        }
+    }
+
+    pub fn self_relative(segments: Vec<String>) -> Self {
+        Qualifier {
+            route: QualifierRoute::SelfRelative,
+            segments,
+        }
+    }
+
+    pub fn route(&self) -> QualifierRoute {
+        self.route
+    }
+
+    /// The segments in path order, whatever the route.
+    pub fn segments(&self) -> &[String] {
+        &self.segments
+    }
+
+    /// The `::`-joined spelling when the route is exact; `None` for a
+    /// self-relative qualifier, which no spelling names without its base.
+    pub fn exact_fq(&self) -> Option<String> {
+        match self.route {
+            QualifierRoute::Exact => Some(self.segments.join("::")),
+            QualifierRoute::SelfRelative => None,
+        }
+    }
+
+    /// The `::`-joined spelling this qualifier names from the primary
+    /// definition context `primary`: the exact path itself, or the child
+    /// route descended from `primary`.
+    pub fn fq_in(&self, primary: &str) -> String {
+        match self.route {
+            QualifierRoute::Exact => self.segments.join("::"),
+            QualifierRoute::SelfRelative => format!("{primary}::{}", self.segments.join("::")),
+        }
+    }
+
+    /// The authored spelling, for diagnostics and for the catalog's record
+    /// of a written qualifier.
+    pub fn spelled(&self) -> String {
+        match self.route {
+            QualifierRoute::Exact => self.segments.join("::"),
+            QualifierRoute::SelfRelative => format!(".::{}", self.segments.join("::")),
+        }
+    }
+
+    /// The qualifier [`Self::spelled`] writes as `text`.
+    pub fn from_spelled(text: &str) -> Self {
+        let (route, path) = match text.strip_prefix(".::") {
+            Some(path) => (QualifierRoute::SelfRelative, path),
+            None => (QualifierRoute::Exact, text),
+        };
+        Qualifier {
+            route,
+            segments: path.split("::").map(str::to_string).collect(),
+        }
+    }
 }
 
 /// Semantic reference routing selected by the authored namespace separator.
@@ -521,11 +614,20 @@ impl Ref {
     /// write it back out.
     pub fn written_call_identity(&self, registry: &Registry) -> CallableId {
         let spelling = registry.intern(&self.name_text(), false);
+        // A target callable stands in the engine's own namespace, which no
+        // primary context descends into: the segments are written as they
+        // were spelled. (A self-relative callee that missed DelightQL's
+        // catalog refused before reaching this mint.)
         let namespace = self
-            .namespace_texts()
-            .into_iter()
-            .map(|part| registry.intern(&part, false))
-            .collect();
+            .qualifier()
+            .map(|qualifier| {
+                qualifier
+                    .segments()
+                    .iter()
+                    .map(|part| registry.intern(part, false))
+                    .collect()
+            })
+            .unwrap_or_default();
         registry.mint_function(spelling, namespace)
     }
 }
@@ -563,21 +665,18 @@ impl crate::lispy::ToLispy for ArmIx {
     }
 }
 
-/// Call-site evidence: the outer `?` and the mutation `!!`.
+/// Call-site evidence: the mutation `!!`. A `?` written on a call is the
+/// role of the member the call stands in, and lives on that member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FunctorMarks {
-    outer: bool,
     mutation: bool,
 }
 
 impl FunctorMarks {
-    pub fn with_evidence(outer: bool, mutation: bool) -> Self {
-        FunctorMarks { outer, mutation }
+    pub fn with_evidence(mutation: bool) -> Self {
+        FunctorMarks { mutation }
     }
 
-    pub fn outer(&self) -> bool {
-        self.outer
-    }
     pub fn mutation(&self) -> bool {
         self.mutation
     }
@@ -774,11 +873,13 @@ mod tests {
             "enum Mark",
             "enum Namespace",
             "enum Never",
+            "enum QualifierRoute",
             "enum RefOrigin",
             "enum ResolutionMode",
             "enum SyntheticReason",
             "struct ArmIx",
             "struct FunctorMarks",
+            "struct Qualifier",
             "struct Ref",
             "struct Vec1",
             "struct Vec2",
@@ -803,6 +904,9 @@ mod tests {
             "Mark::Plain",
             "Namespace::Ambient",
             "Namespace::Path",
+            "Namespace::SelfRelative",
+            "QualifierRoute::Exact",
+            "QualifierRoute::SelfRelative",
             "RefOrigin::Authored",
             "RefOrigin::Synthetic",
             "ResolutionMode::Normal",
@@ -871,17 +975,33 @@ mod tests {
         assert!(Vec1::<Spelling>::try_from_vec(Vec::new()).is_none());
     }
 
-    /// Namespace is Ambient or a non-empty path; there is no Rooted variant
-    /// (this test is the absence, written down: the match below is
-    /// exhaustive with two arms).
+    /// Namespace is Ambient, an exact non-empty path, or the self-relative
+    /// child route; there is no Rooted variant (this test is the absence,
+    /// written down: the match below is exhaustive with three arms).
     #[test]
-    fn namespace_has_exactly_two_states() {
+    fn namespace_has_exactly_three_states() {
         let registry = Rc::new(Registry::new(&[]));
         let ns = Namespace::Path(Vec1::new(registry.intern("t", false)));
         let arms = match ns {
             Namespace::Ambient => 1,
             Namespace::Path(_) => 2,
+            Namespace::SelfRelative(_) => 3,
         };
         assert_eq!(arms, 2);
+    }
+
+    /// A self-relative qualifier names nothing by itself: only a primary
+    /// context makes it a path, and the exact spelling it answers with is
+    /// the child of that context.
+    #[test]
+    fn self_relative_qualifier_resolves_only_against_a_primary_context() {
+        let qualifier = Qualifier::self_relative(vec!["scr".to_string()]);
+        assert_eq!(qualifier.exact_fq(), None);
+        assert_eq!(qualifier.fq_in("home"), "home::scr");
+        assert_eq!(qualifier.fq_in("lib::a"), "lib::a::scr");
+        assert_eq!(qualifier.spelled(), ".::scr");
+        let exact = Qualifier::exact(vec!["lib".to_string(), "a".to_string()]);
+        assert_eq!(exact.exact_fq().as_deref(), Some("lib::a"));
+        assert_eq!(exact.fq_in("home"), "lib::a");
     }
 }

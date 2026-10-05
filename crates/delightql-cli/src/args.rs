@@ -77,11 +77,11 @@ pub enum Command {
         #[arg(long, conflicts_with = "query")]
         file: Option<PathBuf>,
 
-        /// Stop at intermediate stage for inspection
+        /// Inspect instead of executing: a compile stage, or a digest of a pure statement (an effect refuses)
         #[arg(long, value_enum)]
         to: Option<Stage>,
 
-        /// Output format (table, box, json, jsonl, csv, tsv, list, raw)
+        /// Output format (table, box, json, jsonl, csv, tsv, list, raw; hash, totalhash, fingerprint digest an executed result)
         #[arg(short = 'f', long, value_parser = parse_output_format)]
         format: Option<OutputFormat>,
 
@@ -315,11 +315,11 @@ pub enum ToolCommand {
         /// DQL query to run against j(j TEXT)
         query: String,
 
-        /// Output format (table, box, json, jsonl, csv, tsv, list, raw)
+        /// Output format (table, box, json, jsonl, csv, tsv, list, raw; hash, totalhash, fingerprint digest an executed result)
         #[arg(short = 'f', long, value_parser = parse_output_format)]
         format: Option<OutputFormat>,
 
-        /// Stop at intermediate stage for inspection
+        /// Inspect instead of executing: a compile stage, or a digest of a pure statement (an effect refuses)
         #[arg(long, value_enum)]
         to: Option<Stage>,
     },
@@ -330,11 +330,11 @@ pub enum ToolCommand {
         /// DQL query to run against c(...)
         query: String,
 
-        /// Output format (table, box, json, jsonl, csv, tsv, list, raw)
+        /// Output format (table, box, json, jsonl, csv, tsv, list, raw; hash, totalhash, fingerprint digest an executed result)
         #[arg(short = 'f', long, value_parser = parse_output_format)]
         format: Option<OutputFormat>,
 
-        /// Stop at intermediate stage for inspection
+        /// Inspect instead of executing: a compile stage, or a digest of a pure statement (an effect refuses)
         #[arg(long, value_enum)]
         to: Option<Stage>,
 
@@ -359,11 +359,11 @@ pub enum ToolCommand {
         #[arg(long = "table", num_args = 2, value_names = ["SPEC", "PATH"])]
         tables: Vec<String>,
 
-        /// Output format (table, box, json, jsonl, csv, tsv, list, raw)
+        /// Output format (table, box, json, jsonl, csv, tsv, list, raw; hash, totalhash, fingerprint digest an executed result)
         #[arg(short = 'f', long, value_parser = parse_output_format)]
         format: Option<OutputFormat>,
 
-        /// Stop at intermediate stage for inspection
+        /// Inspect instead of executing: a compile stage, or a digest of a pure statement (an effect refuses)
         #[arg(long, value_enum)]
         to: Option<Stage>,
     },
@@ -390,7 +390,11 @@ pub enum ColorMode {
     Never,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+/// What `--to` asks for. Every value but `results` is an INSPECTION: the
+/// statement is compiled, or — for the digests — run only if the compiler
+/// finds it effect-free, on a session that refuses an effect before any
+/// dispatcher runs. `results` (the default) is the executing road.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Stage {
     /// Show CST (Concrete Syntax Tree)
     Cst,
@@ -414,12 +418,42 @@ pub enum Stage {
     Fingerprint,
     /// Show just the data hash as plain text (column-name independent)
     Hash,
-    /// Show byte-level data hash (type-preserving, platform-independent)
-    #[value(name = "bhash")]
-    ByteHash,
     /// Show just the total hash as plain text (includes column names)
     #[value(name = "totalhash")]
     TotalHash,
+}
+
+impl Stage {
+    /// The `sys::execution.compile` stage name this asks for, when it asks
+    /// for a compilation rather than a result.
+    pub fn compile_stage(self) -> Option<&'static str> {
+        match self {
+            Stage::Cst => Some("cst"),
+            Stage::AstUnresolved => Some("ast-unresolved"),
+            Stage::AstResolved => Some("ast-resolved"),
+            Stage::AstRefined => Some("ast-refined"),
+            Stage::AstSql => Some("ast-sql"),
+            Stage::Sql => Some("sql"),
+            Stage::Results | Stage::Fingerprint | Stage::Hash | Stage::TotalHash => None,
+        }
+    }
+
+    /// The digest this asks for, when it asks for one of a result.
+    pub fn digest(self) -> Option<crate::output_format::Digest> {
+        use crate::output_format::Digest;
+        match self {
+            Stage::Fingerprint => Some(Digest::Fingerprint),
+            Stage::Hash => Some(Digest::Hash),
+            Stage::TotalHash => Some(Digest::TotalHash),
+            Stage::Cst
+            | Stage::AstUnresolved
+            | Stage::AstResolved
+            | Stage::AstRefined
+            | Stage::AstSql
+            | Stage::Sql
+            | Stage::Results => None,
+        }
+    }
 }
 
 /// Eager --dialect validation, mirroring --format's contract: a bogus

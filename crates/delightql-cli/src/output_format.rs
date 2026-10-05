@@ -10,13 +10,43 @@ use std::io::{self, IsTerminal};
 pub enum OutputFormat {
     #[default]
     Table, // Default pipe-delimited table
-    Box,  // Unicode box-drawing table (like SQLite's .mode box)
-    Json, // JSON array of objects
+    Box,   // Unicode box-drawing table (like SQLite's .mode box)
+    Json,  // JSON array of objects
     Jsonl, // One JSON object per row (streams; composes with jq)
-    Csv,  // Comma-separated values
-    Tsv,  // Tab-separated values
-    List, // Key=value pairs
-    Raw,  // Raw bytes (no formatting, no text conversion)
+    Csv,   // Comma-separated values
+    Tsv,   // Tab-separated values
+    List,  // Key=value pairs
+    Raw,   // Raw bytes (no formatting, no text conversion)
+    /// One machine value standing for the whole executed result.
+    Digest(Digest),
+}
+
+/// A digest of an executed result: the rendering `--to hash`,
+/// `--to totalhash` and `--to fingerprint` print for a pure statement, and
+/// the rendering an EXECUTING road (`--to results -f hash` and siblings)
+/// prints after running the statement, effects included.
+///
+/// Three distinct contracts over one digest of the protocol cells (man
+/// dql-query): hash = data only; totalhash = schema+data (column names
+/// participate); fingerprint = the structured JSON. Collapsing them would
+/// make totalhash blind to a column rename and fingerprint emit a bare
+/// digest instead of the structured JSON its name promises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Digest {
+    Hash,
+    TotalHash,
+    Fingerprint,
+}
+
+impl OutputFormat {
+    /// The digest this format is, if it is one. A digest is a single
+    /// machine value, so no console sink ships mid-run sets beside it.
+    pub fn digest(self) -> Option<Digest> {
+        match self {
+            OutputFormat::Digest(digest) => Some(digest),
+            _ => None,
+        }
+    }
 }
 
 impl OutputFormat {
@@ -54,28 +84,94 @@ impl OutputFormat {
             "tsv" => Some(OutputFormat::Tsv),
             "list" => Some(OutputFormat::List),
             "raw" => Some(OutputFormat::Raw),
+            "hash" => Some(OutputFormat::Digest(Digest::Hash)),
+            "totalhash" => Some(OutputFormat::Digest(Digest::TotalHash)),
+            "fingerprint" => Some(OutputFormat::Digest(Digest::Fingerprint)),
             _ => None,
         }
     }
 
+    /// The spelling `--format` and `.format` take for this format.
+    pub fn name(self) -> &'static str {
+        match self {
+            OutputFormat::Table => "table",
+            OutputFormat::Box => "box",
+            OutputFormat::Json => "json",
+            OutputFormat::Jsonl => "jsonl",
+            OutputFormat::Csv => "csv",
+            OutputFormat::Tsv => "tsv",
+            OutputFormat::List => "list",
+            OutputFormat::Raw => "raw",
+            OutputFormat::Digest(Digest::Hash) => "hash",
+            OutputFormat::Digest(Digest::TotalHash) => "totalhash",
+            OutputFormat::Digest(Digest::Fingerprint) => "fingerprint",
+        }
+    }
+
     pub fn all_formats() -> &'static [&'static str] {
-        &["table", "box", "json", "jsonl", "csv", "tsv", "list", "raw"]
+        &[
+            "table",
+            "box",
+            "json",
+            "jsonl",
+            "csv",
+            "tsv",
+            "list",
+            "raw",
+            "hash",
+            "totalhash",
+            "fingerprint",
+        ]
     }
 }
 
-/// Format query results with optional zebra coloring, header suppression, and sanitization
-pub fn format_output_with_zebra(
+/// Format query results with optional header suppression and sanitization.
+pub fn format_output(
     columns: &[String],
-    rows: &[Vec<String>],
+    rows: &[Vec<Option<String>>],
     format: OutputFormat,
-    zebra_mode: Option<usize>,
     no_headers: bool,
     no_sanitize: bool,
 ) -> String {
+    // THE FORMATS WITH A READER take their cells still nullable: each owns
+    // one representation of absence and one escape law, so a reader
+    // recovers every value — SQL NULL, the text `NULL` and the empty text
+    // are three values and render three ways.
+    //
+    // TWO LAWS MEET HERE, and the terminal-safety law is not repealed by a
+    // format having a reader: what the CLI prints reaches a terminal unless
+    // the user says otherwise, and a record format is what a pipe gets by
+    // default. So the ordinary rendering is a DISPLAY of the value — a
+    // dangerous control byte becomes its `\xHH` spelling before the
+    // format's own escaping, exactly as on the console — and the explicit
+    // opt-out is the faithful serialization. The display is injective too:
+    // the safety spelling is reserved (`sanitize.rs`), tab, newline,
+    // quotes, carriage return and absence are left to the format's own
+    // encoding, so the values the observation contract separates stay
+    // separate either way. JSON needs no such step: its escape spells
+    // every control character as `\u00XX`, which is both safe and
+    // faithful.
+    match format {
+        OutputFormat::Json => return format_as_json(columns, rows),
+        OutputFormat::Jsonl => return format_as_jsonl(columns, rows),
+        OutputFormat::Csv | OutputFormat::Tsv => {
+            let (columns, rows) = if no_sanitize {
+                (columns.to_vec(), rows.to_vec())
+            } else {
+                sanitize_nullable(columns, rows)
+            };
+            return match format {
+                OutputFormat::Csv => format_as_csv(&columns, &rows, no_headers),
+                _ => format_as_tsv(&columns, &rows, no_headers),
+            };
+        }
+        _ => {}
+    }
+    let rows: Vec<Vec<String>> = rows.iter().map(|row| console_cells(row)).collect();
+    let rows = &rows;
+
     // Sanitize cell values unless opted out.
-    // JSON excluded — serde_json handles control char encoding.
     let needs_sanitize = !no_sanitize
-        && !matches!(format, OutputFormat::Json)
         && (columns
             .iter()
             .any(|c| crate::sanitize::needs_sanitization(c))
@@ -86,13 +182,45 @@ pub fn format_output_with_zebra(
     if needs_sanitize {
         let (safe_cols, safe_rows, widths) =
             crate::sanitize::sanitize_rows_with_widths(columns, rows);
-        format_output_inner(
-            &safe_cols, &safe_rows, format, zebra_mode, no_headers, &widths,
-        )
+        format_output_inner(&safe_cols, &safe_rows, format, no_headers, &widths)
     } else {
         let widths = crate::sanitize::compute_column_widths(columns, rows);
-        format_output_inner(columns, rows, format, zebra_mode, no_headers, &widths)
+        format_output_inner(columns, rows, format, no_headers, &widths)
     }
+}
+
+/// The terminal-safety pass over nullable cells: text takes the reserved
+/// safety spelling, absence stays absent.
+fn sanitize_nullable(
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+    let columns = columns
+        .iter()
+        .map(|name| crate::sanitize::sanitize_record_text(name).into_owned())
+        .collect();
+    let rows = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| {
+                    cell.as_deref()
+                        .map(|text| crate::sanitize::sanitize_record_text(text).into_owned())
+                })
+                .collect()
+        })
+        .collect();
+    (columns, rows)
+}
+
+/// One row as the console shows it: THE DISPLAY BOUNDARY, and the only
+/// kind of place a cell's absence is allowed to become the four characters
+/// `NULL` — what is printed here has no reader that could mistake it for
+/// the value again.
+pub fn console_cells(row: &[Option<String>]) -> Vec<String> {
+    row.iter()
+        .map(|cell| cell.clone().unwrap_or_else(|| "NULL".to_string()))
+        .collect()
 }
 
 /// Max column width before we abandon box formatting and fall back to plain table.
@@ -104,27 +232,28 @@ fn format_output_inner(
     columns: &[String],
     rows: &[Vec<String>],
     format: OutputFormat,
-    zebra_mode: Option<usize>,
     no_headers: bool,
     column_widths: &[usize],
 ) -> String {
     match format {
-        OutputFormat::Table => format_as_table_with_zebra(columns, rows, zebra_mode, no_headers),
+        OutputFormat::Table => format_as_table(columns, rows, no_headers),
         OutputFormat::Box => {
             // Fall back to plain table if any column is too wide for box formatting
             let too_wide = column_widths.iter().any(|&w| w > MAX_BOX_COLUMN_WIDTH);
             if !too_wide && should_use_box_format() {
-                format_as_box_with_zebra(columns, rows, zebra_mode, no_headers, column_widths)
+                format_as_box(columns, rows, no_headers, column_widths)
             } else {
-                format_as_table_with_zebra(columns, rows, zebra_mode, no_headers)
+                format_as_table(columns, rows, no_headers)
             }
         }
-        OutputFormat::Json => format_as_json(columns, rows),
-        OutputFormat::Jsonl => format_as_jsonl(columns, rows),
-        OutputFormat::Csv => format_as_csv(columns, rows, no_headers),
-        OutputFormat::Tsv => format_as_tsv(columns, rows, no_headers),
-        OutputFormat::List => format_as_list_with_zebra(columns, rows, zebra_mode),
+        OutputFormat::List => format_as_list(columns, rows),
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Csv | OutputFormat::Tsv => {
+            unreachable!(
+                "a format with a reader renders its nullable cells before the console road"
+            )
+        }
         OutputFormat::Raw => unreachable!("Raw format handled before display_results"),
+        OutputFormat::Digest(_) => unreachable!("a digest is rendered by exec_ng::render_digest"),
     }
 }
 
@@ -155,101 +284,19 @@ fn supports_unicode() -> bool {
             .contains("UTF8")
 }
 
-/// Get ANSI color code based on zebra mode and column index
-fn get_zebra_color(zebra_mode: Option<usize>, col_index: usize) -> &'static str {
-    match zebra_mode {
-        None => "", // No coloring
-        Some(2) => {
-            // Blue and cyan (more visible than white)
-            match col_index % 2 {
-                0 => "\x1b[34m", // Blue
-                _ => "\x1b[36m", // Cyan (instead of white)
-            }
-        }
-        Some(3) => {
-            // Red, white, and blue
-            match col_index % 3 {
-                0 => "\x1b[31m", // Red
-                1 => "\x1b[37m", // White
-                _ => "\x1b[34m", // Blue
-            }
-        }
-        Some(4) => {
-            // Red, white, blue, and green
-            match col_index % 4 {
-                0 => "\x1b[31m", // Red
-                1 => "\x1b[37m", // White
-                2 => "\x1b[34m", // Blue
-                _ => "\x1b[32m", // Green
-            }
-        }
-        _ => "", // Invalid mode
-    }
-}
-
-/// Reset ANSI color
-const RESET_COLOR: &str = "\x1b[0m";
-
-fn format_as_table_with_zebra(
-    columns: &[String],
-    rows: &[Vec<String>],
-    zebra_mode: Option<usize>,
-    no_headers: bool,
-) -> String {
+fn format_as_table(columns: &[String], rows: &[Vec<String>], no_headers: bool) -> String {
     let mut output = String::new();
 
-    // Header with zebra coloring (skip if no_headers is true)
     if !columns.is_empty() && !no_headers {
-        let header_parts: Vec<String> = columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                if zebra_mode.is_some() {
-                    format!("{}{}{}", get_zebra_color(zebra_mode, i), col, RESET_COLOR)
-                } else {
-                    col.clone()
-                }
-            })
-            .collect();
-        output.push_str(&header_parts.join(" | "));
+        output.push_str(&columns.join(" | "));
         output.push('\n');
-
-        // Separator with zebra coloring
-        let sep_parts: Vec<String> = columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                let dashes = "-".repeat(col.len());
-                if zebra_mode.is_some() {
-                    format!(
-                        "{}{}{}",
-                        get_zebra_color(zebra_mode, i),
-                        dashes,
-                        RESET_COLOR
-                    )
-                } else {
-                    dashes
-                }
-            })
-            .collect();
-        output.push_str(&sep_parts.join("-|-"));
+        let dashes: Vec<String> = columns.iter().map(|col| "-".repeat(col.len())).collect();
+        output.push_str(&dashes.join("-|-"));
         output.push('\n');
     }
 
-    // Rows with zebra coloring
     for row in rows {
-        let row_parts: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(i, val)| {
-                if zebra_mode.is_some() {
-                    format!("{}{}{}", get_zebra_color(zebra_mode, i), val, RESET_COLOR)
-                } else {
-                    val.clone()
-                }
-            })
-            .collect();
-        output.push_str(&row_parts.join(" | "));
+        output.push_str(&row.join(" | "));
         output.push('\n');
     }
 
@@ -286,10 +333,9 @@ fn pad_center(text: &str, width: usize) -> String {
     }
 }
 
-fn format_as_box_with_zebra(
+fn format_as_box(
     columns: &[String],
     rows: &[Vec<String>],
-    zebra_mode: Option<usize>,
     no_headers: bool,
     column_widths: &[usize],
 ) -> String {
@@ -304,18 +350,7 @@ fn format_as_box_with_zebra(
     if no_headers {
         // Output rows without box drawing
         for row in rows {
-            let row_parts: Vec<String> = row
-                .iter()
-                .enumerate()
-                .map(|(i, val)| {
-                    if zebra_mode.is_some() {
-                        format!("{}{}{}", get_zebra_color(zebra_mode, i), val, RESET_COLOR)
-                    } else {
-                        val.clone()
-                    }
-                })
-                .collect();
-            output.push_str(&row_parts.join(" | "));
+            output.push_str(&row.join(" | "));
             output.push('\n');
         }
         return output;
@@ -357,16 +392,10 @@ fn format_as_box_with_zebra(
     // Draw top border
     output.push_str(&draw_line(TOP_LEFT, TOP_JUNCTION, TOP_RIGHT));
 
-    // Draw header row with zebra coloring
+    // Draw header row
     output.push(VERTICAL);
     for (i, col) in columns.iter().enumerate() {
-        let padded = format!(" {} ", pad_left(col, widths[i] - 2));
-        if zebra_mode.is_some() {
-            let color = get_zebra_color(zebra_mode, i);
-            output.push_str(&format!("{}{}{}", color, padded, RESET_COLOR));
-        } else {
-            output.push_str(&padded);
-        }
+        output.push_str(&format!(" {} ", pad_left(col, widths[i] - 2)));
         output.push(VERTICAL);
     }
     output.push('\n');
@@ -391,35 +420,16 @@ fn format_as_box_with_zebra(
             output.push(VERTICAL);
             for (i, cell) in row.iter().enumerate() {
                 if i < widths.len() {
-                    let padded = format!(" {} ", pad_left(cell, widths[i] - 2));
-                    if zebra_mode.is_some() {
-                        let color = get_zebra_color(zebra_mode, i);
-                        output.push_str(&format!("{}{}{}", color, padded, RESET_COLOR));
-                    } else {
-                        output.push_str(&padded);
-                    }
-                    output.push(VERTICAL);
+                    output.push_str(&format!(" {} ", pad_left(cell, widths[i] - 2)));
                 } else {
                     // Handle row with more cells than columns (shouldn't happen normally)
-                    let cell_output = format!(" {} ", cell);
-                    if zebra_mode.is_some() {
-                        let color = get_zebra_color(zebra_mode, i);
-                        output.push_str(&format!("{}{}{}", color, cell_output, RESET_COLOR));
-                    } else {
-                        output.push_str(&cell_output);
-                    }
-                    output.push(VERTICAL);
+                    output.push_str(&format!(" {} ", cell));
                 }
+                output.push(VERTICAL);
             }
             // Handle row with fewer cells than columns
-            for i in row.len()..columns.len() {
-                let padded = format!(" {:<width$} ", "", width = widths[i] - 2);
-                if zebra_mode.is_some() {
-                    let color = get_zebra_color(zebra_mode, i);
-                    output.push_str(&format!("{}{}{}", color, padded, RESET_COLOR));
-                } else {
-                    output.push_str(&padded);
-                }
+            for width in widths.iter().take(columns.len()).skip(row.len()) {
+                output.push_str(&format!(" {:<width$} ", "", width = width - 2));
                 output.push(VERTICAL);
             }
             output.push('\n');
@@ -526,13 +536,10 @@ pub fn json_escape(s: &str) -> String {
     out
 }
 
-/// Stringly-caller face of JSON output (tools paths, which have no
-/// descriptors and no NULL fidelity — their cells arrive as the string
-/// "NULL"). Everything emits as strings, in relation order. The typed
-/// path is exec_ng's display_results_json, which reads nullable cells
-/// and descriptors; upgrading the tools paths to it remains
-/// outstanding.
-fn format_as_json(columns: &[String], rows: &[Vec<String>]) -> String {
+/// JSON without descriptors (the tools paths): NULL is `null`, every
+/// other cell a string, in relation order. The typed road with declared
+/// column descriptors is exec_ng's `json_document`.
+fn format_as_json(columns: &[String], rows: &[Vec<Option<String>>]) -> String {
     if rows.is_empty() {
         return "[]\n".to_string();
     }
@@ -543,65 +550,67 @@ fn format_as_json(columns: &[String], rows: &[Vec<String>]) -> String {
             out.push_str(",\n");
         }
         out.push_str("  ");
-        let cells: Vec<Option<String>> = row.iter().map(|c| Some(c.clone())).collect();
-        out.push_str(&json_object_row(columns, &descriptors, &cells));
+        out.push_str(&json_object_row(columns, &descriptors, row));
     }
     out.push_str("\n]\n");
     out
 }
 
-fn format_as_jsonl(columns: &[String], rows: &[Vec<String>]) -> String {
+fn format_as_jsonl(columns: &[String], rows: &[Vec<Option<String>>]) -> String {
     let descriptors: Vec<String> = vec![String::new(); columns.len()];
     let mut out = String::new();
     for row in rows {
-        let cells: Vec<Option<String>> = row.iter().map(|c| Some(c.clone())).collect();
-        out.push_str(&json_object_row(columns, &descriptors, &cells));
+        out.push_str(&json_object_row(columns, &descriptors, row));
         out.push('\n');
     }
     out
 }
 
-fn format_as_csv(columns: &[String], rows: &[Vec<String>], no_headers: bool) -> String {
+/// CSV, one record per line, the heading first unless suppressed.
+fn format_as_csv(columns: &[String], rows: &[Vec<Option<String>>], no_headers: bool) -> String {
     let mut output = String::new();
-
-    // Header (skip if no_headers is true)
     if !columns.is_empty() && !no_headers {
-        output.push_str(&escape_csv_row(columns));
+        output.push_str(&join_fields(
+            columns.iter().map(|name| csv_field(Some(name))),
+            ",",
+        ));
         output.push('\n');
     }
-
-    // Rows
     for row in rows {
-        output.push_str(&escape_csv_row(row));
+        output.push_str(&join_fields(
+            row.iter().map(|cell| csv_field(cell.as_deref())),
+            ",",
+        ));
         output.push('\n');
     }
-
     output
 }
 
-fn format_as_tsv(columns: &[String], rows: &[Vec<String>], no_headers: bool) -> String {
+/// TSV, one record per line, the heading first unless suppressed.
+fn format_as_tsv(columns: &[String], rows: &[Vec<Option<String>>], no_headers: bool) -> String {
     let mut output = String::new();
-
-    // Header (skip if no_headers is true)
     if !columns.is_empty() && !no_headers {
-        output.push_str(&escape_tsv_row(columns));
+        output.push_str(&join_fields(
+            columns.iter().map(|name| tsv_field(Some(name))),
+            "\t",
+        ));
         output.push('\n');
     }
-
-    // Rows
     for row in rows {
-        output.push_str(&escape_tsv_row(row));
+        output.push_str(&join_fields(
+            row.iter().map(|cell| tsv_field(cell.as_deref())),
+            "\t",
+        ));
         output.push('\n');
     }
-
     output
 }
 
-fn format_as_list_with_zebra(
-    columns: &[String],
-    rows: &[Vec<String>],
-    zebra_mode: Option<usize>,
-) -> String {
+fn join_fields(fields: impl Iterator<Item = String>, separator: &str) -> String {
+    fields.collect::<Vec<_>>().join(separator)
+}
+
+fn format_as_list(columns: &[String], rows: &[Vec<String>]) -> String {
     let mut output = String::new();
 
     for (row_idx, row) in rows.iter().enumerate() {
@@ -611,63 +620,57 @@ fn format_as_list_with_zebra(
 
         for (i, column) in columns.iter().enumerate() {
             let value = row.get(i).map(|s| s.as_str()).unwrap_or("");
-            if zebra_mode.is_some() {
-                // Apply zebra coloring to both column name and value
-                let color = get_zebra_color(zebra_mode, i);
-                output.push_str(&format!("{}{} = {}{}\n", color, column, value, RESET_COLOR));
-            } else {
-                output.push_str(&format!("{} = {}\n", column, value));
-            }
+            output.push_str(&format!("{} = {}\n", column, value));
         }
     }
 
     output
 }
 
-fn escape_csv_row(row: &[String]) -> String {
-    row.iter()
-        .map(|field| escape_csv_field(field))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn escape_csv_field(field: &str) -> String {
-    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_string()
+/// THE CSV CELL LAW. SQL NULL is the empty unquoted field; the empty text
+/// is `""`; text holding a comma, a quote or a line break is quoted with
+/// its quotes doubled; every other text is itself. So the text `NULL`
+/// renders `NULL`, and the three are pairwise distinct.
+fn csv_field(cell: Option<&str>) -> String {
+    match cell {
+        None => String::new(),
+        Some("") => "\"\"".to_string(),
+        Some(field) if field.contains([',', '"', '\n', '\r']) => {
+            format!("\"{}\"", field.replace('"', "\"\""))
+        }
+        Some(field) => field.to_string(),
     }
 }
 
-fn escape_tsv_row(row: &[String]) -> String {
-    row.iter()
-        .map(|field| escape_tsv_field(field))
-        .collect::<Vec<_>>()
-        .join("\t")
-}
-
-fn escape_tsv_field(field: &str) -> String {
-    field
-        .replace('\t', "\\t")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
+/// THE TSV CELL LAW. SQL NULL is `\N`; text escapes its own alphabet — a
+/// backslash as `\\`, a tab as `\t`, a newline as `\n`, a carriage return
+/// as `\r` — and every other byte is literal. Escaping the backslash first
+/// is what keeps the law injective: the text `\n` renders `\\n`, a newline
+/// renders `\n`, and the text `\N` renders `\\N`.
+fn tsv_field(cell: Option<&str>) -> String {
+    match cell {
+        None => "\\N".to_string(),
+        Some(field) => field
+            .replace('\\', "\\\\")
+            .replace('\t', "\\t")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn format_as_table(columns: &[String], rows: &[Vec<String>]) -> String {
-        format_as_table_with_zebra(columns, rows, None, false)
+    fn nullable(rows: &[Vec<String>]) -> Vec<Vec<Option<String>>> {
+        rows.iter()
+            .map(|row| row.iter().cloned().map(Some).collect())
+            .collect()
     }
 
-    fn format_as_box(columns: &[String], rows: &[Vec<String>]) -> String {
+    fn boxed(columns: &[String], rows: &[Vec<String>]) -> String {
         let widths = crate::sanitize::compute_column_widths(columns, rows);
-        format_as_box_with_zebra(columns, rows, None, false, &widths)
-    }
-
-    fn format_as_list(columns: &[String], rows: &[Vec<String>]) -> String {
-        format_as_list_with_zebra(columns, rows, None)
+        format_as_box(columns, rows, false, &widths)
     }
 
     #[test]
@@ -693,7 +696,9 @@ mod tests {
     #[test]
     fn test_output_format_all_formats() {
         let formats = OutputFormat::all_formats();
-        assert_eq!(formats.len(), 8);
+        assert_eq!(formats.len(), 11);
+        assert!(formats.contains(&"hash"));
+        assert!(formats.contains(&"fingerprint"));
         assert!(formats.contains(&"jsonl"));
         assert!(formats.contains(&"table"));
         assert!(formats.contains(&"box"));
@@ -701,6 +706,15 @@ mod tests {
         assert!(formats.contains(&"csv"));
         assert!(formats.contains(&"tsv"));
         assert!(formats.contains(&"list"));
+    }
+
+    /// Every spelling reads as the format whose name it is.
+    #[test]
+    fn every_format_is_named_by_its_spelling() {
+        for spelling in OutputFormat::all_formats() {
+            let format = OutputFormat::from_str(spelling).expect("a listed spelling parses");
+            assert_eq!(format.name(), *spelling);
+        }
     }
 
     #[test]
@@ -711,7 +725,7 @@ mod tests {
             vec!["Bob".to_string(), "25".to_string()],
         ];
 
-        let result = format_as_table(&columns, &rows);
+        let result = format_as_table(&columns, &rows, false);
         let expected = "name | age\n-----|----\nAlice | 30\nBob | 25\n";
         assert_eq!(result, expected);
     }
@@ -724,6 +738,7 @@ mod tests {
             vec!["Bob".to_string(), "25".to_string()],
         ];
 
+        let rows = nullable(&rows);
         let result = format_as_json(&columns, &rows);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed.is_array());
@@ -742,7 +757,7 @@ mod tests {
             vec!["Bob".to_string(), "Los Angeles".to_string()],
         ];
 
-        let result = format_as_csv(&columns, &rows, false);
+        let result = format_as_csv(&columns, &nullable(&rows), false);
         let expected = "name,city\nAlice,New York\nBob,Los Angeles\n";
         assert_eq!(result, expected);
     }
@@ -755,7 +770,7 @@ mod tests {
             vec!["Bob".to_string(), "25".to_string()],
         ];
 
-        let result = format_as_tsv(&columns, &rows, false);
+        let result = format_as_tsv(&columns, &nullable(&rows), false);
         let expected = "name\tage\nAlice\t30\nBob\t25\n";
         assert_eq!(result, expected);
     }
@@ -781,7 +796,7 @@ mod tests {
             vec!["Jane".to_string(), "Normal text".to_string()],
         ];
 
-        let result = format_as_csv(&columns, &rows, false);
+        let result = format_as_csv(&columns, &nullable(&rows), false);
         assert!(result.contains("\"John, Jr.\""));
         assert!(result.contains("\"A \"\"nice\"\" person\""));
         assert!(result.contains("Jane"));
@@ -795,8 +810,98 @@ mod tests {
             "Has\ttabs and\nnewlines".to_string(),
         ]];
 
-        let result = format_as_tsv(&columns, &rows, false);
+        let result = format_as_tsv(&columns, &nullable(&rows), false);
         assert!(result.contains("Has\\ttabs and\\nnewlines"));
+    }
+
+    /// THE CROSSING: a dangerous control byte in a record format is spelled
+    /// out unless the opt-out is explicit, in CSV and TSV alike, and the
+    /// opt-out yields the raw byte. The observation contract's values stay
+    /// distinct on both sides of the crossing.
+    #[test]
+    fn record_formats_cross_the_terminal_safety_boundary_like_the_console() {
+        let columns = vec!["x".to_string()];
+        let red = vec![vec![Some("\x1b[31mRED".to_string())]];
+        for format in [OutputFormat::Csv, OutputFormat::Tsv] {
+            let displayed = format_output(&columns, &red, format, true, false);
+            assert!(
+                !displayed.contains('\x1b'),
+                "{format:?} let ESC through: {displayed:?}"
+            );
+            assert!(
+                displayed.contains("\\x1B[31mRED"),
+                "{format:?}: {displayed:?}"
+            );
+            let faithful = format_output(&columns, &red, format, true, true);
+            assert!(
+                faithful.contains("\x1b[31mRED"),
+                "{format:?} opt-out: {faithful:?}"
+            );
+            // ESC and the authored text `\x1B` are two values on both sides.
+            let authored = vec![vec![Some("\\x1B[31mRED".to_string())]];
+            for no_sanitize in [false, true] {
+                assert_ne!(
+                    format_output(&columns, &red, format, true, no_sanitize),
+                    format_output(&columns, &authored, format, true, no_sanitize),
+                    "{format:?} no_sanitize={no_sanitize}: ESC and authored \\x1B collide"
+                );
+            }
+
+            let three = vec![
+                vec![None],
+                vec![Some("NULL".to_string())],
+                vec![Some(String::new())],
+            ];
+            let rendered = |rows: &[Vec<Option<String>>], no_sanitize: bool| -> Vec<String> {
+                format_output(&columns, rows, format, true, no_sanitize)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            };
+            for no_sanitize in [false, true] {
+                let lines = rendered(&three, no_sanitize);
+                assert_eq!(lines.len(), 3);
+                assert_ne!(lines[0], lines[1]);
+                assert_ne!(lines[1], lines[2]);
+                assert_ne!(lines[0], lines[2]);
+                let spelled = vec![
+                    vec![Some("a\\nb".to_string())],
+                    vec![Some("a\nb".to_string())],
+                ];
+                let lines = rendered(&spelled, no_sanitize);
+                assert_ne!(lines[0], lines[1], "{format:?} no_sanitize={no_sanitize}");
+            }
+        }
+    }
+
+    /// The record formats are injective over distinct cells: SQL NULL, the
+    /// text `NULL` and the empty text render three ways, and text spelling
+    /// an escape is told from the character it spells.
+    #[test]
+    fn csv_and_tsv_tell_every_value_apart() {
+        let columns = vec!["x".to_string()];
+        let three = vec![
+            vec![None],
+            vec![Some("NULL".to_string())],
+            vec![Some(String::new())],
+        ];
+        assert_eq!(format_as_csv(&columns, &three, true), "\nNULL\n\"\"\n");
+        assert_eq!(format_as_tsv(&columns, &three, true), "\\N\nNULL\n\n");
+
+        let spelled = |text: &str| vec![vec![Some(text.to_string())]];
+        assert_ne!(
+            format_as_tsv(&columns, &spelled("a\\nb"), true),
+            format_as_tsv(&columns, &spelled("a\nb"), true)
+        );
+        assert_ne!(
+            format_as_tsv(&columns, &spelled("a\\tb"), true),
+            format_as_tsv(&columns, &spelled("a\tb"), true)
+        );
+        assert_eq!(format_as_tsv(&columns, &spelled("\\N"), true), "\\\\N\n");
+        assert_eq!(
+            format_as_csv(&columns, &spelled("a\nb"), true),
+            "\"a\nb\"\n"
+        );
     }
 
     #[test]
@@ -804,10 +909,10 @@ mod tests {
         let columns = vec![];
         let rows = vec![];
 
-        assert_eq!(format_as_table(&columns, &rows), "");
-        assert_eq!(format_as_json(&columns, &rows), "[]\n");
-        assert_eq!(format_as_csv(&columns, &rows, false), "");
-        assert_eq!(format_as_tsv(&columns, &rows, false), "");
+        assert_eq!(format_as_table(&columns, &rows, false), "");
+        assert_eq!(format_as_json(&columns, &nullable(&rows)), "[]\n");
+        assert_eq!(format_as_csv(&columns, &nullable(&rows), false), "");
+        assert_eq!(format_as_tsv(&columns, &nullable(&rows), false), "");
         assert_eq!(format_as_list(&columns, &rows), "");
     }
 
@@ -816,13 +921,13 @@ mod tests {
         let columns = vec!["name".to_string(), "age".to_string()];
         let rows = vec![];
 
-        let table_result = format_as_table(&columns, &rows);
+        let table_result = format_as_table(&columns, &rows, false);
         assert!(table_result.contains("name | age"));
 
-        let csv_result = format_as_csv(&columns, &rows, false);
+        let csv_result = format_as_csv(&columns, &nullable(&rows), false);
         assert_eq!(csv_result, "name,age\n");
 
-        let json_result = format_as_json(&columns, &rows);
+        let json_result = format_as_json(&columns, &nullable(&rows));
         assert_eq!(json_result, "[]\n");
     }
 
@@ -834,7 +939,7 @@ mod tests {
             vec!["2".to_string(), "Bob".to_string(), "25".to_string()],
         ];
 
-        let result = format_as_box(&columns, &rows);
+        let result = boxed(&columns, &rows);
 
         // Check for box drawing characters
         assert!(result.contains('┌'));
@@ -864,7 +969,7 @@ mod tests {
         let columns = vec!["id".to_string(), "name".to_string()];
         let rows = vec![];
 
-        let result = format_as_box(&columns, &rows);
+        let result = boxed(&columns, &rows);
 
         // Check for box drawing characters
         assert!(result.contains('┌'));
@@ -889,7 +994,7 @@ mod tests {
             vec!["a".to_string(), "very long value here".to_string()],
         ];
 
-        let result = format_as_box(&columns, &rows);
+        let result = boxed(&columns, &rows);
 
         // The columns should be padded appropriately
         // First column should be at least as wide as "short" + padding
@@ -916,7 +1021,7 @@ mod tests {
         let columns = vec!["value".to_string()];
         let rows = vec![vec!["123".to_string()], vec!["456".to_string()]];
 
-        let result = format_as_box(&columns, &rows);
+        let result = boxed(&columns, &rows);
 
         // Check it handles single column correctly
         assert!(result.contains("value"));

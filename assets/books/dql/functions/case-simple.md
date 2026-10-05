@@ -5,18 +5,18 @@ as what it is: a function, and therefore a relation.
 
 ```delightql
 employee(*)
-    |> +(  _:(Department @
-            "engineering"  -> "tech";
-            "data science" -> "tech";
-            _              -> "other") as kind )
+    |> +(  _:(title @
+            "IT Manager" -> "tech";
+            "IT Staff"   -> "tech";
+            _            -> "other") as kind )
 ```
 
 ```sql
 select
   *,
-  case Department
-    when 'engineering' then 'tech'
-    when 'data science' then 'tech'
+  case title
+    when 'IT Manager' then 'tech'
+    when 'IT Staff' then 'tech'
     else 'other'
   end as kind
 from employee;
@@ -25,8 +25,8 @@ from employee;
 The ANON-FUNC sigil `_:(  )`{.delightql .sigil} creates an anonymous case
 function. The F-AND sigil `->`{.delightql .sigil} separates input patterns
 (left) from output values (right). The SEMI-OR sigil `;`{.delightql .sigil}
-separates cases. The header Department `@`{.delightql .sigil} binds the input
-to the Department column.
+separates cases. The header `title` `@`{.delightql .sigil} binds the input
+to the `title` column.
 
 This is *stacked notation* applied to functions: the `->`{.delightql .sigil} acts as a special comma
 that declares a functional dependency -- columns left of the arrow are inputs,
@@ -35,19 +35,19 @@ columns right are outputs.
 **Named case functions**. The same notation defines reusable functions in assertion mode:
 
 ```{.delightql .numberLines .am}
-department_kind(
-  Department     -> kind
+title_kind(
+  title        -> kind
   ------------------
-  "engineering"  -> "tech";
-  "data science" -> "tech";
-  _              -> "other"
+  "IT Manager" -> "tech";
+  "IT Staff"   -> "tech";
+  _            -> "other"
 )
 
-?- employee(*)
-  |> +(  department_kind:(Department) as kind )
+?- _(title @ "IT Staff"; "Sales Manager")
+  |> +(  title_kind:(title) as kind )
 ```
 
-The predicate `department_kind` is both a table (two columns, three rows) and a
+The predicate `title_kind` is both a table (two columns, three rows) and a
 function (input determines output). The `->`{.delightql .sigil} tells the compiler which column is
 the input when invoked as a function.
 
@@ -56,9 +56,9 @@ Without `->`{.delightql .sigil}, the predicate is valid but not callable as a fu
 ```{.delightql .numberLines .am }
 //WILL NOT WORK!! (at least if you want to use it for function calls)
 //    .. it is a perfectly acceptable predicate
-department_kind("engineering"  , "tech")
-department_kind("data science" , "tech")
-department_kind( _             , "other")
+title_kind("IT Manager"    , "tech")
+title_kind("IT Staff"      , "tech")
+title_kind("Sales Manager" , "other")
 ```
 
 [Prolog calls these input/output declarations modes or adornments. Delightql's

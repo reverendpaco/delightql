@@ -119,13 +119,6 @@ impl<P: Phase> SealedCall<P> {
         matches!(self, Self::Effect(_))
     }
 
-    pub(crate) fn call_mut(&mut self) -> &mut FunctorCall<P> {
-        match self {
-            Self::Pure(call) => &mut call.0,
-            Self::Effect(call) => &mut call.0,
-        }
-    }
-
     pub(crate) fn into_inner(self) -> FunctorCall<P> {
         match self {
             Self::Pure(call) => call.0,
@@ -234,10 +227,6 @@ impl<P: Phase> StandardApplication<P> {
 
 impl<P: Phase> FunctorCall<P> {
     pub(crate) fn call(&self) -> &Self {
-        self
-    }
-
-    pub(crate) fn call_mut(&mut self) -> &mut Self {
         self
     }
 
@@ -384,7 +373,7 @@ impl<P: Phase<Scope = (), ScalarOutput = ()>> ScalarizedRelation<P> {
             Scalarization::BoundToOne { ordering } => {
                 let bound = TupleOrdinalClause {
                     operator: TupleOrdinalOperator::LessThan,
-                    value: 1,
+                    value: crate::pipeline::asts::core::CompileTimeInteger::Number(1),
                     offset: None,
                 };
                 vec![Step::authored(if ordering.is_empty() {
@@ -819,6 +808,7 @@ pub struct SearchedArm<P: Phase = Unresolved> {
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("clause_arm")]
 pub struct ClauseArm<P: Phase = Unresolved> {
+    pub(crate) formals: crate::pipeline::asts::core::definitions::ClauseFormals,
     pub guard: Option<TruthExpression<P>>,
     pub result: DomainExpression<P>,
 }
@@ -830,10 +820,285 @@ pub struct ClauseArm<P: Phase = Unresolved> {
 /// and its arms hold clause BODIES. Lowering spells it as the target's
 /// `CASE`, which is a rendering choice and not a claim that the author
 /// wrote one.
+///
+/// THE CARRIER OWNS ITS INVARIANT: the arms are private, nonempty by their
+/// type, and ordered by the one door that builds them — a selection with no
+/// arm, two fallbacks, or a fallback before a guard is not a value of this
+/// type. A phase crossing keeps every fact it cannot re-judge: `cross` maps
+/// each guard to a guard and each result to a result, so the count and the
+/// guarded/unguarded pattern survive the crossing unchanged.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("clause_selection")]
 pub struct ClauseSelection<P: Phase = Unresolved> {
-    pub arms: Vec<ClauseArm<P>>,
+    /// The `Box` is the recursion break: a `Vec1` holds its head inline,
+    /// and an arm holds a domain expression that may hold a selection.
+    arms: Box<crate::pipeline::asts::vocabulary::Vec1<ClauseArm<P>>>,
+}
+
+/// HOW A CLAUSE SELECTION CROSSES A PHASE: one object that maps a guard to
+/// a guard and a result to a result. The carrier asks it for each part in
+/// turn, so no crossing can answer with an arm of a different shape.
+pub trait ClauseCrossing<P: Phase, Q: Phase> {
+    type Error;
+    fn enter(
+        &mut self,
+        _: &crate::pipeline::asts::core::definitions::ClauseFormals,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn leave(&mut self, _: &crate::pipeline::asts::core::definitions::ClauseFormals) {}
+    fn guard(&mut self, guard: TruthExpression<P>) -> Result<TruthExpression<Q>, Self::Error>;
+    fn result(&mut self, result: DomainExpression<P>) -> Result<DomainExpression<Q>, Self::Error>;
+}
+
+/// THE ORDERED-CLAUSE LAW's fault: which rule of clause order the family
+/// broke. A value function returns exactly one value per input, so its
+/// clauses are ordered first-match alternatives and the single unguarded
+/// clause is the fallback that must stand last. A consulted family and a
+/// query-scoped one break the same rule, so the fault has one refusal
+/// whichever neck declared the family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClauseOrderFault {
+    /// More than one clause stands unguarded: nothing selects between them.
+    UnguardedMultiplicity { unguarded: usize },
+    /// The one unguarded clause stands before a guarded one. Positions are
+    /// authored, 1-based.
+    UnguardedPosition { position: usize, of: usize },
+}
+
+impl ClauseOrderFault {
+    /// The refusal: the `ddl/head` leaf naming the rule broken, taught
+    /// with the family's name.
+    pub fn refusal(&self, name: &str) -> crate::error::DelightQLError {
+        use crate::diagnostic::DdlHead;
+        let message = self.describe(name);
+        crate::error::DelightQLError::from(match self {
+            ClauseOrderFault::UnguardedMultiplicity { .. } => {
+                DdlHead::UnguardedMultiplicity { message }
+            }
+            ClauseOrderFault::UnguardedPosition { .. } => DdlHead::UnguardedPosition { message },
+        })
+    }
+
+    /// The teaching, naming the family.
+    pub fn describe(&self, name: &str) -> String {
+        match self {
+            ClauseOrderFault::UnguardedMultiplicity { unguarded } => format!(
+                "value function '{name}': found {unguarded} unguarded clauses, but a value \
+                 function returns exactly one value per input — its clauses are ordered \
+                 first-match alternatives, and the single unguarded clause is the fallback \
+                 that stands last. Guard all but the last clause"
+            ),
+            ClauseOrderFault::UnguardedPosition { position, of } => format!(
+                "value function '{name}': unguarded clause is at position {position} but \
+                 must be the last clause (position {of}). Move the fallback clause to the end"
+            ),
+        }
+    }
+}
+
+/// ONE LAW FOR EVERY VALUE FUNCTION'S CLAUSE ORDER, judged from the guards
+/// alone: at most one clause is unguarded, and that clause is last. A
+/// single clause, guarded or not, is lawful; an all-guarded family is
+/// lawful and simply has no fallback.
+pub fn judge_clause_order(guarded: &[bool]) -> Result<(), ClauseOrderFault> {
+    let unguarded: Vec<usize> = guarded
+        .iter()
+        .enumerate()
+        .filter(|(_, guarded)| !**guarded)
+        .map(|(index, _)| index)
+        .collect();
+    if unguarded.len() > 1 {
+        return Err(ClauseOrderFault::UnguardedMultiplicity {
+            unguarded: unguarded.len(),
+        });
+    }
+    if let Some(&index) = unguarded.first() {
+        if index + 1 != guarded.len() {
+            return Err(ClauseOrderFault::UnguardedPosition {
+                position: index + 1,
+                of: guarded.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+impl<P: Phase> ClauseSelection<P> {
+    /// THE ONE DOOR a family's clauses assemble through: the arms in
+    /// authored order, nonempty by the argument's type, judged by the
+    /// ordered-clause law before the selection exists. A selection that
+    /// lowered to a `CASE` with two `ELSE`s, an `ELSE` before a `WHEN`, or
+    /// no branch at all, is never built.
+    pub fn assemble(
+        arms: crate::pipeline::asts::vocabulary::Vec1<ClauseArm<P>>,
+    ) -> Result<Self, ClauseOrderFault> {
+        let guarded: Vec<bool> = arms.iter().map(|arm| arm.guard.is_some()).collect();
+        judge_clause_order(&guarded)?;
+        Ok(ClauseSelection {
+            arms: Box::new(arms),
+        })
+    }
+
+    /// WHAT A VALUE FUNCTION'S CLAUSES DENOTE, on every declaration road:
+    /// one unguarded clause is that clause's body outright; anything else
+    /// — several clauses, or a lone guarded clause whose guard may not hold
+    /// — is the ordered selection. A consulted family and a query-scoped
+    /// one spend this door alike, so where a function was declared cannot
+    /// change what its guards mean.
+    pub fn family_body(
+        arms: crate::pipeline::asts::vocabulary::Vec1<ClauseArm<P>>,
+    ) -> Result<DomainExpression<P>, ClauseOrderFault> {
+        if arms.len() == 1 && arms.first().guard.is_none() && arms.first().formals.is_empty() {
+            let (only, _) = arms.into_head_tail();
+            return Ok(only.result);
+        }
+        Ok(DomainExpression::Application(
+            FunctionApplication::ClauseSelection(Self::assemble(arms)?),
+        ))
+    }
+
+    /// The arms in authored order, at least one.
+    pub fn arms(&self) -> &crate::pipeline::asts::vocabulary::Vec1<ClauseArm<P>> {
+        &self.arms
+    }
+
+    /// The arms, spent — the lowering's door. What leaves is the ordered,
+    /// nonempty run; no arm list re-enters except through `assemble`.
+    pub fn into_arms(self) -> crate::pipeline::asts::vocabulary::Vec1<ClauseArm<P>> {
+        *self.arms
+    }
+
+    /// CROSS A PHASE keeping every fact the door judged: each guard maps to
+    /// a guard and each result to a result, so the count and the pattern of
+    /// guarded and unguarded arms are the ones the door admitted.
+    pub fn cross<Q: Phase, C: ClauseCrossing<P, Q>>(
+        self,
+        crossing: &mut C,
+    ) -> Result<ClauseSelection<Q>, C::Error> {
+        let arms = self.arms.try_map(|arm| {
+            crossing.enter(&arm.formals)?;
+            let result = (|| {
+                Ok(ClauseArm {
+                    formals: arm.formals.clone(),
+                    guard: arm.guard.map(|guard| crossing.guard(guard)).transpose()?,
+                    result: crossing.result(arm.result)?,
+                })
+            })();
+            crossing.leave(&arm.formals);
+            result
+        })?;
+        Ok(ClauseSelection {
+            arms: Box::new(arms),
+        })
+    }
+}
+
+#[cfg(test)]
+mod clause_order_tests {
+    //! The ordered-clause law, judged from guard presence alone.
+    use super::{judge_clause_order, ClauseOrderFault};
+
+    #[test]
+    fn guarded_clauses_then_one_fallback_are_lawful() {
+        assert_eq!(judge_clause_order(&[true, true, false]), Ok(()));
+    }
+
+    #[test]
+    fn an_all_guarded_family_has_no_fallback_and_is_lawful() {
+        assert_eq!(judge_clause_order(&[true, true]), Ok(()));
+    }
+
+    #[test]
+    fn a_single_clause_is_lawful_either_way() {
+        assert_eq!(judge_clause_order(&[false]), Ok(()));
+        assert_eq!(judge_clause_order(&[true]), Ok(()));
+    }
+
+    #[test]
+    fn two_unguarded_clauses_refuse_on_multiplicity() {
+        assert_eq!(
+            judge_clause_order(&[true, false, false]),
+            Err(ClauseOrderFault::UnguardedMultiplicity { unguarded: 2 })
+        );
+        // Every clause unguarded is exactly as ambiguous.
+        assert_eq!(
+            judge_clause_order(&[false, false]),
+            Err(ClauseOrderFault::UnguardedMultiplicity { unguarded: 2 })
+        );
+    }
+
+    #[test]
+    fn an_unguarded_clause_before_a_guarded_one_refuses_on_position() {
+        assert_eq!(
+            judge_clause_order(&[false, true]),
+            Err(ClauseOrderFault::UnguardedPosition { position: 1, of: 2 })
+        );
+    }
+
+    /// The door judges; the family-body door keeps a lone guarded clause as
+    /// a selection and hands a lone unguarded clause's body back outright.
+    #[test]
+    fn the_family_body_selects_unless_one_unguarded_clause_stands_alone() {
+        use super::{ClauseArm, ClauseSelection};
+        use crate::pipeline::asts::core::{
+            Comparison, DomainExpression, FunctionApplication, LiteralValue, TruthExpression,
+        };
+        use crate::pipeline::asts::vocabulary::{CmpOp, Vec1};
+        let null =
+            || DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null));
+        let guard = || {
+            TruthExpression::Comparison(Comparison {
+                operator: CmpOp::Equal,
+                left: Box::new(null()),
+                right: Box::new(null()),
+            })
+        };
+        let arm = |guard: Option<TruthExpression>| ClauseArm {
+            formals: Default::default(),
+            guard,
+            result: null(),
+        };
+
+        assert!(matches!(
+            ClauseSelection::family_body(Vec1::new(arm(None))),
+            Ok(DomainExpression::Application(FunctionApplication::Ground(
+                _
+            )))
+        ));
+        assert!(matches!(
+            ClauseSelection::family_body(Vec1::new(arm(Some(guard())))),
+            Ok(DomainExpression::Application(
+                FunctionApplication::ClauseSelection(_)
+            ))
+        ));
+        assert_eq!(
+            ClauseSelection::family_body(Vec1::with_tail(arm(None), vec![arm(None)])).err(),
+            Some(ClauseOrderFault::UnguardedMultiplicity { unguarded: 2 })
+        );
+        assert_eq!(
+            ClauseSelection::assemble(Vec1::with_tail(arm(None), vec![arm(Some(guard()))])).err(),
+            Some(ClauseOrderFault::UnguardedPosition { position: 1, of: 2 })
+        );
+    }
+
+    #[test]
+    fn the_teaching_names_the_family_and_the_rule() {
+        let multiplicity = ClauseOrderFault::UnguardedMultiplicity { unguarded: 2 }.describe("f");
+        assert!(
+            multiplicity.contains("value function 'f'"),
+            "{multiplicity}"
+        );
+        assert!(
+            multiplicity.contains("found 2 unguarded clauses"),
+            "{multiplicity}"
+        );
+        let position = ClauseOrderFault::UnguardedPosition { position: 1, of: 2 }.describe("f");
+        assert!(
+            position.contains("unguarded clause is at position 1 but must be the last clause"),
+            "{position}"
+        );
+    }
 }
 
 /// THE DECLARED MODE: `f(a, b -> c, d ---- 1, 2 -> "x", "y"; … ; _ -> …)`.

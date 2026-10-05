@@ -4,22 +4,22 @@ Definitions may carry structured documentation between the neck and the
 body.  The docs block uses the annotation delimiters with the `docs`
 identifier:
 
-```
+```text
   <HEAD>  <NECK>  (~~docs ... ~~)  <BODY>
 ```
 
 ## Syntax {.dqlh}
 
-```dql
-high_paid_employees(*) :-
+```{.delightql .am}
+long_tracks(*) :-
   (~~docs
-    Employees with salary above the company median.
+    Tracks longer than ten minutes.
 
     Returns:
-      columns: inherited from employee
+      columns: inherited from track
       cardinality: variable
   ~~)
-  employee(*), Salary > 50000
+  track(*), milliseconds > 600000
 ```
 
 The docs block is a `(~~docs ... ~~)` annotation.  The body is raw
@@ -34,16 +34,16 @@ expression of the body.  Only one docs block per definition is permitted.
 The docs block is valid on any rule-form definition:
 
 **Views:**
-```dql
-active_users(*) :-
+```{.delightql .am}
+usa_customers(*) :-
   (~~docs
-    Users whose account status is active.
+    Customers whose country is USA.
   ~~)
-  users(*), status = 'active'
+  customer(*), country = "USA"
 ```
 
 **Functions:**
-```dql
+```{.delightql .am}
 tax_amount:(price, rate) :-
   (~~docs
     Computes tax as price times rate, rounded to two decimal places.
@@ -55,7 +55,7 @@ tax_amount:(price, rate) :-
 ```
 
 **Higher-order rules:**
-```dql
+```{.delightql .am}
 same_schema(T(*), V(*))(*) :-
   (~~docs
     Compares T's and V's schema for
@@ -68,8 +68,8 @@ same_schema(T(*), V(*))(*) :-
       column type: boolean
       cardinality: 1
   ~~)
-  first_md(*)  : T(?)
-  second_md(*) : V(?)
+  first_md(*)  : T(^)
+  second_md(*) : V(^)
   together(*)  :
     second_md(*),
       first_md(*.(column_name, ordinal))
@@ -80,13 +80,13 @@ same_schema(T(*), V(*))(*) :-
 ```
 
 **Sigma predicates:**
-```dql
-+is_recent(threshold) :-
+```{.delightql .am}
+is_recent(invoice_date, threshold) :-
   (~~docs
-    Filters to rows where created_at is
+    Filters to rows where invoice_date is
     within threshold days of today.
   ~~)
-  created_at > date:('now', '-' ++ threshold ++ ' days')
+  invoice_date > date:("now", ("-" ++ threshold) ++ " days")
 ```
 
 The docs block is not valid on facts (which have no neck) or on
@@ -94,12 +94,12 @@ shadow-neck definitions (which are query-scoped and ephemeral).
 
 ## Storage {.dqlh}
 
-When a definition is loaded via `consult!()`, the docs text is extracted
+When a definition is loaded via `consult!`, the docs text is extracted
 at parse time and stored alongside the entity in the system catalog.
 
 The docs are queryable through the system metadata:
 
-```dql
-sys::entities.entities(*)
+```delightql
+sys::entities.entity(*)
   |> ( name, doc )
 ```

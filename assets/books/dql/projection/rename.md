@@ -4,12 +4,12 @@ Rename a column during projection with `as`:
 
 ```delightql
 employee(*)
-  |>  (FirstName as f, LastName)
+  |>  (first_name as f, last_name)
 ```
 
-```Sql
+```sql
 select
-  FirstName as f,
-  LastName
+  first_name as f,
+  last_name
 from employee;
 ```

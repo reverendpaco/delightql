@@ -64,7 +64,13 @@ CREATE TABLE connection (
     identity TEXT,
     connection_type INTEGER NOT NULL,
     description TEXT,
-    FOREIGN KEY (connection_type) REFERENCES connection_type_enum(id)
+    -- The session shadow (sys::shadow::<root>) this connection's temp schema
+    -- is registered under, fixed by the first session object registered on
+    -- it. The connection-owning root is recorded once, never re-derived
+    -- from the mounts that share the connection later.
+    shadow_namespace_id INTEGER,
+    FOREIGN KEY (connection_type) REFERENCES connection_type_enum(id),
+    FOREIGN KEY (shadow_namespace_id) REFERENCES namespace(id)
 );
 CREATE UNIQUE INDEX connection_identity_uq ON connection(identity)
     WHERE identity IS NOT NULL;
@@ -99,6 +105,11 @@ CREATE TABLE cartridge (
 -- ============================================================================
 
 -- Entity: Stores entity definitions (views, functions, tables, etc.)
+--
+-- AN ENTITY OWNS EVERY ROW THAT NAMES IT. Each reference to an entity, and
+-- to a row an entity owns, is declared ON DELETE CASCADE, so deleting the
+-- entity row retires the entity whole: no remover lists the rows it expects,
+-- and a table added later retires with its entity by its own declaration.
 CREATE TABLE entity (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -122,7 +133,7 @@ CREATE TABLE entity_clause (
     ordinal INTEGER NOT NULL,
     definition TEXT NOT NULL,
     location TEXT,
-    FOREIGN KEY (entity_id) REFERENCES entity(id)
+    FOREIGN KEY (entity_id) REFERENCES entity(id) ON DELETE CASCADE
 );
 
 -- Clause ordinals are authored order and unique within their family.
@@ -138,7 +149,7 @@ CREATE TABLE referenced_entity (
     containing_entity_id INTEGER NOT NULL,
     location TEXT,
     FOREIGN KEY (apparent_type) REFERENCES entity_type_enum(id),
-    FOREIGN KEY (containing_entity_id) REFERENCES entity(id)
+    FOREIGN KEY (containing_entity_id) REFERENCES entity(id) ON DELETE CASCADE
 );
 
 -- Entity Attribute: Stores columns/parameters/domains for entities
@@ -151,7 +162,7 @@ CREATE TABLE entity_attribute (
     position INTEGER,
     is_nullable INTEGER DEFAULT 1,  -- boolean
     default_value TEXT,
-    FOREIGN KEY (entity_id) REFERENCES entity(id),
+    FOREIGN KEY (entity_id) REFERENCES entity(id) ON DELETE CASCADE,
     UNIQUE (entity_id, attribute_name, attribute_type)
 );
 
@@ -164,7 +175,7 @@ CREATE TABLE ho_param (
     kind TEXT NOT NULL,  -- 'glob', 'argumentative', 'scalar', 'ground_scalar'
     column_name TEXT,    -- canonical name from free-var clauses (NULL for table params)
     stropped INTEGER NOT NULL DEFAULT 0,  -- the declared identifier's strop bit: exact when set
-    FOREIGN KEY (entity_id) REFERENCES entity(id)
+    FOREIGN KEY (entity_id) REFERENCES entity(id) ON DELETE CASCADE
 );
 
 -- Column schema for argumentative functor parameters
@@ -174,7 +185,7 @@ CREATE TABLE ho_param_column (
     column_name TEXT NOT NULL,
     column_position INTEGER NOT NULL,
     stropped INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (ho_param_id) REFERENCES ho_param(id)
+    FOREIGN KEY (ho_param_id) REFERENCES ho_param(id) ON DELETE CASCADE
 );
 
 -- Edge catalog (GROUNDING-AND-MENTION.md "Persistence"): each row is a
@@ -189,7 +200,7 @@ CREATE TABLE join_edge (
     right_spelling TEXT NOT NULL,
     context_name TEXT NOT NULL,
     clause_ordinal INTEGER NOT NULL,
-    FOREIGN KEY (entity_id) REFERENCES entity(id)
+    FOREIGN KEY (entity_id) REFERENCES entity(id) ON DELETE CASCADE
 );
 
 -- Functional Dependency: THE DECLARED MODE of a fact function.
@@ -207,7 +218,7 @@ CREATE TABLE functional_dependency (
     position INTEGER NOT NULL,
     attribute_name TEXT NOT NULL,
     stropped INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (entity_id) REFERENCES entity(id),
+    FOREIGN KEY (entity_id) REFERENCES entity(id) ON DELETE CASCADE,
     UNIQUE (entity_id, role, position),
     CHECK (role IN ('input', 'output'))
 );
@@ -219,7 +230,7 @@ CREATE TABLE interior_entity (
     id INTEGER PRIMARY KEY,
     parent_entity_id INTEGER NOT NULL,
     column_name TEXT NOT NULL,
-    FOREIGN KEY (parent_entity_id) REFERENCES entity(id)
+    FOREIGN KEY (parent_entity_id) REFERENCES entity(id) ON DELETE CASCADE
 );
 
 -- Interior Entity Attribute: Columns within an interior entity.
@@ -231,17 +242,30 @@ CREATE TABLE interior_entity_attribute (
     attribute_name TEXT NOT NULL,
     position INTEGER NOT NULL,
     child_interior_entity_id INTEGER,
-    FOREIGN KEY (interior_entity_id) REFERENCES interior_entity(id),
-    FOREIGN KEY (child_interior_entity_id) REFERENCES interior_entity(id)
+    FOREIGN KEY (interior_entity_id) REFERENCES interior_entity(id) ON DELETE CASCADE,
+    FOREIGN KEY (child_interior_entity_id) REFERENCES interior_entity(id) ON DELETE CASCADE
 );
 
+-- A nested interior belongs to the entity whose interior holds it. A pointer
+-- into another entity's interiors would make retiring that entity delete a
+-- row this one still describes itself with.
+CREATE TRIGGER interior_child_shares_its_entity
+BEFORE INSERT ON interior_entity_attribute
+WHEN NEW.child_interior_entity_id IS NOT NULL
+  AND (SELECT parent_entity_id FROM interior_entity WHERE id = NEW.child_interior_entity_id)
+      IS NOT (SELECT parent_entity_id FROM interior_entity WHERE id = NEW.interior_entity_id)
+BEGIN
+    SELECT RAISE(ABORT, 'interior_child_shares_its_entity: a nested interior belongs to the entity of the interior that holds it');
+END;
+
 -- ============================================================================
--- Entity Resolution: Tracks when a reference resolves to a definition
+-- Entity Resolution: Tracks when a reference resolves to a definition.
+-- The row relates two entities and retires with either.
 CREATE TABLE entity_resolution (
     entity_id INTEGER NOT NULL,
     referenced_entity_id INTEGER NOT NULL,
-    FOREIGN KEY (entity_id) REFERENCES entity(id),
-    FOREIGN KEY (referenced_entity_id) REFERENCES referenced_entity(id),
+    FOREIGN KEY (entity_id) REFERENCES entity(id) ON DELETE CASCADE,
+    FOREIGN KEY (referenced_entity_id) REFERENCES referenced_entity(id) ON DELETE CASCADE,
     PRIMARY KEY (entity_id, referenced_entity_id)
 );
 
@@ -261,7 +285,11 @@ CREATE TABLE namespace (
     pid INTEGER,
     fq_name TEXT,
     default_data_ns TEXT,
-    kind TEXT NOT NULL DEFAULT 'unknown',
+    -- The closed population `namespace::NamespaceKind` decodes; every
+    -- lifecycle verb decides each of these, and no other spelling can land.
+    kind TEXT NOT NULL DEFAULT 'unknown' CHECK (kind IN (
+        'system', 'container', 'data', 'lib', 'scratch', 'grounded', 'blueprint', 'unknown'
+    )),
     provenance TEXT,
     source_path TEXT,
     writable INTEGER NOT NULL DEFAULT 0,
@@ -325,10 +353,25 @@ CREATE TABLE activated_entity (
     activation_time INTEGER DEFAULT (strftime('%s', 'now')),
     namespace_id INTEGER NOT NULL,
     cartridge_id INTEGER NOT NULL,
-    FOREIGN KEY (entity_id) REFERENCES entity(id),
+    FOREIGN KEY (entity_id) REFERENCES entity(id) ON DELETE CASCADE,
     FOREIGN KEY (namespace_id) REFERENCES namespace(id),
     FOREIGN KEY (cartridge_id) REFERENCES cartridge(id),
     PRIMARY KEY (entity_id, namespace_id)
+);
+
+-- Session overlay: the durable data namespace a session materialization
+-- overlays. The object itself is activated under the shadow of its
+-- connection's owning data root (sys::shadow::<root>); bare selection reads
+-- it inside the namespace recorded here, never the namespace its shadow path
+-- spells. A row is retired with its entity, so a reused entity id never
+-- inherits another object's owner. The owner may be unmounted while its
+-- session object lives on: the row keeps the id it recorded, which no later
+-- namespace reuses (namespace ids are AUTOINCREMENT), so the object joins no
+-- overlay and is still held against every later owner.
+CREATE TABLE session_overlay (
+    entity_id INTEGER PRIMARY KEY,
+    durable_namespace_id INTEGER NOT NULL,
+    FOREIGN KEY (entity_id) REFERENCES entity(id) ON DELETE CASCADE
 );
 
 -- Enlisted Entity: Entity aliased into another namespace
@@ -337,7 +380,7 @@ CREATE TABLE enlisted_entity (
     entity_id INTEGER NOT NULL,
     from_namespace_id INTEGER NOT NULL,
     to_namespace_id INTEGER NOT NULL,
-    FOREIGN KEY (entity_id) REFERENCES entity(id),
+    FOREIGN KEY (entity_id) REFERENCES entity(id) ON DELETE CASCADE,
     FOREIGN KEY (from_namespace_id) REFERENCES namespace(id),
     FOREIGN KEY (to_namespace_id) REFERENCES namespace(id)
 );
@@ -393,28 +436,93 @@ BEGIN
     SELECT RAISE(ABORT, 'an activated definition family requires at least one clause');
 END;
 
--- Namespace Local Enlist: the enlistments a consulted file declared for
--- its own namespace. They stand while the load stands; reconsult replaces
--- them with the replacement file's.
-CREATE TABLE namespace_local_enlist (
-    namespace_id INTEGER NOT NULL,       -- The DDL's own namespace
-    enlisted_namespace_id INTEGER NOT NULL, -- The namespace that was enlisted inside the DDL
-    PRIMARY KEY (namespace_id, enlisted_namespace_id),
+-- Lexical Import: THE IMPORTS A LOAD CAPTURED WHEN IT WAS ADMITTED — the
+-- namespaces whose entities a body admitted in that load may select bare
+-- after its own namespace misses. A consulted file captures the
+-- enlistments its own text declared; an inline block captures the session's
+-- enlist set at the moment it was admitted. A later delist! at the prompt
+-- cannot rebind an admitted body, and a further enlist! cannot widen it.
+--
+-- Keyed by the LOAD, not the namespace: two inline blocks admitted into the
+-- same scratch namespace (both into `home`) each own their own capture, so
+-- a body reads the imports its OWN load captured — never a sibling load's.
+-- `cartridge_id` names the load; a definition family reads the rows of its
+-- own cartridge. A definition-free facade mints no cartridge (the lifecycle
+-- reaches a cartridge only through its entities), so its rows carry a NULL
+-- cartridge and are read by namespace — sound because a facade IS its
+-- namespace's sole load. The rows follow the namespace's lifecycle: a
+-- reconsult replaces them whole, and namespace removal drops them.
+CREATE TABLE lexical_import (
+    namespace_id INTEGER NOT NULL,
+    -- The load that captured this import. NULL only for a definition-free
+    -- facade, which has no cartridge; every definition-bearing load names
+    -- its cartridge here so sibling loads in one namespace stay distinct.
+    cartridge_id INTEGER,
+    imported_namespace_id INTEGER NOT NULL,
     FOREIGN KEY (namespace_id) REFERENCES namespace(id),
-    FOREIGN KEY (enlisted_namespace_id) REFERENCES namespace(id)
+    -- A capture cannot outlive the load that owns it: destroying a
+    -- cartridge (reconsult, removal, retract!) is refused while any import
+    -- row still names it, so every removal road deletes the capture with
+    -- the cartridge. NULL (a facade's load) references nothing.
+    FOREIGN KEY (cartridge_id) REFERENCES cartridge(id),
+    FOREIGN KEY (imported_namespace_id) REFERENCES namespace(id)
 );
+-- One import appears once per load. IFNULL folds a facade's NULL load to a
+-- single per-namespace bucket; distinct cartridges keep distinct buckets.
+CREATE UNIQUE INDEX lexical_import_load_uq
+    ON lexical_import(namespace_id, IFNULL(cartridge_id, 0), imported_namespace_id);
 
--- Namespace Local Alias: Records which aliases were created inside a DDL file.
--- These are scoped to the DDL's namespace — they don't leak to the caller.
--- Used by the resolver to activate alias dependencies when resolving a view body.
+-- THE LOAD OWNS THE NAMESPACE it captures under: a non-NULL cartridge must
+-- be a load activated in the same namespace. No catalog write can publish a
+-- capture under a namespace other than the load's owner — the same
+-- relationship the sealed declaration reach enforces in code, enforced here
+-- for publication. A facade's NULL load owns no families and is exempt.
+CREATE TRIGGER lexical_import_load_owns_namespace
+BEFORE INSERT ON lexical_import
+WHEN NEW.cartridge_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM activated_entity
+      WHERE namespace_id = NEW.namespace_id AND cartridge_id = NEW.cartridge_id)
+BEGIN
+    SELECT RAISE(ABORT, 'lexical_import: a captured import must be keyed by a load activated in its namespace');
+END;
+
+-- Namespace Local Alias: THE QUALIFIER ALIASES A LOAD CAPTURED WHEN IT WAS
+-- ADMITTED — the routes a body admitted in that load reads a one-segment
+-- qualifier through. A consulted file captures the aliases its own text
+-- declared; an inline block captures the session's aliases as they stand at
+-- its admission. Each row holds the namespace the alias NAMED then, by
+-- identity: a later session alias, a delist!, or another namespace given the
+-- same shorthand does not reach an admitted body. They never leak to a caller.
+--
+-- Keyed by the LOAD exactly as lexical_import is: two blocks admitted into
+-- `home` each read their own capture. NULL is a definition-free facade's
+-- load, read by namespace.
 CREATE TABLE namespace_local_alias (
     namespace_id INTEGER NOT NULL,
+    cartridge_id INTEGER,
     alias TEXT NOT NULL,
     target_namespace_id INTEGER NOT NULL,
-    PRIMARY KEY (namespace_id, alias),
     FOREIGN KEY (namespace_id) REFERENCES namespace(id),
+    -- A capture cannot outlive its load: every road that destroys a
+    -- cartridge deletes the aliases that load captured first.
+    FOREIGN KEY (cartridge_id) REFERENCES cartridge(id),
     FOREIGN KEY (target_namespace_id) REFERENCES namespace(id)
 );
+-- One shorthand per load.
+CREATE UNIQUE INDEX namespace_local_alias_load_uq
+    ON namespace_local_alias(namespace_id, IFNULL(cartridge_id, 0), alias);
+
+-- THE LOAD OWNS THE NAMESPACE it captures under, as for lexical_import.
+CREATE TRIGGER namespace_local_alias_load_owns_namespace
+BEFORE INSERT ON namespace_local_alias
+WHEN NEW.cartridge_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM activated_entity
+      WHERE namespace_id = NEW.namespace_id AND cartridge_id = NEW.cartridge_id)
+BEGIN
+    SELECT RAISE(ABORT, 'namespace_local_alias: a captured alias must be keyed by a load activated in its namespace');
+END;
 
 -- Exposed Namespace: Records which child namespaces a DDL re-exports
 -- through its facade. When someone enlists the parent, exposed children's
@@ -666,7 +774,7 @@ CREATE TABLE dialect_form_rule (
     min_version  TEXT,
     max_version  TEXT,
     FOREIGN KEY (form_type) REFERENCES entity_type_enum(id),
-    FOREIGN KEY (entity_id) REFERENCES entity(id)
+    FOREIGN KEY (entity_id) REFERENCES entity(id) ON DELETE CASCADE
 );
 
 -- Per-dialect spelling of leaves (Axis B): operators, literals, keywords, SQL
@@ -783,6 +891,80 @@ INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
     ('duckdb',   'fn.__dql_arbitrary', 'template', 'any_value({0})');
 
 -- ----------------------------------------------------------------------------
+-- Seed rows: the splice (`fn.__dql_json_splice`). The transformer stamps a
+-- structured value the language made and CARRIED into a constructor (a
+-- column, a CTE, a scalar subquery), so the constructor nests it instead of
+-- quoting its bytes. Canonical/sqlite spelling is `json(x)`: sqlite loses
+-- the JSON subtype across a subquery or a CTE and the mark restores it.
+-- postgres/duckdb/mysql carry a JSON-typed value through those boundaries
+-- and their object/array constructors nest it as it is, so the splice is
+-- the value itself. sqlserver holds JSON as text and its JSON_OBJECT quotes
+-- text unless JSON_QUERY marks it as a document.
+-- ----------------------------------------------------------------------------
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres',  'fn.__dql_json_splice', 'template', '{0}'),
+    ('duckdb',    'fn.__dql_json_splice', 'template', '{0}'),
+    ('mysql',     'fn.__dql_json_splice', 'template', '{0}'),
+    ('sqlserver', 'fn.__dql_json_splice', 'template', 'JSON_QUERY({0})');
+
+-- The admission (`fn.__dql_json_scalar`): an ordinary value a structure the
+-- language makes takes as a member; the label (`fn.__dql_json_label`): a
+-- value that becomes one of its keys. The canonical (SQLite) spellings are
+-- CASEs in code: SQLite prints a REAL in fifteen digits both into a document
+-- and into a key, so a REAL is written in the shortest digits SQLite reads
+-- back as the same REAL, and refuses where none does. These targets' writers
+-- are not claimed by that measurement; the member and the key are the value,
+-- as their constructors have always taken them.
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres',  'fn.__dql_json_scalar', 'template', '{0}'),
+    ('duckdb',    'fn.__dql_json_scalar', 'template', '{0}'),
+    ('mysql',     'fn.__dql_json_scalar', 'template', '{0}'),
+    ('sqlserver', 'fn.__dql_json_scalar', 'template', '{0}'),
+    ('postgres',  'fn.__dql_json_label',  'template', '{0}'),
+    ('duckdb',    'fn.__dql_json_label',  'template', '{0}'),
+    ('mysql',     'fn.__dql_json_label',  'template', '{0}'),
+    ('sqlserver', 'fn.__dql_json_label',  'template', '{0}');
+
+-- The exact operand (`fn.__dql_exact`): a value DelightQL equality, a
+-- grouping or a partition compares as the value it is, never under the
+-- collation its column declares. The canonical (SQLite) spelling is a
+-- postfix `COLLATE BINARY` in code. These targets are not claimed by that
+-- measurement; the operand is the value, as their comparisons have always
+-- taken it.
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres',  'fn.__dql_exact', 'template', '{0}'),
+    ('duckdb',    'fn.__dql_exact', 'template', '{0}'),
+    ('mysql',     'fn.__dql_exact', 'template', '{0}'),
+    ('sqlserver', 'fn.__dql_exact', 'template', '{0}');
+
+-- A json_each element must cross the expansion's subquery as one complete
+-- JSON document when a nested object/tuple pattern will inspect it. The
+-- form is `(value, kind)`, both columns of the sequence TVF. The canonical
+-- (SQLite) spelling is a CASE in code: a container's value IS its document
+-- and an atom's is json_quote'd — decided from the `type` column, a value,
+-- because the JSON subtype SQLite marks a container with is dropped by a
+-- sorter or a materialized subquery, after which json_quote would turn the
+-- document into a string. Typed-JSON targets hand back every element as a
+-- document already; the handler spends the kind unread.
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres',  'fn.__dql_json_each_document', 'rust_handler', 'json_each_document_is_value'),
+    ('duckdb',    'fn.__dql_json_each_document', 'rust_handler', 'json_each_document_is_value'),
+    ('mysql',     'fn.__dql_json_each_document', 'rust_handler', 'json_each_document_is_value'),
+    ('sqlserver', 'fn.__dql_json_each_document', 'rust_handler', 'json_each_document_is_value');
+
+-- ----------------------------------------------------------------------------
+-- Seed row: the approximate numeric literal (`lit.approximate`). An
+-- exponent-bearing NUMBER (`1e3`, `1.25e-2`) is the language's approximate
+-- category. SQLite, DuckDB, MySQL and SQL Server read the spelling as their
+-- binary floating-point type, so the canonical rendering is the spelling
+-- itself. PostgreSQL reads an unadorned exponent constant as exact
+-- `numeric`; the category is stated with a cast so the target does not
+-- choose a different one.
+-- ----------------------------------------------------------------------------
+INSERT INTO dialect_render (dialect, render_key, rule_kind, body) VALUES
+    ('postgres', 'lit.approximate', 'template', 'CAST({0} AS double precision)');
+
+-- ----------------------------------------------------------------------------
 -- Seed rows: rust_handler rules — renders a positional template cannot
 -- express (DESIGN §4.4). Bodies name compiled handlers in
 -- pipeline/dialect_pack.rs (rust_render_handler).
@@ -883,7 +1065,6 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('danger', 'cardinality/cartesian', 'Unrestricted cartesian product.', 'DECLARED, NOT YET ENFORCED (2026-07-17, R-1): the intended OFF behavior — a join with no usable key refuses (the classic accidental row explosion) — is not built; today a condition-less join compiles and runs as a cartesian product regardless of this gate. When enforcement lands, OFF will refuse and ON will allow. Guardrail-class: may be opened from the CLI (--danger cardinality/cartesian=ON) or inline.'),
     ('danger', 'termination/unbounded', 'Unbounded recursive query.', 'DECLARED, NOT YET ENFORCED (2026-07-17, R-1): the intended OFF behavior — recursive queries must be provably bounded — is not built; today an unbounded recursion compiles without warning (and may not terminate). When enforcement lands, OFF will refuse and ON will allow. Guardrail-class: CLI-overridable.'),
     ('danger', 'semantics/min_multiplicity', 'True INTERSECT ALL via ROW_NUMBER (min-multiplicity).', 'Changes what a set operator MEANS (bag semantics via minimum multiplicity), so it is semantic-class: inline-only ((~~danger://semantics/min_multiplicity ON~~)), never a CLI flag — a flag that silently changes query meaning would make the same text mean different things in different shells.'),
-    ('danger', 'scope/duplicate', 'Two live scopes sharing one answering name.', 'TWO LIVE SCOPES NEVER SHARE A NAME: by default, two relations in one lexical environment answering to one canonical name refuse at scope activation (delightql-error://semantic/scope/duplicate). Acknowledging this gate admits the co-activation: qualified references over the shared name resolve against whichever occurrences remain distinguishable, and the ambiguity is the author''s. Guardrail-class: CLI-overridable (--danger scope/duplicate=ON) or inline.'),
     ('config', 'generation/rule/inlining/view', 'Inline consulted view rules instead of emitting CTEs.', 'Strategy selection, not meaning: with this ON the compiler inlines view-rule bodies as subqueries rather than emitting CTEs. Results are identical either way; generated SQL shape differs. Inline: (~~config://generation/rule/inlining/view ON~~); CLI: --config.'),
     ('config', 'generation/rule/inlining/fact', 'Inline consulted fact rules instead of emitting CTEs.', 'As generation/rule/inlining/view, for fact rules.'),
     ('diagnostic', 'autoload', 'Health of the embedded autoload (stdlib) modules.', 'The autoload provider (dql selftest) force-loads every embedded .dql module through the real loader and reports failures. Members: autoload/parse_failed, autoload/consult_failed.'),
@@ -892,6 +1073,29 @@ INSERT INTO identifier (kind, hierarchy, summary, explanation) VALUES
     ('diagnostic', 'catalog', 'Integrity of the entity catalog.', 'The catalog provider (dql selftest) checks that the compiler''s own system tables are properly placed in the catalog. Members: catalog/orphaned_entity.'),
     ('diagnostic', 'catalog/orphaned_entity', 'A system table has no namespace address.', 'A physical system table exists (and is queryable by direct name via the schema fallback) but has no activated_entity row, so it lives in no sys:: namespace and is invisible to the namespace-organized views (sys::util.tables_as_d2, catalog enumeration). Doctrine: everything the compiler or runtime uses should be dogfood-exposed — there are no intentional hidden internals. Fix: activate the table into its namespace (import/activation.rs + import/namespace.rs), as sys::targeting did for the dialect_* tables.');
 
+
+-- ----------------------------------------------------------------------------
+-- sys::config — what the host stated at boot, and what a session set since.
+-- setting_key is core's registry, projected from settings.rs; no row is
+-- authored here. setting holds values by layer: 'boot' rows are written
+-- before a handle's pristine image is frozen, so every reset restores them;
+-- 'session' rows are written into the running instance and vanish on reset.
+-- A NULL value is a key stated as none, which is an answer.
+-- ----------------------------------------------------------------------------
+CREATE TABLE setting_key (
+    key       TEXT NOT NULL PRIMARY KEY,
+    required  INTEGER NOT NULL,
+    nullable  INTEGER NOT NULL,
+    session   INTEGER NOT NULL,
+    summary   TEXT NOT NULL
+);
+
+CREATE TABLE setting (
+    key    TEXT NOT NULL REFERENCES setting_key(key),
+    layer  TEXT NOT NULL CHECK (layer IN ('boot', 'session')),
+    value  TEXT,
+    PRIMARY KEY (key, layer)
+);
 
 -- ----------------------------------------------------------------------------
 -- sys::format — the formatter's style bundles as burned rows.

@@ -26,7 +26,7 @@ use crate::pipeline::asts::core::Callable;
 use crate::pipeline::asts::core::{
     AuthoredColumn, ColumnOrdinal, ColumnRange, DomainExpression, Enclyph, FunctionApplication,
     FunctorCall, Glob, LiteralValue, NamespacePath, Path, PathStep, PureCall, Record, RecordMember,
-    RegexSelector, Spread, StandardApplication, Tuple, Unresolved,
+    RegexCase, RegexSelector, Spread, StandardApplication, Tuple, Unresolved,
 };
 use crate::pipeline::asts::core::{NamedReference, Reference};
 use crate::pipeline::asts::vocabulary::{Mark, ResolutionMode, Vec1};
@@ -148,14 +148,15 @@ impl<'t> Normalizer<'t> {
     fn column_ordinal(&mut self, node: cst::Ordinal<'t>) -> Result<ColumnOrdinal> {
         let inner = self.require(node.child(), "an ordinal has a position")?;
         let position = self.compile_time_integer(inner, "a column ordinal")?;
-        let reverse = position < 0;
+        if let crate::pipeline::asts::core::CompileTimeInteger::Number(n) = position {
+            if u16::try_from(n.unsigned_abs()).is_err() {
+                return Err(crate::diagnostic::DelightQLError::from(crate::diagnostic::Constraint::General {
+                    message: format!("column ordinal |{n}| is out of range"),
+                }));
+            }
+        }
         Ok(ColumnOrdinal {
-            position: position.unsigned_abs().try_into().map_err(|_| {
-                crate::diagnostic::DelightQLError::from(crate::diagnostic::Constraint::General {
-                    message: format!("column ordinal |{position}| is out of range"),
-                })
-            })?,
-            reverse,
+            position,
             qualifier: self.written_qualifier(node.qualifier())?,
             namespace_path: NamespacePath::empty(),
             // The whole-heading spelling `q|*|` is `positional_heading`, a
@@ -184,15 +185,47 @@ impl<'t> Normalizer<'t> {
     // Spreads — the multi-domex
     // -----------------------------------------------------------------
 
+    /// `/re/` or `/re/c`: the characters between the slashes, and the flag
+    /// letters glued after the closing one. The pattern holds no `/`, so the
+    /// last one closes it.
+    pub(super) fn regex_selector(&self, node: cst::Regex<'t>) -> Result<RegexSelector<Unresolved>> {
+        let text = self.text(node);
+        let close = text.rfind('/').filter(|at| *at > 0).ok_or_else(|| {
+            Internal::invariant("normalize::value", "a regex token is slash-delimited")
+        })?;
+        let pattern = &text[1..close];
+        let flags = &text[close + 1..];
+        let case = match flags {
+            "" => RegexCase::Ignored,
+            "c" => RegexCase::Exact,
+            _ if flags.contains(['i', 'I']) => {
+                return Err(DelightQLError::from(Parse::RegexIgnoreCase {
+                    message: format!(
+                        "`{text}`: a column regex already ignores case, as a column reference \
+                         does; write `/{pattern}/`. The one flag, `c`, makes the match \
+                         case-sensitive: `/{pattern}/c`"
+                    ),
+                }))
+            }
+            _ => {
+                return Err(DelightQLError::from(Parse::RegexFlag {
+                    message: format!(
+                        "`{text}`: `{flags}` is not a regex flag. The one flag, `c`, makes the \
+                         match case-sensitive: `/{pattern}/c`"
+                    ),
+                }))
+            }
+        };
+        Ok(RegexSelector::new(pattern.to_string(), case))
+    }
+
     /// THE SPREAD IS A MULTI-DOMEX: an authored multi-reference that EXPANDS
     /// at resolution into the columns it addresses. It computes no value, so
     /// there is no scalar node under it to hang a name on.
     pub(crate) fn spread(&mut self, node: cst::Spread<'t>) -> Result<Spread<Unresolved>> {
         match node {
             cst::Spread::Glob(glob) => Ok(Spread::Glob(self.glob(glob)?)),
-            cst::Spread::Regex(regex) => Ok(Spread::Regex(RegexSelector::new(
-                regex_interior(self.text(regex)).to_string(),
-            ))),
+            cst::Spread::Regex(regex) => Ok(Spread::Regex(self.regex_selector(regex)?)),
             cst::Spread::PositionalSpan(span) => {
                 Ok(Spread::PositionalSpan(self.column_range(span)?))
             }
@@ -331,6 +364,13 @@ impl<'t> Normalizer<'t> {
                 FunctionApplication::Enclyph(self.enclyph_like(enclyph)?),
             )),
             cst::NonInfixApplication::JsonAccess(access) => self.json_access(access),
+            // A DEFINITION-OWNED SCALAR REFERENCE leaves as its selection; a
+            // slot it stands in constrains its column, never binds one.
+            cst::NonInfixApplication::ParameterReference(parameter) => Ok(
+                DomainExpression::Reference(crate::pipeline::asts::core::Reference::Argument(
+                    self.parameter_reference(parameter)?,
+                )),
+            ),
         }
     }
 
@@ -773,7 +813,7 @@ impl<'t> Normalizer<'t> {
 
     /// The one builder behind both open spellings.
     ///
-    /// Zero holes means implicit landing: `x /-> upper:(y)` is `upper(x, y)`.
+    /// Zero holes means implicit landing: `x >> upper:(y)` is `upper(x, y)`.
     /// The position that applies the callable supplies the slot, so the
     /// elision is honoured by leaving the argument row as written.
     fn open_application(
@@ -852,7 +892,7 @@ impl<'t> Normalizer<'t> {
     // The function pipe
     // -----------------------------------------------------------------
 
-    /// THE SUBSTITUTION LAW at value level, SPENT HERE. `/->` lands the
+    /// THE SUBSTITUTION LAW at value level, SPENT HERE. `>>` lands the
     /// flowing value at the argument row's final place, and a written `@`
     /// overrides that.
     ///
@@ -867,8 +907,8 @@ impl<'t> Normalizer<'t> {
             match child {
                 cst::FunctionPipeChild::DomainExpression(expression) if value.is_none() => {
                     // NO PRECEDENCE. An infix composition standing as the
-                    // pipe's source has two readings — `(a ++ b) /-> f` and
-                    // `a ++ (b /-> f)` — and the language picks neither.
+                    // pipe's source has two readings — `(a ++ b) >> f` and
+                    // `a ++ (b >> f)` — and the language picks neither.
                     if let cst::DomainExpression::FunctionApplication(
                         cst::FunctionApplication::InfixOperator(_),
                     ) = expression
@@ -921,90 +961,15 @@ has no reading. Parenthesize the operand the pipe receives."
         self.apply_callable(callable, flowing)
     }
 
-    /// A CALLABLE, APPLIED. The one place the value level spends a landing.
-    ///
-    /// The slot was judged where the callable was built, so this only spends
-    /// it: a form with an argument row and no written slot takes the default
-    /// landing, and everything else receives the value where the author
-    /// wrote it.
+    /// A CALLABLE, APPLIED, by the one landing the value level spends
+    /// (`landing::land`).
     pub(crate) fn apply_callable(
         &mut self,
         node: cst::Callable<'t>,
         flowing: Domex,
     ) -> Result<Domex> {
-        match self.callable(node)? {
-            Callable::Functor(application) => self.land_in_application(application, flowing),
-            Callable::String(template) => {
-                let parts = template.into_parts();
-                let spent = landing::spend(
-                    parts
-                        .iter()
-                        .filter_map(|part| match part {
-                            ValueTemplatePart::Interpolation(value) => Some((**value).clone()),
-                            ValueTemplatePart::Text(_) => None,
-                        })
-                        .collect(),
-                    &flowing,
-                )?;
-                let mut spent = spent.into_iter();
-                let parts = parts
-                    .into_iter()
-                    .map(|part| match part {
-                        ValueTemplatePart::Interpolation(_) => ValueTemplatePart::Interpolation(
-                            Box::new(spent.next().expect("one spent value per interpolation")),
-                        ),
-                        text => text,
-                    })
-                    .collect();
-                Ok(DomainExpression::Application(
-                    FunctionApplication::Template(
-                        crate::pipeline::asts::core::ValueTemplate::interpolating(parts)
-                            .expect("the build already proved an interpolation is present"),
-                    ),
-                ))
-            }
-            // A binder was already spent into its uses, so what stands here
-            // is a body with slots — one if the author wrote the bare hole,
-            // however many the binder named.
-            Callable::Lambda(lambda) => {
-                let mut spent = landing::spend(vec![*lambda.body], &flowing)?;
-                Ok(spent.pop().expect("one value in, one value out"))
-            }
-        }
-    }
-
-    /// The landing a form WITH an argument row takes.
-    fn land_in_application(
-        &mut self,
-        mut application: StandardApplication<Unresolved>,
-        flowing: Domex,
-    ) -> Result<Domex> {
-        let application = match landing::holes_in_application(&application)? {
-            // ZERO HOLES: the default landing, the row's final place. This
-            // is why `x /-> upper:(y)` means `upper(y, x)`.
-            0 => {
-                use crate::pipeline::asts::core::operators::CallArguments;
-                let call = application.call_mut();
-                let arguments = match std::mem::replace(&mut call.arguments, CallArguments::None) {
-                    CallArguments::Scalar(members) => members,
-                    CallArguments::None => Vec::new(),
-                    other @ CallArguments::HigherOrder(_) => {
-                        call.arguments = other;
-                        return Err(Internal::invariant(
-                            "normalize::value",
-                            "a scalar application carries a scalar argument row",
-                        ));
-                    }
-                };
-                call.arguments =
-                    CallArguments::Scalar(landing::land_final(Argument::plain(flowing), arguments));
-                application
-            }
-            _ => landing::spend_in_application(application, &flowing)?,
-        };
-        Ok(DomainExpression::Application(
-            FunctionApplication::Standard(application),
-        ))
+        let callable = self.callable(node)?;
+        landing::land(callable, &flowing)
     }
 
     // -----------------------------------------------------------------
@@ -1135,10 +1100,9 @@ has no reading. Parenthesize the operand the pipe receives."
                         cst::RecordChild::CommaSigil(_) => {}
                     }
                 }
-                Ok(Enclyph::Record(Record::plain(self.require(
-                    Vec1::try_from_vec(members),
-                    "a record has at least one member",
-                )?)))
+                // `{}` is the empty record: zero members is a value here,
+                // never a refusal.
+                Ok(Enclyph::Record(Record::plain(members)))
             }
             cst::EnclyphLike::Tuple(tuple) => {
                 let mut elements = Vec::new();
@@ -1155,12 +1119,8 @@ has no reading. Parenthesize the operand the pipe receives."
                         cst::TupleChild::CommaSigil(_) => {}
                     }
                 }
-                Ok(Enclyph::Tuple(Box::new(Tuple {
-                    elements: self.require(
-                        Vec1::try_from_vec(elements),
-                        "a tuple has at least one element",
-                    )?,
-                })))
+                // `[]` is the empty tuple.
+                Ok(Enclyph::Tuple(Box::new(Tuple { elements })))
             }
         }
     }
@@ -1306,7 +1266,7 @@ has no reading. Parenthesize the operand the pipe receives."
                             crate::pipeline::asts::vocabulary::FunctorMarks::default(),
                         )?
                     }
-                    None => self.mention_read(identifier.clone(), passthrough, Access::All, false),
+                    None => self.mention_read(identifier.clone(), passthrough, Access::All),
                 };
                 let body = self.compressed_interior(interior, base)?;
                 Ok(DomainExpression::Application(
@@ -1325,10 +1285,7 @@ has no reading. Parenthesize the operand the pipe receives."
                 let interior =
                     self.require(subquery.interior(), "an inner form has an interior")?;
                 let mut continuations = interior.continuation();
-                let first = self.require(
-                    continuations.next(),
-                    "a sourceless inner form names its first relation",
-                )?;
+                let first = continuations.next().ok_or_else(sourceless_needs_a_base)?;
                 let base = match first {
                     cst::Continuation::BinaryContinuation(
                         cst::BinaryContinuation::CommaContinuation(comma),
@@ -1501,20 +1458,35 @@ has no reading. Parenthesize the operand the pipe receives."
                     PathStep::Key(super::ground::string_interior(self.text(string)).to_string())
                 }
                 cst::PathKey::Number(number) => {
-                    let text = self.text(number);
-                    let index_value = text.parse::<i64>().map_err(|_| {
-                        Internal::invariant(
-                            "normalize::value",
-                            format!("'{text}' is not a path index"),
-                        )
-                    })?;
-                    PathStep::Index(index_value)
+                    // The number token spells `1.0` as one token; in a path
+                    // its dot is the path's own separator, so it is two
+                    // index keys.
+                    for part in self.text(number).split('.') {
+                        steps.push(PathStep::Index(path_index(part)?));
+                    }
+                    continue;
                 }
             };
             steps.push(step);
         }
         Ok(steps)
     }
+}
+
+/// One numeric path key: a position written in decimal digits, a minus
+/// sign counting from the end.
+fn path_index(text: &str) -> Result<i64> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    let index = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse::<i64>().ok())
+        .flatten();
+    index.ok_or_else(|| {
+        DelightQLError::from(Parse::General {
+            message: format!(
+                "'{text}' is not a path index: a numeric path key is a position written in decimal digits"
+            ),
+        })
+    })
 }
 
 /// THE SOURCELESS INNER FORM has no OUTER base relation — the body resolves
@@ -1568,13 +1540,6 @@ pub(crate) fn comparison_operator(text: &str) -> Option<crate::pipeline::asts::v
         ">=" => CmpOp::GreaterThanOrEqual,
         _ => return None,
     })
-}
-
-/// The characters between a regex's slashes.
-pub(super) fn regex_interior(text: &str) -> &str {
-    text.strip_prefix('/')
-        .and_then(|rest| rest.strip_suffix('/'))
-        .unwrap_or(text)
 }
 
 /// Escapes belong to template text and to nothing else: a plain string

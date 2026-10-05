@@ -4,12 +4,9 @@
 pub mod commands;
 pub mod completions;
 pub mod config;
-
-pub mod info_panel;
-
-pub mod multi_pane_tui;
 pub mod name_generator;
 pub mod parser_worker;
+pub mod surface;
 pub mod worker;
 
 #[cfg(feature = "prettify")]
@@ -29,8 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use self::commands::{handle_dot_command, is_dot_command, process_query, CommandResult, ReplState};
 use self::completions::DotCommandCompleter;
-use self::config::ReplParserOperation;
-use self::multi_pane_tui::run_multi_pane_tui;
+use self::config::{InputMode, ReplParserOperation};
 use self::parser_worker::{ParserWorkerController, ProbeOutcome};
 use self::worker::WorkerResult;
 
@@ -134,54 +130,17 @@ impl ReadySignal {
     }
 }
 
-/// Get the appropriate prompt based on mode and Unicode support
-fn get_prompt(sql_mode: bool, is_continuation: bool) -> &'static str {
-    let supports_unicode = supports_unicode();
-
+/// The prompt for what the REPL reads, and whether the line continues one.
+/// Definition input names the namespace its definitions land in.
+fn get_prompt(mode: InputMode, is_continuation: bool) -> &'static str {
     if is_continuation {
-        "  -> " // Continuation prompt (always ASCII)
-    } else if sql_mode {
-        "SQL> "
-    } else if supports_unicode {
-        "∂> " // Delta prompt for DelightQL
-    } else {
-        "> " // ASCII fallback
+        return "  -> "; // Continuation prompt (always ASCII)
     }
-}
-
-/// Custom event handler for Ctrl+X, t to toggle multi-pane TUI
-struct MultiPaneTuiToggleHandler {
-    trigger_multi_pane_tui: Arc<Mutex<bool>>,
-    current_line: Arc<Mutex<String>>,
-}
-
-impl ConditionalEventHandler for MultiPaneTuiToggleHandler {
-    fn handle(
-        &self,
-        evt: &Event,
-        _: rustyline::RepeatCount,
-        _: bool,
-        ctx: &EventContext,
-    ) -> Option<Cmd> {
-        // Check for Ctrl+X, t sequence
-        if let (Some(k1), Some(k2)) = (evt.get(0), evt.get(1)) {
-            if (*k1 == KeyEvent::ctrl('X') || *k1 == KeyEvent::ctrl('x'))
-                && (*k2 == KeyEvent(KeyCode::Char('t'), Modifiers::NONE)
-                    || *k2 == KeyEvent(KeyCode::Char('T'), Modifiers::SHIFT))
-            {
-                // Save current line content
-                if let Ok(mut line) = self.current_line.lock() {
-                    *line = ctx.line().to_string();
-                }
-                // Set flag to trigger multi-pane TUI
-                if let Ok(mut trigger) = self.trigger_multi_pane_tui.lock() {
-                    *trigger = true;
-                }
-                // Use Interrupt to break out of readline
-                return Some(Cmd::Interrupt);
-            }
-        }
-        None
+    match mode {
+        InputMode::Sql => "SQL> ",
+        InputMode::Definitions => "home> ",
+        InputMode::Query if supports_unicode() => "∂> ", // Delta prompt for DelightQL
+        InputMode::Query => "> ",                        // ASCII fallback
     }
 }
 
@@ -318,8 +277,11 @@ impl ConditionalEventHandler for SchemaDisplayHandler {
             if *k == KeyEvent(KeyCode::Tab, Modifiers::NONE) {
                 let line = ctx.line();
 
-                // Fall through to dot-command completer for dot commands
-                if line.starts_with('.') {
+                // Fall through to dot-command completer for dot commands,
+                // and in definition input, where there is no query to show.
+                if line.starts_with('.')
+                    || self.worker.road() == self::parser_worker::HelperRoad::Definitions
+                {
                     return None;
                 }
 
@@ -522,18 +484,6 @@ pub fn run_interactive_with_connection(
     // In interactive mode, default is verbose unless quiet is specified
     let show_meta = !quiet;
 
-    if show_meta {
-        println!("DelightQL REPL - Interactive Mode");
-        println!("Type '.help' for commands, '.exit' to quit");
-        println!("Use Alt+Enter for multi-line queries");
-        println!("Use Ctrl-B/Ctrl-F to jump between continuations");
-        println!("Use Ctrl-X, t to toggle TUI");
-        println!("Use Ctrl-X, d/D to delete to next/prev continuation");
-        if highlights_path.is_some() {
-            println!("Using custom syntax highlighting");
-        }
-    }
-
     // Create REPL state (with optional connection)
     let mut repl_state =
         ReplState::new_with_connection(db_path.clone(), output_format, connection)?;
@@ -552,12 +502,16 @@ pub fn run_interactive_with_connection(
 
     // Show database type if in verbose mode
     if show_meta {
-        let db_type = repl_state.db_connection.database_type();
-        let db_location = db_path
-            .as_ref()
-            .map(|p| format!("file: {}", p))
-            .unwrap_or_else(|| "memory".to_string());
-        println!("Connected to {} ({})", db_type, db_location);
+        let connection = format!(
+            "{}, {}",
+            repl_state.db_connection.database_type(),
+            db_path.as_deref().unwrap_or("in memory")
+        );
+        let surface = surface::of(repl_state.repl_db.as_deref());
+        print!(
+            "{}",
+            surface::render_welcome(&surface, env!("CARGO_PKG_VERSION"), &connection)
+        );
     }
 
     // Set up readline editor with completion
@@ -580,26 +534,8 @@ pub fn run_interactive_with_connection(
         db.record_editor_road(road);
     }
 
-    // Use Ctrl+X as leader key (avoids conflicts with Ctrl+T transpose)
-    // Add custom event handler for Ctrl+X, t (toggle TUI)
-    let trigger_multi_pane_tui = Arc::new(Mutex::new(false));
+    // The line as it stood when a key handler interrupted the prompt.
     let current_line_storage = Arc::new(Mutex::new(String::new()));
-
-    for ctrl_x_key in [KeyEvent::ctrl('x'), KeyEvent::ctrl('X')] {
-        for t_key in [
-            KeyEvent(KeyCode::Char('t'), Modifiers::NONE),
-            KeyEvent(KeyCode::Char('T'), Modifiers::SHIFT),
-        ] {
-            let tui_handler = MultiPaneTuiToggleHandler {
-                trigger_multi_pane_tui: trigger_multi_pane_tui.clone(),
-                current_line: current_line_storage.clone(),
-            };
-            rl.bind_sequence(
-                Event::KeySeq(vec![ctrl_x_key, t_key]),
-                EventHandler::Conditional(Box::new(tui_handler)),
-            );
-        }
-    }
 
     // Add custom event handler for Tab (schema display via META-IZE)
     let trigger_schema_display = Arc::new(Mutex::new(false));
@@ -700,8 +636,8 @@ pub fn run_interactive_with_connection(
     //
     // A restored line carries its cursor: `(before, after)` is exactly
     // `readline_with_initial`'s tuple, so an interrupt-and-restore round trip
-    // (Tab's meta-ize, the TUI toggle) puts the caret back where the user left
-    // it. Storing only the text forces it to end-of-line.
+    // (Tab's meta-ize) puts the caret back where the user left it. Storing
+    // only the text forces it to end-of-line.
     let mut preserved_line: Option<(String, String)> = None;
     let mut multiline_buffer: Vec<String> = vec![];
     let ready = ReadySignal::from_environment();
@@ -720,7 +656,7 @@ pub fn run_interactive_with_connection(
             || preserved_line
                 .as_ref()
                 .map_or(false, |(l, r)| l.contains('\n') || r.contains('\n'));
-        let prompt = get_prompt(repl_state.config().sql_mode(), is_continuation);
+        let prompt = get_prompt(repl_state.config().input_mode(), is_continuation);
 
         // The ready byte: a replay driver holding the other end of the
         // pipe waits for it before typing the next line. Written right
@@ -759,15 +695,6 @@ pub fn run_interactive_with_connection(
                                 eprintln!("Error: {}", e);
                             }
                         }
-                    } else if multiline_buffer.is_empty() && trimmed == "." {
-                        // Single dot toggles multi-pane TUI — only when buffer empty
-                        repl_state.prepare_tui_snapshot();
-                        let handle = repl_state.dql_handle.clone();
-                        let connection = repl_state.db_connection.clone();
-                        let final_window_position =
-                            run_multi_pane_tui(repl_state.shared_info.clone(), handle, connection)?;
-                        repl_state.shared_info.last_window_position = Some(final_window_position);
-                        continue;
                     } else if multiline_buffer.is_empty() && is_dot_command(trimmed) {
                         // Dot commands execute immediately when buffer is empty
                         let _ = rl.add_history_entry(&line);
@@ -791,17 +718,6 @@ pub fn run_interactive_with_connection(
 
                     let line_to_process = line.trim();
 
-                    // Special case: single dot toggles multi-pane TUI
-                    if line_to_process == "." {
-                        repl_state.prepare_tui_snapshot();
-                        let handle = repl_state.dql_handle.clone();
-                        let connection = repl_state.db_connection.clone();
-                        let final_window_position =
-                            run_multi_pane_tui(repl_state.shared_info.clone(), handle, connection)?;
-                        repl_state.shared_info.last_window_position = Some(final_window_position);
-                        continue;
-                    }
-
                     let _ = rl.add_history_entry(&line);
 
                     match process_input(line_to_process, &mut repl_state, &QUERY_INTERRUPTED) {
@@ -814,40 +730,6 @@ pub fn run_interactive_with_connection(
                 }
             }
             Err(rustyline::error::ReadlineError::Interrupted) => {
-                // Check if this was triggered by Ctrl+T
-                if let Ok(trigger) = trigger_multi_pane_tui.lock() {
-                    if *trigger {
-                        // Reset the trigger
-                        drop(trigger);
-                        if let Ok(mut trigger) = trigger_multi_pane_tui.lock() {
-                            *trigger = false;
-                        }
-
-                        // Get the saved line
-                        let saved_line = if let Ok(line) = current_line_storage.lock() {
-                            line.clone()
-                        } else {
-                            String::new()
-                        };
-
-                        // Update shared info with the current line
-                        repl_state.shared_info.last_input = saved_line.clone();
-
-                        // Open multi-pane TUI
-                        repl_state.prepare_tui_snapshot();
-                        let handle = repl_state.dql_handle.clone();
-                        let connection = repl_state.db_connection.clone();
-                        let final_window_position =
-                            run_multi_pane_tui(repl_state.shared_info.clone(), handle, connection)?;
-                        repl_state.shared_info.last_window_position = Some(final_window_position);
-
-                        // Preserve the line for the next iteration. The TUI
-                        // toggle records no cursor, so it restores at end.
-                        preserved_line = Some((saved_line, String::new()));
-                        continue;
-                    }
-                }
-
                 // Check if this was triggered by Tab (schema display)
                 if let Ok(trigger) = trigger_schema_display.lock() {
                     if *trigger {
@@ -885,12 +767,12 @@ pub fn run_interactive_with_connection(
                     multiline_buffer.clear();
                     println!();
                 } else {
-                    println!("CTRL+C");
+                    println!("{}", repl_state.say(surface::Message::CtrlC, &[]));
                 }
                 continue;
             }
             Err(rustyline::error::ReadlineError::Eof) => {
-                println!("CTRL+D - Exiting");
+                println!("{}", repl_state.say(surface::Message::CtrlD, &[]));
                 break;
             }
             Err(err) => {
@@ -927,7 +809,7 @@ pub fn run_interactive_with_connection(
         crate::client::exit::finish(Some(&mut **handle), 0);
     }
 
-    println!("Goodbye!");
+    println!("{}", repl_state.say(surface::Message::Goodbye, &[]));
     Ok(())
 }
 

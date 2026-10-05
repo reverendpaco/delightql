@@ -164,6 +164,7 @@ fn unescape(s: &str) -> Result<String, String> {
                     ('d', 'q') => out.push('"'),
                     ('a', 'q') => out.push('\''),
                     ('s', 'c') => out.push('§'),
+                    ('p', 'p') => out.push('⊥'),
                     _ => {
                         return Err(format!(
                             "outside the house man dialect: unknown escape '\\({}{}'",

@@ -8,7 +8,8 @@
 //!
 //! Each case names the defect it would reproduce under today's model.
 
-use super::origin::Hint;
+use super::id::CallableCategory;
+use super::origin::{CteRole, Hint};
 use super::sink::Probe;
 use super::*;
 
@@ -173,24 +174,6 @@ fn a_reference_to_an_unnamed_scope_refuses() {
 //
 // Today's failure: two process-global counters, so a nested compile draws
 // from the same sequence as everything the process compiled before it.
-
-#[test]
-fn an_interior_scope_is_linked_both_ways() {
-    let reg = Registry::new(&[]);
-    let (_entity, outer, _id, owner) = users(&reg);
-
-    let interior = reg.mint_interior_scope(owner, Hint::None);
-    let nested = reg.sql_column(
-        interior,
-        Some(reg.intern("nested", false)),
-        Addressing::Bare,
-    );
-
-    assert_eq!(reg.kind_of(interior), ScopeKind::Interior);
-    assert_eq!(reg.parent_of(interior), Some(outer));
-    assert_eq!(reg.parent_of(interior), Some(reg.scope_of(owner)));
-    assert_eq!(reg.scope_of(nested), interior);
-}
 
 #[test]
 fn emitted_names_do_not_depend_on_registry_age() {
@@ -465,9 +448,14 @@ fn qualified_sql_literal_names_get_a_safe_spelling() {
 fn only_callable_intrinsics_have_a_canonical_spelling() {
     for (intrinsic, expected) in [
         (Intrinsic::JsonExtractRaw, Some("json_extract")),
+        (Intrinsic::JsonEachDocument, None),
         (Intrinsic::JsonEachArray, Some("json_each")),
         (Intrinsic::JsonEachObject, Some("json_each")),
         (Intrinsic::JsonObject, Some("json_object")),
+        (Intrinsic::JsonSplice, Some("json")),
+        (Intrinsic::JsonScalar, None),
+        (Intrinsic::JsonLabel, None),
+        (Intrinsic::Exact, None),
         (Intrinsic::ScalarMax, Some("max")),
         (Intrinsic::ScalarMin, Some("min")),
         (Intrinsic::Round2, Some("round")),
@@ -708,7 +696,7 @@ fn a_reported_scope_keeps_the_authored_spelling_baptism_had_to_disambiguate() {
 }
 
 // -------------------------------------------------------------------------
-// The ordinal report is a REFERENCE, so it must be typable
+// The ordinal a teaching points at is a REFERENCE, so it must be typable
 // -------------------------------------------------------------------------
 
 /// A scope answering to `name` holding two never-named columns.
@@ -724,45 +712,39 @@ fn unnamed_pair(reg: &Registry, name: &str, stropped: bool) -> (ScopeId, Vec<Col
     (scope, cols)
 }
 
-fn spell_ordinal_report(reg: &Registry, c: ColId) -> Option<String> {
+fn spell_ordinal_reference(reg: &Registry, c: ColId) -> String {
     let mut out = String::new();
-    reg.write_ordinal_report(c, &mut Probe(&mut out))
-        .then_some(out)
+    reg.write_ordinal_reference(c, &mut Probe(&mut out));
+    out
 }
 
 #[test]
-fn an_unqualified_ordinal_report_is_the_bare_position() {
+fn an_unqualified_ordinal_reference_is_the_bare_position() {
     let reg = Registry::new(&[]);
     let (_, cols) = unnamed_pair(&reg, "", false);
-    assert_eq!(spell_ordinal_report(&reg, cols[1]).as_deref(), Some("|2|"));
+    assert_eq!(spell_ordinal_reference(&reg, cols[1]), "|2|");
 }
 
 #[test]
-fn a_qualified_ordinal_report_carries_the_answering_name() {
+fn a_qualified_ordinal_reference_carries_the_answering_name() {
     let reg = Registry::new(&[]);
     let (_, cols) = unnamed_pair(&reg, "t", false);
-    assert_eq!(spell_ordinal_report(&reg, cols[0]).as_deref(), Some("t|1|"));
+    assert_eq!(spell_ordinal_reference(&reg, cols[0]), "t|1|");
 }
 
 #[test]
-fn a_stropped_qualifier_keeps_its_delimiters_in_the_report() {
-    // `a b|1|` reaches nothing: the report promises the characters the
+fn a_stropped_qualifier_keeps_its_delimiters_in_the_reference() {
+    // `a b|1|` reaches nothing: the teaching promises the characters the
     // reader would type, and for a stropped name those include the
     // delimiters. The bit travels to the sink rather than being flattened
     // into one string, so the sink can spell it.
     let reg = Registry::new(&[]);
     let (_, cols) = unnamed_pair(&reg, "a b", true);
-    assert_eq!(
-        spell_ordinal_report(&reg, cols[0]).as_deref(),
-        Some("`a b`|1|")
-    );
+    assert_eq!(spell_ordinal_reference(&reg, cols[0]), "`a b`|1|");
 }
 
 #[test]
 fn an_authored_column_reports_the_name_its_author_wrote() {
-    // WHICH road a column takes is baptism's call — a spelling that lost an
-    // ambiguity is emitted invented too, and this road cannot see that. What
-    // it answers is the position, whenever asked; the report chooses.
     let reg = Registry::new(&[]);
     let (scope, cols) = answering(&reg, "t", &["id"]);
     let baptised = baptise(
@@ -782,10 +764,12 @@ fn an_authored_column_reports_the_name_its_author_wrote() {
 }
 
 #[test]
-fn a_poisoned_column_reports_its_position_not_the_drawn_characters() {
-    // Two `id`s: neither keeps the spelling, and neither may report the one
-    // drawn for it — a value in a row that no second run reproduces is not
-    // an answer. The position is, and it is what reaches the column.
+fn a_poisoned_column_reports_the_characters_its_heading_displays() {
+    // Two `id`s: neither keeps the spelling, and each reports the exact
+    // name its heading displays — the one drawn for it. An ordinal is an
+    // address, not a column name, so neither report is the position. The
+    // drawn characters are data of this compilation only, so the check
+    // compares within it and pins no bytes.
     let reg = Registry::new(&[]);
     let (scope, cols) = answering(&reg, "t", &["id", "id"]);
     let baptised = baptise(
@@ -804,8 +788,16 @@ fn a_poisoned_column_reports_its_position_not_the_drawn_characters() {
         baptised.write_column_report(c, &mut Probe(&mut out));
         out
     };
-    assert_eq!(report(cols[0]), "t|1|");
-    assert_eq!(report(cols[1]), "t|2|");
+    let displayed = |c| {
+        let mut out = String::new();
+        baptised.write_column(c, &mut Probe(&mut out));
+        out
+    };
+    for column in &cols {
+        assert!(baptised.drew(*column), "a poisoned column's name is drawn");
+        assert_eq!(report(*column), displayed(*column));
+    }
+    assert_ne!(report(cols[0]), report(cols[1]));
 }
 
 // -------------------------------------------------------------------------
@@ -899,14 +891,53 @@ fn an_authored_alias_of_the_table_itself_keeps_its_spelling() {
 }
 
 #[test]
-fn an_authored_mint_spelling_preempts_the_canonical_draw() {
+fn an_unnamed_relation_reports_that_it_is_unnamed() {
     use crate::names::Addressing;
 
     let reg = Registry::new(&[]);
     let scope = reg.anonymous_scope(None);
-    // The author took the exact characters the canonical mint would draw
-    // first. Stropped: `<mint:1>` is no classic identifier.
-    let authored = reg.intern("<mint:1>", true);
+    // A column whose value no act of production described keeps the bare
+    // mark; the relation nobody named says so after the mark.
+    let column = reg.sql_column(scope, None, Addressing::Published);
+    let bundle = Bundle::gather(vec![Statement {
+        scopes: vec![scope],
+        headings: vec![vec![column]],
+        refs: vec![],
+        ..Default::default()
+    }])
+    .reserve_authored(&reg);
+    let baptised = baptise(&reg, &bundle).expect("bundle names cleanly");
+    let drawn = |text: &str, word: &str| {
+        text.strip_prefix(&format!("⊥{word}"))
+            .is_some_and(|digits| {
+                digits.len() == 16
+                    && digits
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+    };
+    let mut report = String::new();
+    baptised.write_answers_to(scope, &mut crate::names::sink::Probe(&mut report));
+    assert!(drawn(&report, "unnamed_"), "{report}");
+    let mut spelled = String::new();
+    baptised.write_column(column, &mut crate::names::sink::Probe(&mut spelled));
+    assert!(drawn(&spelled, ""), "{spelled}");
+}
+
+#[test]
+fn an_authored_mint_spelling_preempts_the_draw() {
+    use crate::names::Addressing;
+
+    // The author took the exact characters the mint would draw first.
+    // Stropped: a drawn spelling is no classic identifier.
+    let salt = 0x5eed;
+    let mut predicted = crate::names::mint::Mint::with_salt(salt);
+    let first = predicted.spell(crate::names::mint::Mark::Bare);
+    let second = predicted.spell(crate::names::mint::Mark::Bare);
+
+    let reg = Registry::new(&[]);
+    let scope = reg.anonymous_scope(None);
+    let authored = reg.intern(&first, true);
     let named = reg.sql_column(scope, Some(authored), Addressing::Published);
     let anonymous = reg.sql_column(scope, None, Addressing::Published);
     let bundle = Bundle::gather(vec![Statement {
@@ -916,10 +947,10 @@ fn an_authored_mint_spelling_preempts_the_canonical_draw() {
         ..Default::default()
     }])
     .reserve_authored(&reg);
-    let baptised = crate::names::baptism::baptise_with_policy(
+    let baptised = crate::names::baptism::baptise_with_mint(
         &reg,
         &bundle,
-        crate::names::policy::NamePolicy::Canonical,
+        crate::names::mint::Mint::with_salt(salt),
     )
     .expect("bundle names cleanly");
     let spell = |column| {
@@ -929,6 +960,6 @@ fn an_authored_mint_spelling_preempts_the_canonical_draw() {
     };
     // ALIAS ALWAYS PRE-EMPTS A MINT: the invention skips the authored
     // characters, so no two outputs share one emitted name.
-    assert_eq!(spell(named), "`<mint:1>`");
-    assert_eq!(spell(anonymous), "<mint:2>");
+    assert_eq!(spell(named), format!("`{first}`"));
+    assert_eq!(spell(anonymous), second);
 }

@@ -1,0 +1,5 @@
+`dot_command`(*) :- repl::data.dot_command(*)
+welcome(*) :- repl::data.welcome(*)
+key_binding(*) :- repl::data.key_binding(*)
+example(*) :- repl::data.example(*)
+message(*) :- repl::data.message(*)

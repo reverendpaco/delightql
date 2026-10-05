@@ -5,6 +5,7 @@
 // Layer 0: 14 data terms (ClientTerm, ServerTerm) + typestate client
 // Layer 1: Control vocabulary (Reset) — structurally unreachable from DQL
 
+pub mod digest;
 pub mod layer0;
 pub mod layer1;
 pub mod manifest;

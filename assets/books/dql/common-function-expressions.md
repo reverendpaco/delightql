@@ -9,17 +9,17 @@ separates the functional functor on the left from any valid domain expression
 on the right. CFEs may **only** be created by pre-labeling.
 
 ```delightql
-enweirden:(age) :
-  age /-> :(@ - 18) /-> max:(0) /-> min:(100)
+enweirden:(total) :
+  total >> :(@ - 5) >> max:(0) >> min:(10)
 
-users(*) |> (enweirden:(age) as silly, age)
+invoice(*) |> (enweirden:(total) as silly, total)
 ```
 
 ```sql
 SELECT
-  min(max("age" - 18, 0), 100) AS "silly",
-  "age" AS "age"
-FROM "users";
+  min(max("total" - 5, 0), 10) AS "silly",
+  "total" AS "total"
+FROM "invoice";
 ```
 
 
@@ -28,41 +28,55 @@ CTEs and CFEs may be intermixed:
 
 ```delightql
 double:(x) : (x * 2)
-users(*), age > 25 : adults
+invoice(*), total > 5 : over_five
 triple:(y) : (y * 3)
-young_adults(*): adults(*), age < 40
-young_adults(*)
-  |> ( id,
-      first_name,
-      age,
-      double:(age) as doubled,
-      age /-> double:() /-> double:() as quadrupled,
-      triple:(age) as tripled,
-      double:(triple:(age)) as sextupled)
+mid_range(*): over_five(*), total < 10
+mid_range(*)
+  |> ( invoice_id,
+      billing_city,
+      total,
+      double:(total) as doubled,
+      total >> double:() >> double:() as quadrupled,
+      triple:(total) as tripled,
+      double:(triple:(total)) as sextupled)
 ```
 
 ```sql
-WITH adults AS (
+WITH over_five AS (
     SELECT
         *
-    FROM users
-    WHERE age > 25
+    FROM invoice
+    WHERE total > 5
 ),
-young_adults AS (
+mid_range AS (
     SELECT
         *
-    FROM adults
-    WHERE age < 40
+    FROM over_five
+    WHERE total < 10
 )
 SELECT
-    id,
-    first_name,
-    age,
-    (age * 2) AS doubled,
-    ((age * 2) * 2) AS quadrupled,
-    (age * 3) AS tripled,
-    ((age * 3) * 2) AS sextupled
+    invoice_id,
+    billing_city,
+    total,
+    (total * 2) AS doubled,
+    ((total * 2) * 2) AS quadrupled,
+    (total * 3) AS tripled,
+    ((total * 3) * 2) AS sextupled
 FROM
-    young_adults;
+    mid_range;
 ```
 
+## Clause-local parameters
+
+A value function's clauses bind actuals by argument position. Each clause
+chooses its own scalar names; arity, roles and context capture must agree.
+This applies to common functions and consulted functions alike.
+
+```delightql
+f:(x | x > 1) : x * 10
+f:(y) : y + 100
+_(v @ 1; 3) |> (f:(v) as r)
+```
+
+The results are 101 and 30. The guard and computation in each clause use
+that clause's names. Scalar parameter metadata identifies argument positions.

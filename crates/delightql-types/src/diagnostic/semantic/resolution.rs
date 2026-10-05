@@ -30,6 +30,15 @@ pub enum Resolution {
     #[error("Column not found: {column}")]
     Column { column: String, context: String },
 
+    /// `$.x` reads the scalar formal `x` of a relational or effect
+    /// higher-order clause the reference stands in, nearest first. None
+    /// declares `x`: the search never reaches a relation's columns, a
+    /// namespace or a caller, and a value function's or lambda's bare
+    /// parameter is not a marked formal.
+    #[leaf("parameter", class = Syntax, summary = "A `$.x` reference names no enclosing higher-order formal.")]
+    #[error("Validation error: {message}")]
+    Parameter { message: String },
+
     /// After a join, an unqualified column name exists on more than one
     /// side. Qualify it with the relation alias (u.id).
     #[leaf("ambiguous", class = Syntax, summary = "A name matches more than one column in scope.")]
@@ -64,12 +73,6 @@ pub enum Resolution {
     #[leaf("fact_function/relational_face", class = Syntax, summary = "A default-bearing fact function was used as a relation.")]
     #[error("Validation error: {message}")]
     FactFunctionRelationalFace { message: String },
-
-    /// The common higher-order expression: the query-scoped parameterized
-    /// rule, its recursion law and its clause agreement.
-    #[family("choe", summary = "A common higher-order expression is ill-formed.")]
-    #[error(transparent)]
-    Choe(Choe),
 
     /// The higher-order family: how arguments and piped relations land at a
     /// functor's parameters. Every parameter is inbound and must be supplied
@@ -139,33 +142,6 @@ pub enum Resolution {
     ScopeStale { message: String },
 }
 
-/// `semantic/resolution/choe/…`
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Taxon)]
-#[taxon(lineage(DelightQLError::Semantic, Semantic::Resolution, Resolution::Choe))]
-pub enum Choe {
-    /// A common higher-order expression (CHOE) — `p(T(*))(*) : body` — is
-    /// the query-scoped parameterized rule. Its body is the query's own text
-    /// and sees the bindings declared before it, itself included, so a
-    /// self-reference selects the definition being expanded. A CHOE has no
-    /// fixpoint to re-enter: self-reference refuses. Write the recursion as
-    /// a consulted rule, or bind the recursive relation with an ordinary
-    /// `%`-badged CTE.
-    #[leaf("recursion", class = Syntax, summary = "A common higher-order expression's body reaches itself.")]
-    #[error("Validation error: {message}")]
-    Recursion { message: String },
-
-    /// Repeated heads of one common higher-order expression are clauses of
-    /// ONE query-local definition and accumulate by UNION ALL, under CLAUSE
-    /// AGREEMENT: every clause declares the same number of parameters and
-    /// publishes one agreed heading — the same names, in the same
-    /// positions. A clause whose heading differs is a different relation;
-    /// give it its own name, or conform its heading with head `as` or a
-    /// projection in the body.
-    #[leaf("head_agreement", class = Syntax, summary = "The clauses of one common higher-order expression disagree.")]
-    #[error("Validation error: {message}")]
-    HeadAgreement { message: String },
-}
-
 /// `semantic/resolution/ho/…`
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Taxon)]
 #[taxon(lineage(DelightQLError::Semantic, Semantic::Resolution, Resolution::Ho))]
@@ -227,6 +203,13 @@ pub enum Ho {
     #[leaf("residual-capture", class = Syntax, summary = "A residual rule value captured a caller occurrence.")]
     #[error("Validation error: {message}")]
     ResidualCapture { message: String },
+
+    /// A residual rule value was completed by rows built from its
+    /// construction rows by an operation that no longer says which
+    /// construction row each of them is.
+    #[leaf("residual-completion", class = Syntax, summary = "A residual rule value was completed by rows that lost their construction rows.")]
+    #[error("Validation error: {message}")]
+    ResidualCompletion { message: String },
 
     /// A residual rule value's signature does not match the contract the
     /// consuming position demands: its remaining inputs, their modes, or

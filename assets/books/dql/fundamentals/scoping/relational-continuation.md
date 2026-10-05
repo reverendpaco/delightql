@@ -6,15 +6,15 @@ Relational continuations are defined as all strings that
  - and are not themselves valid delightql RELEXs
 
 ```delightql
-users(*), age<50
+customer(*), country = "Canada"
    |> +( :"{last_name}, {first_name}" as full_name)
 ```
 
 Examples of continuations in the above valid delightql RELEX:
 
-  - `, age<50`{.delightql}
+  - `, country = "Canada"`{.delightql}
   - `|> +( :"{last_name}, {first_name}" as full_name)`{.delightql}
-  - `, age<50 |> +( :"{last_name}, {first_name}" as full_name)`{.delightql}
+  - `, country = "Canada" |> +( :"{last_name}, {first_name}" as full_name)`{.delightql}
 
 The continuation concept allows syntactic analysis of semantic concepts regarding scope and transformation.
 
@@ -24,9 +24,9 @@ A continuation anchor is any location in a string where the substring to the lef
 
 
 ```delightql
-users(*)               //  ①
-   , age<50            //  ②
-   |> ( last_name )    //  ③
+album(*)               //  ①
+   , artist_id = 22     //  ②
+   |> ( title )        //  ③
 ```
 
 The above example has three continuation anchors at
@@ -39,11 +39,11 @@ of the relational expression (**RELEX**) to the left of a continuation anchor.
 It is the ordered set of logic variables (columns) that are in scope.
 
 ```delightql
-users(*) as u
-   //  ①  CPR = [ u.last_name, u.first_name, u.age]
-   , age<50
-   //  ②  CPR = [ u.last_name, u.first_name, u.age]
-   |> ( last_name )
-   //  ③  CPR = [ last_name]
+album(*) as a
+   //  ①  CPR = [ a.album_id, a.Title, a.artist_id ]
+   , artist_id = 22
+   //  ②  CPR = [ a.album_id, a.Title, a.artist_id ]
+   |> ( title )
+   //  ③  CPR = [ Title ]
 ```
 

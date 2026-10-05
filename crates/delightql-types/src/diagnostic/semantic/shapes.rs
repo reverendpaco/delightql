@@ -25,6 +25,12 @@ pub enum Constraint {
     #[error("Validation error: {message}")]
     PositionalAlias { message: String },
 
+    /// A pattern, range or glob that addresses no column of its input:
+    /// an empty match is a mistake wherever it is written.
+    #[leaf("selector_empty", class = Syntax, summary = "A selector addressed no column.")]
+    #[error("Validation error: {message}")]
+    SelectorEmpty { message: String },
+
     /// A pivot's keys, values, or column set are not what the pivot
     /// operation requires.
     #[leaf("pivot", class = Syntax, summary = "A pivot is ill-formed.")]
@@ -74,6 +80,28 @@ pub enum Constraint {
     #[error("Validation error: {message}")]
     MetadataPerRow { message: String },
 
+    /// On a target that gives a column one type, the cells that stand at
+    /// one position of a correlated anonymous table must already share
+    /// one type: the target would otherwise convert them to a common type
+    /// and could change a value (a BIGINT beside a DOUBLE comes back as a
+    /// rounded DOUBLE). A cell's type is known from its literal spelling,
+    /// the declared type of the column it reads, or an explicit
+    /// `cast:(x, ::type)`; cast every cell of the position to one type, or
+    /// split the table so each position holds one type. SQLite types the
+    /// value rather than the column and never refuses here.
+    #[leaf("target_typing", class = Syntax, summary = "Cells at one position of a correlated anonymous table would be converted to one type by the target.")]
+    #[error("Validation error: {message}")]
+    TargetTyping { message: String },
+
+    /// The construction requires a guarantee the target has no spelling
+    /// for — a binding evaluated once and read at every spend, which a
+    /// closed configured rule value and the occurrence stage of a
+    /// correlated interior both require. The target is named; on one that
+    /// spells the guarantee the same query is admitted.
+    #[leaf("target_capability", class = Syntax, summary = "The target cannot spell a guarantee the construction requires.")]
+    #[error("Validation error: {message}")]
+    TargetCapability { message: String },
+
     /// An argumentative functor passed as a higher-order parameter must
     /// match the arity the parameter declares.
     #[leaf("ho_param/argumentative_functor/arity", class = Syntax, summary = "An argumentative functor parameter's arity mismatches.")]
@@ -90,6 +118,20 @@ pub enum Limitation {
     #[leaf("not_implemented", class = Syntax, summary = "A form this release does not implement.")]
     #[error("Not implemented: {message}")]
     NotImplemented { message: String },
+
+    /// A document path can yield an ordinary atom, a record, or a tuple on
+    /// different rows.  After that value crosses a SQL relation boundary,
+    /// supported targets do not all retain the per-value kind needed to tell
+    /// a structured value from genuine JSON-looking text.  Until DelightQL
+    /// carries that evidence with each value, a structural consumer must act
+    /// before the boundary or the original document must cross instead.
+    #[leaf(
+        "dynamic_structured_continuity",
+        class = Syntax,
+        summary = "A dynamic document value crossed a boundary without the evidence needed for structural use."
+    )]
+    #[error("Not implemented: {message}")]
+    DynamicStructuredContinuity { message: String },
 }
 
 /// `semantic/identifier/…`
@@ -163,6 +205,12 @@ pub enum Cfe {
     #[error("Validation error: {message}")]
     FormalsUndeclared { message: String },
 
+    /// A guard stood on a curried callable parameter; a guard filters a
+    /// value, and a callable parameter takes code.
+    #[leaf("guard/position", class = Syntax, summary = "A guard stood on a callable parameter.")]
+    #[error("Validation error: {message}")]
+    GuardPosition { message: String },
+
     /// A lambda was applied with the wrong number of arguments.
     #[leaf("lambda_arity", class = Syntax, summary = "A lambda was applied with the wrong arity.")]
     #[error("Validation error: {message}")]
@@ -172,12 +220,6 @@ pub enum Cfe {
     #[leaf("parameter/duplicate", class = Syntax, summary = "A value function declares a parameter twice.")]
     #[error("Validation error: {message}")]
     ParameterDuplicate { message: String },
-
-    /// A query-scoped value function reaches itself; value functions do not
-    /// recurse.
-    #[leaf("recursion", class = Syntax, summary = "A value function recurses.")]
-    #[error("Validation error: {message}")]
-    Recursion { message: String },
 }
 
 /// `semantic/compression/…`
@@ -249,20 +291,6 @@ pub enum FactFunction {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Taxon)]
 #[taxon(lineage(DelightQLError::Semantic, Semantic::Ho))]
 pub enum HoDefinition {
-    /// A higher-order view's scalar parameter is spliced into the body as a
-    /// value, not a column. When its name equals a column the body would
-    /// otherwise resolve to (e.g. `g(age)(*) :- users(*), age > 40` where
-    /// users has an age column), the substitution silently CAPTURES the
-    /// column: constraints on it tautologize (`age > 40` becomes `50 > 40`)
-    /// and the column drops from the output — both silent. Refused loudly
-    /// at expansion (call time), where body relations carry real schemas,
-    /// so both concretely-named bodies and glob-param bodies (T(*)) are
-    /// caught. Remedy: rename the parameter so it no longer shadows the
-    /// column.
-    #[leaf("param_shadows_column", class = Syntax, summary = "A scalar parameter name collides with a body column.")]
-    #[error("Validation error: {message}")]
-    ParamShadowsColumn { message: String },
-
     /// A bare scalar actual resolves to more than one caller occurrence, so
     /// the call cannot say which value it supplies.
     #[leaf("actual/ambiguous_occurrence", class = Syntax, summary = "A scalar actual names more than one caller occurrence.")]
@@ -468,17 +496,25 @@ pub enum Setop {
     #[error("Validation error: {message}")]
     CorrelationAmbiguous { message: String },
 
-    /// More than one column of one operand corresponds to a column of the
-    /// other, so the corresponding operation cannot align them.
-    #[leaf("correspondence/ambiguous", class = Syntax, summary = "More than one column corresponds.")]
-    #[error("Validation error: {message}")]
-    CorrespondenceAmbiguous { message: String },
-
     /// The minimum-multiplicity gate refuses a correlation operator inside
     /// a set operation whose multiplicity it cannot bound.
     #[leaf("min_multiplicity/correlation_operator", class = Syntax, summary = "A correlation operator under the minimum-multiplicity gate.")]
     #[error("Validation error: {message}")]
     MinMultiplicityCorrelationOperator { message: String },
+
+    /// The minimum-multiplicity gate changes only a correlated union; a
+    /// statement where no correlated union spends it acknowledges a danger
+    /// it never exercises.
+    #[leaf("min_multiplicity/unspent", class = Syntax, summary = "A minimum-multiplicity gate no correlated union spends.")]
+    #[error("Validation error: {message}")]
+    MinMultiplicityUnspent { message: String },
+
+    /// The minimum-multiplicity gate pairs whole rows; a correlation
+    /// comparing only some of the columns the arms share leaves which copy
+    /// pairs to row order.
+    #[leaf("min_multiplicity/partial", class = Syntax, summary = "A minimum-multiplicity correlation compares only some shared columns.")]
+    #[error("Validation error: {message}")]
+    MinMultiplicityPartial { message: String },
 }
 
 /// `semantic/set_operation/…`
@@ -542,4 +578,17 @@ pub enum Window {
     #[leaf("not_a_window", class = Syntax, summary = "A window was attached to a non-window function.")]
     #[error("Validation error: {message}")]
     NotAWindow { message: String },
+
+    /// A window was evaluated by a condition a join evaluates per pair of
+    /// rows. Compute the window in an earlier stage and join on its column.
+    #[leaf("on_join", class = Syntax, summary = "A window was evaluated by a join's condition.")]
+    #[error("Validation error: {message}")]
+    OnJoin { message: String },
+
+    /// A guard was written on a window function that is not an aggregate. A
+    /// guard filters the contributions an aggregate reads; a ranking or
+    /// offset function reads none.
+    #[leaf("guard", class = Syntax, summary = "A guard was written on a window function that is not an aggregate.")]
+    #[error("Validation error: {message}")]
+    Guard { message: String },
 }

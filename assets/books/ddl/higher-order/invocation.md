@@ -1,9 +1,17 @@
 # Direct Invocation {.dqlh}
 
-Tables can be passed in as parameter arguments:
+Tables can be passed in as parameter arguments. Given this definition:
+
+```{.delightql .am}
+genre_track_count(T(*), G(*))(genre, track_count) :-
+  T(*), G(*.(genre_id))
+    |> %(G.name as genre ~> count:(*) as track_count)
+```
+
+a call passes two tables:
 
 ```delightql
-department_employee_count(employee_2019(*), department_2019(*))(*)
+genre_track_count(track(*), genre(*))(*)
 ```
 
 The call site mirrors the definition head: each table parameter in this example is a
@@ -12,9 +20,9 @@ full functor expression.
 Because call-site arguments are relation expressions, they can compose:
 
 ```delightql
-department_employee_count(
-  employee_2019(*, Salary > 50000),
-  department_2019(*)
+genre_track_count(
+  track(*, milliseconds > 300000),
+  genre(*)
 )(*)
 ```
 
@@ -25,15 +33,15 @@ Here the first argument is a filtered relation.
 Pipes can be used on any higher-order predicate that takes
 a table-valued parameter:
 
-```delightql
+```{.delightql .am}
 clean_employees(T(*))(*) :-
-  T(*) as t
-    |> $(trim:())(t.LastName, t.FirstName)
-    |> $(to_iso:())(t.BirthDate, t.HireDate)
+  T(*)
+    |> $(trim:())(last_name, first_name)
+    |> $(date:())(birth_date, hire_date)
 ```
 
 ```delightql
-employee_2019(*)
+employee(*)
   |> clean_employees(*)
 ```
 
@@ -42,17 +50,16 @@ rule name is the output schema.
 
 Chaining is possible:
 
-```delightql
-mask_ssn(mask_value,T(*))(*) :-
-  T(*) |> $$(mask_value as ssn)
+```{.delightql .am}
+mask_phone(mask_value,T(*))(*) :-
+  T(*) |> $$($.mask_value as phone)
 ```
 
 ```delightql
-employee_2019(*)
-  |;| employee_2018(*)
-  |;| employee_2017(*)
+employee_2024(*)
+  |;| employee_2025(|> *(job_title as title, manager_id as reports_to))
   |> clean_employees(*)
-  |> mask_ssn("***-**-****")(*)
+  |> mask_phone("+1 (***) ***-****")(*)
 ```
 
 **Note**. As with function pipes, the relation is piped into the last parameter
@@ -64,14 +71,17 @@ parameter, use `@` (the f-param placeholder) to mark where it goes -- the same
 syntax as function pipes:
 
 ```delightql
--- Definition: scalar first, table second
-tagged(T(*),label)(*) :- T(*), ...
+// Definition: table first, scalar second
+tagged(T(*),label)(*) : T(*) |> +($.label as tag)
 
--- Direct invocation (always works):
-tagged(users(*),"young"))(*)
+// Direct invocation (always works):
+tagged(customer(*),"vip")(*)
 
--- Piped invocation with @:
-users(*) |> tagged(@,"young")(*)
+// A `:` definition lasts one query, so it is restated:
+tagged(T(*),label)(*) : T(*) |> +($.label as tag)
+
+// Piped invocation with @:
+customer(*) |> tagged(@,"vip")(*)
 ```
 
 The `@` tells the compiler which parameter receives the piped relation.

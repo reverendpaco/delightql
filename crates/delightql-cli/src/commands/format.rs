@@ -81,8 +81,7 @@ fn apply_style_bundle(config: &mut delightql_formatter::FormatConfig, style: &st
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
     let query = format!("sys::format.bundle(*), bundle = \"{}\"", style);
-    let qr = session
-        .query(&query)
+    let qr = crate::exec_ng::query(&mut *session, &query)
         .map_err(|e| anyhow::anyhow!("reading style bundle: {}", e))?;
     let fr = session
         .fetch(&qr.handle, 2)

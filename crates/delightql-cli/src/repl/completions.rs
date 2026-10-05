@@ -321,6 +321,12 @@ impl Highlighter for DotCommandCompleter {
             self.well_formed.set(true);
             return true;
         }
+        // Definition input has no goal to stand alone: the prompt is never
+        // swapped there, so no verdict is probed for.
+        if self.worker.road() == super::parser_worker::HelperRoad::Definitions {
+            self.well_formed.set(true);
+            return true;
+        }
         // The only Highlighter hook that receives BOTH the line and the cursor,
         // and rustyline calls it before drawing the prompt on every edit AND
         // every cursor move. So it is where the verdict is computed.

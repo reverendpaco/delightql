@@ -4,38 +4,38 @@
 .sigil} separates grouping columns (left) from reduced columns (right):
 
 ```delightql
-employee(*)
-  |> %(Department ~>  count:(*) , sum:(Salary) )
+invoice(*)
+  |> %(billing_country ~>  count:(*) , sum:(total) )
 ```
 
 
 
 ```sql
 select
-  Department,  -- grouping column
-  count(*),    -- reduced column
-  sum(Salary)  -- reduced column
-from employee
-  group by Department;
+  billing_country,  -- grouping column
+  count(*),        -- reduced column
+  sum(total)       -- reduced column
+from invoice
+  group by billing_country;
 ```
 
 Grouping columns may be expressions:
 
 ```delightql
-employee(*)
-    |> %( Salary > 50000  as high_low,
-          upper:(Department) ~>
+invoice(*)
+    |> %( total > 10  as high_low,
+          upper:(billing_country) ~>
             count:(*) ,
-            avg:(Salary) )
+            avg:(total) )
 ```
 
 
 ```sql
 select
-  Salary > 50000 as high_low, -- grouping column
-  upper(Department),  -- grouping column
+  total > 10 as high_low, -- grouping column
+  upper(billing_country),  -- grouping column
   count(*),    -- reduced column
-  avg(Salary)  -- reduced column
-from employee
-  group by upper(Department), (Salary > 50000) ;
+  avg(total)   -- reduced column
+from invoice
+  group by upper(billing_country), (total > 10) ;
 ```

@@ -3,56 +3,50 @@
 # Contextual Functions {.dqlh}
 
 The `..` sigil indicates a function that captures variables from its invocation context:
-```delightql
-excess_index:(..) :-
-  (1 + total - (interest_rate / 252))
-    /-> greatest:(0.01)
-    /-> ln:()
-    /-> :(@ * 2)
-    /-> sum:(<~ #(date))
-    /-> exp:()
+```{.delightql .am}
+bitrate:(..) :-
+  (bytes * 8.0)
+    >> :(@ / milliseconds)
+    >> round:(@, 1)
 ```
 ```delightql
-prices(*) |> (excess_index:(..) as idx)
+track(*) |> (name, bitrate:(..) as kbps)
 ```
 
-The function analyzes its body for free variables (`total`, `interest_rate`,
-`date`) and expects them from the calling relation. This is structural typing
+The function analyzes its body for free variables (`bytes`, `milliseconds`)
+and expects them from the calling relation. This is structural typing
 for functions -- any relation with those columns can use the function.
 
 **Mixed parameters:**
 
 Combine context capture with explicit arguments:
-```delightql
-scaled_index:(.., scale_factor) :-
-  (1 + total - (interest_rate / 252))
-    /-> greatest:(0.01)
-    /-> ln:()
-    /-> :(@ * scale_factor)
-    /-> exp:()
+```{.delightql .am}
+line_amount:(.., discount) :-
+  (unit_price * quantity)
+    >> :(@ * (1 - discount))
+    >> round:(@, 2)
 ```
 ```delightql
-prices(*) |> (
-  scaled_index:(.., 2) as double_scaled,
-  scaled_index:(.., 0.5) as half_scaled
+invoice_line(*) |> (
+  line_amount:(.., 0) as full_price,
+  line_amount:(.., 0.25) as discounted
 )
 ```
 
 **Named context:**
 
 Explicitly declare captured variables:
-```delightql
-scaled_index:(..{total, interest_rate}, scale_factor) :-
-  (1 + total - (interest_rate / 252))
-    /-> greatest:(0.01)
-    /-> :(@ * scale_factor)
-    /-> exp:()
+```{.delightql .am}
+net_amount:(..{unit_price, quantity}, discount) :-
+  (unit_price * quantity)
+    >> :(@ * (1 - discount))
+    >> round:(@, 2)
 ```
 
 This makes dependencies visible in the signature and allows overriding context with explicit values:
 ```delightql
-prices(*) |> (
-  scaled_index:(.., 2) as from_context,
-  scaled_index:(manual_total, manual_rate, 2) as explicit
+invoice_line(*) |> (
+  net_amount:(.., 0) as from_context,
+  net_amount:(1.99, quantity, 0) as explicit
 )
 ```

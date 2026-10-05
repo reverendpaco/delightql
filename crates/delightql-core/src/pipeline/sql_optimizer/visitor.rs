@@ -115,21 +115,6 @@ fn transform_query<T: QueryTransformer>(
                 right: transformed_right,
             }
         }
-        QueryExpression::WithCte { ctes, query } => {
-            // Transform each CTE's query
-            let transformed_ctes = ctes
-                .into_iter()
-                .map(|cte| cte.rewrite_parts(|part| transform_query(part, transformer)))
-                .collect::<Result<Vec<_>>>()?;
-
-            let transformed_inner = Box::new(transform_query(*query, transformer)?);
-            QueryExpression::WithCte {
-                ctes: transformed_ctes,
-                query: transformed_inner,
-            }
-        }
-        // VALUES - no subqueries to process
-        other => other,
     };
 
     // Then apply the transformer to this node
@@ -379,7 +364,7 @@ pub(super) fn exposed_scopes(table: &TableExpression) -> Vec<crate::names::Scope
     let mut out = Vec::new();
     fn walk(table: &TableExpression, out: &mut Vec<crate::names::ScopeId>) {
         match table {
-            TableExpression::Scope(scope) | TableExpression::QualifiedScope { scope, .. } => {
+            TableExpression::Scope(scope) => {
                 out.push(*scope)
             }
             TableExpression::Entity {

@@ -4,7 +4,8 @@
 use anyhow::Result;
 use std::time::Instant;
 
-use super::info_panel::SharedReplState;
+use super::config::InputMode;
+use super::surface::Message;
 use crate::args::Stage;
 use crate::connection::ConnectionManager;
 use crate::output_format::OutputFormat;
@@ -24,12 +25,11 @@ pub struct ReplState {
     pub db_path: Option<String>,
     pub last_query: Option<String>,
     pub last_execution_time: Option<std::time::Duration>,
-    pub shared_info: SharedReplState, // Shared with multi-pane TUI
     pub db_connection: ConnectionManager, // Persistent database connection
     pub dql_handle: Arc<std::sync::Mutex<Box<dyn delightql_core::api::DqlHandle>>>, // Persistent DqlHandle (wrapped in Arc<Mutex> for thread-safe mutation)
     /// The typed operational configuration — the one authority. Private to
     /// this module; every mutation crosses the typed operations below, which
-    /// also project the option row and refresh the TUI snapshot.
+    /// also project the option row.
     config: super::config::ReplConfig,
     pub name_generator: super::name_generator::ReplNameGenerator,
     pub captures: Vec<ReplCapture>,
@@ -46,6 +46,12 @@ pub struct ReplState {
 }
 
 impl ReplState {
+    /// What the REPL says as `message`, in the wording `repl::surface`
+    /// holds, its placeholders filled in from `fills`.
+    pub fn say(&self, message: Message, fills: &[(&str, &str)]) -> String {
+        super::surface::say(self.repl_db.as_deref(), message, fills)
+    }
+
     /// The interactive state over the PROCESS's client database.
     pub fn new(db_path: Option<String>, output_format: OutputFormat) -> Result<Self> {
         Self::new_with_connection(db_path, output_format, None)
@@ -99,8 +105,6 @@ impl ReplState {
 
         let dql_handle = Arc::new(std::sync::Mutex::new(handle));
 
-        let shared_info = SharedReplState::new(std::env::args().collect(), db_path.clone());
-
         // ONE configuration authority: the controller takes this config's
         // budgets and its SHARED helper policy, then the same config moves
         // into the state — startup cannot mint two authorities.
@@ -112,11 +116,10 @@ impl ReplState {
             None,
         ));
 
-        let mut state = Self {
+        let state = Self {
             db_path,
             last_query: None,
             last_execution_time: None,
-            shared_info,
             db_connection,
             dql_handle,
             config,
@@ -128,7 +131,6 @@ impl ReplState {
             repl_namespace_available,
         };
         state.seed_config_options();
-        state.sync_shared_config();
         Ok(state)
     }
 
@@ -189,99 +191,49 @@ impl ReplState {
     }
 
     // --- typed configuration operations: validate, change the typed value,
-    // --- project the option row, refresh the TUI snapshot — one act.
+    // --- project the option row — one act.
 
     pub fn set_output_format(&mut self, format: OutputFormat, source: &str) {
         self.config.set_output_format(format);
         self.project_config_option("output_format", source);
-        self.sync_shared_config();
     }
 
     pub fn set_target_stage(&mut self, stage: Option<Stage>, source: &str) {
         self.config.set_target_stage(stage);
         self.project_config_option("target_stage", source);
-        self.sync_shared_config();
     }
 
-    pub fn set_input_mode_sql(&mut self, sql: bool, source: &str) {
-        self.config.set_input_mode_sql(sql);
+    /// Switch what the prompt reads. The helpers' parses follow: in
+    /// definition input the prompt's text is definitions, not a goal.
+    pub fn set_input_mode(&mut self, mode: InputMode, source: &str) {
+        self.config.set_input_mode(mode);
+        self.parser_worker.set_road(match mode {
+            InputMode::Definitions => super::parser_worker::HelperRoad::Definitions,
+            InputMode::Query | InputMode::Sql => super::parser_worker::HelperRoad::Prompt,
+        });
         self.project_config_option("input_mode", source);
-        self.sync_shared_config();
-    }
-
-    pub fn set_zebra_mode(&mut self, colors: usize, source: &str) -> Result<(), String> {
-        self.config.set_zebra_mode(colors)?;
-        self.project_config_option("zebra_columns", source);
-        self.sync_shared_config();
-        Ok(())
     }
 
     pub fn set_no_headers(&mut self, no_headers: bool, source: &str) {
         self.config.set_no_headers(no_headers);
         self.project_config_option("headers", source);
-        self.sync_shared_config();
     }
 
     pub fn set_show_meta_output(&mut self, show: bool, source: &str) {
         self.config.set_show_meta_output(show);
         self.project_config_option("meta_output", source);
-        self.sync_shared_config();
     }
 
     pub fn set_multiline(&mut self, multiline: bool, source: &str) {
         self.config.set_multiline(multiline);
         self.project_config_option("multiline", source);
-        self.sync_shared_config();
     }
 
-    /// Manual breaker control: change the shared policy, project the row,
-    /// refresh the snapshot — one act. Enabling arms the breaker again.
+    /// Manual breaker control: change the shared policy and project the row
+    /// — one act. Enabling arms the breaker again.
     pub fn set_editor_parser_helpers(&mut self, enabled: bool, source: &str) {
         self.config.set_editor_parser_helpers(enabled);
         self.project_config_option("editor_parser_helpers", source);
-        self.sync_shared_config();
-    }
-
-    /// Refresh the WHOLE TUI snapshot before a launch: the config fields
-    /// and the Window C history ring, both projected from their authorities
-    /// (the typed config, the input ledger). The snapshot is a presentation
-    /// cache; nothing reads it back.
-    pub fn prepare_tui_snapshot(&mut self) {
-        self.sync_shared_config();
-        if let Some(db) = &self.repl_db {
-            if let Ok(rows) = db.history_rows() {
-                let entries: Vec<super::info_panel::QueryHistoryEntry> = rows
-                    .into_iter()
-                    .filter(|row| row.kind == "dql" && row.outcome == "succeeded")
-                    .filter_map(|row| {
-                        row.generated_sql
-                            .map(|sql| super::info_panel::QueryHistoryEntry {
-                                dql: row.input,
-                                sql,
-                            })
-                    })
-                    .collect();
-                let start = entries.len().saturating_sub(50);
-                self.shared_info.query_history = entries[start..].to_vec();
-            }
-        }
-    }
-
-    /// Sync current config into shared_info for TUI display. The snapshot
-    /// is a presentation cache written FROM the typed state, never an
-    /// authority.
-    pub fn sync_shared_config(&mut self) {
-        let output_format = self.config.output_format_rendered();
-        let target_stage = self.config.target_stage_rendered().to_string();
-        self.shared_info.sync_config(
-            &output_format,
-            &target_stage,
-            self.config.sql_mode(),
-            self.config.zebra_mode(),
-            self.config.no_headers(),
-            self.config.multiline(),
-            self.config.editor_helpers_enabled(),
-        );
     }
 }
 
@@ -470,126 +422,97 @@ pub struct DotCommand {
 }
 
 /// THE enumerable dot-command surface — every other surface is a
-/// projection of this table: the `.help` screen, tab completion, and
-/// `cli::surface`'s `dot_command` rows all render from it, and the
-/// dispatcher's match arms are welded to it in both directions by
-/// `registry_and_dispatch_agree`. Adding an arm without a row (or a row
-/// without an arm) fails that test — there is no second source to drift.
+/// projection of this table: `repl::surface.dot_command` (and so the `.help`
+/// screen) and tab completion render from it, and the dispatcher's match
+/// arms are welded to it in both directions by `registry_and_dispatch_agree`.
+/// Adding an arm without a row (or a row without an arm) fails that test —
+/// there is no second source to drift.
 pub const DOT_COMMANDS: &[DotCommand] = &[
     DotCommand {
         name: ".help",
         aliases: &[],
         args: "",
-        section: "General",
-        summary: "Show this help message",
+        section: "Commands",
+        summary: "List commands, keys and examples",
         example: "",
     },
     DotCommand {
         name: ".exit",
         aliases: &[".quit"],
         args: "",
-        section: "General",
-        summary: "Exit the REPL",
-        example: "",
-    },
-    DotCommand {
-        name: ".info",
-        aliases: &[],
-        args: "",
-        section: "Display & Output",
-        summary: "Show the multi-pane TUI (Ctrl-X, t toggles while typing; a lone `.` too)",
+        section: "Commands",
+        summary: "Leave the REPL",
         example: "",
     },
     DotCommand {
         name: ".format",
         aliases: &[],
         args: "[FORMAT]",
-        section: "Display & Output",
-        summary: "Set or show output format (table, json, csv, tsv, list)",
-        example: "",
-    },
-    DotCommand {
-        name: ".zebra",
-        aliases: &[],
-        args: "[0-4]",
-        section: "Display & Output",
-        summary: "Column coloring (0=off [default], 2=blue/cyan, 3=RWB, 4=RWBG)",
+        section: "Commands",
+        summary: "Show or set the output format",
         example: "",
     },
     DotCommand {
         name: ".to",
         aliases: &[],
         args: "[STAGE]",
-        section: "Display & Output",
-        summary: "Show output stage (cst, ast-unresolved, ast-resolved, etc.)",
+        section: "Commands",
+        summary: "Show a compile stage instead of results (sql, ast-resolved, …)",
         example: "",
     },
     DotCommand {
-        name: ".dql",
-        aliases: &[],
+        name: ".query",
+        aliases: &[".dql"],
         args: "[query]",
-        section: "Mode Commands",
-        summary: "Switch to DQL mode (default); with a query, execute one-off",
+        section: "Commands",
+        summary: "Query input (the default); with a query, run just that query",
         example: "",
+    },
+    DotCommand {
+        name: ".ddl",
+        aliases: &[],
+        args: "[definitions]",
+        section: "Commands",
+        summary:
+            "Definition input: rules and functions land in home; with definitions, admit just those",
+        example: ".ddl adults(*) :- users(*), age >= 18",
     },
     DotCommand {
         name: ".sql",
         aliases: &[],
         args: "[query]",
-        section: "Mode Commands",
-        summary: "Switch to SQL mode; with a query, execute one-off",
+        section: "Commands",
+        summary: "SQL input; with a query, run just that query",
         example: "",
     },
     DotCommand {
         name: ".multiline",
         aliases: &[],
         args: "[on|off]",
-        section: "Mode Commands",
-        summary: "Toggle multiline input mode (default: on)",
+        section: "Commands",
+        summary: "Multiline input: Enter continues, an empty line runs (default on)",
         example: "",
     },
     DotCommand {
         name: ".bug",
         aliases: &[],
         args: "[description…]",
-        section: "File & Diagnostics",
-        summary: "Write this session's error.log, context and replay-script, plus the databases and DDL it used, as bug-<stamp>.tgz",
+        section: "Commands",
+        summary: "Package this session for a bug report, as bug-<stamp>.tgz",
         example: ".bug the join drops rows after the second pipe",
     },
     DotCommand {
         name: ".repl",
         aliases: &[],
         args: "helpers [status|on|off]",
-        section: "File & Diagnostics",
-        summary: "Inspect or control the optional parser helpers (coloring, parse-aware prompt, continuation navigation); submission preflight stays on",
+        section: "Commands",
+        summary: "Show or switch the optional parser helpers",
         example: ".repl helpers status",
     },
 ];
 
 /// Every spelling the dispatcher accepts (names + aliases), in registry
-/// order — the projection consumed by tab completion and the surface rows.
-/// The registry projected into `repl::surface.dot_command` rows: one per
-/// accepted spelling, aliases pointing at the canonical spelling.
-pub fn dot_command_surface() -> Vec<crate::client::database::SurfaceRow> {
-    use crate::client::database::SurfaceRow;
-    DOT_COMMANDS
-        .iter()
-        .flat_map(|cmd| {
-            let row = |spelling: &'static str, is_alias: bool| SurfaceRow {
-                spelling,
-                canonical_name: cmd.name,
-                is_alias,
-                args: cmd.args,
-                section: cmd.section,
-                summary: cmd.summary,
-                example: cmd.example,
-            };
-            std::iter::once(row(cmd.name, false))
-                .chain(cmd.aliases.iter().map(move |alias| row(alias, true)))
-        })
-        .collect()
-}
-
+/// order — the projection consumed by tab completion.
 pub fn dot_command_spellings() -> impl Iterator<Item = &'static str> {
     DOT_COMMANDS
         .iter()
@@ -626,7 +549,7 @@ pub fn handle_dot_command(cmd: &str, repl_state: &mut ReplState) -> Result<Comma
             (Ok(_), false) => (InputOutcome::Refused, None),
             (Ok(_), true) => (InputOutcome::Succeeded, None),
         };
-        note_lost_ledger_write(&db.close_input(id, outcome, error, None, Some(elapsed_ms)));
+        note_lost_ledger_write(&db.close_input(id, outcome, error, Some(elapsed_ms)));
     }
     result
 }
@@ -653,241 +576,92 @@ fn dispatch_dot_command(
     match parts[0] {
         ".exit" | ".quit" => Ok(CommandResult::Exit),
 
-        ".info" => {
-            // Switch to multi-pane TUI
-            repl_state.prepare_tui_snapshot();
-            let handle = repl_state.dql_handle.clone();
-            let connection = repl_state.db_connection.clone();
-            let final_window_position = super::multi_pane_tui::run_multi_pane_tui(
-                repl_state.shared_info.clone(),
-                handle,
-                connection,
-            )?;
-            // Update the persistent position
-            repl_state.shared_info.last_window_position = Some(final_window_position);
-            println!(); // Clean line after returning
-            Ok(CommandResult::Continue)
-        }
-
         ".help" => {
-            print_help();
+            let surface = super::surface::of(repl_state.repl_db.as_deref());
+            print!("{}", super::surface::render_help(&surface));
             Ok(CommandResult::Continue)
         }
 
         ".format" => {
+            let formats = OutputFormat::all_formats().join(", ");
             if parts.len() > 1 {
                 match OutputFormat::from_str(parts[1]) {
                     Some(format) => {
                         repl_state.set_output_format(format, ".format");
                         if repl_state.config().show_meta_output() {
-                            println!("Output format set to: {:?}", format);
+                            println!(
+                                "{}",
+                                repl_state.say(Message::OutputFormat, &[("format", format.name())])
+                            );
                         }
                     }
-                    None => {
-                        eprintln!(
-                            "Invalid format '{}'. Available formats: {}",
-                            parts[1],
-                            OutputFormat::all_formats().join(", ")
-                        );
-                    }
+                    None => eprintln!(
+                        "{}",
+                        repl_state.say(
+                            Message::UnknownFormat,
+                            &[("format", parts[1]), ("formats", &formats)]
+                        )
+                    ),
                 }
             } else if repl_state.config().show_meta_output() {
+                let format = repl_state.config().output_format().name();
                 println!(
-                    "Current output format: {:?}",
-                    repl_state.config().output_format()
+                    "{}",
+                    repl_state.say(Message::OutputFormat, &[("format", format)])
                 );
                 println!(
-                    "Available formats: {}",
-                    OutputFormat::all_formats().join(", ")
+                    "{}",
+                    repl_state.say(Message::FormatChoices, &[("formats", &formats)])
                 );
             }
             Ok(CommandResult::Continue)
         }
 
-        ".sql" => {
-            if parts.len() > 1 {
-                // Execute one-off SQL query while staying in current mode
-                let sql_query = cmd[4..].trim(); // Skip ".sql" prefix
-                if repl_state.config().show_meta_output() {
-                    println!("Executing SQL: {}", sql_query);
-                }
-                // One-off in a NAMED mode, through the ledger-owning road —
-                // the submission gets its own `sql` row beside this
-                // dot-command row, exactly as `.dql` one-offs do.
-                let dummy_flag = std::sync::atomic::AtomicBool::new(false);
-                process_query_in_mode(sql_query, repl_state, &dummy_flag, true)?;
-            } else {
-                // Set SQL mode explicitly
-                repl_state.set_input_mode_sql(true, ".sql");
-                if repl_state.config().show_meta_output() {
-                    println!("SQL mode enabled - queries will be executed as raw SQL");
-                }
-            }
-            Ok(CommandResult::Continue)
-        }
-
-        ".dql" => {
-            if parts.len() > 1 {
-                // Execute one-off DQL query while staying in current mode
-                let dql_query = cmd[4..].trim(); // Skip ".dql" prefix
-                if repl_state.config().show_meta_output() {
-                    println!("Executing DQL: {}", dql_query);
-                }
-                // One-off: the mode is named for this execution, not flipped
-                // in the configuration.
-                let dummy_flag = std::sync::atomic::AtomicBool::new(false);
-                process_query_in_mode(dql_query, repl_state, &dummy_flag, false)?;
-            } else {
-                // Set DQL mode explicitly
-                repl_state.set_input_mode_sql(false, ".dql");
-                if repl_state.config().show_meta_output() {
-                    println!("DQL mode enabled - queries will be parsed as DelightQL");
-                }
-            }
-            Ok(CommandResult::Continue)
-        }
-
-        ".zebra" => {
-            if parts.len() > 1 {
-                match parts[1].parse::<usize>() {
-                    Ok(n) if n <= 4 => {
-                        // The typed operation validates; 0/1 disables.
-                        let _ = repl_state.set_zebra_mode(n, ".zebra");
-                        if repl_state.config().show_meta_output() {
-                            match repl_state.config().zebra_mode() {
-                                None => println!("Zebra mode disabled"),
-                                Some(n) => {
-                                    let color_desc = match n {
-                                        2 => "blue and cyan",
-                                        3 => "red, white, and blue",
-                                        4 => "red, white, blue, and green",
-                                        _ => unreachable!(),
-                                    };
-                                    println!(
-                                        "Zebra mode enabled with {} colors: {}",
-                                        n, color_desc
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        eprintln!("Zebra mode supports 2-4 colors only");
-                        eprintln!("Use .zebra 0 to disable");
-                    }
-                    Err(_) => {
-                        eprintln!("Invalid number. Usage: .zebra <2-4>");
-                        eprintln!("  .zebra 2  - blue and cyan");
-                        eprintln!("  .zebra 3  - red, white, and blue");
-                        eprintln!("  .zebra 4  - red, white, blue, and green");
-                        eprintln!("  .zebra 0  - disable zebra mode");
-                    }
-                }
-            } else {
-                // Show current zebra mode
-                if repl_state.config().show_meta_output() {
-                    match repl_state.config().zebra_mode() {
-                        None => println!("Zebra mode is disabled"),
-                        Some(n) => {
-                            let color_desc = match n {
-                                2 => "blue and cyan",
-                                3 => "red, white, and blue",
-                                4 => "red, white, blue, and green",
-                                _ => "unknown",
-                            };
-                            println!("Zebra mode is enabled with {} colors: {}", n, color_desc);
-                        }
-                    }
-                }
-            }
-            Ok(CommandResult::Continue)
-        }
+        ".query" | ".dql" => input_mode_command(cmd, parts, InputMode::Query, repl_state),
+        ".ddl" => input_mode_command(cmd, parts, InputMode::Definitions, repl_state),
+        ".sql" => input_mode_command(cmd, parts, InputMode::Sql, repl_state),
 
         ".to" => {
+            use clap::ValueEnum;
+            // `--to`'s vocabulary: one spelling per stage, `results` the
+            // default that names no stage.
+            let stages = Stage::value_variants()
+                .iter()
+                .filter_map(|stage| stage.to_possible_value())
+                .map(|value| value.get_name().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             if parts.len() > 1 {
-                // Parse the stage
-                let stage_str = parts[1];
-                match stage_str {
-                    "cst" => {
-                        repl_state.set_target_stage(Some(Stage::Cst), ".to");
+                match Stage::from_str(parts[1], false) {
+                    Ok(stage) => {
+                        let stage = (stage != Stage::Results).then_some(stage);
+                        repl_state.set_target_stage(stage, ".to");
                         if repl_state.config().show_meta_output() {
-                            println!("Output stage set to: CST");
+                            let stage = repl_state.config().target_stage_rendered();
+                            println!(
+                                "{}",
+                                repl_state.say(Message::OutputStage, &[("stage", stage)])
+                            );
                         }
                     }
-                    "ast-unresolved" => {
-                        repl_state.set_target_stage(Some(Stage::AstUnresolved), ".to");
-                        if repl_state.config().show_meta_output() {
-                            println!("Output stage set to: Unresolved AST");
-                        }
-                    }
-                    "ast-resolved" => {
-                        repl_state.set_target_stage(Some(Stage::AstResolved), ".to");
-                        if repl_state.config().show_meta_output() {
-                            println!("Output stage set to: Resolved AST");
-                        }
-                    }
-                    "ast-refined" => {
-                        repl_state.set_target_stage(Some(Stage::AstRefined), ".to");
-                        if repl_state.config().show_meta_output() {
-                            println!("Output stage set to: Refined AST");
-                        }
-                    }
-                    "ast-sql" | "sql-ast" => {
-                        repl_state.set_target_stage(Some(Stage::AstSql), ".to");
-                        if repl_state.config().show_meta_output() {
-                            println!("Output stage set to: SQL AST");
-                        }
-                    }
-                    "sql" => {
-                        repl_state.set_target_stage(Some(Stage::Sql), ".to");
-                        if repl_state.config().show_meta_output() {
-                            println!("Output stage set to: SQL");
-                        }
-                    }
-                    "results" => {
-                        repl_state.set_target_stage(None, ".to");
-                        if repl_state.config().show_meta_output() {
-                            println!("Output stage set to: Results (default)");
-                        }
-                    }
-                    "hash" => {
-                        repl_state.set_target_stage(Some(Stage::Hash), ".to");
-                        if repl_state.config().show_meta_output() {
-                            println!("Output stage set to: Hash");
-                        }
-                    }
-                    "fingerprint" => {
-                        repl_state.set_target_stage(Some(Stage::Fingerprint), ".to");
-                        if repl_state.config().show_meta_output() {
-                            println!("Output stage set to: Fingerprint");
-                        }
-                    }
-                    _ => {
-                        eprintln!("Invalid stage '{}'. Available stages:", stage_str);
-                        eprintln!("  cst, ast-unresolved, ast-resolved, ast-refined, sql-ast, sql, results, hash, fingerprint");
-                    }
+                    Err(_) => eprintln!(
+                        "{}",
+                        repl_state.say(
+                            Message::UnknownStage,
+                            &[("stage", parts[1]), ("stages", &stages)]
+                        )
+                    ),
                 }
-            } else {
-                // Show current stage
-                if repl_state.config().show_meta_output() {
-                    match repl_state.config().target_stage() {
-                        None => println!("Current output stage: Results (default)"),
-                        Some(Stage::Cst) => println!("Current output stage: CST"),
-                        Some(Stage::AstUnresolved) => {
-                            println!("Current output stage: Unresolved AST")
-                        }
-                        Some(Stage::AstResolved) => println!("Current output stage: Resolved AST"),
-                        Some(Stage::AstRefined) => println!("Current output stage: Refined AST"),
-                        Some(Stage::AstSql) => println!("Current output stage: SQL AST"),
-                        Some(Stage::Sql) => println!("Current output stage: SQL"),
-                        Some(Stage::Results) => println!("Current output stage: Results"),
-                        Some(Stage::Fingerprint) => println!("Current output stage: Fingerprint"),
-                        Some(Stage::Hash) => println!("Current output stage: Hash"),
-                        Some(Stage::ByteHash) => println!("Current output stage: ByteHash"),
-                        Some(Stage::TotalHash) => println!("Current output stage: TotalHash"),
-                    }
-                    println!("Available stages: cst, ast-unresolved, ast-resolved, ast-refined, sql-ast, sql, results, hash, bhash, totalhash, fingerprint");
-                }
+            } else if repl_state.config().show_meta_output() {
+                let stage = repl_state.config().target_stage_rendered();
+                println!(
+                    "{}",
+                    repl_state.say(Message::OutputStage, &[("stage", stage)])
+                );
+                println!(
+                    "{}",
+                    repl_state.say(Message::StageChoices, &[("stages", &stages)])
+                );
             }
             Ok(CommandResult::Continue)
         }
@@ -904,20 +678,24 @@ fn dispatch_dot_command(
                 match parts[1] {
                     "on" => repl_state.set_multiline(true, ".multiline"),
                     "off" => repl_state.set_multiline(false, ".multiline"),
-                    _ => eprintln!("Usage: .multiline [on|off]"),
+                    _ => eprintln!(
+                        "{}",
+                        super::surface::usage(repl_state.repl_db.as_deref(), ".multiline")
+                    ),
                 }
             } else {
                 let toggled = !repl_state.config().multiline();
                 repl_state.set_multiline(toggled, ".multiline");
             }
             if repl_state.config().show_meta_output() {
+                let state = if repl_state.config().multiline() {
+                    "on"
+                } else {
+                    "off"
+                };
                 println!(
-                    "Multiline mode: {}",
-                    if repl_state.config().multiline() {
-                        "on"
-                    } else {
-                        "off"
-                    }
+                    "{}",
+                    repl_state.say(Message::Multiline, &[("state", state)])
                 );
             }
             Ok(CommandResult::Continue)
@@ -929,19 +707,53 @@ fn dispatch_dot_command(
         }
 
         _ => {
-            eprintln!("Unknown command: {}", parts[0]);
-            eprintln!("Type '.help' for available commands");
+            eprintln!(
+                "{}",
+                repl_state.say(Message::UnknownCommand, &[("command", parts[0])])
+            );
             Ok(CommandResult::Continue)
         }
     }
 }
 
-/// `.repl dump <path>` — the one road by which the live client database
-/// reaches disk outside a bug report. The dump is a snapshot: it can contain
-/// sensitive literals and paths (authored inputs, exact timed-out text —
-/// deliberately unredacted, because a transformed input is not a faithful
-/// reproducer), and the live database continues collecting afterwards. A
-/// failed dump leaves the live database untouched.
+/// `.query`, `.ddl`, `.sql`: alone, switch what the prompt reads; with text
+/// after the command, run just that text in the mode the command names —
+/// through the ledger-owning road, the configured mode unchanged.
+fn input_mode_command(
+    cmd: &str,
+    parts: &[&str],
+    mode: InputMode,
+    repl_state: &mut ReplState,
+) -> Result<CommandResult> {
+    let show = repl_state.config().show_meta_output();
+    if parts.len() > 1 {
+        let text = cmd[parts[0].len()..].trim();
+        let said = match mode {
+            InputMode::Query => Some(Message::QueryOneOff),
+            InputMode::Sql => Some(Message::SqlOneOff),
+            InputMode::Definitions => None,
+        };
+        if let (true, Some(said)) = (show, said) {
+            println!("{}", repl_state.say(said, &[("query", text)]));
+        }
+        let dummy_flag = std::sync::atomic::AtomicBool::new(false);
+        process_query_in_mode(text, repl_state, &dummy_flag, mode)?;
+    } else {
+        repl_state.set_input_mode(mode, parts[0]);
+        if show {
+            let said = match mode {
+                InputMode::Query => Message::QueryMode,
+                InputMode::Definitions => Message::DdlMode,
+                InputMode::Sql => Message::SqlMode,
+            };
+            println!("{}", repl_state.say(said, &[]));
+        }
+    }
+    Ok(CommandResult::Continue)
+}
+
+/// `.repl helpers [status|on|off]`: the optional parser assistance.
+/// Submission safety preflight is not configurable.
 fn handle_repl_command(parts: &[&str], repl_state: &mut ReplState) {
     match parts {
         // The omitted action reads as `status`.
@@ -951,36 +763,25 @@ fn handle_repl_command(parts: &[&str], repl_state: &mut ReplState) {
             } else {
                 "off"
             };
-            println!(
-                "Optional parser helpers (prompt well-formedness, syntax coloring, \
-                 continuation navigation): {state}"
-            );
-            println!("Submission safety preflight: always on");
+            println!("{}", repl_state.say(Message::Helpers, &[("state", state)]));
+            println!("{}", repl_state.say(Message::Preflight, &[]));
         }
         [_, "helpers", "on"] => {
             repl_state.set_editor_parser_helpers(true, ".repl helpers");
             if repl_state.config().show_meta_output() {
-                println!("Optional parser helpers re-enabled; the breaker is armed again.");
+                println!("{}", repl_state.say(Message::HelpersOn, &[]));
             }
         }
         [_, "helpers", "off"] => {
             repl_state.set_editor_parser_helpers(false, ".repl helpers");
             if repl_state.config().show_meta_output() {
-                println!(
-                    "Optional parser helpers disabled. Submission safety preflight \
-                     remains enabled."
-                );
+                println!("{}", repl_state.say(Message::HelpersOff, &[]));
             }
         }
-        _ => {
-            eprintln!("Usage: .repl helpers [status|on|off]");
-            eprintln!(
-                "dump writes a snapshot of the live REPL database (inputs, configuration,                  timeout evidence). The snapshot can contain sensitive literals and                  paths from this session."
-            );
-            eprintln!(
-                "helpers inspects or sets the optional parser assistance (prompt                  well-formedness, syntax coloring, continuation navigation).                  Submission safety preflight is not configurable."
-            );
-        }
+        _ => eprintln!(
+            "{}",
+            super::surface::usage(repl_state.repl_db.as_deref(), ".repl")
+        ),
     }
 }
 
@@ -1014,15 +815,23 @@ fn handle_bug_command(repl_state: &mut ReplState, description: &str) -> Result<(
     };
     match report {
         Ok(report) => {
-            println!("bug report: {}", report.archive.display());
+            let archive = report.archive.display().to_string();
+            let databases = report.databases.len().to_string();
+            let ddl_files = report.ddl_files.len().to_string();
             println!(
-                "  {} database file(s), {} DDL file(s), repl.sqlite, and the session files",
-                report.databases.len(),
-                report.ddl_files.len()
+                "{}",
+                repl_state.say(Message::BugWritten, &[("archive", &archive)])
             );
             println!(
-                "  replay with: dql query --replay-repl {}",
-                report.archive.display()
+                "{}",
+                repl_state.say(
+                    Message::BugContents,
+                    &[("databases", &databases), ("ddl_files", &ddl_files)]
+                )
+            );
+            println!(
+                "{}",
+                repl_state.say(Message::BugReplay, &[("archive", &archive)])
             );
         }
         Err(e) => crate::client::incident::error(
@@ -1035,75 +844,23 @@ fn handle_bug_command(repl_state: &mut ReplState, description: &str) -> Result<(
     Ok(())
 }
 
-/// Print help message
-fn print_help() {
-    println!("DelightQL REPL Commands:");
-    // Dot commands render FROM the registry — this screen cannot know a
-    // command the dispatcher doesn't, or miss one it does.
-    let mut current_section = "";
-    for cmd in DOT_COMMANDS {
-        if cmd.section != current_section {
-            println!();
-            println!("{}:", cmd.section);
-            current_section = cmd.section;
-        }
-        let mut invocation = cmd.name.to_string();
-        for alias in cmd.aliases {
-            invocation.push_str(", ");
-            invocation.push_str(alias);
-        }
-        if !cmd.args.is_empty() {
-            invocation.push(' ');
-            invocation.push_str(cmd.args);
-        }
-        if invocation.len() <= 18 {
-            println!("  {:<18} {}", invocation, cmd.summary);
-        } else {
-            println!("  {}", invocation);
-            println!("  {:<18} {}", "", cmd.summary);
-        }
-        if !cmd.example.is_empty() {
-            println!("  {:<18} Example: {}", "", cmd.example);
-        }
-    }
-    println!();
-    println!("Keyboard Shortcuts:");
-    println!("  Enter              Continue query (multiline on) or execute (multiline off)");
-    println!("  Enter (empty line) Submit accumulated query (multiline on)");
-    println!("  Alt+Enter          Insert newline within current line");
-    println!("  Ctrl+C             Cancel partial input (multiline on)");
-    println!("  Ctrl-X, t          Toggle multi-pane TUI (H/J/K/L to navigate)");
-    println!("  Ctrl-B / Ctrl-F    Jump to the previous / next continuation");
-    println!("  Ctrl-X, d / D      Delete to the next / previous continuation");
-    println!();
-    println!("Query Examples:");
-    println!("  users(*) |> (name, email)");
-    println!("  products(*), price > 10 ~> avg:(price)");
-    println!();
-    println!("Introspection (Meta-Circular System):");
-    println!("  sys::cartridges.cartridge(*)       List all installed cartridges");
-    println!("  sys::entities.entity(*)            List all discovered entities");
-    println!("  sys::ns.namespace(*)               List all namespaces");
-    println!("  sys::ns.activated_entity(*)        List entity activations");
-}
-
 /// Process a query using the new pipeline, in the configured input mode.
 pub fn process_query(
     query: &str,
     repl_state: &mut ReplState,
     interrupted_flag: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
-    let sql_mode = repl_state.config().sql_mode();
-    process_query_in_mode(query, repl_state, interrupted_flag, sql_mode)
+    let mode = repl_state.config().input_mode();
+    process_query_in_mode(query, repl_state, interrupted_flag, mode)
 }
 
-/// The same, in a NAMED mode — the `.dql`/`.sql` one-offs execute in their
-/// own mode without flipping the configuration.
+/// The same, in a NAMED mode — the `.query`/`.ddl`/`.sql` one-offs execute
+/// in their own mode without flipping the configuration.
 pub fn process_query_in_mode(
     query: &str,
     repl_state: &mut ReplState,
     interrupted_flag: &std::sync::atomic::AtomicBool,
-    sql_mode: bool,
+    mode: InputMode,
 ) -> Result<()> {
     use std::sync::{atomic::Ordering, mpsc};
     use std::thread;
@@ -1115,10 +872,10 @@ pub fn process_query_in_mode(
 
     // The one ordered ledger: the submission opens as `started` and closes
     // with its dispatched outcome below.
-    let ledger_kind = if sql_mode {
-        crate::client::database::InputKind::Sql
-    } else {
-        crate::client::database::InputKind::Dql
+    let ledger_kind = match mode {
+        InputMode::Query => crate::client::database::InputKind::Dql,
+        InputMode::Definitions => crate::client::database::InputKind::Ddl,
+        InputMode::Sql => crate::client::database::InputKind::Sql,
     };
     let ledger_id = repl_state.repl_db.as_ref().map(|db| {
         let (id, outcome) = db.record_input(ledger_kind, query);
@@ -1128,15 +885,11 @@ pub fn process_query_in_mode(
     let close_ledger = |repl_state: &ReplState,
                         outcome: crate::client::database::InputOutcome,
                         error: Option<String>,
-                        sql: Option<String>,
                         elapsed_ms: Option<f64>| {
         if let (Some(id), Some(db)) = (ledger_id, repl_state.repl_db.as_ref()) {
-            note_lost_ledger_write(&db.close_input(id, outcome, error, sql, elapsed_ms));
+            note_lost_ledger_write(&db.close_input(id, outcome, error, elapsed_ms));
         }
     };
-
-    // Update shared info for multi-pane TUI
-    repl_state.shared_info.update(query, None);
 
     // Submission preflight: the EXACT submitted bytes, at the exact entrance
     // the compiler will take, parsed inside the containment worker BEFORE
@@ -1148,14 +901,21 @@ pub fn process_query_in_mode(
     // replacement) refuses DISTINCTLY, because the in-process parser is
     // unkillable and crossing it without a containment verdict is exactly
     // the freeze this boundary exists to prevent.
-    if !sql_mode {
+    if mode != InputMode::Sql {
         use super::parser_worker::ProbeOutcome;
         use super::worker::WorkerResult;
+        // The bytes the compiler will take are preflighted: a query behind
+        // the host's wrap (`exec_ng::query`), definitions as written
+        // (`exec_ng::define`).
+        let submitted = match mode {
+            InputMode::Definitions => std::borrow::Cow::Borrowed(query),
+            InputMode::Query | InputMode::Sql => delightql_cst::prompt_wrap(query),
+        };
         let mut refusal: Option<String> = None;
         for attempt in 0..2 {
             match repl_state.parser_worker.probe(
                 super::config::ReplParserOperation::SubmissionPreflight,
-                query,
+                &submitted,
                 None,
             ) {
                 ProbeOutcome::Answer(WorkerResult::Preflight { .. }) => {
@@ -1231,14 +991,13 @@ pub fn process_query_in_mode(
                     "preflight",
                     &delightql_types::diagnostic::Client::PreflightRefused { message: said }.into(),
                 );
-                incident.input = Some(query.to_string());
+                incident.input = Some(submitted.to_string());
                 db.record_incident(incident);
             }
             close_ledger(
                 repl_state,
                 crate::client::database::InputOutcome::Refused,
                 Some(reason),
-                None,
                 Some(start_time.elapsed().as_secs_f64() * 1000.0),
             );
             return Ok(());
@@ -1253,9 +1012,10 @@ pub fn process_query_in_mode(
     let target_stage = repl_state.config().target_stage();
     let output_format = repl_state.config().output_format();
     let db_connection = repl_state.db_connection.clone(); // Clone the connection
-    let zebra_mode = repl_state.config().zebra_mode();
     let no_headers = repl_state.config().no_headers();
     let dql_handle = Arc::clone(&repl_state.dql_handle); // Clone Arc reference for thread
+                                                         // Filled on the query thread, where the client database is out of reach.
+    let defined_wording = super::surface::wording(repl_state.repl_db.as_deref(), Message::Defined);
 
     // Get interrupt handle BEFORE spawning thread (SQLite only)
     // This ensures we can interrupt the actual connection being used
@@ -1286,30 +1046,44 @@ pub fn process_query_in_mode(
         .spawn(move || {
             let run_all = || -> Result<Option<crate::exec_ng::ResultMetadata>> {
                 // Now we can use the cloned connection in the thread
-                let result = if sql_mode {
+                let result = if mode == InputMode::Sql {
                     // For SQL mode, we'll execute directly without thread interruption for now
                     // This means Ctrl-C won't work for SQL queries yet
                     execute_sql_directly(
                         &query_str,
                         &db_connection,
-                        zebra_mode,
                         target_stage.as_ref().or(Some(&Stage::Sql)),
                     )
                     .map(|_| None)
                 // SQL doesn't return metadata
+                } else if mode == InputMode::Definitions {
+                    // Definitions execute whatever the output stage: there is
+                    // no compilation of them to inspect.
+                    let mut handle = dql_handle.lock().unwrap_or_else(|e| e.into_inner());
+                    let defined = crate::exec_ng::define(&mut **handle, &query_str)?;
+                    let entities = defined
+                        .iter()
+                        .map(|(namespace, entity)| format!("{namespace}.{entity}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!(
+                        "{}",
+                        super::surface::fill(&defined_wording, &[("entities", &entities)])
+                    );
+                    Ok(None)
                 } else {
-                    crate::exec_ng::ZEBRA_MODE.with(|z| *z.borrow_mut() = zebra_mode);
-
                     let run = || -> Result<Option<crate::exec_ng::ResultMetadata>> {
                         let mut handle = dql_handle.lock().unwrap_or_else(|e| e.into_inner());
-                        let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
                         crate::exec_ng::execute_query(
                             &query_str,
-                            &mut *session,
+                            &mut **handle,
                             target_stage,
-                            output_format,
-                            no_headers,
-                            false,
+                            crate::exec_ng::Rendering {
+                                format: output_format,
+                                no_headers,
+                                no_sanitize: false,
+                            },
+                            crate::exec_ng::ShippedSets::Discarded,
                             false,
                         )
                     };
@@ -1345,11 +1119,10 @@ pub fn process_query_in_mode(
     loop {
         // Check if interrupted
         if interrupted_flag.load(Ordering::Relaxed) {
-            println!("Query execution interrupted");
+            println!("{}", repl_state.say(Message::QueryInterrupted, &[]));
             close_ledger(
                 repl_state,
                 crate::client::database::InputOutcome::Interrupted,
-                None,
                 None,
                 Some(start_time.elapsed().as_secs_f64() * 1000.0),
             );
@@ -1392,7 +1165,6 @@ pub fn process_query_in_mode(
                 repl_state.last_execution_time = Some(execution_time);
 
                 let execution_ms = execution_time.as_secs_f64() * 1000.0;
-                let last_sql = repl_state.shared_info.last_sql.clone();
 
                 match result {
                     Ok(_metadata) => {
@@ -1400,7 +1172,6 @@ pub fn process_query_in_mode(
                             repl_state,
                             crate::client::database::InputOutcome::Succeeded,
                             None,
-                            last_sql,
                             Some(execution_ms),
                         );
 
@@ -1419,7 +1190,6 @@ pub fn process_query_in_mode(
                             repl_state,
                             crate::client::database::InputOutcome::Failed,
                             Some(e.to_string()),
-                            last_sql,
                             Some(execution_ms),
                         );
                         return Err(e);
@@ -1437,7 +1207,6 @@ pub fn process_query_in_mode(
                     repl_state,
                     crate::client::database::InputOutcome::Failed,
                     Some("query execution thread disconnected".to_string()),
-                    None,
                     Some(start_time.elapsed().as_secs_f64() * 1000.0),
                 );
                 return Err(anyhow::anyhow!(
@@ -1450,48 +1219,22 @@ pub fn process_query_in_mode(
 
 // Helper function to execute query and return metadata
 
-/// Get ANSI color code based on zebra mode and column index
-fn get_zebra_color(zebra_mode: Option<usize>, col_index: usize) -> &'static str {
-    match zebra_mode {
-        None => "", // No coloring
-        Some(2) => {
-            // Blue and cyan (more visible than white)
-            match col_index % 2 {
-                0 => "\x1b[34m", // Blue
-                _ => "\x1b[36m", // Cyan
-            }
-        }
-        Some(3) => {
-            // Red, white, and blue
-            match col_index % 3 {
-                0 => "\x1b[31m", // Red
-                1 => "\x1b[37m", // White
-                _ => "\x1b[34m", // Blue
-            }
-        }
-        Some(4) => {
-            // Red, white, blue, and green
-            match col_index % 4 {
-                0 => "\x1b[31m", // Red
-                1 => "\x1b[37m", // White
-                2 => "\x1b[34m", // Blue
-                _ => "\x1b[32m", // Green
-            }
-        }
-        _ => "", // Invalid mode
-    }
-}
-
-/// Reset ANSI color
-const RESET_COLOR: &str = "\x1b[0m";
-
 /// Execute SQL directly without DelightQL parsing using the persistent connection
 fn execute_sql_directly(
     sql: &str,
     db_connection: &ConnectionManager,
-    zebra_mode: Option<usize>,
     target_stage: Option<&crate::args::Stage>,
 ) -> Result<()> {
+    // A digest's evidence is the protocol cell. SQL mode prints the
+    // executor's display text, where an absent cell is already the text NULL,
+    // so it has no cells to digest — and refuses before running anything.
+    if target_stage.is_some_and(|stage| stage.digest().is_some()) {
+        return Err(anyhow::anyhow!(
+            "a digest reads the protocol cells of a DQL result; SQL mode prints \
+             display text and has none to digest"
+        ));
+    }
+
     // Execute the SQL based on connection type
     // Convert to common QueryResult type (SQLite's version)
     let results = match db_connection {
@@ -1514,120 +1257,20 @@ fn execute_sql_directly(
         }
     };
 
-    // Handle different output stages
-    match target_stage {
-        Some(crate::args::Stage::Hash) => {
-            // Generate hash from results
-            use crate::util::fingerprint::ResultFingerprint;
-            use delightql_backends::QueryResults;
-            use std::path::Path;
-
-            // Convert QueryResult to QueryResults
-            let query_results = QueryResults {
-                columns: results.columns.clone(),
-                rows: results.rows.clone(),
-                row_count: results.rows.len(),
-            };
-
-            // Get the database path for fingerprinting
-            let db_info = db_connection
-                .connection_info()
-                .map_err(|e| anyhow::anyhow!("Failed to get connection info: {}", e))?;
-            let db_path_ref = db_info.path.as_deref();
-            let fingerprint =
-                ResultFingerprint::from_results(&query_results, db_path_ref.map(Path::new))
-                    .map_err(|e| anyhow::anyhow!("Failed to generate fingerprint: {}", e))?;
-
-            // Output just the data hash
-            println!("{}", fingerprint.data_hash);
-            return Ok(());
-        }
-        Some(crate::args::Stage::Fingerprint) => {
-            // Generate full fingerprint JSON
-            use crate::util::fingerprint::ResultFingerprint;
-            use delightql_backends::QueryResults;
-            use std::path::Path;
-
-            // Convert QueryResult to QueryResults
-            let query_results = QueryResults {
-                columns: results.columns.clone(),
-                rows: results.rows.clone(),
-                row_count: results.rows.len(),
-            };
-
-            let db_info = db_connection
-                .connection_info()
-                .map_err(|e| anyhow::anyhow!("Failed to get connection info: {}", e))?;
-            let db_path_ref = db_info.path.as_deref();
-            let fingerprint =
-                ResultFingerprint::from_results(&query_results, db_path_ref.map(Path::new))
-                    .map_err(|e| anyhow::anyhow!("Failed to generate fingerprint: {}", e))?;
-
-            let json_output = serde_json::to_string_pretty(&fingerprint)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize fingerprint: {}", e))?;
-            println!("{}", json_output);
-            return Ok(());
-        }
-        _ => {
-            // Default: print results as table
-        }
-    }
-
     // Get row count before consuming the results
     let row_count = results.row_count();
 
     // Print results in table format
     if !results.columns.is_empty() {
-        // Print header with zebra coloring
-        let header: Vec<String> = results
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                if zebra_mode.is_some() {
-                    format!("{}{}{}", get_zebra_color(zebra_mode, i), col, RESET_COLOR)
-                } else {
-                    col.clone()
-                }
-            })
-            .collect();
-        println!("{}", header.join("\t"));
-
-        // Print separator with zebra coloring
+        println!("{}", results.columns.join("\t"));
         let sep: Vec<String> = results
             .columns
             .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let dashes = "-".repeat(c.len());
-                if zebra_mode.is_some() {
-                    format!(
-                        "{}{}{}",
-                        get_zebra_color(zebra_mode, i),
-                        dashes,
-                        RESET_COLOR
-                    )
-                } else {
-                    dashes
-                }
-            })
+            .map(|c| "-".repeat(c.len()))
             .collect();
         println!("{}", sep.join("\t"));
-
-        // Print rows with zebra coloring
         for row in results.rows {
-            let colored_row: Vec<String> = row
-                .iter()
-                .enumerate()
-                .map(|(i, val)| {
-                    if zebra_mode.is_some() {
-                        format!("{}{}{}", get_zebra_color(zebra_mode, i), val, RESET_COLOR)
-                    } else {
-                        val.clone()
-                    }
-                })
-                .collect();
-            println!("{}", colored_row.join("\t"));
+            println!("{}", row.join("\t"));
         }
     }
 
@@ -1840,7 +1483,7 @@ mod recovery_boundary_tests {
         }
         assert_eq!(
             queries.lock().unwrap().as_slice(),
-            ["mount!(\"db.sqlite\", \"main\")(*)"],
+            ["?- mount!(\"db.sqlite\", \"main\")(*)"],
             "the re-mount is the same mount the REPL opened with"
         );
     }

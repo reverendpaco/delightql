@@ -1,7 +1,7 @@
 # ETL and scripting {.dqlh}
 
 Scripting is the act of utilizing effect rules --
-builtin or authored -- to affect some change to a system.
+built-in or authored -- to affect some change to a system.
 
 Delightql provides the following semantic guarantees that
 makes scripting principled:
@@ -9,27 +9,36 @@ makes scripting principled:
  - all directive invocations return a receipt -- zero or one rules
  - all authored effect rules must end in another directive
  - the COMMA `,` short-circuits effects after any other effect that returns a zero row receipt
- - certain builtin directives -- run! chief among them -- have a well-known protocol
+ - certain built-in directives -- run! chief among them -- have a well-known protocol
 
 
-```delightql
+```{.delightql .am}
 
-recent_orders(*) :- source.orders(*), order_date >= "2026-07-01"
+?- mount!("etl.sqlite", "etl")(*)
+?- enlist!("main")(*)    // track, customer, and staged are read bare
+
+landed(*) :-
+    etl.partner_sale_2025_06_30(*)
+      |;| etl.partner_sale_2025_07_31(*)
+      |> %(*)
 
 quarantine!(Bad(*))(*) :-
-    Bad(*) |> insert!(warehouse.orders_quarantine(*))(*)
+    Bad(*) |> insert!(etl.partner_sale_quarantine(*))(*)
 
 stage!(*) :-
-    recent_orders(*) |> temp_table!(staged(*))(*)
+    landed(*)
+      |> $$(lower:(trim:(buyer_email)) as buyer_email)
+      |> temp_table!(staged(*))(*)
 
-load!(*) :-
-    staged(*), +customers(customer_id), amount > 0
-      |> insert!(warehouse.orders(*))(*)
+load!(Good(*))(*) :-
+    Good(*), +track(*.(track_id)), +customer(, email = buyer_email), quantity > 0
+      |> insert!(etl.partner_sale_line(*))(*)
 
 main!(*) :-
     stage!(*) : s!
-    staged(*), \+customers(customer_id) |> quarantine!(*) : q!
-    load!(*) : l!
+    staged(*), (\+track(*.(track_id)) or \+customer(, email = buyer_email))
+      |> quarantine!(*) : q!
+    staged(*) |> load!(*) : l!
 
     s!(*) ; q!(*) ; l!(*)
 ```

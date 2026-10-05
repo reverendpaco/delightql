@@ -32,23 +32,17 @@
 
 use crate::diagnostic::{ErrorSelector, Internal, Parse};
 use crate::error::{DelightQLError, Result};
-use crate::pipeline::asts::core::{DangerSpec, InlineDdlSpec, OptionSpec, Query, Unresolved};
+use crate::pipeline::asts::core::{DangerSpec, OptionSpec, Query, StatementBlocks, Unresolved};
 use crate::pipeline::asts::ddl::ClauseDecl;
 use crate::pipeline::query_features::{FeatureCollector, HoParamBindings};
 use crate::pipeline::syntax::{cst, SyntaxTree, TypedNode};
 use std::rc::Rc;
 
 mod definitions;
-pub(crate) use definitions::awaits_substitution;
 mod effects;
 mod ground;
 mod landing;
-/// THE SUBSTITUTION LAW's one exported judgment: the cover applies a
-/// callable to a cell the way a pipe applies one to a flowing value, so it
-/// spends this rather than choosing a position of its own. The refusals stay
-/// inside — the landing is spent here and nowhere later, so no other
-/// position has one to refuse.
-pub(crate) use landing::land_final;
+pub(crate) use landing::land;
 pub(crate) mod names;
 mod relex;
 mod spec;
@@ -85,7 +79,6 @@ impl CrossingPermit {
 pub struct Sidecars {
     pub dangers: Vec<DangerSpec>,
     pub options: Vec<OptionSpec>,
-    pub ddl_blocks: Vec<InlineDdlSpec>,
     /// The error this form declares it expects. One per form: two would be
     /// two claims about one outcome.
     pub expected_error: Option<ErrorSelector>,
@@ -94,10 +87,7 @@ pub struct Sidecars {
 impl Sidecars {
     /// Whether the form declared anything at all.
     pub fn is_empty(&self) -> bool {
-        self.dangers.is_empty()
-            && self.options.is_empty()
-            && self.ddl_blocks.is_empty()
-            && self.expected_error.is_none()
+        self.dangers.is_empty() && self.options.is_empty() && self.expected_error.is_none()
     }
 }
 
@@ -120,8 +110,14 @@ pub enum GoalCategory {
 /// One goal, what it declared, and what it is.
 #[derive(Debug)]
 pub struct Goal {
-    pub query: Query<Unresolved>,
+    /// Private: the ordering a goal's body ends in is consumed only when the
+    /// goal runs as a statement, so every road out says which one it is.
+    query: Query<Unresolved>,
     pub declared: Sidecars,
+    /// The inline blocks this goal carries, by where they stand in it. A
+    /// block is not a declaration about the goal: it is a step of the
+    /// program, admitted before or after the goal runs.
+    pub blocks: StatementBlocks,
     pub category: GoalCategory,
     /// The goal body AS AUTHORED, trimmed — the bytes between `?-` and the
     /// end of the form. Provenance: the liminal ledger names a goal by its
@@ -129,11 +125,22 @@ pub struct Goal {
     pub spelling: String,
 }
 
+impl Goal {
+    /// The goal's query, borrowed for inspection.
+    pub fn query(&self) -> &Query<Unresolved> {
+        &self.query
+    }
+
+    /// The goal's query, owned: run as a statement or read as a relation.
+    pub fn into_query(self) -> Query<Unresolved> {
+        self.query
+    }
+}
+
 /// One TOP-LEVEL FORM of a submission.
 ///
 /// A subordinate `(~~ddl ~~)` block is not one: it declares a block the
-/// enclosing consultation processes, and it lands in `declared` with every
-/// other file-level declaration.
+/// enclosing consultation processes, and it lands in [`Normalized::blocks`].
 #[derive(Debug)]
 pub enum TopLevelForm {
     /// One clause of a definition or fact. Grouping clauses by subject and
@@ -158,6 +165,10 @@ pub struct Normalized {
     /// What no GOAL claimed: a definition's own declarations, and anything a
     /// canonical file states outside a goal. A goal's own travel on the goal.
     pub declared: Sidecars,
+    /// The blocks no goal carries — a file's subordinate blocks, and a
+    /// definition's — in authored order, split by where they stand against
+    /// the file's first goal: before it (`leading`) or after (`trailing`).
+    pub blocks: StatementBlocks,
 }
 
 impl Normalized {
@@ -221,17 +232,6 @@ pub fn stored_definition_file(
     normalizer.run(Entrance::DefinitionFile)
 }
 
-/// The stored-source entrance with a call site's bindings in hand.
-pub fn stored_bound_definition_file(
-    tree: &SyntaxTree,
-    registry: Rc<crate::names::Registry>,
-    bindings: HoParamBindings,
-) -> Result<Normalized> {
-    let mut normalizer = Normalizer::bound(tree, registry, bindings);
-    normalizer.stored_source = true;
-    normalizer.run(Entrance::DefinitionFile)
-}
-
 /// The utility entrance: bare queries executed in order.
 pub fn query_sequence(
     tree: &SyntaxTree,
@@ -256,22 +256,35 @@ pub fn submission(tree: &SyntaxTree, registry: Rc<crate::names::Registry>) -> Re
     }
 }
 
-/// One INVOCATION of a parameterized definition: the same source, normalized
-/// again with the call site's bindings in hand.
-///
-/// The bindings are supplied at the entrance rather than applied afterwards
-/// because substitution is a CST-to-AST judgment: a formal in relation
-/// position becomes the supplied relation, a formal in value position becomes
-/// the supplied value, and a formal in a bound becomes the supplied integer.
-/// Walking a built tree to rewrite them would have to re-decide, from the
-/// AST, which positions were formals — the question this boundary already
-/// answered.
-pub fn bound_query_sequence(
+/// ONE PARAMETERIZED BODY, READ AGAIN FROM ITS TEXT, on either neck. The
+/// text is one relational body (`relex`), read under the marked scopes it
+/// was written in, with its own clause's scope opened from `params`. The
+/// text was admitted where it was written, so no authored name is admitted
+/// again, and the body meets the ordering law as a definition body.
+pub fn reread_body(
     tree: &SyntaxTree,
     registry: Rc<crate::names::Registry>,
-    bindings: HoParamBindings,
-) -> Result<Normalized> {
-    Normalizer::bound(tree, registry, bindings).run(Entrance::QuerySequence)
+    enclosing: crate::pipeline::asts::core::definitions::MarkedScopes,
+    params: &[crate::pipeline::asts::core::definitions::HoParam],
+) -> Result<Query<Unresolved>> {
+    let mut reader = Normalizer::new(tree, registry);
+    reader.stored_source = true;
+    reader.marked = enclosing;
+    let body = reader.sole_body()?;
+    let scope = reader.clause_scope(params);
+    let own = scope.id();
+    let mut query = reader.within_scope(scope, |reader| match body {
+        cst::QuerySequenceChild::Relex(relex) => reader.relex_query(relex),
+        // An effect body is read once, where it is written, and every
+        // invocation spends that reading.
+        cst::QuerySequenceChild::Effrelex(_) => Err(Internal::invariant(
+            "normalize::reread_body",
+            "an effect body is never read again",
+        )),
+    })?;
+    query.locals.clause_formals =
+        crate::pipeline::asts::core::definitions::ClauseFormals::Marked(own);
+    Ok(query)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -326,6 +339,10 @@ pub(crate) struct Normalizer<'t> {
     /// query the bindings belong to. They travel here rather than being
     /// rebuilt from the tree by whoever notices them.
     hoisted_ctes: Vec<relex::LetBinding>,
+    /// THE MARKED SCOPES the text now being read stands in, nearest first:
+    /// every relational or effect higher-order clause around it. A `$.x` is
+    /// selected here and nowhere else.
+    marked: crate::pipeline::asts::core::definitions::MarkedScopes,
     out: Normalized,
 }
 
@@ -341,6 +358,7 @@ impl<'t> Normalizer<'t> {
             last_term: None,
             building: None,
             hoisted_ctes: Vec::new(),
+            marked: Default::default(),
             out: Normalized::default(),
         }
     }
@@ -354,6 +372,39 @@ impl<'t> Normalizer<'t> {
         let mut normalizer = Self::new(tree, registry);
         normalizer.features.ho_bindings = Some(bindings);
         normalizer
+    }
+
+    /// READ WITHIN ONE MORE MARKED SCOPE: a relational or effect
+    /// higher-order clause's, for the extent of `read`. The scope stands
+    /// nearest; the scopes around it stay searchable behind it.
+    pub(crate) fn within_scope<R>(
+        &mut self,
+        scope: crate::pipeline::asts::core::definitions::MarkedScope,
+        read: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let around = std::mem::replace(&mut self.marked, Default::default());
+        self.marked = around.within(scope);
+        let out = read(self);
+        self.marked = around;
+        out
+    }
+
+    /// The marked scope a parameterized clause's body is READ AGAIN under:
+    /// its scalar formals. [`reread_body`] is its one caller.
+    fn clause_scope(
+        &self,
+        params: &[crate::pipeline::asts::core::definitions::HoParam],
+    ) -> crate::pipeline::asts::core::definitions::MarkedScope {
+        crate::pipeline::asts::core::definitions::MarkedScope::of_clause(params)
+    }
+
+    /// The marked scope a clause opens where it is WRITTEN, on either neck:
+    /// its scalar formals, with no actuals — a use reads its body again with
+    /// its own.
+    pub(crate) fn declared_scope(
+        params: &[crate::pipeline::asts::core::definitions::HoParam],
+    ) -> crate::pipeline::asts::core::definitions::MarkedScope {
+        crate::pipeline::asts::core::definitions::MarkedScope::of_clause(params)
     }
 
     /// The bindings the call site supplied, if any.
@@ -479,6 +530,9 @@ impl<'t> Normalizer<'t> {
             (Entrance::QuerySequence, cst::SourceFileChild::QuerySequenceRoot(root)) => {
                 self.query_sequence(root)?
             }
+            (Entrance::DefinitionFile, cst::SourceFileChild::QuerySequenceRoot(_)) => {
+                return Err(Parse::FileCategory.into())
+            }
             // The entrance is what the CALLER named; the tree carrying another
             // branch means the selector and the parse disagree, which is a
             // façade defect rather than an authoring mistake.
@@ -499,35 +553,55 @@ impl<'t> Normalizer<'t> {
     /// starts empty for the next one. Draining at the boundary is what keeps
     /// a sidecar from bleeding forward — or backward, since nothing is read
     /// until the form that could own it has closed.
-    fn drain(&mut self) -> Sidecars {
+    fn drain(&mut self) -> (Sidecars, StatementBlocks) {
         let fresh = FeatureCollector::inheriting_ho_bindings(&self.features);
         let mut collector = std::mem::replace(&mut self.features, fresh);
-        Sidecars {
+        let declared = Sidecars {
             dangers: collector.take_dangers(),
             options: collector.take_options(),
-            ddl_blocks: collector.take_ddl_blocks(),
             expected_error: self.pending_error.take(),
-        }
+        };
+        (declared, collector.take_statement_blocks())
     }
 
-    fn push_goal(&mut self, query: Query<Unresolved>, category: GoalCategory, spelling: String) {
-        let declared = self.drain();
+    fn push_goal(
+        &mut self,
+        query: Query<Unresolved>,
+        category: GoalCategory,
+        spelling: String,
+    ) -> Result<()> {
+        let (declared, blocks) = self.drain();
         self.out.forms.push(TopLevelForm::Goal(Goal {
             query,
             declared,
+            blocks,
             category,
             spelling,
         }));
+        Ok(())
     }
 
     /// A definition's declarations are the FILE's: a definition is itself a
     /// file-level form. Draining here is what stops them reaching the next
     /// goal, which did not write them.
     fn absorb_file_level(&mut self) {
-        let declared = self.drain();
+        let (declared, blocks) = self.drain();
         self.out.declared.dangers.extend(declared.dangers);
         self.out.declared.options.extend(declared.options);
-        self.out.declared.ddl_blocks.extend(declared.ddl_blocks);
+        // Not a program step: the form's blocks keep their authored order,
+        // on the side of the first goal they were written on.
+        let after_a_goal = self
+            .out
+            .forms
+            .iter()
+            .any(|form| matches!(form, TopLevelForm::Goal(_)));
+        let side = if after_a_goal {
+            &mut self.out.blocks.trailing
+        } else {
+            &mut self.out.blocks.leading
+        };
+        side.extend(blocks.leading);
+        side.extend(blocks.trailing);
         if let Some(hook) = declared.expected_error {
             self.out.declared.expected_error = Some(hook);
         }
@@ -548,7 +622,7 @@ impl<'t> Normalizer<'t> {
                 }
                 cst::DefinitionFileChild::TopLevelGoal(goal) => {
                     let (query, category, spelling) = self.top_level_goal(goal)?;
-                    self.push_goal(query, category, spelling);
+                    self.push_goal(query, category, spelling)?;
                 }
                 // A subordinate block belongs to the FILE, so it lands where
                 // every other file-level declaration lands. It is not a goal
@@ -563,6 +637,32 @@ impl<'t> Normalizer<'t> {
             }
         }
         Ok(())
+    }
+
+    /// The one body a parameterized body's text holds.
+    fn sole_body(&self) -> Result<cst::QuerySequenceChild<'t>> {
+        let only_body = || {
+            DelightQLError::from(crate::diagnostic::Constraint::General {
+                message: format!(
+                    "a body is one relational expression: '{}'",
+                    crate::pipeline::parse::truncate_for_display(self.tree.source(), 60)
+                ),
+            })
+        };
+        let Some(cst::SourceFileChild::QuerySequenceRoot(root)) = self.tree.root_branch() else {
+            return Err(only_body());
+        };
+        let mut bodies = root
+            .children()
+            .filter_map(|child| match child {
+                cst::QuerySequenceRootChild::QuerySequence(sequence) => Some(sequence),
+                cst::QuerySequenceRootChild::QuerySequenceHeader(_) => None,
+            })
+            .flat_map(|sequence| sequence.children());
+        match (bodies.next(), bodies.next()) {
+            (Some(body), None) => Ok(body),
+            _ => Err(only_body()),
+        }
     }
 
     fn query_sequence(&mut self, root: cst::QuerySequenceRoot<'t>) -> Result<()> {
@@ -595,7 +695,7 @@ impl<'t> Normalizer<'t> {
                     self.text(effrelex).trim().to_string(),
                 ),
             };
-            self.push_goal(query, category, spelling);
+            self.push_goal(query, category, spelling)?;
             self.building = None;
         }
         Ok(())

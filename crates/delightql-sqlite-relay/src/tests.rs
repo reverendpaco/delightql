@@ -75,7 +75,7 @@ fn make_sql_session() -> Session<DirectTransport<SqlParty>> {
     let client = Client::new(transport);
 
     match client
-        .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+        .version(1_000_000, delightql_protocol::PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
         .expect("version handshake failed")
     {
         VersionResult::Accepted(s) => s,
@@ -322,7 +322,7 @@ fn raw_sql_dml_affected_rows() {
     let client = Client::new(transport);
 
     let mut session = match client
-        .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+        .version(1_000_000, delightql_protocol::PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
         .unwrap()
     {
         VersionResult::Accepted(s) => s,
@@ -381,7 +381,7 @@ fn raw_sql_dml_insert_then_select() {
     let client = Client::new(transport);
 
     let mut session = match client
-        .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+        .version(1_000_000, delightql_protocol::PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
         .unwrap()
     {
         VersionResult::Accepted(s) => s,

@@ -7,37 +7,36 @@ applies to. Rows not matching the predicate pass through unchanged.
 
 ```delightql
 employee(*)
-  |> $(upper:())(LastName, FirstName | Department = "Executive")
+  |> $(upper:())(last_name, first_name | title = "IT Staff")
 ```
 
 ```sql
 SELECT
-  EmployeeId,
+  employee_id,
   CASE
-    WHEN Department = 'Executive' THEN upper(
-      LastName
+    WHEN title = 'IT Staff' THEN upper(
+      last_name
     )
-    ELSE LastName
-  END AS LastName,
+    ELSE last_name
+  END AS last_name,
   CASE
-    WHEN Department = 'Executive' THEN upper(
-      FirstName
+    WHEN title = 'IT Staff' THEN upper(
+      first_name
     )
-    ELSE FirstName
-  END AS FirstName,
-  Title,
-  Department,
-  ReportsTo,
-  BirthDate,
-  HireDate,
-  Address,
-  City,
-  State,
-  Country,
-  PostalCode,
-  Phone,
-  Fax,
-  Email
+    ELSE first_name
+  END AS first_name,
+  title,
+  reports_to,
+  birth_date,
+  hire_date,
+  address,
+  city,
+  state,
+  country,
+  postal_code,
+  phone,
+  fax,
+  email
 FROM employee;
 ```
 
@@ -53,39 +52,38 @@ original values.
 
 ```delightql
 employee(*)
-  |> $$("REDACTED" as Phone, "---" as Fax | Department = "Executive")
+  |> $$("REDACTED" as phone, "---" as fax | title = "IT Staff")
 ```
 
 ```sql
 select
-    EmployeeId,
-    LastName,
-    FirstName,
-    Title,
-    Department,
-    ReportsTo,
-    BirthDate,
-    HireDate,
-    Address,
-    City,
-    State,
-    Country,
-    PostalCode,
-    case when Department = 'Executive'
-         then 'REDACTED' else Phone end as Phone,
-    case when Department = 'Executive'
+    employee_id,
+    last_name,
+    first_name,
+    title,
+    reports_to,
+    birth_date,
+    hire_date,
+    address,
+    city,
+    state,
+    country,
+    postal_code,
+    case when title = 'IT Staff'
+         then 'REDACTED' else phone end as phone,
+    case when title = 'IT Staff'
          then '---' else Fax end        as Fax,
-    Email
+    email
 from employee;
 ```
 
 The predicate goes at the end of the item list, after the last `as` target.
 
-**Composability**. If-only composes with function composition and chaining:
+**Composability**. If-only composes with callable nesting and chaining:
 
 ```delightql
-employee(*)
-  |> $(upper:() /-> trim:())(FirstName, LastName | Country = "USA")
+customer(*)
+  |> $(trim:(upper:(@)))(first_name, last_name | country = "USA")
 ```
 
 If-only is syntactic sugar over CASE expressions. The equivalent without
@@ -93,6 +91,6 @@ if-only:
 
 ```delightql
 employee(*)
-  |> $$( _:(Department = "Executive" -> upper:(LastName);  _ -> LastName)  as LastName,
-         _:(Department = "Executive" -> upper:(FirstName); _ -> FirstName) as FirstName)
+  |> $$( _:(title = "IT Staff" -> upper:(last_name);  _ -> last_name)  as last_name,
+         _:(title = "IT Staff" -> upper:(first_name); _ -> first_name) as first_name)
 ```

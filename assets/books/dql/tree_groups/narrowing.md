@@ -7,17 +7,17 @@ relational composition, but it requires projecting out the intermediate
 columns when they are no longer needed:
 
 ```delightql
-j(*), j ~= {.packages} |> -(j)
-  , packages ~= ~> {.version, .name, .description} |> -(packages)
+partner_sale(*), payload ~= {.items} |> -(payload)
+  , items ~= ~> {.track_id, .price, .quantity} |> -(items)
 ```
 
 When the intent is to drill into a column, extract fields, and discard
 everything else, the `.column{...}`{.delightql} operator expresses this more efficiently:
 
 ```delightql
-j(*)
-  |> .j{.packages}
-  |> .packages{.version, .name, .description}
+partner_sale(*)
+  |> .payload{.items}
+  |> .items{.track_id, .price, .quantity}
 ```
 
 Each step replaces the current row with the destructured result.
@@ -31,16 +31,16 @@ Each step replaces the current row with the destructured result.
 | `|> .col(*)`   | No              | Same expansion as drill-down, interior heading only (schema-known) |
 | `.col{...}`    | No              | Navigate into nested JSON; only interior fields matter — and the REQUIRED form for external JSON (static heading witness) |
 
-**Example -- cargo metadata:**
+**Example -- partner sale items:**
 
 ```delightql
-j(*)
-  |> (j:{.packages} as packages)
-  |> .packages{.version, .name, .description}
+partner_sale(*)
+  |> (payload:{.items} as items)
+  |> .items{.track_id, .price, .quantity}
 ```
 
-The path extraction `j:{.packages}`{.delightql} pulls the packages array out of the
-top-level object; then `.packages{...}`{.delightql} iterates and extracts fields.
-The result is a flat table with `version`, `name`, and `description`
+The path extraction `payload:{.items}`{.delightql} pulls the items array out of the
+top-level object; then `.items{...}`{.delightql} iterates and extracts fields.
+The result is a flat table with `track_id`, `price`, and `quantity`
 columns -- no intermediate columns to clean up.
 

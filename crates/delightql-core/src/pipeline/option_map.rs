@@ -9,9 +9,8 @@
 // multiple paths lead to the same result. Annotations and flags carry the
 // bare hierarchy; canonical_config_uri() normalizes.
 
-use std::collections::HashMap;
 
-use super::asts::core::{OptionSpec, OptionState};
+use super::asts::core::OptionState;
 
 /// Known option URIs and their default states.
 const KNOWN_OPTIONS: &[(&str, OptionState)] = &[
@@ -43,32 +42,4 @@ pub fn known_config_hierarchies() -> Vec<&'static str> {
         .iter()
         .map(|(uri, _)| uri.trim_start_matches(CONFIG_URI_SCHEME))
         .collect()
-}
-
-/// A map of option URIs to their current states.
-#[derive(Debug, Clone)]
-pub struct OptionMap {
-    options: HashMap<String, OptionState>,
-}
-
-impl OptionMap {
-    pub fn with_defaults() -> Self {
-        let options = KNOWN_OPTIONS
-            .iter()
-            .map(|(uri, state)| (uri.to_string(), *state))
-            .collect();
-        Self { options }
-    }
-
-    pub fn apply_overrides(&mut self, specs: &[OptionSpec]) {
-        for spec in specs {
-            self.options.insert(spec.uri.clone(), spec.state);
-        }
-    }
-}
-
-impl Default for OptionMap {
-    fn default() -> Self {
-        Self::with_defaults()
-    }
 }

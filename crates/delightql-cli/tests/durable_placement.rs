@@ -55,6 +55,34 @@ fn run_dql(dir: &Path, db: &str, query: &str, sequential: bool) -> (bool, String
     )
 }
 
+/// Run `dql query` with `stdin = query` and no `--db`: `main` is backed by
+/// the session's in-memory primary.
+fn run_dql_without_db(dir: &Path, query: &str) -> (bool, String, String) {
+    let mut child = Command::new(dql_bin())
+        .arg("query")
+        .arg("--to")
+        .arg("results")
+        .arg("--sequential")
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dql");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(query.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait dql");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
 /// A db file with `orders` (3 rows, 2 EU / 1 US).
 fn fixture(dir: &Path) -> std::path::PathBuf {
     let db = dir.join("world.db");
@@ -73,8 +101,9 @@ fn fixture(dir: &Path) -> std::path::PathBuf {
 /// dies "Table not found: archived".
 ///
 /// `table!` is the DURABLE analog of `temp_table!` (materialize-pipe §1):
-/// the CTAS must land in the backend schema of the connection its source
-/// reads from — the mounted `--db` file — and survive the session.
+/// an unqualified target is the session's default write target, `main`, so
+/// the CTAS lands in main's backing — the mounted `--db` file — and survives
+/// the session.
 #[test]
 fn table_bang_persists_to_the_db_file_across_sessions() {
     let dir = tempfile::tempdir().unwrap();
@@ -181,5 +210,166 @@ fn temp_table_over_temp_view_replaces_the_view() {
     assert!(
         stdout.contains("102") && !stdout.contains("101"),
         "sw must be the TABLE's world (US only) after the replace.\nstdout:\n{stdout}"
+    );
+}
+
+/// Without `--db`, `main` is backed by the in-memory primary: a session
+/// object is created in its temp schema and read back through its recorded
+/// placement, never re-derived from a mount `main` does not have (R9).
+#[test]
+fn temp_create_then_read_without_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ok, stdout, stderr) = run_dql_without_db(
+        dir.path(),
+        "_(v @ 7) |> temp_table!(staged(*))(*)\n\nstaged(*)",
+    );
+    assert!(
+        ok,
+        "temp create-then-read must work without --db.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(stdout.trim(), "v\n7", "stdout:\n{stdout}");
+}
+
+/// The same with a durable `table!` first: it creates an ordinary object in
+/// the in-memory primary, and the durable and session objects of one name
+/// stay two identities — the exact durable route reads the durable one even
+/// though the temp schema holds the name (R9, R5).
+#[test]
+fn durable_then_temp_create_then_read_without_db() {
+    let dir = tempfile::tempdir().unwrap();
+    for (read, expected) in [
+        ("d(*) ; staged(*)", "v\n1\n2"),
+        ("main.t(*)", "v\n3"),
+        ("sys::shadow::main.t(*)", "v\n4"),
+        ("t(*)", "v\n4"),
+    ] {
+        let (ok, stdout, stderr) = run_dql_without_db(
+            dir.path(),
+            &format!(
+                "_(v @ 1) |> table!(d(*))(*)\n\n\
+                 _(v @ 2) |> temp_table!(staged(*))(*)\n\n\
+                 _(v @ 3) |> table!(t(*))(*)\n\n\
+                 _(v @ 4) |> temp_table!(t(*))(*)\n\n\
+                 {read}"
+            ),
+        );
+        assert!(
+            ok,
+            "{read}: creation and read must work without --db.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(stdout.trim(), expected, "{read}: stdout:\n{stdout}");
+    }
+}
+
+/// A qualified target places the object in its own namespace's file, even
+/// though that file shares the primary connection with `main`; the `--db`
+/// file never receives it (F26).
+#[test]
+fn qualified_table_bang_lands_in_the_mounted_file_across_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(dir.path());
+    let other = dir.path().join("other.db");
+    rusqlite::Connection::open(&other)
+        .unwrap()
+        .execute_batch("CREATE TABLE anchor (v INTEGER);")
+        .unwrap();
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        db.to_str().unwrap(),
+        "mount!(\"other.db\", \"data::n\")(*)\n\n\
+         orders(*), region = \"EU\" |> table!(data::n.kept(*))(*)",
+        true,
+    );
+    assert!(
+        ok,
+        "a qualified table! should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("data::n.kept"),
+        "the receipt names the selected target.\nstdout:\n{stdout}"
+    );
+    let holds = |path: &Path| -> i64 {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'kept'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(holds(&other), 1, "the mounted file holds the object");
+    assert_eq!(holds(&db), 0, "the --db file does not");
+}
+
+/// Unmounting a session object's durable owner on the primary connection
+/// leaves the connection's temp pool alive: the object stays exactly
+/// readable at its shadow path, and a later owner of the name is refused
+/// with the holder named.
+#[test]
+fn a_session_object_outlives_its_unmounted_owner_on_the_primary() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(dir.path());
+    for (name, rows) in [
+        ("n.db", "seed(v INTEGER); INSERT INTO seed VALUES (7)"),
+        ("k.db", "anchor(v INTEGER)"),
+    ] {
+        rusqlite::Connection::open(dir.path().join(name))
+            .unwrap()
+            .execute_batch(&format!("CREATE TABLE {rows};"))
+            .unwrap();
+    }
+    let prefix = "mount!(\"n.db\", \"data::n\")(*)\n\n\
+                  mount!(\"k.db\", \"data::k\")(*)\n\n\
+                  data::n.seed(*) |> temp_table!(data::n.t(*))(*)\n\n\
+                  unmount!(\"data::n\")(*)\n\n";
+
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        db.to_str().unwrap(),
+        &format!("{prefix}sys::shadow::main.t(*)"),
+        true,
+    );
+    assert!(
+        ok,
+        "the owner unmounts and the object reads.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(stdout.trim(), "v\n7", "stdout:\n{stdout}");
+
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        db.to_str().unwrap(),
+        &format!("{prefix}_(v @ 1) |> temp_table!(data::k.t(*))(*)"),
+        true,
+    );
+    assert!(
+        !ok,
+        "a new owner must not take the name.\nstdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("semantic/effect/ddl/temp_name_held")
+            && stderr.contains("sys::shadow::main.t")
+            && stderr.contains("no longer in the catalog"),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// An immutable embedded image is not data backing a creation may write:
+/// `cli::surface` refuses rather than landing the object in `main` (R8).
+#[test]
+fn cli_surface_is_not_a_creation_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(dir.path());
+    let (ok, stdout, stderr) = run_dql(
+        dir.path(),
+        db.to_str().unwrap(),
+        "_(v @ 1) |> temp_table!(cli::surface.zz(*))(*)",
+        false,
+    );
+    assert!(!ok, "the creation must refuse.\nstdout:\n{stdout}");
+    assert!(
+        stderr.contains("semantic/effect/ddl/target_namespace")
+            && stderr.contains("immutable embedded image"),
+        "stderr:\n{stderr}"
     );
 }

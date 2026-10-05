@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
 use super::{Chain, DomainExpression, Phase, Unresolved};
-use crate::diagnostic::{Choe, Constraint, Ddl, DelightQLError, Internal, Resolution, Semantic};
+use crate::diagnostic::{Constraint, DelightQLError, Internal, Resolution};
 use crate::{lispy::ToLispy, ToLispy};
 use std::fmt;
 
@@ -134,11 +134,35 @@ impl InlineDdlBody {
     }
 }
 
+/// THE BLOCKS ONE STATEMENT CARRIES, by where they stand in it.
+///
+/// A statement is one step of a linear program. A block written in its
+/// preamble LEADS it and is admitted before the statement runs; a block
+/// written after its head began TRAILS it and is admitted after the
+/// statement's effects, so an `enlist!` or `alias!` it follows is in its
+/// lexical world. The grammar attaches a block written between two
+/// statements to the earlier one; that attachment is where the block
+/// stands, not permission to admit it first.
+#[derive(Debug, Clone, Default)]
+pub struct StatementBlocks {
+    /// Written before the statement's body.
+    pub leading: Vec<InlineDdlSpec>,
+    /// Written after the statement's head.
+    pub trailing: Vec<InlineDdlSpec>,
+}
+
+impl StatementBlocks {
+    /// Whether the statement carries any block at all.
+    pub fn is_empty(&self) -> bool {
+        self.leading.is_empty() && self.trailing.is_empty()
+    }
+}
+
 /// THE LEXICAL HORIZON of a query-scoped body: the last authored declaration
 /// position the body may see. The query-local name authority assigns the
 /// positions while it reads the block, so visibility is an ordering fact and
 /// never reconstructed from whichever per-kind collection a consumer has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct LexicalHorizon(usize);
 
 impl LexicalHorizon {
@@ -150,29 +174,10 @@ impl LexicalHorizon {
         LexicalHorizon(usize::MAX)
     }
 
-    pub(crate) fn is_all(self) -> bool {
-        self.0 == usize::MAX
-    }
-
     pub(crate) fn admits(&self, position: usize) -> bool {
         position <= self.0
     }
 
-    pub(crate) fn contains(&self, declaration: LexicalHorizon) -> bool {
-        declaration.0 <= self.0
-    }
-
-    /// This horizon read in a block whose positions all moved later by
-    /// `offset`. A horizon reaching every declaration still reaches every
-    /// declaration; a bounded one keeps exactly the run it bounded, because
-    /// the claims it bounds moved the same distance.
-    pub(crate) fn shifted(self, offset: usize) -> Self {
-        if self.is_all() {
-            self
-        } else {
-            LexicalHorizon(self.0 + offset)
-        }
-    }
 }
 
 impl ToLispy for LexicalHorizon {
@@ -188,6 +193,7 @@ pub(crate) enum QueryLocalKind {
     Relation,
     Value,
     HigherOrder,
+    Sigma,
     EffectRelation,
     EffectHigherOrder,
 }
@@ -198,6 +204,7 @@ impl QueryLocalKind {
             QueryLocalKind::Relation => "common table expression",
             QueryLocalKind::Value => "common function expression",
             QueryLocalKind::HigherOrder => "common higher-order expression",
+            QueryLocalKind::Sigma => "common sigma expression",
             QueryLocalKind::EffectRelation => "effect common table expression",
             QueryLocalKind::EffectHigherOrder => "effect common higher-order expression",
         }
@@ -210,6 +217,7 @@ pub(crate) enum QueryLocalDemand {
     Relation,
     Value,
     HigherOrder,
+    Sigma,
     Effect,
 }
 
@@ -219,6 +227,7 @@ impl QueryLocalDemand {
             QueryLocalDemand::Relation => "relation position",
             QueryLocalDemand::Value => "value-call position",
             QueryLocalDemand::HigherOrder => "parameterized relation position",
+            QueryLocalDemand::Sigma => "sigma position",
             QueryLocalDemand::Effect => "effect position",
         }
     }
@@ -229,6 +238,8 @@ impl QueryLocalDemand {
             (QueryLocalDemand::Relation, QueryLocalKind::Relation)
                 | (QueryLocalDemand::Value, QueryLocalKind::Value)
                 | (QueryLocalDemand::HigherOrder, QueryLocalKind::HigherOrder)
+                | (QueryLocalDemand::Sigma, QueryLocalKind::Relation)
+                | (QueryLocalDemand::Sigma, QueryLocalKind::Sigma)
                 | (QueryLocalDemand::Effect, QueryLocalKind::EffectRelation)
                 | (QueryLocalDemand::Effect, QueryLocalKind::EffectHigherOrder)
         )
@@ -313,6 +324,13 @@ impl QueryLocalNames {
         self.claims.contains_key(name)
     }
 
+    /// The kind this block claims a spelling as, whatever position asks and
+    /// wherever its horizon stands: a claim decides a bare mention even
+    /// where resolution will refuse it for kind or visibility.
+    pub(crate) fn claim(&self, name: &delightql_types::SqlIdentifier) -> Option<QueryLocalKind> {
+        self.claims.get(name).map(|claim| claim.kind)
+    }
+
     pub(crate) fn judge(
         &self,
         name: &delightql_types::SqlIdentifier,
@@ -348,42 +366,6 @@ impl QueryLocalNames {
                 Err(query_local_position_refusal(name, kind, demand, true))
             }
         }
-    }
-
-    /// TAKE ANOTHER BLOCK'S CLAIMS INTO THIS ONE, at the position this
-    /// block has reached, and answer the distance they moved.
-    ///
-    /// The claims keep their authored order relative to one another: a
-    /// block absorbed second stands wholly after a block absorbed first,
-    /// exactly as its text stood after that text. The caller moves the
-    /// manifestations the same distance in the same act, which is why the
-    /// distance is the answer and not a number the caller chose.
-    ///
-    /// A spelling both blocks declare under DIFFERENT kinds refuses here,
-    /// where one name space closes over the merged block. Under the same
-    /// kind the earlier claim keeps the position — the earlier declaration
-    /// is where the name became visible.
-    fn absorb(&mut self, other: QueryLocalNames) -> crate::error::Result<usize> {
-        let offset = self.next_position;
-        for (name, claim) in other.claims {
-            match self.claims.get(&name) {
-                Some(standing) if standing.kind != claim.kind => {
-                    return Err(crate::pipeline::bindings::one_query_local_name(&name));
-                }
-                Some(_) => {}
-                None => {
-                    self.claims.insert(
-                        name,
-                        QueryLocalClaim {
-                            kind: claim.kind,
-                            first_position: claim.first_position + offset,
-                        },
-                    );
-                }
-            }
-        }
-        self.next_position += other.next_position;
-        Ok(offset)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -437,32 +419,120 @@ pub struct HoDefinition {
     horizon: LexicalHorizon,
 }
 
+/// A COMMON SIGMA EXPRESSION — the query-scoped truth-rule family. Its
+/// clauses are assembled by the same definition-group authority as a
+/// consulted sigma family, while the stamped horizon keeps its body in the
+/// query-local world that declared it.
+#[derive(Debug, Clone)]
+pub struct SigmaDefinition {
+    name: delightql_types::SqlIdentifier,
+    group: crate::pipeline::asts::ddl::DefinitionGroup,
+    horizon: LexicalHorizon,
+}
+
+impl SigmaDefinition {
+    /// THE ONE DOOR: repeated local sigma clauses become one disjoining
+    /// definition group, and the first clause's horizon governs every body.
+    pub fn assemble(
+        name: delightql_types::SqlIdentifier,
+        family: crate::pipeline::asts::ddl::ClauseFamily,
+        horizon: LexicalHorizon,
+    ) -> crate::error::Result<Self> {
+        let group = crate::pipeline::asts::ddl::DefinitionGroup::assemble(family)?;
+        if group.kind() != crate::pipeline::asts::ddl::DefKind::Sigma {
+            return Err(Internal::invariant(
+                "query_local_sigma",
+                format!(
+                    "a common sigma expression '{}' assembled a non-sigma definition",
+                    name
+                ),
+            ));
+        }
+        Ok(Self {
+            name,
+            group,
+            horizon,
+        })
+    }
+
+    pub fn name(&self) -> &delightql_types::SqlIdentifier {
+        &self.name
+    }
+
+    pub fn group(&self) -> &crate::pipeline::asts::ddl::DefinitionGroup {
+        &self.group
+    }
+
+    pub fn horizon(&self) -> LexicalHorizon {
+        self.horizon
+    }
+}
+
+impl PartialEq for SigmaDefinition {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.horizon == other.horizon
+            && self.group.clauses().len() == other.group.clauses().len()
+            && self
+                .group
+                .clauses()
+                .iter()
+                .zip(other.group.clauses())
+                .all(|(a, b)| a.full_source == b.full_source)
+    }
+}
+
+impl ToLispy for SigmaDefinition {
+    fn to_lispy(&self) -> String {
+        let clauses = self
+            .group
+            .clauses()
+            .iter()
+            .map(|clause| format!("{:?}", clause.full_source))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "(sigma_definition (name {}) (horizon {}) (clauses {}))",
+            self.name.to_lispy(),
+            self.horizon.to_lispy(),
+            clauses
+        )
+    }
+}
+
 impl HoDefinition {
-    /// THE ONE DOOR: one subject's clauses, in authored order, assembled.
-    /// A refusal of the assembler's head laws is the CHOE's own
-    /// head-agreement identity: the clauses are query text, not DDL.
+    /// THE ONE DOOR: one subject's clauses, in authored order, assembled by
+    /// the assembler every consulted definition crosses, so a head law or an
+    /// effect-body law refuses under its own identity on either neck.
     pub fn assemble(
         name: delightql_types::SqlIdentifier,
         effect: CteEffectDeclaration,
-        decls: Vec<crate::pipeline::asts::ddl::ClauseDecl>,
+        family: crate::pipeline::asts::ddl::ClauseFamily,
         horizon: LexicalHorizon,
     ) -> crate::error::Result<Self> {
-        let group =
-            crate::pipeline::asts::ddl::DefinitionGroup::assemble(decls).map_err(|error| {
-                match error {
-                    // A head-law refusal of the assembler is the CHOE's own
-                    // head-agreement identity: the clauses are query text.
-                    error @ crate::error::DelightQLError::Semantic(Semantic::Ddl(Ddl::Head(_))) => {
-                        DelightQLError::from(Choe::HeadAgreement {
-                            message: format!(
-                                "the clauses of the common higher-order expression '{name}' \
-                                 do not agree: {error}"
-                            ),
-                        })
-                    }
-                    other => other,
-                }
-            })?;
+        let group = crate::pipeline::asts::ddl::DefinitionGroup::assemble(family)?;
+        // THE NAME AND KIND ARE THE CLAUSES' OWN: a pure CHOE's clauses are
+        // parameterized views under its subject; an effect mirror's are
+        // effect rules under the marked subject `name!`.
+        let (kind, subject) = match effect {
+            CteEffectDeclaration::Pure => {
+                (crate::pipeline::asts::ddl::DefKind::HoView, name.clone())
+            }
+            CteEffectDeclaration::DemandsDirective => (
+                crate::pipeline::asts::ddl::DefKind::Effect,
+                delightql_types::SqlIdentifier::new(format!("{}!", name.as_str())),
+            ),
+        };
+        if group.kind() != kind || group.name_identifier() != Some(&subject) {
+            return Err(Internal::invariant(
+                "query_local_choe",
+                format!(
+                    "a common higher-order expression '{name}' assembled clauses of {:?} '{}'",
+                    group.kind(),
+                    group.name()
+                ),
+            ));
+        }
         Ok(HoDefinition {
             name,
             effect,
@@ -491,14 +561,6 @@ impl HoDefinition {
 
     pub fn horizon(&self) -> &LexicalHorizon {
         &self.horizon
-    }
-
-    /// This definition read in a block whose positions all moved later by
-    /// `offset`; only the block's own absorption calls it, in the same act
-    /// that moved the claims.
-    fn shifted(mut self, offset: usize) -> Self {
-        self.horizon = self.horizon.shifted(offset);
-        self
     }
 }
 
@@ -551,15 +613,15 @@ impl ToLispy for HoDefinition {
 /// horizon the authored position minted.
 ///
 /// A block with no claim carries no authored binding to claim: that is a
-/// compiler-built query, said by [`QueryLocals::none`] and by
-/// [`QueryLocals::compiler_built`], which admits only subjects no authored
-/// spelling answers to — never by an empty ledger a later phase would read
-/// as a request to reconstruct one.
+/// compiler-built query, said by [`QueryLocals::none`] — never by an empty
+/// ledger a later phase would read as a request to reconstruct one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryLocals<P: Phase = Unresolved> {
+    pub(crate) clause_formals: super::definitions::ClauseFormals,
     names: P::QueryLocalNames,
     cfes: P::CfeBindings,
     hos: P::HoBindings,
+    sigmas: P::SigmaBindings,
     ctes: Vec<CteBinding<P>>,
 }
 
@@ -567,9 +629,11 @@ impl<P: Phase> QueryLocals<P> {
     /// NO QUERY-LOCAL BINDING OF ANY KIND, and therefore no claim.
     pub fn none() -> Self {
         QueryLocals {
+            clause_formals: Default::default(),
             names: P::no_query_local_names(),
             cfes: P::no_cfe_bindings(),
             hos: P::no_ho_bindings(),
+            sigmas: P::no_sigma_bindings(),
             ctes: Vec::new(),
         }
     }
@@ -591,6 +655,12 @@ impl<P: Phase> QueryLocals<P> {
         P::ho_bindings(&self.hos)
     }
 
+    /// The query-scoped sigma families this phase still holds — empty where
+    /// the phase has spent them.
+    pub fn sigmas(&self) -> &[SigmaDefinition] {
+        P::sigma_bindings(&self.sigmas)
+    }
+
     /// The one name/visibility fact for every binding above.
     pub(crate) fn names(&self) -> &P::QueryLocalNames {
         &self.names
@@ -602,6 +672,7 @@ impl<P: Phase> QueryLocals<P> {
             && P::query_local_names_is_empty(&self.names)
             && P::cfe_bindings(&self.cfes).is_empty()
             && P::ho_bindings(&self.hos).is_empty()
+            && P::sigma_bindings(&self.sigmas).is_empty()
     }
 
     /// CROSS A PHASE BOUNDARY AS ONE BLOCK. Whether the claims and the
@@ -614,9 +685,11 @@ impl<P: Phase> QueryLocals<P> {
         F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized,
     {
         Ok(QueryLocals {
+            clause_formals: self.clause_formals,
             names: super::phases::carry_query_local_names::<P, Q>(self.names)?,
             cfes: super::phases::carry_cfe_bindings::<P, Q>(self.cfes)?,
             hos: super::phases::carry_ho_bindings::<P, Q>(self.hos)?,
+            sigmas: super::phases::carry_sigma_bindings::<P, Q>(self.sigmas)?,
             ctes: self
                 .ctes
                 .into_iter()
@@ -631,13 +704,15 @@ impl<P: Phase> QueryLocals<P> {
 /// admitted and rearranged freely: there is no ledger left to disagree with.
 impl<P> QueryLocals<P>
 where
-    P: Phase<QueryLocalNames = (), CfeBindings = (), HoBindings = ()>,
+    P: Phase<QueryLocalNames = (), CfeBindings = (), HoBindings = (), SigmaBindings = ()>,
 {
     pub fn spent(ctes: Vec<CteBinding<P>>) -> Self {
         QueryLocals {
+            clause_formals: Default::default(),
             names: (),
             cfes: (),
             hos: (),
+            sigmas: (),
             ctes,
         }
     }
@@ -686,48 +761,6 @@ impl QueryLocals<Unresolved> {
         Ok(())
     }
 
-    /// A BLOCK OF COMPILER-BUILT CARRIERS ALONE: relations the compiler
-    /// wrote, under generated, frontier or structural subjects, which no
-    /// authored name answers to. Deliberately claimless — an authored
-    /// subject here refuses, because an authored spelling that no claim
-    /// covers would fall through to a consulted or catalog definition.
-    pub(crate) fn compiler_built(ctes: Vec<CteBinding<Unresolved>>) -> crate::error::Result<Self> {
-        if let Some(name) = ctes
-            .iter()
-            .find_map(|cte| cte.subject().authored_name().cloned())
-        {
-            return Err(Internal::invariant(
-                "query_local_block",
-                format!(
-                    "a compiler-built query bound the authored name '{name}': an authored \
-                     spelling is claimed by the block that declares it, and a claimless \
-                     binding is not a query-local name"
-                ),
-            ));
-        }
-        Ok(QueryLocals {
-            names: QueryLocalNames::default(),
-            cfes: Vec::new(),
-            hos: Vec::new(),
-            ctes,
-        })
-    }
-
-    /// SPEND THE BLOCK: resolution takes the claims and the definitions
-    /// they govern out together, registers each definition where its claim
-    /// says it stands, and leaves nothing behind. There is no way back —
-    /// the parts are consumed, never re-paired.
-    pub(crate) fn spend(
-        self,
-    ) -> (
-        QueryLocalNames,
-        Vec<CfeDefinition>,
-        Vec<HoDefinition>,
-        Vec<CteBinding<Unresolved>>,
-    ) {
-        (self.names, self.cfes, self.hos, self.ctes)
-    }
-
     /// RESTATE THE RELATION BINDINGS ONE AT A TIME, each handed THIS BLOCK
     /// carrying only the bindings already restated — the scope a binding's
     /// own body stands in when a pass rewrites the bindings in order.
@@ -746,9 +779,11 @@ impl QueryLocals<Unresolved> {
     ) -> crate::error::Result<()> {
         let standing = std::mem::take(&mut self.ctes);
         let mut reached = QueryLocals {
+            clause_formals: Default::default(),
             names: self.names.clone(),
             cfes: self.cfes.clone(),
             hos: self.hos.clone(),
+            sigmas: self.sigmas.clone(),
             ctes: Vec::new(),
         };
         for cte in standing {
@@ -768,30 +803,134 @@ impl QueryLocals<Unresolved> {
         Ok(())
     }
 
-    /// THE RELATION BINDINGS ALONE, with no claim ledger: the block for one
-    /// statement of a body whose claims and definitions are already declared
-    /// on the world. A binding resolves afresh in every statement — the
-    /// world it reads changes as the plan creates relations — while the
-    /// claims that judge its name stay the body's, declared once.
-    pub(crate) fn bindings_only(ctes: Vec<CteBinding<Unresolved>>) -> Self {
-        QueryLocals {
-            names: QueryLocalNames::default(),
-            cfes: Vec::new(),
-            hos: Vec::new(),
-            ctes,
-        }
-    }
 }
 
-/// One CHOE's clauses as the block reads them: gathered by SUBJECT in
-/// authored order, under the horizon the block stood at when the FIRST
-/// clause was written.
+/// One CHOE's clauses as the block reads them: every clause admitted under
+/// one claimed name, in authored order, under the horizon the block stood at
+/// when the FIRST clause was written. A query-local definition is its claim,
+/// so the claim partitions the block's clauses; each partition is gathered
+/// into its one family when the block seals.
 #[derive(Debug)]
 struct HoClauseGroup {
     name: delightql_types::SqlIdentifier,
     effect: CteEffectDeclaration,
     decls: Vec<crate::pipeline::asts::ddl::ClauseDecl>,
     horizon: LexicalHorizon,
+}
+
+/// One local sigma family's clauses, gathered in authored order. A repeated
+/// subject is one truth family, so its clauses are later assembled and
+/// disjoined together rather than selected as a value-function fallback.
+#[derive(Debug)]
+struct SigmaClauseGroup {
+    name: delightql_types::SqlIdentifier,
+    decls: Vec<crate::pipeline::asts::ddl::ClauseDecl>,
+    horizon: LexicalHorizon,
+}
+
+/// The one family a claim's clauses gather into. A group exists because a
+/// clause was admitted under its claim, so it is never empty.
+fn claimed_family(
+    site: &str,
+    decls: Vec<crate::pipeline::asts::ddl::ClauseDecl>,
+) -> crate::error::Result<crate::pipeline::asts::ddl::ClauseFamily> {
+    crate::pipeline::asts::ddl::ClauseFamily::gather_one(decls)?
+        .ok_or_else(|| Internal::invariant(site, "a claimed group holds at least one clause"))
+}
+
+/// ONE AUTHORED CLAUSE of a query-scoped value function, as the normalizer
+/// reads a `cfe` head: its signature, the guard its scalar parameters
+/// stated (several guards conjoin — each filters its own argument, so the
+/// clause fires only when all hold), and the body it computes. A clause is
+/// not a definition: repeated heads under one name are ordered clauses of
+/// ONE value function, and only the block that admits them assembles it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CfeClause {
+    pub name: delightql_types::SqlIdentifier,
+    pub formals: CfeFormals,
+    pub context_mode: ContextMode,
+    pub guard: Option<super::expressions::TruthExpression<Unresolved>>,
+    pub body: DomainExpression<Unresolved>,
+}
+
+impl CfeClause {
+    /// The clause's signature as the one head assembler reads it: each
+    /// formal's role at its position, and the context capture. A guard is
+    /// the clause's own filter, not part of the signature.
+    fn head(&self) -> super::definitions::Head {
+        super::definitions::Head::signature(
+            self.formals
+                .iter()
+                .map(|formal| super::definitions::HoParam::Scalar {
+                    name: formal.name.clone(),
+                    guard: None,
+                    callable: formal.role == CfeFormalRole::Callable,
+                })
+                .collect(),
+        )
+        .with_context(self.context_mode.clone())
+    }
+}
+
+/// One value function's clauses as the block reads them: gathered by NAME
+/// in authored order, each with the head it declared, under the positional
+/// signature the first clause declared and the horizon the block stood at
+/// when it was written.
+#[derive(Debug)]
+struct CfeClauseFamily {
+    name: delightql_types::SqlIdentifier,
+    formals: CfeFormals,
+    context_mode: ContextMode,
+    horizon: LexicalHorizon,
+    /// Every clause's head, in authored order: nonempty by construction.
+    heads: Vec<super::definitions::Head>,
+    /// The clause that opened the family, then every clause that joined:
+    /// nonempty by construction, in authored order.
+    first: super::ClauseArm<Unresolved>,
+    rest: Vec<super::ClauseArm<Unresolved>>,
+}
+
+impl CfeClauseFamily {
+    /// A LATER CLAUSE JOINS THE FAMILY. What the clauses must agree on is
+    /// judged over all of them at once, when the family is assembled.
+    fn join(&mut self, clause: CfeClause) {
+        self.heads.push(clause.head());
+        self.rest.push(super::ClauseArm {
+            formals: super::definitions::ClauseFormals::cfe(&clause.formals),
+            guard: clause.guard,
+            result: clause.body,
+        });
+    }
+
+    /// THE FAMILY, ASSEMBLED. Its clauses' signatures travel with it, for
+    /// the one judgment of a family's parameter row where it is declared.
+    /// Its body is what the one family-body door denotes for its clauses —
+    /// the same door a consulted value function's clauses cross, so a lone
+    /// unguarded clause is its body, a lone guarded clause selects, and the
+    /// ordered-clause law is judged once, here.
+    fn assemble(self) -> crate::error::Result<CfeDefinition> {
+        let CfeClauseFamily {
+            name,
+            formals,
+            context_mode,
+            horizon,
+            heads,
+            first,
+            rest,
+        } = self;
+        let body = super::ClauseSelection::family_body(
+            crate::pipeline::asts::vocabulary::Vec1::with_tail(first, rest),
+        )
+        .map_err(|fault| fault.refusal(name.as_str()))?;
+        Ok(CfeDefinition {
+            name,
+            formals,
+            context_mode,
+            horizon,
+            body,
+            clause_signatures: ClauseSignatures(heads),
+        })
+    }
 }
 
 /// THE ONE DOOR A QUERY-LOCAL BLOCK IS MINTED THROUGH.
@@ -806,10 +945,12 @@ struct HoClauseGroup {
 #[derive(Debug, Default)]
 pub struct QueryLocalBlock {
     names: QueryLocalNames,
-    cfes: Vec<CfeDefinition>,
+    families: Vec<CfeClauseFamily>,
     hos: Vec<HoDefinition>,
+    sigmas: Vec<SigmaDefinition>,
     ctes: Vec<CteBinding<Unresolved>>,
     groups: Vec<HoClauseGroup>,
+    sigma_groups: Vec<SigmaClauseGroup>,
 }
 
 impl QueryLocalBlock {
@@ -835,12 +976,55 @@ impl QueryLocalBlock {
         Ok(())
     }
 
-    /// Admit one value definition.
-    pub(crate) fn admit_cfe(&mut self, mut cfe: CfeDefinition) -> crate::error::Result<()> {
-        cfe.horizon = self
+    /// Admit one clause of a value function. Every clause claims the name;
+    /// a repeated name joins the family the first clause opened, which
+    /// keeps the horizon that clause minted — the family is ONE definition
+    /// with one declaration site. Its clauses' agreement is judged when the
+    /// block seals.
+    pub(crate) fn admit_cfe(&mut self, clause: CfeClause) -> crate::error::Result<()> {
+        let horizon = self
             .names
-            .declare(cfe.name.clone(), QueryLocalKind::Value)?;
-        self.cfes.push(cfe);
+            .declare(clause.name.clone(), QueryLocalKind::Value)?;
+        if let Some(family) = self
+            .families
+            .iter_mut()
+            .find(|family| family.name == clause.name)
+        {
+            family.join(clause);
+            return Ok(());
+        }
+        let head = clause.head();
+        let CfeClause {
+            name,
+            formals,
+            context_mode,
+            guard,
+            body,
+        } = clause;
+        let clause_formals = super::definitions::ClauseFormals::cfe(&formals);
+        let formals = CfeFormals::in_binding_order(
+            formals
+                .iter()
+                .enumerate()
+                .map(|(position, formal)| CfeFormal {
+                    name: super::definitions::argument_name(position),
+                    role: formal.role,
+                })
+                .collect(),
+        )?;
+        self.families.push(CfeClauseFamily {
+            name,
+            formals,
+            context_mode,
+            horizon,
+            heads: vec![head],
+            first: super::ClauseArm {
+                formals: clause_formals,
+                guard,
+                result: body,
+            },
+            rest: Vec::new(),
+        });
         Ok(())
     }
 
@@ -872,57 +1056,67 @@ impl QueryLocalBlock {
         Ok(())
     }
 
-    /// TAKE ONE WHOLE BLOCK INTO THIS ONE, claims and manifestations in the
-    /// same act.
-    ///
-    /// An internal rebuilding road — the parameterized expansion that
-    /// squishes a definition's clause bodies into one query — must move the
-    /// authored fact, not re-derive it: the collections it hoists no longer
-    /// record which name was written before which. Absorption is the move.
-    /// The absorbed claims stand after everything already admitted, and
-    /// every manifestation absorbed with them travels the same distance, so
-    /// each contributing block keeps exactly the visibility its text had.
-    pub(crate) fn absorb(
+    /// Admit one truth-rule clause. Repeated clauses join one sigma family;
+    /// the definition group, not clause order, supplies its disjunction.
+    pub(crate) fn admit_sigma_clause(
         &mut self,
-        locals: QueryLocals<Unresolved>,
-    ) -> crate::error::Result<usize> {
-        let QueryLocals {
-            names,
-            cfes,
-            hos,
-            ctes,
-        } = locals;
-        let offset = self.names.absorb(names)?;
-        self.cfes
-            .extend(cfes.into_iter().map(|cfe| cfe.shifted(offset)));
-        self.hos
-            .extend(hos.into_iter().map(|ho| ho.shifted(offset)));
-        self.ctes
-            .extend(ctes.into_iter().map(|cte| cte.shifted(offset)));
-        Ok(offset)
+        name: delightql_types::SqlIdentifier,
+        decl: crate::pipeline::asts::ddl::ClauseDecl,
+    ) -> crate::error::Result<()> {
+        let horizon = self.names.declare(name.clone(), QueryLocalKind::Sigma)?;
+        if let Some(group) = self
+            .sigma_groups
+            .iter_mut()
+            .find(|group| group.name == name)
+        {
+            group.decls.push(decl);
+            return Ok(());
+        }
+        self.sigma_groups.push(SigmaClauseGroup {
+            name,
+            decls: vec![decl],
+            horizon,
+        });
+        Ok(())
     }
 
-    /// The finished block.
+    /// The finished block: every clause family assembled into its one
+    /// definition, in the order the families opened.
     pub(crate) fn seal(self) -> crate::error::Result<QueryLocals<Unresolved>> {
         let QueryLocalBlock {
             names,
-            cfes,
+            families,
             mut hos,
+            mut sigmas,
             ctes,
             groups,
+            sigma_groups,
         } = self;
+        let cfes = families
+            .into_iter()
+            .map(CfeClauseFamily::assemble)
+            .collect::<crate::error::Result<Vec<_>>>()?;
         for group in groups {
             hos.push(HoDefinition::assemble(
                 group.name,
                 group.effect,
-                group.decls,
+                claimed_family("query_local_choe", group.decls)?,
+                group.horizon,
+            )?);
+        }
+        for group in sigma_groups {
+            sigmas.push(SigmaDefinition::assemble(
+                group.name,
+                claimed_family("query_local_sigma", group.decls)?,
                 group.horizon,
             )?);
         }
         Ok(QueryLocals {
+            clause_formals: Default::default(),
             names,
             cfes,
             hos,
+            sigmas,
             ctes,
         })
     }
@@ -945,10 +1139,11 @@ pub struct Query<P: Phase = Unresolved> {
 impl<P: Phase> ToLispy for Query<P> {
     fn to_lispy(&self) -> String {
         format!(
-            "(query (local_names {}) (cfes {}) (hos {}) (ctes {}) (body {}))",
+            "(query (local_names {}) (cfes {}) (hos {}) (sigmas {}) (ctes {}) (body {}))",
             self.locals.names.to_lispy(),
             self.locals.cfes.to_lispy(),
             self.locals.hos.to_lispy(),
+            self.locals.sigmas.to_lispy(),
             self.locals.ctes.to_lispy(),
             self.body.to_lispy(),
         )
@@ -998,6 +1193,11 @@ impl<P: Phase> Query<P> {
         self.locals.hos()
     }
 
+    /// The query-scoped sigma families this phase still holds.
+    pub fn sigmas(&self) -> &[SigmaDefinition] {
+        self.locals.sigmas()
+    }
+
     /// The body of a query that carries no bindings; the caller keeps the
     /// whole query otherwise.
     pub fn into_bare_body(self) -> std::result::Result<Chain<P>, Box<Query<P>>> {
@@ -1009,24 +1209,14 @@ impl<P: Phase> Query<P> {
     }
 }
 
-/// ER-context specification: identifies which context to use for & and && operators
-#[derive(Debug, Clone, PartialEq, ToLispy)]
-#[lispy("er_context_spec")]
-pub struct ErContextSpec {
-    /// Optional namespace qualification (e.g., "lib::er_grounded")
-    pub namespace: Option<String>,
-    /// Context name (e.g., "normal", "audit")
-    pub context_name: String,
-}
-
 /// What a CTE label DECLARES about its expression's relationship to effects.
 ///
 /// A bare label asserts a pure expression; a `!`-marked label asserts the
 /// expression demands a directive. The declaration is an assertion, never a
 /// coercion: the effect authority judges it against the body once — a mark
 /// on a pure body refuses (`effect/cte/pure_mark`) before a marked binding
-/// can be constructed, and an effectful body without the mark refuses where
-/// the rule registers (`effect/cte/label`).
+/// can be constructed, and an effectful body under a bare label has no
+/// derivation, so the parse refuses it (`parse/effect/label`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ToLispy)]
 pub enum CteEffectDeclaration {
     /// A bare label: the expression is asserted pure.
@@ -1161,21 +1351,184 @@ mod query_local_name_tests {
 #[cfg(test)]
 mod query_local_block_tests {
     use super::{
-        AuthoredCteSubject, CfeDefinition, CfeFormals, ContextMode, CteAuthority, CteBinding,
+        AuthoredCteSubject, CfeClause, CfeFormals, ContextMode, CteAuthority, CteBinding,
         CteEffectDeclaration, DomainExpression, LexicalHorizon, QueryLocalBlock, QueryLocalDemand,
-        QueryLocalJudgment, QueryLocalKind, QueryLocals,
+        QueryLocalJudgment, QueryLocalKind, Unresolved,
     };
     use delightql_types::SqlIdentifier;
 
-    fn cfe(name: &str) -> CfeDefinition {
-        CfeDefinition::unbounded(
-            SqlIdentifier::new(name),
-            CfeFormals::from_role_groups([], []),
-            ContextMode::None,
-            DomainExpression::Application(super::super::FunctionApplication::Ground(
+    fn cfe(name: &str) -> CfeClause {
+        guarded_cfe(name, None)
+    }
+
+    fn cfe_with(name: &str, formals: CfeFormals) -> CfeClause {
+        CfeClause {
+            formals,
+            ..guarded_cfe(name, None)
+        }
+    }
+
+    fn guarded_cfe(
+        name: &str,
+        guard: Option<super::super::expressions::TruthExpression<Unresolved>>,
+    ) -> CfeClause {
+        CfeClause {
+            name: SqlIdentifier::new(name),
+            formals: CfeFormals::from_role_groups([], []),
+            context_mode: ContextMode::None,
+            guard,
+            body: DomainExpression::Application(super::super::FunctionApplication::Ground(
                 super::super::LiteralValue::Null,
             )),
+        }
+    }
+
+    /// A guard for tests: `null = null`, one comparison, no reads.
+    fn a_guard() -> super::super::expressions::TruthExpression<Unresolved> {
+        let null = || {
+            DomainExpression::Application(super::super::FunctionApplication::Ground(
+                super::super::LiteralValue::Null,
+            ))
+        };
+        super::super::expressions::TruthExpression::Comparison(
+            super::super::expressions::Comparison {
+                operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
+                left: Box::new(null()),
+                right: Box::new(null()),
+            },
         )
+    }
+
+    /// REPEATED HEADS UNDER ONE NAME ARE ONE FAMILY: the block seals one
+    /// definition, its body the ordered selection over the clauses, under
+    /// the horizon the FIRST clause minted.
+    #[test]
+    fn repeated_cfe_heads_seal_as_one_ordered_family() {
+        let mut block = QueryLocalBlock::default();
+        block
+            .admit_cfe(guarded_cfe("f", Some(a_guard())))
+            .expect("guarded clause");
+        block.admit_relation(authored("mid")).expect("mid CTE");
+        block.admit_cfe(cfe("f")).expect("fallback clause");
+        let locals = block.seal().expect("the block seals");
+
+        assert_eq!(locals.cfes().len(), 1, "one family, not two definitions");
+        let family = &locals.cfes()[0];
+        match &family.body {
+            DomainExpression::Application(super::super::FunctionApplication::ClauseSelection(
+                selection,
+            )) => {
+                assert_eq!(selection.arms().len(), 2);
+                assert!(selection.arms().first().guard.is_some());
+                assert!(selection.arms().get(1).expect("two arms").guard.is_none());
+            }
+            other => panic!("expected the ordered selection, got {other:?}"),
+        }
+        // The family's horizon is the first clause's: `mid`, declared
+        // between the clauses, is not visible from the family's body.
+        assert_eq!(
+            locals.names().judge(
+                &SqlIdentifier::new("mid"),
+                family.horizon(),
+                QueryLocalDemand::Relation
+            ),
+            QueryLocalJudgment::NotYetVisible(QueryLocalKind::Relation)
+        );
+    }
+
+    /// One unguarded clause is that clause's body outright; a guarded
+    /// clause alone still selects, because its guard may not hold.
+    #[test]
+    fn a_lone_clause_selects_only_when_guarded() {
+        let mut block = QueryLocalBlock::default();
+        block.admit_cfe(cfe("plain")).expect("plain clause");
+        block
+            .admit_cfe(guarded_cfe("guarded", Some(a_guard())))
+            .expect("guarded clause");
+        let locals = block.seal().expect("the block seals");
+        assert!(matches!(
+            locals.cfes()[0].body,
+            DomainExpression::Application(super::super::FunctionApplication::Ground(_))
+        ));
+        assert!(matches!(
+            locals.cfes()[1].body,
+            DomainExpression::Application(super::super::FunctionApplication::ClauseSelection(_))
+        ));
+    }
+
+    /// THE ORDERED-CLAUSE LAW REACHES THE FAMILY: two unguarded clauses,
+    /// or an unguarded clause before a guarded one, refuse at the seal
+    /// under the `ddl/head` leaf naming the rule, as a consulted family
+    /// does.
+    #[test]
+    fn a_family_refuses_a_misplaced_or_repeated_fallback() {
+        let mut block = QueryLocalBlock::default();
+        block.admit_cfe(cfe("f")).expect("first unguarded");
+        block.admit_cfe(cfe("f")).expect("second unguarded admits");
+        let err = block.seal().expect_err("two fallbacks refuse");
+        assert_eq!(
+            err.error_uri(),
+            "delightql-error://semantic/ddl/head/unguarded_multiplicity"
+        );
+        assert!(
+            format!("{err}").contains("found 2 unguarded clauses"),
+            "{err}"
+        );
+
+        let mut block = QueryLocalBlock::default();
+        block.admit_cfe(cfe("g")).expect("fallback first");
+        block
+            .admit_cfe(guarded_cfe("g", Some(a_guard())))
+            .expect("guarded after admits");
+        let err = block.seal().expect_err("a fallback before a guard refuses");
+        assert_eq!(
+            err.error_uri(),
+            "delightql-error://semantic/ddl/head/unguarded_position"
+        );
+        assert!(
+            format!("{err}").contains("unguarded clause is at position 1"),
+            "{err}"
+        );
+    }
+
+    /// A family's clauses carry their signatures out of the seal, each
+    /// clause's own, for the one judgment of the parameter row where the
+    /// family is declared; scalar spellings are each clause's own.
+    #[test]
+    fn a_family_carries_its_clause_signatures() {
+        let mut block = QueryLocalBlock::default();
+        block
+            .admit_cfe(CfeClause {
+                guard: Some(a_guard()),
+                ..cfe_with("f", CfeFormals::from_role_groups([], [SqlIdentifier::new("x")]))
+            })
+            .expect("a clause admits");
+        block
+            .admit_cfe(cfe_with(
+                "f",
+                CfeFormals::from_role_groups([], [SqlIdentifier::new("x"), SqlIdentifier::new("y")]),
+            ))
+            .expect("a clause admits");
+        let locals = block.seal().expect("the seal judges no parameter row");
+        assert_eq!(locals.cfes()[0].clause_signatures.0.len(), 2);
+
+        let mut block = QueryLocalBlock::default();
+        block
+            .admit_cfe(CfeClause {
+                guard: Some(a_guard()),
+                ..cfe_with(
+                    "g",
+                    CfeFormals::from_role_groups([], [SqlIdentifier::new("x")]),
+                )
+            })
+            .expect("first clause");
+        block
+            .admit_cfe(cfe_with(
+                "g",
+                CfeFormals::from_role_groups([], [SqlIdentifier::new("y")]),
+            ))
+            .expect("second clause");
+        block.seal().expect("scalar spelling is clause-local");
     }
 
     fn relation(subject: AuthoredCteSubject) -> CteBinding {
@@ -1191,7 +1544,6 @@ mod query_local_block_tests {
                         mutation_target: false,
                         passthrough: false,
                     },
-                    outer: false,
                 },
                 super::super::Access::All,
             ),
@@ -1200,7 +1552,6 @@ mod query_local_block_tests {
                 horizon: LexicalHorizon::all(),
                 head: super::super::definitions::Head::glob(),
                 origin: super::super::provenance::CteOrigin::CompilerGenerated,
-                fixpoint: super::super::super::vocabulary::Fixpoint::Bag,
             },
         )
     }
@@ -1209,12 +1560,6 @@ mod query_local_block_tests {
         relation(AuthoredCteSubject::Authored {
             name: SqlIdentifier::new(name),
             effect: CteEffectDeclaration::Pure,
-        })
-    }
-
-    fn generated(name: &str) -> CteBinding {
-        relation(AuthoredCteSubject::Generated {
-            name: SqlIdentifier::new(name),
         })
     }
 
@@ -1244,57 +1589,6 @@ mod query_local_block_tests {
             names.judge(&SqlIdentifier::new("mid"), late, QueryLocalDemand::Relation),
             QueryLocalJudgment::Lawful(QueryLocalKind::Relation)
         );
-    }
-
-    /// ABSORPTION MOVES A WHOLE BLOCK, claims and manifestations together:
-    /// each contributor keeps exactly the visibility its own text had, and
-    /// the definition that was written first is still the one a later
-    /// declaration cannot be seen from.
-    #[test]
-    fn absorbing_two_blocks_keeps_each_ones_own_visibility() {
-        let mut first = QueryLocalBlock::default();
-        first.admit_cfe(cfe("a")).expect("a");
-        first.admit_relation(authored("b")).expect("b");
-        let first = first.seal().expect("first seals");
-
-        let mut second = QueryLocalBlock::default();
-        second.admit_cfe(cfe("c")).expect("c");
-        second.admit_relation(authored("d")).expect("d");
-        let second = second.seal().expect("second seals");
-
-        let mut merged = QueryLocalBlock::default();
-        merged.absorb(first).expect("absorb the first");
-        merged.absorb(second).expect("absorb the second");
-        let merged = merged.seal().expect("the merged block seals");
-
-        let names = merged.names();
-        let at_a = merged.cfes()[0].horizon();
-        let at_c = merged.cfes()[1].horizon();
-        // Within its own block, `a` still cannot see `b`.
-        assert_eq!(
-            names.judge(&SqlIdentifier::new("b"), at_a, QueryLocalDemand::Relation),
-            QueryLocalJudgment::NotYetVisible(QueryLocalKind::Relation)
-        );
-        // Nor can `c` see `d`, though everything of the first block moved
-        // to earlier positions than either of them.
-        assert_eq!(
-            names.judge(&SqlIdentifier::new("d"), at_c, QueryLocalDemand::Relation),
-            QueryLocalJudgment::NotYetVisible(QueryLocalKind::Relation)
-        );
-        assert_eq!(
-            names.judge(&SqlIdentifier::new("b"), at_c, QueryLocalDemand::Relation),
-            QueryLocalJudgment::Lawful(QueryLocalKind::Relation)
-        );
-    }
-
-    /// A compiler-built query binds carriers no authored name answers to.
-    /// An authored subject there REFUSES rather than standing claimless,
-    /// because a claimless authored spelling falls through to a consulted
-    /// or catalog definition.
-    #[test]
-    fn a_compiler_built_block_refuses_an_authored_subject() {
-        assert!(QueryLocals::compiler_built(vec![generated("gen")]).is_ok());
-        assert!(QueryLocals::compiler_built(vec![authored("named")]).is_err());
     }
 
     /// Restating the relation bindings is for spending heads and rewriting
@@ -1327,7 +1621,9 @@ pub struct CteAuthority {
     /// A glob head passes the body's heading through; a listed head is the
     /// closed contract the one assembler enforces across the subject's
     /// clauses. `body : name` is `name(*) : body`, so the labeling
-    /// shorthand and a compiler-built binding both glob.
+    /// shorthand and a compiler-built binding both glob. The head carries
+    /// its badge unjudged: whether this binding is a fixpoint at all is not
+    /// knowable until the self-reference binds.
     #[lispy("head")]
     pub head: crate::pipeline::asts::core::definitions::Head,
     /// TYPED provenance: who authored this CTE — set at CONSTRUCTION,
@@ -1335,13 +1631,6 @@ pub struct CteAuthority {
     /// identifiers). The squished-weave scope override keys on this.
     #[lispy("origin")]
     pub origin: crate::pipeline::asts::core::provenance::CteOrigin,
-    /// The fixpoint flavor the authored head badged (`… : c%`). Carried
-    /// UNJUDGED: whether this binding is a fixpoint at all is not knowable
-    /// until the self-reference binds, so the badge travels to the one
-    /// recursion decision and is spent there with the authority the phase
-    /// deletes.
-    #[lispy("fixpoint")]
-    pub fixpoint: crate::pipeline::asts::vocabulary::Fixpoint,
 }
 
 pub use crate::pipeline::bindings::CteBinding;
@@ -1510,7 +1799,7 @@ impl CfeFormals {
     }
 }
 
-/// Higher-order example: apply_transform:(transform)(value) : value /-> transform:()
+/// Higher-order example: apply_transform:(transform)(value) : value >> transform:()
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 pub struct CfeDefinition {
     /// The name of the function, AS AUTHORED — the strop bit rides with the
@@ -1532,6 +1821,20 @@ pub struct CfeDefinition {
     /// What the body COMPUTES: the one value the rule denotes.
     #[lispy("body")]
     pub body: DomainExpression<Unresolved>,
+    /// Each clause's signature, in authored order: what the family's
+    /// clauses must agree on where it is declared.
+    #[lispy("clause_signatures")]
+    pub clause_signatures: ClauseSignatures,
+}
+
+/// A value function family's clause signatures, in authored order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClauseSignatures(pub Vec<super::definitions::Head>);
+
+impl ToLispy for ClauseSignatures {
+    fn to_lispy(&self) -> String {
+        format!("(clauses {})", self.0.len())
+    }
 }
 
 impl CfeDefinition {
@@ -1543,25 +1846,30 @@ impl CfeDefinition {
         context_mode: ContextMode,
         body: DomainExpression<Unresolved>,
     ) -> Self {
+        let signature = super::definitions::Head::signature(
+            formals
+                .iter()
+                .map(|formal| super::definitions::HoParam::Scalar {
+                    name: formal.name.clone(),
+                    guard: None,
+                    callable: formal.role == CfeFormalRole::Callable,
+                })
+                .collect(),
+        )
+        .with_context(context_mode.clone());
         CfeDefinition {
             name,
             formals,
             context_mode,
             horizon: LexicalHorizon::all(),
             body,
+            clause_signatures: ClauseSignatures(vec![signature]),
         }
     }
 
     /// The declarations visible where this body was authored.
     pub(crate) fn horizon(&self) -> LexicalHorizon {
         self.horizon
-    }
-
-    /// This definition read in a block whose positions all moved later by
-    /// `offset`; only the block's own absorption calls it.
-    fn shifted(mut self, offset: usize) -> Self {
-        self.horizon = self.horizon.shifted(offset);
-        self
     }
 
     /// The formals split at the binding boundary.

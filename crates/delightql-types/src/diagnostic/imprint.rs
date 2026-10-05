@@ -78,16 +78,45 @@ pub enum Manifest {
     #[error("Validation error: {message}")]
     CompanionKey { message: String },
 
+    /// A companion rule is read as a relation, each column found by name in
+    /// its published heading, so its head must name exactly its columns: a
+    /// required column that is missing, or any other column, is refused.
+    #[leaf("companion_heading", class = Syntax, summary = "A companion rule's heading is not its declared columns.")]
+    #[error("Validation error: {message}")]
+    CompanionHeading { message: String },
+
+    /// One entity declares a column twice in `schema`, or defaults it twice
+    /// in `defaults`. Names compare case-insensitively.
+    #[leaf("duplicate_column", class = Syntax, summary = "A column is declared or defaulted twice for one entity.")]
+    #[error("Validation error: {message}")]
+    DuplicateColumn { message: String },
+
     /// A constraint row names a column the entity does not declare.
     #[leaf("constraint_column", class = Syntax, summary = "A constraint names an undeclared column.")]
     #[error("Validation error: {message}")]
     ConstraintColumn { message: String },
 
-    /// A generated-column declaration names a generation kind the manifest
-    /// vocabulary does not admit.
-    #[leaf("generated_kind", class = Syntax, summary = "A generated-column kind is not recognized.")]
+    /// The imprinted body publishes a column the entity's schema does not
+    /// declare, or publishes a position with no name to route by. Values
+    /// reach schema columns by name alone; a column with no schema row has
+    /// nowhere to go.
+    #[leaf("source_column", class = Syntax, summary = "An imprinted body publishes a column the schema does not declare.")]
     #[error("Validation error: {message}")]
-    GeneratedKind { message: String },
+    SourceColumn { message: String },
+
+    /// The entity's schema declares a column the imprinted body does not
+    /// publish, so no value reaches it. The refusal names the column.
+    #[leaf("schema_column", class = Syntax, summary = "A schema column receives no value from the imprinted body.")]
+    #[error("Validation error: {message}")]
+    SchemaColumn { message: String },
+
+    /// Every schema row states its column's `ordinal`, and the cells must be
+    /// integers forming exactly the permutation 1..n over the entity's rows:
+    /// a missing cell, a duplicate, a gap, a value outside 1..n or a
+    /// non-integer is refused by name.
+    #[leaf("ordinal", class = Syntax, summary = "A schema's ordinal cells do not form the permutation 1..n.")]
+    #[error("Validation error: {message}")]
+    Ordinal { message: String },
 
     /// A table constraint names columns the entity does not declare, or
     /// names none.

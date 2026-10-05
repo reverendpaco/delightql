@@ -68,6 +68,63 @@ pub trait DatabaseIntrospector: Send {
                 backend_schema: schema.map(str::to_owned),
             }))
     }
+
+    /// Whether a relation's storage guarantees its declared column types,
+    /// in the backend's own terms: `Some(true)` when every value a column
+    /// holds is what its declared type admits there, `Some(false)` when the
+    /// storage does not enforce the declaration (a computed relation, or one
+    /// whose storage is supplied by other code), `None` when the backend
+    /// cannot tell.
+    fn storage_guarantees_declared_types(
+        &self,
+        _schema: Option<&str>,
+        _relation_name: &str,
+    ) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// How a stored table's rows are identified, in the backend's own
+    /// terms: whether its storage keeps a row locator a statement can read,
+    /// and which stored column, if any, is that locator. `None` when the
+    /// backend cannot tell (a view, a virtual table, a relation it does not
+    /// serve).
+    fn stored_row_identity(
+        &self,
+        _schema: Option<&str>,
+        _relation_name: &str,
+    ) -> Result<Option<StoredRowIdentity>> {
+        Ok(None)
+    }
+
+    /// The columns of a stored table whose values its storage computes (a
+    /// SQLite generated column), by name, in the backend's own terms: a
+    /// statement reads them and never writes them. `None` when the backend
+    /// cannot tell.
+    fn computed_columns(
+        &self,
+        _schema: Option<&str>,
+        _relation_name: &str,
+    ) -> Result<Option<Vec<SqlIdentifier>>> {
+        Ok(None)
+    }
+}
+
+/// A stored table's row identity as its backend keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredRowIdentity {
+    /// The storage keeps no row locator (a SQLite `WITHOUT ROWID` table).
+    /// `key` is the table's declared primary key, its columns in key order;
+    /// empty when it declares none.
+    Unlocated { key: Vec<SqlIdentifier> },
+    /// The storage keeps a row locator. `alias` is the stored column whose
+    /// value is that locator (a SQLite `INTEGER PRIMARY KEY`), if one is.
+    /// `occupied` is every name a column of the table takes in a statement,
+    /// hidden and generated columns included, which a catalog listing of
+    /// the table's columns may omit.
+    Located {
+        alias: Option<SqlIdentifier>,
+        occupied: Vec<SqlIdentifier>,
+    },
 }
 
 /// One directly addressable relation and the schema that must qualify its

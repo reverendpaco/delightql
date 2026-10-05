@@ -16,6 +16,11 @@ repository.workspace = true
 [dependencies]
 tree-sitter.workspace = true
 
+# The parser's C headers for a target with no libc; the crate publishes
+# them to its direct dependents, which the build script consumes.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tree-sitter-language = "=0.1.8"
+
 [build-dependencies]
 cc = "1.0"
 serde_json.workspace = true

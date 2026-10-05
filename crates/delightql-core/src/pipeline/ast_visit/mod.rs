@@ -271,7 +271,7 @@ pub fn walk_visit_relational<P: Phase, F: AstVisit<P> + ?Sized>(
     enter!(v.enter_relational(expr));
     match expr.head().form() {
         GroundForm::Reference(rel) => child!(walk_visit_relation(v, rel)),
-        GroundForm::Literal(anon) => child!(walk_visit_anon_table(v, &anon.table)),
+        GroundForm::Literal(anon) => child!(anon.visited_by(v)),
     }
     for continuation in expr.forms() {
         child!(walk_visit_continuation(v, continuation));
@@ -395,36 +395,7 @@ pub fn walk_visit_inner_relation<P: Phase, F: AstVisit<P> + ?Sized>(
     pattern: &InnerRelationPattern<P>,
 ) -> Result<Descent> {
     enter!(v.enter_inner_relation(pattern));
-    match pattern {
-        InnerRelationPattern::Indeterminate { subquery, .. }
-        | InnerRelationPattern::UncorrelatedDerivedTable { subquery, .. } => {
-            child!(walk_visit_relational(v, subquery));
-        }
-        InnerRelationPattern::CorrelatedScalarJoin {
-            correlation_filters,
-            subquery,
-            ..
-        } => {
-            for f in correlation_filters {
-                child!(walk_visit_boolean(v, f));
-            }
-            child!(walk_visit_relational(v, subquery));
-        }
-        InnerRelationPattern::CorrelatedGroupJoin {
-            correlation_filters,
-            aggregations,
-            subquery,
-            ..
-        } => {
-            for f in correlation_filters {
-                child!(walk_visit_boolean(v, f));
-            }
-            for e in aggregations {
-                child!(walk_visit_domain(v, e));
-            }
-            child!(walk_visit_relational(v, subquery));
-        }
-    }
+    child!(walk_visit_relational(v, pattern.subquery()));
     exit!(v.exit_inner_relation(pattern));
 }
 
@@ -581,7 +552,7 @@ pub fn walk_visit_function<P: Phase, F: AstVisit<P> + ?Sized>(
             child!(walk_visit_enclyph(v, enclyph))
         }
         crate::pipeline::asts::core::FunctionApplication::ClauseSelection(selection) => {
-            for arm in &selection.arms {
+            for arm in selection.arms().iter() {
                 if let Some(guard) = &arm.guard {
                     child!(walk_visit_boolean(v, guard));
                 }

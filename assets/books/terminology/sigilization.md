@@ -10,8 +10,8 @@ For example, delightql sigilizes the **DISTINCT** relational operator with a `%`
 followed by parentheses:
 
 ```delightql
-users(*) |> %(last_name)
-// SQL: SELECT DISTINCT last_name FROM users
+invoice(*) |> %(billing_country)
+// SQL: SELECT DISTINCT billing_country FROM Invoice
 ```
 
 To continue this example, delightql recognizes that `GROUP BY` is simply `DISTINCT`
@@ -20,8 +20,8 @@ columns from aggregate functions with `~>` to get the equivalent of SQL's `GROUP
 BY`:
 
 ```delightql
-users(*) |> %(last_name ~> count:(*), sum:(salary) as salary_by_last_name)
-// SQL: SELECT count(*), sum(salary) as salary_by_last_name FROM users GROUP BY last_name
+invoice(*) |> %(billing_country ~> count:(*), sum:(total) as total_by_country)
+// SQL: SELECT billing_country, count(*), sum(Total) as total_by_country FROM Invoice GROUP BY billing_country
 ```
 
 

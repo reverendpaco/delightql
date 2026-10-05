@@ -78,10 +78,10 @@ TNF-T is the foundation for the interpretive forms that follow.
 Nested objects group related fields -- structure, not data rows.
 ```json
 {
-  "LastName": "eklund",
+  "last_name": "eklund",
   "address": {
-    "City": "boston",
-    "State": "MA"
+    "city": "boston",
+    "state": "MA"
   }
 }
 ```
@@ -89,13 +89,13 @@ Nested objects group related fields -- structure, not data rows.
 The `address` object is a namespace. The tree is semantically equivalent to:
 ```json
 {
-  "LastName": "eklund",
+  "last_name": "eklund",
   "address_City": "boston",
   "address_State": "MA"
 }
 ```
 
-**Relational interpretation:** Namespaced trees flatten to a single row. Pathing (`.address.City`) navigates the namespace.
+**Relational interpretation:** Namespaced trees flatten to a single row. Pathing (`.address.city`) navigates the namespace.
 
 **Trade-off:** More expressive (preserves semantic grouping) but less directly relational (requires flattening).
 
@@ -108,21 +108,21 @@ The `address` object is a namespace. The tree is semantically equivalent to:
 Arrays represent grouped rows -- the result of `GROUP BY`.
 ```json
 [
-  { "Title": "Engineer",
+  { "title": "Engineer",
     "people": [
-      { "FirstName": "Alice", "LastName": "Smith" },
-      { "FirstName": "Bob", "LastName": "Jones" }
+      { "first_name": "Alice", "last_name": "Smith" },
+      { "first_name": "Bob", "last_name": "Jones" }
     ]
   },
-  { "Title": "Manager",
+  { "title": "Manager",
     "people": [
-      { "FirstName": "Carol", "LastName": "White" }
+      { "first_name": "Carol", "last_name": "White" }
     ]
   }
 ]
 ```
 
-Each nesting level is a grouping context. The outer array groups by `Title`; the inner `people` array collects rows within each title.
+Each nesting level is a grouping context. The outer array groups by `title`; the inner `people` array collects rows within each title.
 
 **Relational interpretation:** Direct correspondence to `GROUP BY`. Construction compresses cardinality; destructuring expands it.
 
@@ -136,10 +136,10 @@ Data values become object keys.
 ```json
 {
   "Engineer": [
-    { "FirstName": "Alice", "LastName": "Smith" }
+    { "first_name": "Alice", "last_name": "Smith" }
   ],
   "Manager": [
-    { "FirstName": "Carol", "LastName": "White" }
+    { "first_name": "Carol", "last_name": "White" }
   ]
 }
 ```
@@ -159,9 +159,9 @@ The keys (`Engineer`, `Manager`) are data values lifted to metadata.
 A flat array of homogeneous objects -- the simplest grouped form.
 ```json
 [
-  { "Title": "Engineer", "FirstName": "Alice", "LastName": "Smith" },
-  { "Title": "Engineer", "FirstName": "Bob", "LastName": "Jones" },
-  { "Title": "Manager", "FirstName": "Carol", "LastName": "White" }
+  { "title": "Engineer", "first_name": "Alice", "last_name": "Smith" },
+  { "title": "Engineer", "first_name": "Bob", "last_name": "Jones" },
+  { "title": "Manager", "first_name": "Carol", "last_name": "White" }
 ]
 ```
 
@@ -176,10 +176,10 @@ No nested arrays. Each object is a row; the array is a table.
 *Restriction from TNF-G: single path from root to deepest leaf, no sibling groups.*
 ```json
 [
-  { "Title": "Engineer",
-    "State": "CA",
+  { "title": "Engineer",
+    "state": "CA",
     "people": [
-      { "FirstName": "Alice", "LastName": "Smith" }
+      { "first_name": "Alice", "last_name": "Smith" }
     ]
   }
 ]
@@ -189,15 +189,15 @@ No nested arrays. Each object is a row; the array is a table.
 
 **Why siblings break round-tripping:**
 ```delightql
-employee(*) ~> { Title,
-                 "people": ~> {FirstName, LastName},
-                 "cities": ~> [City] }
+customer(*) ~> { country,
+                 "people": ~> {first_name, last_name},
+                 "cities": ~> [city] }
 ```
 
 Siblings aggregate independently. The join -- which person was in which city -- is not preserved. Destructuring recovers each path independently:
 
-- `Title`, `FirstName`, `LastName` (via `people`)
-- `Title`, `City` (via `cities`)
+- `country`, `first_name`, `last_name` (via `people`)
+- `country`, `city` (via `cities`)
 
 But not the original four-column row. This is TNF-G but not TNF-R.
 
@@ -208,7 +208,7 @@ But not the original four-column row. This is TNF-G but not TNF-R.
 *Combination of TNF-G and TNF-N: grouping structure with namespaced leaf objects.*
 ```json
 [
-  { "Title": "Engineer",
+  { "title": "Engineer",
     "people": [
       { "name": { "first": "Alice", "last": "Smith" },
         "contact": { "email": "alice@x.com", "phone": "555-1234" }
@@ -220,7 +220,7 @@ But not the original four-column row. This is TNF-G but not TNF-R.
 
 The outer structure is grouped (array of objects with nested arrays). The leaf objects use namespacing (`name`, `contact`).
 
-**Relational interpretation:** Destructure the grouping levels; flatten the namespaced leaves. The result has columns `Title`, `name_first`, `name_last`, `contact_email`, `contact_phone`.
+**Relational interpretation:** Destructure the grouping levels; flatten the namespaced leaves. The result has columns `title`, `name_first`, `name_last`, `contact_email`, `contact_phone`.
 
 ---
 
@@ -234,9 +234,9 @@ Real trees often combine forms at different levels. The graph shows which combin
     "version": "1.0"
   },
   "data": [
-    { "Title": "Engineer",
+    { "title": "Engineer",
       "people": [
-        { "FirstName": "Alice", "LastName": "Smith" }
+        { "first_name": "Alice", "last_name": "Smith" }
       ]
     }
   ]

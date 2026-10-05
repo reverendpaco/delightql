@@ -7,32 +7,32 @@ must also be the source table and the schemas must match.
 
 
 ```delightql
-hr.employee!!(*)
-  , Department = "Executive"
-  |> delete!(hr.employee(*))(*)
+employee!!(*)
+  , title = "IT Staff"
+  |> delete!(employee(*))(*)
 ```
 
 ```sql
-DELETE FROM hr.employee
-WHERE Department = 'Executive';
+DELETE FROM employee
+WHERE title = 'IT Staff';
 ```
 
 Without filters, all rows are deleted:
 
 ```delightql
-hr.employee!!(*) |> delete!(hr.employee(*))(*)
+invoice_line!!(*) |> delete!(invoice_line(*))(*)
 ```
 
 ```sql
-DELETE FROM hr.employee;
+DELETE FROM invoice_line;
 ```
 
 To keep only some rows, invert the predicate and delete the
 complement:
 
 ```delightql
-hr.employee!!(*)
-  , Department != "Engineering"
-  |> delete!(hr.employee(*))(*)
+invoice_line!!(*)
+  , unit_price != 0.99
+  |> delete!(invoice_line(*))(*)
 ```
 

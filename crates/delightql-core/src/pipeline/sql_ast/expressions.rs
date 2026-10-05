@@ -3,7 +3,7 @@
 use super::operators::{BinaryOperator, UnaryOperator};
 use super::query::QueryExpression;
 use crate::diagnostic::Internal;
-use crate::pipeline::ast_refined::LiteralValue;
+use crate::pipeline::asts::core::LiteralValue;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FunctionName {
@@ -130,8 +130,8 @@ pub enum DomainExpression {
 
     /// Predicate-position rewrite call (sigma predicates like +like, +between,
     /// +sql_eq). The generator consults the bin_registry to render this. The
-    /// SELECTED entity is the identity carried — its namespace when the
-    /// author qualified it, else the universal bare name — so every SQL-AST
+    /// SELECTED entity is the complete namespace/name identity carried by the
+    /// resolver, whether the author qualified it or not, so every SQL-AST
     /// pass moves the call whole and none reads it as a comparison.
     PredicateRewrite {
         name: String,
@@ -333,7 +333,6 @@ pub struct SqlWindowFrame {
 /// SQL frame mode
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlFrameMode {
-    Groups,
     Rows,
     Range,
 }
@@ -347,103 +346,57 @@ pub enum SqlFrameBound {
     Following(Box<DomainExpression>),
 }
 
-/// A predicate in boolean position (WHERE, ON, HAVING).
-///
-/// Either a plain `DomainExpression` or a rewrite call that the generator
-/// resolves via the bin_registry (sigma predicates like +like, +between).
-#[derive(Debug, Clone, PartialEq)]
-pub enum SqlPredicate {
-    /// A domain expression used as a predicate.
-    Expr(DomainExpression),
-    /// A rewrite-rule predicate (sigma predicates).
-    /// The generator consults the bin_registry to render this.
-    RewriteCall {
-        name: String,
-        namespace: Vec<String>,
-        args: Vec<DomainExpression>,
-        negated: bool,
-    },
-}
-
-impl SqlPredicate {
-    /// Wrap a `DomainExpression` as a predicate.
-    pub(crate) fn new(expr: DomainExpression) -> Self {
-        Self::Expr(expr)
-    }
-
-    /// Wrap a rewrite-rule predicate.
-    pub(crate) fn rewrite_call(
-        name: impl Into<String>,
-        namespace: Vec<String>,
-        args: Vec<DomainExpression>,
-        negated: bool,
-    ) -> Self {
-        Self::RewriteCall {
-            name: name.into(),
-            namespace,
-            args,
-            negated,
-        }
-    }
-
-    /// Unwrap into a `DomainExpression`.
-    /// RewriteCall converts to `DomainExpression::PredicateRewrite`.
-    pub fn into_expr(self) -> DomainExpression {
-        match self {
-            Self::Expr(e) => e,
-            Self::RewriteCall {
-                name,
-                namespace,
-                args,
-                negated,
-            } => DomainExpression::PredicateRewrite {
-                name,
-                namespace,
-                args,
-                negated,
-            },
-        }
-    }
-
-    /// Combine two predicates with AND.
-    pub fn and(self, other: SqlPredicate) -> Self {
-        Self::Expr(DomainExpression::and(vec![
-            self.into_expr(),
-            other.into_expr(),
-        ]))
-    }
-
-    /// Combine two predicates with OR.
-    pub fn or(self, other: SqlPredicate) -> Self {
-        Self::Expr(DomainExpression::or(vec![
-            self.into_expr(),
-            other.into_expr(),
-        ]))
-    }
-
-    /// OBSERVE this predicate: `IS TRUE` positively, `IS NOT TRUE`
-    /// negatively. The two are complementary over every input row, the
-    /// UNKNOWN-answering ones included, which Kleene `NOT` is not.
-    pub fn observed(self, positive: bool) -> Self {
-        Self::Expr(DomainExpression::Observation {
-            expr: Box::new(self.into_expr()),
-            positive,
-        })
-    }
-
-    /// Negate this predicate.
-    pub fn not(self) -> Self {
-        Self::Expr(DomainExpression::Unary {
-            op: super::operators::UnaryOperator::Not,
-            expr: Box::new(self.into_expr()),
-        })
-    }
-}
-
 // Smart constructors for DomainExpression
 impl DomainExpression {
     pub fn literal(value: LiteralValue) -> Self {
         DomainExpression::Literal(value)
+    }
+
+    /// A constant written as a token, signed or parenthesized or not. It
+    /// reads no column and computes nothing, so as an ORDER BY or GROUP BY
+    /// key it distinguishes no rows. Anything that computes, a cast
+    /// included, is read as its value.
+    pub fn is_literal(&self) -> bool {
+        match self {
+            DomainExpression::Literal(_)
+            | DomainExpression::PublishedNameLiteral(_)
+            | DomainExpression::PublishedJsonPathLiteral(_)
+            | DomainExpression::JsonPathLiteral(_)
+            | DomainExpression::ScopeNameLiteral(_) => true,
+            DomainExpression::Parens(inner)
+            | DomainExpression::Unary {
+                op: super::operators::UnaryOperator::Minus | super::operators::UnaryOperator::Plus,
+                expr: inner,
+            } => inner.is_literal(),
+            _ => false,
+        }
+    }
+
+    /// The literal keys SQL reads by POSITION as an ORDER BY or GROUP BY
+    /// key: an integer, or a boolean (SQLite, MySQL and T-SQL spell it `1`
+    /// or `0`), signed or parenthesized or not. `ORDER BY 2` names the second output
+    /// column, and SQLite reads `(2)` and `+2` the same way. Written there, the
+    /// value would be read with another meaning.
+    pub fn reads_as_position(&self) -> bool {
+        match self {
+            DomainExpression::Literal(LiteralValue::Number(number)) => number.is_integer(),
+            DomainExpression::Literal(LiteralValue::Boolean(_)) => true,
+            DomainExpression::Parens(inner)
+            | DomainExpression::Unary {
+                op: super::operators::UnaryOperator::Minus | super::operators::UnaryOperator::Plus,
+                expr: inner,
+            } => inner.reads_as_position(),
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn add(left: DomainExpression, right: DomainExpression) -> Self {
+        DomainExpression::Binary {
+            left: Box::new(left),
+            op: BinaryOperator::Add,
+            right: Box::new(right),
+        }
     }
 
     pub fn star() -> Self {
@@ -475,54 +428,6 @@ impl DomainExpression {
             name: FunctionName::Intrinsic(intrinsic),
             args,
             distinct: false,
-        }
-    }
-
-    pub fn add(left: DomainExpression, right: DomainExpression) -> Self {
-        DomainExpression::Binary {
-            left: Box::new(left),
-            op: BinaryOperator::Add,
-            right: Box::new(right),
-        }
-    }
-
-    pub fn subtract(left: DomainExpression, right: DomainExpression) -> Self {
-        DomainExpression::Binary {
-            left: Box::new(left),
-            op: BinaryOperator::Subtract,
-            right: Box::new(right),
-        }
-    }
-
-    pub fn multiply(left: DomainExpression, right: DomainExpression) -> Self {
-        DomainExpression::Binary {
-            left: Box::new(left),
-            op: BinaryOperator::Multiply,
-            right: Box::new(right),
-        }
-    }
-
-    pub fn divide(left: DomainExpression, right: DomainExpression) -> Self {
-        DomainExpression::Binary {
-            left: Box::new(left),
-            op: BinaryOperator::Divide,
-            right: Box::new(right),
-        }
-    }
-
-    pub fn modulo(left: DomainExpression, right: DomainExpression) -> Self {
-        DomainExpression::Binary {
-            left: Box::new(left),
-            op: BinaryOperator::Modulo,
-            right: Box::new(right),
-        }
-    }
-
-    pub fn concat(left: DomainExpression, right: DomainExpression) -> Self {
-        DomainExpression::Binary {
-            left: Box::new(left),
-            op: BinaryOperator::Concatenate,
-            right: Box::new(right),
         }
     }
 
@@ -570,14 +475,6 @@ impl DomainExpression {
         result
     }
 
-    pub fn eq(left: DomainExpression, right: DomainExpression) -> Self {
-        DomainExpression::Binary {
-            left: Box::new(left),
-            op: BinaryOperator::Equal,
-            right: Box::new(right),
-        }
-    }
-
     pub fn gt(self, other: DomainExpression) -> Self {
         DomainExpression::Binary {
             left: Box::new(self),
@@ -607,12 +504,16 @@ impl DomainExpression {
     /// standing where no row publishes it REFUSES rather than being asked
     /// twice.
     ///
+    /// Each term is compared as `compared` spells it: the caller's equality
+    /// decides how a value and a term are told apart.
+    ///
     /// ONE LOWERING FOR ONE LAW: the query road and the DDL road ask the same
     /// question of the same arms, and a second copy would answer it once.
     pub fn anchored_case(
         anchor: DomainExpression,
         arms: Vec<(LiteralValue, DomainExpression)>,
         default: Option<DomainExpression>,
+        compared: impl Fn(DomainExpression) -> DomainExpression,
     ) -> crate::Result<Self> {
         if !arms
             .iter()
@@ -622,7 +523,7 @@ impl DomainExpression {
                 expr: Some(Box::new(anchor)),
                 when_clauses: arms
                     .into_iter()
-                    .map(|(term, then)| WhenClause::new(DomainExpression::Literal(term), then))
+                    .map(|(term, then)| WhenClause::new(compared(DomainExpression::Literal(term)), then))
                     .collect(),
                 else_clause: default.map(Box::new),
             });
@@ -636,7 +537,7 @@ impl DomainExpression {
                     WhenClause::new(
                         anchor
                             .clone()
-                            .is_not_distinct_from(DomainExpression::Literal(term)),
+                            .is_not_distinct_from(compared(DomainExpression::Literal(term))),
                         then,
                     )
                 })
@@ -689,10 +590,6 @@ impl DomainExpression {
             not: true,
             query: Box::new(query),
         }
-    }
-
-    pub fn subquery(query: QueryExpression) -> Self {
-        DomainExpression::Subquery(Box::new(query))
     }
 
     /// CAST(expr AS type) — `type_name` is the DQL-canonical type word.

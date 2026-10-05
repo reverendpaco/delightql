@@ -13,15 +13,16 @@
 //! reference-versus-literal split is the taxonomy `Grelex` states.
 
 use super::super::TupleOrdinalClause;
-use super::super::{LiteralValue, Phase, Unresolved};
+use super::super::{
+    LiteralValue, Phase, Unresolved,
+};
 use super::access::Slot;
 use super::domain::DomainExpression;
 use super::metadata_types::{FilterOrigin, SetOperator};
-use super::pipes::DestructureMode;
 use super::relational::Relation;
 use super::truth::TruthExpression;
-use crate::diagnostic::{DelightQLError, Internal, Resolution};
-use crate::pipeline::asts::core::operators::{JoinType, PipeOp};
+use crate::diagnostic::Internal;
+use crate::pipeline::asts::core::operators::PipeOp;
 use crate::pipeline::asts::vocabulary::ArmIx;
 use crate::{lispy::ToLispy, ToLispy};
 use delightql_types::SqlIdentifier;
@@ -179,6 +180,20 @@ impl<P: Phase<Scope = ()>> Chain<P> {
 }
 
 impl<P: Phase> Continuation<P> {
+    /// The scalar formals this continuation's row bound names (its count or
+    /// its offset), whether the bound stands alone or in its ordering.
+    pub fn bound_formals(&self) -> Vec<crate::pipeline::asts::core::definitions::FormalSelector> {
+        let bound = match self {
+            Continuation::Bound { bound } => Some(bound),
+            Continuation::Structural(StructuralStep {
+                form: StructuralForm::Ordering { bound, .. },
+                ..
+            }) => bound.as_ref(),
+            _ => None,
+        };
+        bound.map(TupleOrdinalClause::formals).unwrap_or_default()
+    }
+
     /// WHETHER THIS CONTINUATION PUBLISHES ITS OPERAND'S OWN RELATION, BY
     /// LAW.
     ///
@@ -277,11 +292,13 @@ pub enum Standing {
 /// occurrence, so none creates an interface — what such a step publishes
 /// IS the relation standing to its left.
 ///
-/// That is why [`Chain::transparently`] needs no construction capability:
-/// nothing is constructed. It is also why moving one of these onto a
-/// different operand is safe where moving any other step is not — the
-/// result is RESTATED from the prefix it lands on, never carried over from
-/// the prefix it came off.
+/// Nothing is constructed by attaching one, which is why moving one of
+/// these onto a different operand is safe where moving any other step is
+/// not — the result is RESTATED from the prefix it lands on, never carried
+/// over from the prefix it came off. Attaching is still the authority's act
+/// ([`Chain::transparently`] takes its token): a restriction READS, and
+/// what it reads of the standing relation's obligations is spent by the
+/// act that lands it, nowhere else.
 ///
 /// The CORRELATED restriction is deliberately absent. It publishes its
 /// operand's relation too, but attaching it records what that relation
@@ -325,150 +342,6 @@ impl<P: Phase> Transparent<P> {
             Continuation::Correlate { whole } => Ok(Transparent::Correlate { whole }),
             other => Err(other),
         }
-    }
-}
-
-impl<P: Phase<Scope = crate::relation::SemanticRelation>> Chain<P> {
-    /// INSERT A TRANSPARENT CONTINUATION AT A POSITION.
-    ///
-    /// What it publishes is the relation standing to its LEFT at that
-    /// position, restated here. Every later node stands on exactly what it
-    /// stood on, because a transparent step creates no occurrence — which
-    /// is why this is a lawful move for these forms and for no other.
-    pub fn transparently_at(mut self, at: usize, form: Transparent<P>) -> Self {
-        let result = match at.checked_sub(1) {
-            Some(before) => self.continuations[before].result.clone(),
-            None => self.head.result.clone(),
-        };
-        self.continuations.insert(
-            at,
-            Step {
-                form: form.into_form(),
-                result,
-            },
-        );
-        self
-    }
-
-    /// EXTEND BY A CONTINUATION THAT PUBLISHES THIS CHAIN'S OWN RELATION.
-    ///
-    /// See [`Transparent`]. The result is not an argument and not derived:
-    /// it is the relation this chain already publishes, restated at the
-    /// step. A capability would be theatre — the preserve law returns its
-    /// input, so there is nothing here to mint.
-    pub fn transparently(mut self, form: Transparent<P>) -> Self {
-        let result = self.semantic_relation();
-        self.continuations.push(Step {
-            form: form.into_form(),
-            result,
-        });
-        self
-    }
-
-    /// RESTATE WHAT THE OUTERMOST NODE PUBLISHES, and only the authority
-    /// may.
-    ///
-    /// One operation reaches here: an authored alias, which derives an
-    /// export OUT OF what the node already publishes and puts the export
-    /// where it stood. The form does not move and the caller never holds
-    /// either relation, so this is not a road for re-choosing a result —
-    /// it is the one act that replaces a result with a relation derived
-    /// from it.
-    pub(crate) fn restate_outermost(
-        &mut self,
-        authority: &crate::relation::builder::SemanticConstruction,
-        result: crate::relation::SemanticRelation,
-    ) {
-        let _ = authority;
-        match self.continuations.last_mut() {
-            Some(step) => step.result = result,
-            None => self.head.result = result,
-        }
-    }
-
-    /// RESTATE ONE NODE, and only the authority may.
-    ///
-    /// An authored alias EXPORTS what a node publishes under a new
-    /// answering name: the node stays where it is, its payload is either
-    /// unchanged or rebuilt in its interior, and what it publishes becomes
-    /// a relation derived FROM what it published. The caller holds neither
-    /// relation — the authority derives the export from the node's own
-    /// result and writes it back here.
-    pub(crate) fn restate_step(
-        &mut self,
-        _authority: &crate::relation::builder::SemanticConstruction,
-        at: usize,
-        form: Option<Continuation<P>>,
-        result: Option<crate::relation::SemanticRelation>,
-    ) {
-        let step = &mut self.continuations[at];
-        if let Some(form) = form {
-            step.form = form;
-        }
-        if let Some(result) = result {
-            step.result = result;
-        }
-    }
-
-    /// The same act at the head.
-    pub(crate) fn restate_head(
-        &mut self,
-        _authority: &crate::relation::builder::SemanticConstruction,
-        form: Option<GroundForm<P>>,
-        result: Option<crate::relation::SemanticRelation>,
-    ) {
-        if let Some(form) = form {
-            self.head.form = form;
-        }
-        if let Some(result) = result {
-            self.head.result = result;
-        }
-    }
-
-    /// LAND A STEP BACK, and only the authority may.
-    ///
-    /// The authority checks what a caller could get wrong — that the
-    /// step's relation DESCENDS from the operand it is landing on — and
-    /// that check needs the construction record, so the road is
-    /// [`crate::relation::SemanticBuilder::reland`] and this is its
-    /// landing.
-    pub(crate) fn landed(
-        self,
-        _authority: &crate::relation::builder::SemanticConstruction,
-        step: Step<P>,
-    ) -> crate::error::Result<Self> {
-        let Step { form, result } = step;
-        self.admit(form, result)
-    }
-
-    /// ATTACH A CORRELATED RESTRICTION, and only the authority may.
-    ///
-    /// The step publishes the relation this chain already publishes, like a
-    /// restriction — but it is the correlation act's own step: the act that
-    /// holds the token derived the correlation from this chain's relation
-    /// and recorded what that relation owes in the same breath. There is no
-    /// [`Transparent`] spelling of it, so nothing but that act puts one on.
-    pub(crate) fn correlated(
-        self,
-        _authority: &crate::relation::builder::SemanticConstruction,
-        correlated: P::Correlated,
-    ) -> crate::error::Result<Self> {
-        let result = self.semantic_relation();
-        self.admit(Continuation::Correlated(correlated), result)
-    }
-
-    /// EXTEND A BOUND CHAIN, and only the authority may.
-    ///
-    /// The token is unforgeable outside semantic construction, so the one
-    /// road that appends a bound step is the road that just derived it over
-    /// THIS prefix.
-    pub(crate) fn then_derived(
-        mut self,
-        _authority: &crate::relation::builder::SemanticConstruction,
-        step: Step<P>,
-    ) -> Self {
-        self.continuations.push(step);
-        self
     }
 }
 
@@ -609,15 +482,6 @@ impl<P: Phase> Chain<P> {
         }
     }
 
-    /// MARK THE HEAD AN OUTER-JOIN OPERAND. See [`Relation::mark_outer`]:
-    /// orientation is how the head is joined, never what it publishes, so
-    /// this reaches one field and the result is untouched.
-    pub fn mark_head_outer(&mut self, orientation: bool) {
-        if let GroundForm::Reference(relation) = &mut self.head.form {
-            relation.mark_outer(orientation);
-        }
-    }
-
     /// Which set operation the step at that position is. `None` says it is
     /// not a set operation at all.
     pub fn bag_operator_at(&self, at: usize) -> Option<SetOperator> {
@@ -646,21 +510,32 @@ impl<P: Phase> Chain<P> {
         Ok(self)
     }
 
-    /// AN ORDERING SURRENDERS ITS BOUND. The window rewrite performs the
-    /// membership act by ranking instead: the ordering's node stays — it
-    /// republishes its operand through the stage export, and everything
-    /// above it stands on the ports that export minted — and its bound
-    /// comes off to be spent as the rank filter. The relation the node
-    /// publishes is unchanged: the bound was never part of the derivation,
-    /// only the row-bounded fact stamped on its result. Answers `None` for
-    /// any step that is not an ordering carrying a bound, and changes
-    /// nothing then.
-    pub fn surrender_bound(&mut self, at: usize) -> Option<TupleOrdinalClause> {
+    /// AN ORDERING SURRENDERS ITS MEMBERSHIP ACT. The window rewrite performs
+    /// the act by ranking instead: the rank orders by the ordering's keys and
+    /// keeps the interval its bound spells, so both come off the node
+    /// together — an ordering left standing without its bound would be one
+    /// nothing consumes. The node stays only as the stage its export
+    /// published, because everything above it stands on the ports that
+    /// export minted, and it orders nothing. The relation the node publishes
+    /// is unchanged: neither the keys nor the bound were part of the
+    /// derivation, only the row-bounded fact stamped on its result. Answers
+    /// `None` for any step that is not an ordering carrying a bound, and
+    /// changes nothing then.
+    pub fn surrender_membership(
+        &mut self,
+        at: usize,
+    ) -> Option<(
+        Vec<super::super::specs::OrderingSpec<P>>,
+        TupleOrdinalClause,
+    )> {
         match &mut self.continuations[at].form {
             Continuation::Structural(StructuralStep {
-                form: StructuralForm::Ordering { bound, .. },
+                form: StructuralForm::Ordering { specs, bound },
                 ..
-            }) => bound.take(),
+            }) => {
+                let bound = bound.take()?;
+                Some((std::mem::take(specs), bound))
+            }
             _ => None,
         }
     }
@@ -1071,6 +946,18 @@ impl<P: Phase> Chain<P> {
         }
     }
 
+    /// Whether this chain HEADS A CALL: its head reads a functor call,
+    /// whatever follows it. A join frames its right member by this — a
+    /// call at the head takes the row to its left as its caller row
+    /// whether or not restrictions or members follow the call inside the
+    /// same operand.
+    pub fn heads_a_call(&self) -> bool {
+        matches!(
+            self.head.form(),
+            GroundForm::Reference(Relation::FunctorCall { .. })
+        )
+    }
+
     /// The relation this chain names when nothing has consumed it yet.
     pub fn as_bare_relation(&self) -> Option<&Relation<P>> {
         match (self.head.form(), self.continuations.is_empty()) {
@@ -1096,16 +983,6 @@ impl<P: Phase> Chain<P> {
                 continuations: rest,
             },
         ))
-    }
-}
-
-impl<P: Phase<Scope = crate::relation::SemanticRelation>> Chain<P> {
-    /// The semantic result this tree inherently publishes.
-    pub(crate) fn semantic_relation(&self) -> crate::relation::SemanticRelation {
-        match self.continuations.last() {
-            Some(step) => *step.result(),
-            None => *self.head.result(),
-        }
     }
 }
 
@@ -1177,20 +1054,6 @@ impl<P: Phase<Scope = ()>> Step<P> {
     }
 }
 
-impl<P: Phase<Scope = crate::relation::SemanticRelation>> Step<P> {
-    /// THE ONE BOUND-PHASE CONSTRUCTOR, and it is the authority's.
-    ///
-    /// The token is unforgeable outside the semantic construction module,
-    /// so this cannot be reached with a relation somebody chose.
-    pub(crate) fn derived(
-        _authority: &crate::relation::builder::SemanticConstruction,
-        form: Continuation<P>,
-        result: crate::relation::SemanticRelation,
-    ) -> Self {
-        Step { form, result }
-    }
-}
-
 impl<P: Phase> Step<P> {
     /// REBUILD THE RELATIONAL ARM STANDING INSIDE THIS STEP.
     ///
@@ -1216,11 +1079,11 @@ impl<P: Phase> Step<P> {
             Continuation::Member {
                 rhs,
                 correlation,
-                join_type,
+                join,
             } => Continuation::Member {
                 rhs: rebuilt_in_place(rhs, arm)?,
                 correlation,
-                join_type,
+                join,
             },
             Continuation::BagOp {
                 operator,
@@ -1433,47 +1296,6 @@ impl<P: Phase> Peel<P> {
         let landed = rebuilt_in_place(operand, prefix)?;
         landed.admit(form, result)
     }
-
-    /// CROSS A PHASE WITHOUT TAKING THE NODE APART.
-    ///
-    /// `prefix` crosses the operand and `form` the payload, each handed its
-    /// own half and nothing else; the step's own result crosses through the
-    /// phases' own door, which is not an argument here and takes no answer
-    /// from the walk.
-    /// The crossed step is then ADMITTED onto the crossed operand — judged
-    /// against what that operand actually publishes — so a `prefix` that
-    /// hands back some other chain cannot carry a correlation with it. A
-    /// correlated restriction crosses by its own door and is never offered
-    /// to `form`.
-    ///
-    /// A PHASE CROSSING, by type: the operand comes back as the next phase's
-    /// own — the authority's rebuild of it, where refinement rebuilds — so
-    /// what it publishes is that road's to state; a same-phase rewrite
-    /// cannot reach for this road to hand a step another operand.
-    pub fn crossing<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
-        self,
-        walk: &mut F,
-        prefix: impl FnOnce(&mut F, Chain<P>) -> crate::error::Result<Chain<Q>>,
-        form: impl FnOnce(&mut F, Continuation<P>, &P::Scope) -> crate::error::Result<Continuation<Q>>,
-    ) -> crate::error::Result<Chain<Q>>
-    where
-        P: crate::pipeline::asts::core::phases::PhaseCrossing<Q>,
-    {
-        let Peel {
-            prefix: operand,
-            last,
-        } = self;
-        let Step { form: was, result } = last;
-        let landed = prefix(walk, operand)?;
-        let now = match was {
-            Continuation::Correlated(_) => crossed_form(walk, was)?,
-            other => form(walk, other, &result)?,
-        };
-        landed.admit(
-            now,
-            crate::pipeline::asts::core::phases::carry_scope::<P, Q>(result)?,
-        )
-    }
 }
 
 /// A CHAIN TAKEN APART AT ITS TRAILING RUN: the operand, and the run's
@@ -1482,7 +1304,7 @@ impl<P: Phase> Peel<P> {
 /// ONE value, for the reason [`Peel`] is one. The run is the pipe stages,
 /// dimension accesses and structural steps standing at the end — the
 /// partition [`Chain::pop_run_step`] states — and it goes back on in the
-/// order it came off or crosses a phase whole.
+/// order it came off.
 pub struct Run<P: Phase> {
     prefix: Chain<P>,
     steps: Vec<Step<P>>,
@@ -1511,43 +1333,6 @@ impl<P: Phase> Run<P> {
         self.prefix
     }
 
-    /// CROSS A PHASE WITH THE RUN STILL ON.
-    ///
-    /// The operand crosses by `prefix` and each payload by `form`; every
-    /// step's result crosses through the phases' own door, which is not
-    /// an argument. The run lands back in its own order on the chain its
-    /// operand became, each step ADMITTED against what stands under it; a
-    /// correlated restriction crosses by its own door and is never offered
-    /// to `form`.
-    ///
-    /// A PHASE CROSSING, by type, for the reason [`Peel::crossing`] is one.
-    pub fn crossing<Q: Phase, F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized>(
-        self,
-        walk: &mut F,
-        prefix: impl FnOnce(&mut F, Chain<P>) -> crate::error::Result<Chain<Q>>,
-        mut form: impl FnMut(&mut F, Continuation<P>) -> crate::error::Result<Continuation<Q>>,
-    ) -> crate::error::Result<Chain<Q>>
-    where
-        P: crate::pipeline::asts::core::phases::PhaseCrossing<Q>,
-    {
-        let Run {
-            prefix: operand,
-            steps,
-        } = self;
-        let mut landed = prefix(walk, operand)?;
-        for step in steps {
-            let Step { form: was, result } = step;
-            let now = match was {
-                Continuation::Correlated(_) => crossed_form(walk, was)?,
-                other => form(walk, other)?,
-            };
-            landed = landed.admit(
-                now,
-                crate::pipeline::asts::core::phases::carry_scope::<P, Q>(result)?,
-            )?;
-        }
-        Ok(landed)
-    }
 }
 
 /// Where a chain's trailing bag run starts and how many steps it has.
@@ -1770,17 +1555,6 @@ impl<P: Phase<Scope = ()>> Grelex<P> {
     }
 }
 
-impl<P: Phase<Scope = crate::relation::SemanticRelation>> Grelex<P> {
-    /// THE ONE BOUND-PHASE CONSTRUCTOR, and it is the authority's.
-    pub(crate) fn derived(
-        _authority: &crate::relation::builder::SemanticConstruction,
-        form: GroundForm<P>,
-        result: crate::relation::SemanticRelation,
-    ) -> Self {
-        Grelex { form, result }
-    }
-}
-
 impl<P: Phase> Grelex<P> {
     /// REBUILD THE RELATIONAL OPERAND STANDING INSIDE THIS HEAD.
     ///
@@ -1802,32 +1576,6 @@ impl<P: Phase> Grelex<P> {
             literal @ GroundForm::Literal(_) => literal,
         };
         Ok(Grelex { form, result })
-    }
-
-    /// CROSS A PHASE, keeping what this head publishes.
-    ///
-    /// The head's own form is rebuilt into the next phase; what it publishes
-    /// crosses through the phases' own door, because a crossing is not the
-    /// place a head acquires a different relation. There is no argument here
-    /// for a result — which is the whole difference between crossing a node
-    /// and rebuilding one out of its parts.
-    ///
-    /// A PHASE CROSSING, by type, for the reason [`Peel::crossing`] is one:
-    /// the form closure may rebuild what stands INSIDE the head — a
-    /// consulted body, a derived table's subquery — into the next phase's
-    /// own, and a same-phase rewrite cannot reach for this road to put
-    /// another body under a head's kept identity.
-    pub(crate) fn crossing<Q: Phase>(
-        self,
-        form: impl FnOnce(GroundForm<P>) -> crate::error::Result<GroundForm<Q>>,
-    ) -> crate::error::Result<Grelex<Q>>
-    where
-        P: crate::pipeline::asts::core::phases::PhaseCrossing<Q>,
-    {
-        Ok(Grelex {
-            form: form(self.form)?,
-            result: crate::pipeline::asts::core::phases::carry_scope::<P, Q>(self.result)?,
-        })
     }
 
     /// Cross a phase boundary, through the same door a [`Step`] uses.
@@ -1856,11 +1604,7 @@ impl<P: Phase> Grelex<P> {
             GroundForm::Reference(relation) => GroundForm::Reference(
                 crate::pipeline::ast_transform::walk_transform_relation(walk, relation)?,
             ),
-            GroundForm::Literal(anon) => GroundForm::Literal(AnonRelation {
-                table: crate::pipeline::ast_transform::walk_transform_anon_table(walk, anon.table)?,
-                alias: anon.alias,
-                outer: anon.outer,
-            }),
+            GroundForm::Literal(anon) => GroundForm::Literal(anon.crossed(walk)?),
         };
         if form.nested_body() != body {
             return Err(Internal::invariant(
@@ -1870,18 +1614,10 @@ impl<P: Phase> Grelex<P> {
             ));
         }
         let form = match form {
-            GroundForm::Reference(Relation::InnerRelation {
-                pattern,
-                alias,
-                outer,
-            }) => {
+            GroundForm::Reference(Relation::InnerRelation { pattern, alias }) => {
                 let stood_over = Q::into_scope(pattern.subquery().published());
                 let pattern = walk.realize_interior(pattern)?.judged(stood_over)?;
-                GroundForm::Reference(Relation::InnerRelation {
-                    pattern,
-                    alias,
-                    outer,
-                })
+                GroundForm::Reference(Relation::InnerRelation { pattern, alias })
             }
             other => other,
         };
@@ -1914,23 +1650,196 @@ pub enum GroundForm<P: Phase = Unresolved> {
     Literal(AnonRelation<P>),
 }
 
-/// One occurrence of an anonymous relation. Naming and outer orientation
-/// describe where the table stands, not the literal rows it contains.
+/// One occurrence of an anonymous relation. Ordinary and receipt payloads
+/// are separate construction products, so a receipt's table cannot cross
+/// this boundary as an ordinary table that another caller can re-pair.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("anon_relation")]
 pub struct AnonRelation<P: Phase = Unresolved> {
-    pub table: AnonTable<P>,
-    pub alias: Option<SqlIdentifier>,
-    pub outer: bool,
+    payload: AnonRelationPayload<P>,
+}
+
+/// The payload products an anonymous-relation authority can construct.
+/// Receipt rows remain in the receipt arm even when an authored alias is
+/// attached; aliasing changes publication, not provenance.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+enum AnonRelationPayload<P: Phase> {
+    Ordinary {
+        table: AnonTable<P>,
+        name: AnonRelationName,
+    },
+    Receipt {
+        table: AnonTable<P>,
+        alias: Option<SqlIdentifier>,
+        isolation: crate::bin_cartridge::prelude::ReceiptIsolation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+enum AnonRelationName {
+    #[lispy("unnamed")]
+    Unnamed,
+    #[lispy("authored")]
+    Authored(SqlIdentifier),
+}
+
+impl AnonRelationName {
+    fn authored(&self) -> Option<&SqlIdentifier> {
+        match self {
+            Self::Authored(alias) => Some(alias),
+            Self::Unnamed => None,
+        }
+    }
 }
 
 impl<P: Phase> AnonRelation<P> {
     pub fn plain(table: AnonTable<P>) -> Self {
         Self {
-            table,
-            alias: None,
-            outer: false,
+            payload: AnonRelationPayload::Ordinary {
+                table,
+                name: AnonRelationName::Unnamed,
+            },
         }
+    }
+
+    pub(crate) fn authored(table: AnonTable<P>, alias: SqlIdentifier) -> Self {
+        Self {
+            payload: AnonRelationPayload::Ordinary {
+                table,
+                name: AnonRelationName::Authored(alias),
+            },
+        }
+    }
+
+    pub(crate) fn receipt(
+        table: AnonTable<P>,
+        isolation: crate::bin_cartridge::prelude::ReceiptIsolation,
+    ) -> Self {
+        Self {
+            payload: AnonRelationPayload::Receipt {
+                table,
+                alias: None,
+                isolation,
+            },
+        }
+    }
+
+    pub(crate) fn authored_receipt(
+        table: AnonTable<P>,
+        alias: SqlIdentifier,
+        isolation: crate::bin_cartridge::prelude::ReceiptIsolation,
+    ) -> Self {
+        Self {
+            payload: AnonRelationPayload::Receipt {
+                table,
+                alias: Some(alias),
+                isolation,
+            },
+        }
+    }
+
+    /// Cross the payload through the canonical structural AST walk. The walk
+    /// answers only for fields inside this occurrence; it cannot return a
+    /// replacement table to pair with this relation's disposition.
+    pub(crate) fn crossed<Q: Phase, F>(self, walk: &mut F) -> crate::error::Result<AnonRelation<Q>>
+    where
+        F: crate::pipeline::ast_transform::AstTransform<P, Q> + ?Sized,
+    {
+        let Self { payload } = self;
+        let payload = match payload {
+            AnonRelationPayload::Ordinary { table, name } => AnonRelationPayload::Ordinary {
+                table: crate::pipeline::ast_transform::walk_transform_anon_table(walk, table)?,
+                name,
+            },
+            AnonRelationPayload::Receipt {
+                table,
+                alias,
+                isolation,
+            } => AnonRelationPayload::Receipt {
+                table: crate::pipeline::ast_transform::walk_transform_anon_table(walk, table)?,
+                alias,
+                isolation,
+            },
+        };
+        Ok(AnonRelation { payload })
+    }
+
+    /// Ordinary consumers may inspect their table. Receipt rows have no
+    /// ordinary table view; receipt operations and the structural crossing
+    /// remain the only roads that retain their disposition.
+    pub(crate) fn table(&self) -> Option<&AnonTable<P>> {
+        match &self.payload {
+            AnonRelationPayload::Ordinary { table, .. } => Some(table),
+            AnonRelationPayload::Receipt { .. } => None,
+        }
+    }
+
+    pub(crate) fn authored_name(&self) -> Option<&SqlIdentifier> {
+        match &self.payload {
+            AnonRelationPayload::Ordinary { name, .. } => name.authored(),
+            AnonRelationPayload::Receipt { alias, .. } => alias.as_ref(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_authored_name(&self) -> bool {
+        self.authored_name().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_receipt_isolated(&self) -> bool {
+        matches!(self.payload, AnonRelationPayload::Receipt { .. })
+    }
+
+    pub(crate) fn set_authored_name(self, alias: SqlIdentifier) -> Self {
+        let payload = match self.payload {
+            AnonRelationPayload::Ordinary { table, .. } => AnonRelationPayload::Ordinary {
+                table,
+                name: AnonRelationName::Authored(alias),
+            },
+            AnonRelationPayload::Receipt {
+                table, isolation, ..
+            } => AnonRelationPayload::Receipt {
+                table,
+                alias: Some(alias),
+                isolation,
+            },
+        };
+        Self { payload }
+    }
+
+    fn into_terminal_table_inner(self) -> AnonTable<P> {
+        match self.payload {
+            AnonRelationPayload::Ordinary { table, .. }
+            | AnonRelationPayload::Receipt { table, .. } => table,
+        }
+    }
+
+    /// The canonical non-consuming AST visit for either payload product.
+    /// Receipt inspection stays a walk over the owned occurrence; it does not
+    /// return a table that can be installed in an ordinary relation.
+    pub(crate) fn visited_by<F: crate::pipeline::ast_visit::AstVisit<P> + ?Sized>(
+        &self,
+        visitor: &mut F,
+    ) -> crate::error::Result<crate::pipeline::ast_visit::Descent> {
+        match &self.payload {
+            AnonRelationPayload::Ordinary { table, .. }
+            | AnonRelationPayload::Receipt { table, .. } => {
+                crate::pipeline::ast_visit::walk_visit_anon_table(visitor, table)
+            }
+        }
+    }
+}
+
+impl AnonRelation<Unresolved> {
+    /// Combine the prelude executable's completed result. The authority is
+    /// private to that result accumulator, so an unresolved receipt cannot be
+    /// extracted and rebuilt as an ordinary anonymous relation by a caller.
+    pub(crate) fn into_combined_table(
+        self,
+        _authority: crate::bin_cartridge::prelude::CompileResultCombinationAuthority,
+    ) -> AnonTable<Unresolved> {
+        self.into_terminal_table_inner()
     }
 }
 
@@ -2151,21 +2060,20 @@ pub enum Continuation<P: Phase = Unresolved> {
     #[lispy("continuation:destructure")]
     Destructure {
         source: Box<DomainExpression<P>>,
-        /// The heading witness, declared not evaluated. A `TreePattern` by
-        /// type: no consumer checks that a value function "happens to be
-        /// curly" or that an array function is standing in for a pattern.
-        pattern: super::patterns::TreePattern<P>,
-        mode: DestructureMode,
-        /// The columns the expansion publishes — empty before resolution.
-        schema: P::Destructure,
+        /// The heading witness together with the cardinality operation that
+        /// owns it. A scalar-array binder exists only in the iterating arm.
+        /// Once bound, each publishing member holds the occurrence it
+        /// publishes.
+        pattern: super::patterns::DestructurePattern<P>,
     },
     /// §5 — the comma's relation case: another relation joined to the
-    /// chain-so-far. Outerness and what correlates the pair are member data.
+    /// chain-so-far. The member's role and what correlates the pair are
+    /// member data; the relation in `rhs` carries neither.
     #[lispy("continuation:member")]
     Member {
         rhs: Chain<P>,
         correlation: P::MemberCorr,
-        join_type: Option<JoinType>,
+        join: P::MemberJoin,
     },
     /// §6 — the `;` `|;|` `||` `-` family, BINARY: the chain-so-far is the
     /// left operand and this step owns exactly one right arm. `a ; b ; c` is
@@ -2290,9 +2198,8 @@ pub enum StructuralForm<P: Phase = Unresolved> {
     #[lispy("structural:narrow")]
     Narrow {
         nest: super::references::Reference<P>,
+        /// Once bound, each member holds the occurrence it publishes.
         pattern: super::patterns::RecordPattern<P>,
-        /// The columns the narrowing publishes — empty before resolution.
-        schema: P::Destructure,
     },
 }
 
@@ -2323,14 +2230,9 @@ impl<P: Phase> Clone for StructuralForm<P> {
             StructuralForm::Drill { drill } => StructuralForm::Drill {
                 drill: drill.clone(),
             },
-            StructuralForm::Narrow {
-                nest,
-                pattern,
-                schema,
-            } => StructuralForm::Narrow {
+            StructuralForm::Narrow { nest, pattern } => StructuralForm::Narrow {
                 nest: nest.clone(),
                 pattern: pattern.clone(),
-                schema: schema.clone(),
             },
         }
     }
@@ -2414,25 +2316,18 @@ impl<P: Phase> Clone for Continuation<P> {
             Continuation::Correlate { whole } => Continuation::Correlate {
                 whole: whole.clone(),
             },
-            Continuation::Destructure {
-                source,
-                pattern,
-                mode,
-                schema,
-            } => Continuation::Destructure {
+            Continuation::Destructure { source, pattern } => Continuation::Destructure {
                 source: source.clone(),
                 pattern: pattern.clone(),
-                mode: mode.clone(),
-                schema: schema.clone(),
             },
             Continuation::Member {
                 rhs,
                 correlation,
-                join_type,
+                join,
             } => Continuation::Member {
                 rhs: rhs.clone(),
                 correlation: correlation.clone(),
-                join_type: join_type.clone(),
+                join: join.clone(),
             },
             Continuation::BagOp {
                 operator,
@@ -2477,8 +2372,8 @@ pub struct BagCorrelation<P: Phase = Unresolved> {
     pub min_multiplicity: bool,
 }
 
-/// The columns a join CORRESPONDS on — `t(*.(a, b))`, `t(.*)`, and the
-/// unifying anonymous header.
+/// The columns a join CORRESPONDS on — a reused bare binder, a shared row
+/// identity, and the unifying anonymous header.
 ///
 /// NOT A TRUTH. By itself it accepts and rejects no row: it names which
 /// columns must agree, and it decides what the join PUBLISHES. That second
@@ -2502,41 +2397,6 @@ impl Correspondence {
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
     }
-
-    /// Spend lexical names into exact operand ports while both complete
-    /// ordered interfaces are present.
-    pub(crate) fn between(
-        names: impl IntoIterator<Item = crate::names::Sym>,
-        left: &[crate::relation::PortId],
-        right: &[crate::relation::PortId],
-        identities: &crate::names::Registry,
-    ) -> crate::error::Result<Self> {
-        let mut pairs = Vec::new();
-        for name in names {
-            let left_hits: Vec<_> = left
-                .iter()
-                .copied()
-                .filter(|port| identities.published_sym(port.column()) == Some(name))
-                .collect();
-            let right_hits: Vec<_> = right
-                .iter()
-                .copied()
-                .filter(|port| identities.published_sym(port.column()) == Some(name))
-                .collect();
-            let ([left], [right]) = (left_hits.as_slice(), right_hits.as_slice()) else {
-                return Err(DelightQLError::from(Resolution::CorrespondenceNotExact {
-                    message:
-                        "a correspondence name does not select exactly one port in each operand"
-                            .to_string(),
-                }));
-            };
-            pairs.push(crate::relation::form::MergedKey {
-                left: *left,
-                right: *right,
-            });
-        }
-        Ok(Self::new(pairs))
-    }
 }
 
 /// What correlates a member with the chain to its left.
@@ -2552,8 +2412,8 @@ pub enum MemberCorrelation<P: Phase = Unresolved> {
     #[lispy("member_correlation:condition")]
     Condition(TruthExpression<P>),
     /// Phase-selected, and uninhabited before resolution: a correspondence
-    /// is SYNTHESIZED from the access, the anonymous header, or the
-    /// positional pattern that directs it, so there is no authored one to
+    /// is SYNTHESIZED from the anonymous header, the positional pattern,
+    /// or the row identity that directs it, so there is no authored one to
     /// carry and no authored/resolved twin to drift.
     #[lispy("member_correlation:correspond")]
     Correspond(P::Correspondence),
@@ -2680,6 +2540,10 @@ pub struct ErJoinStep<P: Phase = Unresolved> {
     /// The term's own READ — the mention and the access its parens asked
     /// for. A relation and what was asked of it travel together.
     pub rhs: Chain<P>,
+    /// THE PEER'S ROLE: `?` on the peer preserves the left rows the edge
+    /// fails to reach, exactly as on a comma member. Fixed from the peer's
+    /// syntax; the read in `rhs` carries no mark.
+    pub role: super::super::operators::MemberRole,
 }
 
 #[cfg(test)]

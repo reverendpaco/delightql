@@ -116,10 +116,17 @@ pub unsafe extern "C" fn dql_open(
     // powers mount!/import! of URI-scheme databases.
     let factory = Box::new(factory::CabiConnectionFactory);
     let mount_factory = Box::new(factory::CabiConnectionFactory);
-    let mut handle: Box<dyn api::DqlHandle> = match api::open(factory, Some(mount_factory)) {
+    // Only the embedding process knows its working directory, so the C
+    // library states it at boot, captured once: a later chdir in the host
+    // does not move where relative paths resolve.
+    let base = std::env::current_dir()
+        .ok()
+        .and_then(|dir| dir.to_str().map(str::to_string));
+    let boot = api::BootSettings::new().state(api::BASE_DIRECTORY, base.as_deref());
+    let mut handle: Box<dyn api::DqlHandle> = match api::open(factory, Some(mount_factory), boot) {
         Ok(h) => h,
         Err(e) => {
-            set_error(error_out, &e.to_string());
+            set_error(error_out, &api::ApiError::from(e).to_string());
             return std::ptr::null_mut();
         }
     };
@@ -149,7 +156,10 @@ pub unsafe extern "C" fn dql_open(
     ensure_stacksafe();
     let mount_query = format!("mount!(\"{}\", \"main\")(*)", path.replace('"', "\\\""));
     let mount_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        with_stacksafe(|| cabi.session.query(&mount_query))
+        with_stacksafe(|| {
+            cabi.session
+                .query(&delightql_cst::prompt_wrap(&mount_query))
+        })
     }));
     match mount_result {
         Ok(Ok(result)) => {
@@ -174,6 +184,7 @@ pub unsafe extern "C" fn dql_open(
 // ---------------------------------------------------------------------------
 
 /// Execute a DQL query. Returns column metadata and a query_id for fetching.
+/// `dql` is what a user typed at a prompt: this host writes the prompt wrap.
 ///
 /// On failure, returns a zeroed result and writes `*error_out`.
 #[no_mangle]
@@ -209,7 +220,7 @@ pub unsafe extern "C" fn dql_query(
 
     ensure_stacksafe();
     let result = match panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        with_stacksafe(|| cabi.session.query(text))
+        with_stacksafe(|| cabi.session.query(&delightql_cst::prompt_wrap(text)))
     })) {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
@@ -237,6 +248,7 @@ pub unsafe extern "C" fn dql_query(
             name: name.into_raw(),
             position: col.position,
             type_name: type_name.into_raw(),
+            minted: u8::from(col.naming == delightql_core::api::Naming::Minted),
         });
     }
 
@@ -587,6 +599,98 @@ pub unsafe extern "C" fn dql_free_split_result(result: *mut DqlSplitResult) {
 }
 
 // ---------------------------------------------------------------------------
+// Result digest
+// ---------------------------------------------------------------------------
+
+/// The name of the digest framing `dql_digest_rows` computes: a static
+/// NUL-terminated string. Do not free it.
+#[no_mangle]
+pub extern "C" fn dql_digest_version() -> *const c_char {
+    static VERSION: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| CString::new(delightql_protocol::digest::VERSION).unwrap_or_default())
+        .as_ptr()
+}
+
+/// The data digest of `num_rows` rows of `num_cols` cells, as lowercase hex.
+///
+/// The cells are laid out row-major. `cell_lens[i]` is the length of cell `i`,
+/// or -1 when the cell is SQL NULL; the present cells' bytes are concatenated,
+/// in order, in `data` (`data_len` bytes, which may be null when zero). This
+/// is the same digest the CLI's `-f hash` prints and the ball runner pins, so
+/// a host passes the bytes it fetched, never a decoding of them.
+///
+/// On success returns a string to free with `dql_free_string`. On failure
+/// returns null and writes `*error_out`.
+#[no_mangle]
+pub unsafe extern "C" fn dql_digest_rows(
+    data: *const u8,
+    data_len: usize,
+    cell_lens: *const i64,
+    num_rows: usize,
+    num_cols: usize,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    if !error_out.is_null() {
+        *error_out = std::ptr::null_mut();
+    }
+    let Some(num_cells) = num_rows.checked_mul(num_cols) else {
+        set_error(error_out, "num_rows * num_cols overflows");
+        return std::ptr::null_mut();
+    };
+    if (data.is_null() && data_len > 0) || (cell_lens.is_null() && num_cells > 0) {
+        set_error(error_out, "null buffer with a nonzero length");
+        return std::ptr::null_mut();
+    }
+    let data: &[u8] = if data_len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(data, data_len)
+    };
+    let lens: &[i64] = if num_cells == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(cell_lens, num_cells)
+    };
+
+    let mut observation = delightql_protocol::digest::Observation::new();
+    let mut offset = 0usize;
+    for row in lens.chunks(num_cols.max(1)).take(num_rows) {
+        let mut cells: Vec<Option<&[u8]>> = Vec::with_capacity(num_cols);
+        for &len in row {
+            if len < 0 {
+                cells.push(None);
+                continue;
+            }
+            let end = match offset.checked_add(len as usize) {
+                Some(end) if end <= data.len() => end,
+                _ => {
+                    set_error(error_out, "cell lengths exceed data_len");
+                    return std::ptr::null_mut();
+                }
+            };
+            cells.push(Some(&data[offset..end]));
+            offset = end;
+        }
+        observation.row(cells);
+    }
+    // A zero-width result still has rows; `chunks` yields none for them.
+    if num_cols == 0 {
+        for _ in 0..num_rows {
+            observation.row([]);
+        }
+    }
+    if offset != data.len() {
+        set_error(error_out, "data_len exceeds the cells' lengths");
+        return std::ptr::null_mut();
+    }
+    match CString::new(observation.data().hex()) {
+        Ok(hex) => hex.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tree-sitter query splitting (internal)
 // ---------------------------------------------------------------------------
 
@@ -606,6 +710,7 @@ fn split_queries_impl(source: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     use std::ffi::CString;
+
 
     #[test]
     fn round_trip_open_query_fetch_close_destroy() {
@@ -708,6 +813,75 @@ mod tests {
             let mut err: *mut c_char = std::ptr::null_mut();
             let h = dql_open(db_path.as_ptr(), &mut err);
             assert!(h.is_null(), "0-byte file must refuse to mount");
+            assert!(!err.is_null());
+            dql_free_string(err);
+        }
+    }
+
+    /// Every committed vector, marshalled the way a host marshals fetched
+    /// cells, answers the shared digest's value.
+    #[test]
+    fn digest_rows_answers_the_committed_vectors() {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(
+            "../../delightql-protocol/src/digest/vectors.json"
+        ))
+        .unwrap();
+        unsafe {
+            let version = CStr::from_ptr(dql_digest_version()).to_str().unwrap();
+            assert_eq!(version, doc["version"]);
+        }
+        for vector in doc["vectors"].as_array().unwrap() {
+            let rows = vector["rows"].as_array().unwrap();
+            let num_cols = vector["heading"].as_array().unwrap().len();
+            let mut data = Vec::new();
+            let mut lens = Vec::new();
+            for row in rows {
+                for cell in row.as_array().unwrap() {
+                    match cell.as_str() {
+                        None => lens.push(-1i64),
+                        Some(hex) => {
+                            let bytes: Vec<u8> = (0..hex.len())
+                                .step_by(2)
+                                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                                .collect();
+                            lens.push(bytes.len() as i64);
+                            data.extend(bytes);
+                        }
+                    }
+                }
+            }
+            unsafe {
+                let mut err: *mut c_char = std::ptr::null_mut();
+                let hex = dql_digest_rows(
+                    data.as_ptr(),
+                    data.len(),
+                    lens.as_ptr(),
+                    rows.len(),
+                    num_cols,
+                    &mut err,
+                );
+                assert!(!hex.is_null(), "{}", vector["name"]);
+                assert_eq!(
+                    CStr::from_ptr(hex).to_str().unwrap(),
+                    vector["data"],
+                    "{}",
+                    vector["name"]
+                );
+                dql_free_string(hex);
+            }
+        }
+    }
+
+    #[test]
+    fn digest_rows_refuses_lengths_that_disagree_with_the_data() {
+        unsafe {
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let hex = dql_digest_rows(b"ab".as_ptr(), 2, [3i64].as_ptr(), 1, 1, &mut err);
+            assert!(hex.is_null());
+            assert!(!err.is_null());
+            dql_free_string(err);
+            let hex = dql_digest_rows(b"ab".as_ptr(), 2, [1i64].as_ptr(), 1, 1, &mut err);
+            assert!(hex.is_null());
             assert!(!err.is_null());
             dql_free_string(err);
         }

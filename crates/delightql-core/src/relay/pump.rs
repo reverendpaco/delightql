@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! The pump — plays a `CompiledPlan` entry list (effect algebra, plan §3.2).
+//! The pump — plays a `CompiledPlan` entry list (receipt algebra, plan §3.2).
 //!
 //! `handle_query` runs today's fixed assertions → emits → primary sequence
 //! for a `CompiledQuery`; the pump is that loop generalized to iterate an
@@ -19,9 +19,9 @@
 //! (`RelayHooks::on_ship`), the same machinery emit streams already ride.
 //! No wire-protocol change.
 
-use delightql_protocol::{Cell, QueryResponse, ServerTerm, Transport};
+use delightql_protocol::{QueryResponse, ServerTerm, Transport};
 
-use super::{error_term, EagerBuffer, ExecutionFailure, RelayParty};
+use super::{error_term, BufferedResult, EagerBuffer, ExecutionFailure, RelayParty};
 use crate::diagnostic::{Authored, Runtime};
 use crate::pipeline::{
     compiled_query::{CompiledPlan, PlanEntry},
@@ -32,6 +32,15 @@ use crate::pipeline::{
 /// diagnostic, whether this process minted it or admitted it at ingress.
 fn connection_error(failure: ExecutionFailure) -> ServerTerm {
     error_term(&failure)
+}
+
+/// What playing a plan answered, and how many of its runs had committed
+/// when it answered. A failure in a later run leaves the earlier runs
+/// committed; their consequences — created objects above all — are the
+/// session's to account for.
+pub(super) struct Played {
+    pub(super) term: ServerTerm,
+    pub(super) committed_runs: usize,
 }
 
 impl<'a, T: Transport> RelayParty<'a, T> {
@@ -67,6 +76,12 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         error_term(&error)
     }
 
+    /// The plan's answer alone, for tests that play hand-built plans.
+    #[cfg(test)]
+    pub(crate) fn handle_plan(&mut self, plan: &CompiledPlan) -> ServerTerm {
+        self.play(plan).term
+    }
+
     /// Play a `CompiledPlan` start to finish (the pump, plan §3.2).
     ///
     /// Behavior, each piece pinned by the named test in
@@ -79,17 +94,19 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     ///   at each step's first entry the pump samples the step's
     ///   requirement edges at the dependent (Q-D1) through a count(*)
     ///   wrapper, and DECLINES the whole statement stream when any edge
-    ///   is closed. exit! is an ordinary Absent edge (Q-D7); one
-    ///   pre-COMMIT latch read decides whether the post-COMMIT tail
-    ///   (trailing cleanup) runs — bracket entries always run, so an
-    ///   exit-taken run still commits (graceful exit, not abort)
+    ///   is closed. exit! is an ordinary Absent edge (Q-D7), on later
+    ///   runs' steps too; the pre-COMMIT latch read decides whether the
+    ///   post-COMMIT tail (trailing cleanup) runs — bracket edges always
+    ///   run, so an exit-taken run still commits (graceful exit, not abort)
     ///   (`exit_absent_edges_skip_later_steps_and_the_tail`,
     ///   `typed_walk_declines_steps_with_closed_present_edges`,
     ///   `untyped_plans_have_no_exit_machinery`).
-    /// - Transaction bracket: `BeginTransaction` / `CommitTransaction`
-    ///   execute as `BEGIN` / `COMMIT` on their routed connection — the
-    ///   literal words, identical on SQLite/PG/DuckDB (E-T2 confirmed; no
-    ///   dialecting). R-T3 discipline, UNIFORM on all engines: the FIRST
+    /// - Transaction brackets: a typed plan's runs each open and commit
+    ///   their own bracket on their routed connection, in authored order; an
+    ///   untyped plan's `BeginTransaction` / `CommitTransaction` entries do
+    ///   the same. A run that committed stays committed whatever a later run
+    ///   does (`one_plan_commits_each_run_before_a_later_abort`). R-T3
+    ///   discipline, UNIFORM on all engines: the FIRST
     ///   statement error inside a plan is plan-abort — the pump issues
     ///   ROLLBACK on the open bracket's connection, stops executing
     ///   entries, and surfaces the failing statement's TRUE error (E-T3a
@@ -124,7 +141,11 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// - A plan with no shipped entry — or whose final ship was skipped by
     ///   the exit flag — answers with the empty header
     ///   (`plan_with_no_shipped_entry_returns_empty_header`).
-    pub fn handle_plan(&mut self, plan: &CompiledPlan) -> ServerTerm {
+    ///
+    /// The answer carries how many of the plan's runs committed before it
+    /// answered — every run, when it succeeds; the runs before the failing
+    /// one, when a run fails. An untyped plan has no runs.
+    pub(super) fn play(&mut self, plan: &CompiledPlan) -> Played {
         // THE ONE TYPED PROGRAM: a typed plan is walked
         // directly — setup, control, effect, return, and cleanup are all
         // steps, so the D5 trace covers control failures too. The flat
@@ -136,15 +157,24 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             Some(typed) => {
                 let run_id = format!("effect:{}", self.next_effect_run_id);
                 self.next_effect_run_id += 1;
-                // D5: per-step outcomes, tracked in memory and
-                // materialized once at the boundary — best-effort,
-                // because bookkeeping never outranks the run. The
-                // reconciliation is sound: execution is sequential and
-                // abort-on-first-error, so at most ONE step is mid-flight
-                // ("running") when the walk stops.
+                // D5: per-position outcomes over the program order, tracked
+                // in memory and materialized once at the boundary —
+                // best-effort, because bookkeeping never outranks the run.
+                // The reconciliation is sound: execution is sequential and
+                // abort-on-first-error, so at most ONE position is
+                // mid-flight ("running") when the walk stops.
+                let schedule = typed.schedule();
                 let mut trace: Vec<Option<(&'static str, Option<String>)>> =
-                    vec![None; typed.steps.len()];
-                let term = self.play_typed(plan, typed, &mut trace, &run_id);
+                    vec![None; schedule.len()];
+                let mut committed_runs = 0;
+                let term = self.play_typed(
+                    plan,
+                    &schedule,
+                    &typed.guards,
+                    &mut trace,
+                    &run_id,
+                    &mut committed_runs,
+                );
                 let is_error = matches!(term, ServerTerm::Error(_));
                 let err_msg = match &term {
                     ServerTerm::Error(error) => {
@@ -162,48 +192,97 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                     })
                     .collect();
                 let _ = self.system.materialize_effect_run(&outcomes);
-                term
+                Played {
+                    term,
+                    committed_runs,
+                }
             }
-            None => self.play_entries(plan),
+            None => Played {
+                term: self.play_entries(plan),
+                committed_runs: 0,
+            },
         }
     }
 
-    /// Walk the typed program step by step: sample each step's
-    /// requirement edges at the dependent (Q-D1) and decline the whole
-    /// action when any edge is closed; execute the action otherwise.
-    /// exit! is an ordinary Absent edge on later body steps (Q-D7); ONE
-    /// pre-COMMIT latch read decides whether the Cleanup step runs
-    /// (graceful exit: brackets always run; a later run replaces any
-    /// skipped-cleanup residue before recreating its shell). The run's return value is the LAST ship
-    /// across all steps — the Return step's when present, else the
-    /// body-ending stdout ship (body_ending_in_stdout_ships_once) — and
-    /// is always buffered eagerly (COMMIT follows every ship by
-    /// construction, exactly as the flat walk behaved).
+    /// Walk the typed program in its schedule: open each run's bracket,
+    /// sample each step's requirement edges at the dependent (Q-D1) and
+    /// decline the whole action when any edge is closed, execute the action
+    /// otherwise, and commit the run. exit! is an ordinary Absent edge on
+    /// later steps (Q-D7), later runs' included; the latch is read before
+    /// each COMMIT, and once taken the Cleanup step does not run (graceful
+    /// exit: brackets always run; a later plan replaces any skipped-cleanup
+    /// residue before recreating its shell). The plan's return value is the
+    /// LAST ship in program order — the Return step's when present, else the
+    /// body-ending stdout ship (body_ending_in_stdout_ships_once) — and is
+    /// always buffered eagerly (a COMMIT follows every ship by
+    /// construction).
     fn play_typed(
         &mut self,
         plan: &CompiledPlan,
-        typed: &crate::pipeline::compiled_query::TypedEffectPlan,
+        schedule: &[crate::pipeline::compiled_query::Scheduled<'_>],
+        guards: &[crate::pipeline::compiled_query::GuardDefinition],
         trace: &mut [Option<(&'static str, Option<String>)>],
         run_id: &str,
+        committed_runs: &mut usize,
     ) -> ServerTerm {
-        use crate::pipeline::compiled_query::{AbortProvenance, EffectAction, TerminalAction};
-        self.last_run_exited = false;
+        use crate::pipeline::compiled_query::{
+            AbortProvenance, EffectAction, Scheduled, TerminalAction,
+        };
         let mut open_bracket: Option<Option<i64>> = None;
         let mut final_response: Option<ServerTerm> = None;
         let mut exited = false;
-        let last_ship = typed.steps.iter().rposition(|s| s.action.ship().is_some());
+        let last_ship = schedule.iter().rposition(
+            |scheduled| matches!(scheduled, Scheduled::Step(step) if step.action.ship().is_some()),
+        );
 
-        for (idx, step) in typed.steps.iter().enumerate() {
-            // "Brackets ALWAYS run" is enforced HERE, not merely by the
-            // builder's discipline: a Begin/Commit step
-            // never samples edges, so no construction can gate the
-            // bracket closed and strand an open transaction.
-            let bracket = matches!(
-                step.action,
-                EffectAction::Begin { .. } | EffectAction::Commit { .. }
-            );
-            if !bracket && !step.requirements.is_empty() {
-                match self.step_open(step, &typed.guards) {
+        for (idx, scheduled) in schedule.iter().enumerate() {
+            let step = match scheduled {
+                Scheduled::Begin { connection_id } => {
+                    trace[idx] = Some(("running", None));
+                    match self.execute_sql_routed(
+                        self.system
+                            .dialect_for_connection(*connection_id)
+                            .transaction_begin(),
+                        *connection_id,
+                    ) {
+                        Ok(_) => open_bracket = Some(*connection_id),
+                        Err(failure) => {
+                            self.rollback_open_bracket(&mut open_bracket);
+                            return connection_error(failure);
+                        }
+                    }
+                    trace[idx] = Some(("done", None));
+                    continue;
+                }
+                Scheduled::Commit { connection_id } => {
+                    trace[idx] = Some(("running", None));
+                    // The pre-COMMIT latch read: the flag can only have
+                    // been written inside the bracket, and on PG a
+                    // single run's ON COMMIT DROP shells vanish at COMMIT —
+                    // so this is the one moment the tail decision can be
+                    // read.
+                    if !exited {
+                        if let Some(sql) = plan.exit_probe_sql.as_deref() {
+                            exited = self.exit_flag_set(sql, *connection_id);
+                        }
+                    }
+                    match self.execute_sql_routed("COMMIT", *connection_id) {
+                        Ok(_) => {
+                            open_bracket = None;
+                            *committed_runs += 1;
+                        }
+                        Err(failure) => {
+                            self.rollback_open_bracket(&mut open_bracket);
+                            return connection_error(failure);
+                        }
+                    }
+                    trace[idx] = Some(("done", None));
+                    continue;
+                }
+                Scheduled::Step(step) => *step,
+            };
+            if !step.requirements.is_empty() {
+                match self.step_open(step, guards) {
                     Ok(None) => {}
                     Ok(Some(closed_detail)) => {
                         trace[idx] = Some(("skipped", Some(closed_detail)));
@@ -223,38 +302,11 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             }
             trace[idx] = Some(("running", None));
             match &step.action {
-                EffectAction::Begin { connection_id } => {
-                    match self.execute_sql_routed("BEGIN", *connection_id) {
-                        Ok(_) => open_bracket = Some(*connection_id),
-                        Err(failure) => {
-                            self.rollback_open_bracket(&mut open_bracket);
-                            return connection_error(failure);
-                        }
-                    }
-                }
-                EffectAction::Commit { connection_id } => {
-                    // The pre-COMMIT latch read: the flag can only have
-                    // been written inside the bracket, and on PG the
-                    // ON COMMIT DROP shells vanish at COMMIT — so this is
-                    // the one moment the tail decision can be read.
-                    if !exited {
-                        if let Some(sql) = plan.exit_probe_sql.as_deref() {
-                            exited = self.exit_flag_set(sql, *connection_id);
-                        }
-                    }
-                    match self.execute_sql_routed("COMMIT", *connection_id) {
-                        Ok(_) => open_bracket = None,
-                        Err(failure) => {
-                            self.rollback_open_bracket(&mut open_bracket);
-                            return connection_error(failure);
-                        }
-                    }
-                }
                 EffectAction::Check {
                     statement, refusal, ..
                 } => match self.execute_sql_routed(&statement.sql, statement.connection_id) {
-                    Ok((_cols, rows)) => {
-                        let passed = super::cell_says_yes(rows.first());
+                    Ok(result) => {
+                        let passed = super::cell_says_yes(result.first_row());
                         if !passed {
                             let refused = match refusal {
                                 Some(refusal) => refusal.clone(),
@@ -303,7 +355,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                             AbortProvenance::Assertion { label } => label.as_str(),
                         };
                         match self.execute_sql_routed(&probe.sql, probe.connection_id) {
-                            Ok((_columns, rows)) if rows.is_empty() => {
+                            Ok(result) if result.rows().is_empty() => {
                                 if matches!(provenance, AbortProvenance::Assertion { .. }) {
                                     let observed = self.observe_assertion_verdict(
                                         verdict::Verdict {
@@ -324,7 +376,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                                     }
                                 }
                             }
-                            Ok((_columns, _rows)) => {
+                            Ok(_nonempty) => {
                                 let detail = format!("{label}\n  abort input was nonempty");
                                 self.rollback_open_bracket(&mut open_bracket);
                                 let mut observation_failure = None;
@@ -364,6 +416,68 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         }
                     }
                 },
+                EffectAction::Session {
+                    directive,
+                    arguments,
+                    report,
+                } => {
+                    let rows = match self.execute_sql_routed(&arguments.sql, arguments.connection_id) {
+                        Ok(result) => result.text_rows(),
+                        Err(failure) => {
+                            trace[idx] = Some(("error", Some(failure.to_string())));
+                            self.rollback_open_bracket(&mut open_bracket);
+                            return connection_error(failure);
+                        }
+                    };
+                    // The runtime's act takes one row of arguments: a lift of
+                    // any other count is one set-at-a-time demand it does not
+                    // perform yet.
+                    if rows.len() != 1 {
+                        let error: crate::diagnostic::DelightQLError = crate::diagnostic::EffectPipe::LiftedNotYet {
+                            message: format!(
+                                "{directive}! received a {}-row lifted argument: a piped relation is ONE \
+                                 set-at-a-time demand, and that execution is not built yet for this directive. \
+                                 Pipe a single row, or issue separate statements",
+                                rows.len()
+                            ),
+                        }
+                        .into();
+                        trace[idx] = Some(("error", Some(error.to_string())));
+                        self.rollback_open_bracket(&mut open_bracket);
+                        return error_term(&error);
+                    }
+                    for row in rows {
+                        let reported = match self.system.perform_session_act(directive, &row) {
+                            Ok(reported) => reported,
+                            Err(error) => {
+                                trace[idx] = Some(("error", Some(error.to_string())));
+                                self.rollback_open_bracket(&mut open_bracket);
+                                return error_term(&error);
+                            }
+                        };
+                        // Each row the act reports is written where the
+                        // receipt's carried relation reads it.
+                        let Some(fill) = report else {
+                            continue;
+                        };
+                        for reported_row in &reported {
+                            let Some(sql) = fill.filled(reported_row) else {
+                                let error = crate::diagnostic::Internal::invariant(
+                                    "relay::pump",
+                                    format!("{directive}! reported a row of another width than its receipt declares"),
+                                );
+                                trace[idx] = Some(("error", Some(error.to_string())));
+                                self.rollback_open_bracket(&mut open_bracket);
+                                return error_term(&error);
+                            };
+                            if let Err(failure) = self.execute_sql_routed(&sql, fill.statement.connection_id) {
+                                trace[idx] = Some(("error", Some(failure.to_string())));
+                                self.rollback_open_bracket(&mut open_bracket);
+                                return connection_error(failure);
+                            }
+                        }
+                    }
+                }
                 EffectAction::Cleanup(stmts) => {
                     if exited {
                         trace[idx] = Some((
@@ -387,12 +501,18 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         }
                     }
                     if let Some(ship) = action.ship() {
-                        match self.execute_sql_routed(&ship.sql, ship.connection_id) {
-                            Ok((columns, rows)) => {
-                                if Some(idx) == last_ship {
-                                    final_response = Some(self.eager_header(&columns, rows));
+                        let is_final = Some(idx) == last_ship;
+                        match self
+                            .execute_sql_routed(&ship.sql, ship.connection_id)
+                            .and_then(|result| match is_final {
+                                true => result.named(ship.naming.as_deref()),
+                                false => Ok(result),
+                            }) {
+                            Ok(result) => {
+                                if is_final {
+                                    final_response = Some(self.eager_header(result));
                                 } else if let Some(ref mut hook) = self.hooks.on_ship {
-                                    hook(&columns, &rows);
+                                    hook(&result.names(), result.rows());
                                 }
                             }
                             Err(failure) => {
@@ -406,9 +526,6 @@ impl<'a, T: Transport> RelayParty<'a, T> {
             trace[idx] = Some(("done", None));
         }
 
-        // F5: the receipt binder reads whether this
-        // run answered NO — the exit! latch decides the EMPTY receipt.
-        self.last_run_exited = exited;
         final_response.unwrap_or_else(|| self.empty_header_response())
     }
 
@@ -427,7 +544,12 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         for (idx, entry) in plan.entries.iter().enumerate() {
             match entry {
                 PlanEntry::BeginTransaction { connection_id, .. } => {
-                    match self.execute_sql_routed("BEGIN", *connection_id) {
+                    match self.execute_sql_routed(
+                        self.system
+                            .dialect_for_connection(*connection_id)
+                            .transaction_begin(),
+                        *connection_id,
+                    ) {
                         Ok(_) => open_bracket = Some(*connection_id),
                         Err(failure) => {
                             self.rollback_open_bracket(&mut open_bracket);
@@ -461,9 +583,9 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         // stdout!-style set: deliver live through the hook
                         // side channel (the protocol ruling).
                         match self.execute_sql_routed(&st.sql, st.connection_id) {
-                            Ok((columns, rows)) => {
+                            Ok(result) => {
                                 if let Some(ref mut hook) = self.hooks.on_ship {
-                                    hook(&columns, &rows);
+                                    hook(&result.names(), result.rows());
                                 }
                             }
                             Err(failure) => {
@@ -479,8 +601,15 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         match self.sql_session.query(sql_bytes) {
                             Ok(QueryResponse::Header {
                                 handle: backend_handle,
-                                dimensions,
+                                mut dimensions,
                             }) => {
+                                if let Err(refusal) =
+                                    super::stamp_naming(&mut dimensions, st.naming.as_deref())
+                                {
+                                    let _ = self.sql_session.close(backend_handle);
+                                    self.rollback_open_bracket(&mut open_bracket);
+                                    return error_term(&refusal);
+                                }
                                 let frontend_handle = self.next_handle();
                                 self.handles.insert(frontend_handle.clone(), backend_handle);
                                 return ServerTerm::Header {
@@ -503,9 +632,12 @@ impl<'a, T: Transport> RelayParty<'a, T> {
                         // Final ship with entries still to run after it (or
                         // routed off the streaming connection): buffer
                         // eagerly, answer once the plan finishes.
-                        match self.execute_sql_routed(&st.sql, st.connection_id) {
-                            Ok((columns, rows)) => {
-                                final_response = Some(self.eager_header(&columns, rows));
+                        match self
+                            .execute_sql_routed(&st.sql, st.connection_id)
+                            .and_then(|result| result.named(st.naming.as_deref()))
+                        {
+                            Ok(result) => {
+                                final_response = Some(self.eager_header(result));
                             }
                             Err(failure) => {
                                 self.rollback_open_bracket(&mut open_bracket);
@@ -517,8 +649,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
 
                 PlanEntry::Check { statement, refusal } => {
                     match self.execute_sql_routed(&statement.sql, statement.connection_id) {
-                        Ok((_cols, rows)) => {
-                            let passed = super::cell_says_yes(rows.first());
+                        Ok(result) => {
+                            let passed = super::cell_says_yes(result.first_row());
                             if !passed {
                                 let refused = match refusal {
                                     Some(refusal) => refusal.clone(),
@@ -550,7 +682,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
     /// relation, which a presence read would false-interpret — count
     /// always yields a genuine row. Any closed edge declines the whole
     /// step; a sampling error aborts like a statement error (R-T3) —
-    /// the transformer guarantees every referenced shell exists.
+    /// the plan's compiler guarantees every referenced shell exists.
     /// `Ok(None)` = every edge open; `Ok(Some(detail))` = the first
     /// closed edge, described for the D5 run trace.
     fn step_open(
@@ -561,8 +693,8 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         use crate::pipeline::compiled_query::GuardPolarity;
         for req in &step.requirements {
             let guard = &guards[req.guard_id];
-            let (_cols, rows) = self.execute_sql_routed(&guard.sql, step.route)?;
-            let present = super::cell_count(rows.first())
+            let result = self.execute_sql_routed(&guard.sql, step.route)?;
+            let present = super::cell_count(result.first_row())
                 .map(|n| n > 0)
                 .unwrap_or(false);
             let (polarity, open) = match req.polarity {
@@ -598,7 +730,7 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         // (crates/delightql-cli/tests/effects_on_targets.rs); the
         // in-process backend path by `exit_peek_skips_remaining_data_entries`.
         match self.execute_sql_routed(sql, connection_id) {
-            Ok((_cols, rows)) => super::cell_count(rows.first())
+            Ok(result) => super::cell_count(result.first_row())
                 .map(|n| n > 0)
                 .unwrap_or(false),
             Err(_) => false,
@@ -614,19 +746,14 @@ impl<'a, T: Transport> RelayParty<'a, T> {
         }
     }
 
-    /// Buffer an eagerly-executed result set and answer with its Header —
-    /// the same shape as handle_query's eager primary path.
-    pub(super) fn eager_header(&mut self, columns: &[String], rows: Vec<Vec<Cell>>) -> ServerTerm {
-        let dimensions = Self::eager_dimensions(columns);
+    /// Buffer one whole result and answer with its Header — the one road
+    /// from an executed result to a wire response. The dimensions are the
+    /// result's own: nothing here rebuilds a heading from names.
+    pub(super) fn eager_header(&mut self, result: BufferedResult) -> ServerTerm {
+        let dimensions = result.dimensions.clone();
         let handle = self.next_handle();
-        self.eager_buffers.insert(
-            handle.clone(),
-            EagerBuffer {
-                dimensions: dimensions.clone(),
-                rows,
-                cursor: 0,
-            },
-        );
+        self.eager_buffers
+            .insert(handle.clone(), EagerBuffer::buffered(result));
         ServerTerm::Header { handle, dimensions }
     }
 }

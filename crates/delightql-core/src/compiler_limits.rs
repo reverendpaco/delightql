@@ -391,6 +391,55 @@ impl Drop for Running {
 pub struct ArmedLimits {
     nesting: NestingBudget,
     refinement: RefinementBudget,
+    admission: Admission,
+}
+
+/// What ONE compilation may do to the world it compiles against.
+///
+/// Armed with the limits and inherited exactly as they are: a nested
+/// compilation caused by an observing one observes too, because it is handed
+/// the same object. An admission threaded as its own parameter would be
+/// correct only as long as every executing site remembered to consult it;
+/// riding with the budgets, it reaches every site the budgets reach.
+///
+/// The judgment is made where an effect is about to execute, never by
+/// reading a callee's spelling or the SQL a statement lowers to: the
+/// statement's road refuses an effect statement, an inline DDL block refuses
+/// before it registers, and the runtime refuses at the one announcement
+/// every executing site makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// The ordinary session: effects execute.
+    Execute,
+    /// An observation: a pure statement runs and answers; a statement that
+    /// would execute an effect is refused before anything runs.
+    Observe,
+}
+
+impl Admission {
+    /// Spend this admission on `demand`, which is about to execute as
+    /// `class`: a pure execution is admitted under observation; an effect
+    /// is what observation exists to keep from running.
+    pub fn admit(
+        self,
+        demand: &str,
+        class: crate::bin_cartridge::ExecutionClass,
+    ) -> crate::error::Result<()> {
+        match (self, class) {
+            (Admission::Execute, _) => Ok(()),
+            (Admission::Observe, crate::bin_cartridge::ExecutionClass::Pure) => Ok(()),
+            (Admission::Observe, crate::bin_cartridge::ExecutionClass::Effect) => {
+                Err(crate::diagnostic::Effect::Observation {
+                    message: format!(
+                        "this session observes: '{demand}' would execute an effect, and an \
+                     inspection must never mutate the namespace, database, filesystem, \
+                     output, or session. Run it as a query to execute it."
+                    ),
+                }
+                .into())
+            }
+        }
+    }
 }
 
 impl ArmedLimits {
@@ -399,7 +448,23 @@ impl ArmedLimits {
         ArmedLimits {
             nesting: NestingBudget::from_policy(),
             refinement: RefinementBudget::new(REFINEMENT_DEPTH.effective()),
+            admission: Admission::Execute,
         }
+    }
+
+    /// Arm a NEW compilation from process policy that OBSERVES: its budgets
+    /// are the policy's, and no effect it or its nested work reaches may
+    /// execute.
+    pub fn observing() -> Self {
+        ArmedLimits {
+            admission: Admission::Observe,
+            ..ArmedLimits::from_policy()
+        }
+    }
+
+    /// What this compilation may do to the world.
+    pub fn admission(&self) -> Admission {
+        self.admission
     }
 
     /// The limits in force here.

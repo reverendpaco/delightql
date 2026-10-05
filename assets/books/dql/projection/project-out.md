@@ -4,28 +4,28 @@ The PROJECT-OUT operator [ -(◌) ]{.sidesigil} subtracts columns from a relatio
 
 ```delightql
 employee(*)
-  |> -(BirthDate, Email)
+  |> -(birth_date, email)
 ```
 
 ```sql
 select
-    EmployeeId,
-    LastName,
-    FirstName,
-    Title,
-    ReportsTo,
-    --  BirthDate, -- column projected out
-    HireDate,
-    Address,
-    City,
-    State,
-    Country,
-    PostalCode,
-    Phone,
-    Fax,
-    -- Email
+    employee_id,
+    last_name,
+    first_name,
+    title,
+    reports_to,
+    --  birth_date, -- column projected out
+    hire_date,
+    address,
+    city,
+    state,
+    country,
+    postal_code,
+    phone,
+    fax
+    -- Email -- column projected out
 from employee;
 ```
 
-All columns except `BirthDate` and `Email` are retained. This is particularly
+All columns except `birth_date` and `email` are retained. This is particularly
 useful for wide tables where listing retained columns would be tedious.

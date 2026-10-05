@@ -51,6 +51,12 @@ pub struct NamespacePath {
     // Private: enforce invariants via constructors
     // SmallVec[2]: inline storage for 0-2 items (no allocation)
     items: SmallVec<[NamespaceItem; 2]>,
+    /// How the path reaches its namespace: an exact path, or the
+    /// self-relative child route `.::child` whose base is the primary
+    /// definition context of the world the mention stands in. Only a
+    /// world resolves the relative route; an exact spelling is answered
+    /// by `qualifier().exact_fq()` alone.
+    route: crate::pipeline::asts::vocabulary::QualifierRoute,
 }
 
 impl Default for NamespacePath {
@@ -101,17 +107,46 @@ impl NamespacePath {
     ///
     /// Examples: `users(*)`, `id`, `count:(*)`
     pub fn empty() -> Self {
-        NamespacePath { items: smallvec![] }
+        NamespacePath {
+            items: smallvec![],
+            route: crate::pipeline::asts::vocabulary::QualifierRoute::Exact,
+        }
     }
 
-    /// The `::`-joined fully-qualified spelling (empty string for an
-    /// empty path). The catalog's `fq_name` convention.
-    pub fn fq_string(&self) -> String {
-        self.items
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect::<Vec<_>>()
-            .join("::")
+    /// The written qualifier this path is: its route and its segments in
+    /// path order. Only a lexical world turns it into a namespace; an
+    /// exact route's `::`-joined spelling is `Qualifier::exact_fq`.
+    pub fn qualifier(&self) -> crate::pipeline::asts::vocabulary::Qualifier {
+        let segments: Vec<String> = self.items.iter().map(|i| i.name.to_string()).collect();
+        match self.route {
+            crate::pipeline::asts::vocabulary::QualifierRoute::Exact => {
+                crate::pipeline::asts::vocabulary::Qualifier::exact(segments)
+            }
+            crate::pipeline::asts::vocabulary::QualifierRoute::SelfRelative => {
+                crate::pipeline::asts::vocabulary::Qualifier::self_relative(segments)
+            }
+        }
+    }
+
+    /// The path a written qualifier is, route and all.
+    pub fn from_qualifier(
+        qualifier: &crate::pipeline::asts::vocabulary::Qualifier,
+    ) -> Result<Self, NamespaceError> {
+        let parts = qualifier.segments().to_vec();
+        match qualifier.route() {
+            crate::pipeline::asts::vocabulary::QualifierRoute::Exact => Self::from_parts(parts),
+            crate::pipeline::asts::vocabulary::QualifierRoute::SelfRelative => {
+                Self::self_relative(parts)
+            }
+        }
+    }
+
+    /// The self-relative child route `.::child`: the same segments, based
+    /// at the primary definition context of whichever world reads it.
+    pub fn self_relative(parts: Vec<String>) -> Result<Self, NamespaceError> {
+        let mut path = Self::from_parts(parts)?;
+        path.route = crate::pipeline::asts::vocabulary::QualifierRoute::SelfRelative;
+        Ok(path)
     }
 
     /// Single-level path (e.g., just schema or just database)
@@ -129,6 +164,7 @@ impl NamespacePath {
             items: smallvec![NamespaceItem {
                 name: SqlIdentifier::new(name)
             }],
+            route: crate::pipeline::asts::vocabulary::QualifierRoute::Exact,
         }
     }
 
@@ -177,6 +213,7 @@ impl NamespacePath {
                     name: SqlIdentifier::new(name),
                 })
                 .collect(),
+            route: crate::pipeline::asts::vocabulary::QualifierRoute::Exact,
         })
     }
 
@@ -252,13 +289,22 @@ impl NamespacePath {
     ///
     /// Core's rich NamespacePath needs to convert to the simplified
     /// types version when calling DatabaseSchema methods.
-    pub fn to_types_namespace_path(&self) -> delightql_types::namespace::NamespacePath {
-        let parts: Vec<String> = self
-            .items
-            .iter()
-            .map(|item| item.name.to_string())
-            .collect();
-        delightql_types::namespace::NamespacePath::from_parts(parts)
+    ///
+    /// Only an EXACT path names a backend namespace; a self-relative route
+    /// answers `None`, because no schema provider stands in a primary
+    /// definition context — the world resolves it first.
+    pub fn to_types_namespace_path(&self) -> Option<delightql_types::namespace::NamespacePath> {
+        match self.route {
+            crate::pipeline::asts::vocabulary::QualifierRoute::SelfRelative => None,
+            crate::pipeline::asts::vocabulary::QualifierRoute::Exact => {
+                let parts: Vec<String> = self
+                    .items
+                    .iter()
+                    .map(|item| item.name.to_string())
+                    .collect();
+                Some(delightql_types::namespace::NamespacePath::from_parts(parts))
+            }
+        }
     }
 
     /// Create from delightql_types::NamespacePath
@@ -274,7 +320,10 @@ impl NamespacePath {
                 name: SqlIdentifier::new(item.name.as_str()),
             })
             .collect();
-        NamespacePath { items }
+        NamespacePath {
+            items,
+            route: crate::pipeline::asts::vocabulary::QualifierRoute::Exact,
+        }
     }
 }
 
@@ -284,7 +333,14 @@ impl std::fmt::Display for NamespacePath {
             write!(f, "(empty)")
         } else {
             let parts: Vec<_> = self.iter_reversed().map(|i| i.name.as_str()).collect();
-            write!(f, "{}", parts.join("."))
+            match self.route {
+                crate::pipeline::asts::vocabulary::QualifierRoute::Exact => {
+                    write!(f, "{}", parts.join("."))
+                }
+                crate::pipeline::asts::vocabulary::QualifierRoute::SelfRelative => {
+                    write!(f, ".::{}", parts.join("."))
+                }
+            }
         }
     }
 }
@@ -313,78 +369,6 @@ impl ToLispy for NamespaceItem {
 // ============================================================================
 // Metadata Structures (from resolver phase onward)
 // ============================================================================
-
-/// An arena column occurrence handle.
-///
-/// The compilation registry owns the occurrence's scope, spelling,
-/// addressing, provenance, and value facts.
-#[derive(Debug, Clone)]
-pub struct ColumnMetadata {
-    identity: crate::names::ColId,
-}
-
-impl ColumnMetadata {
-    pub fn new(identity: crate::names::ColId) -> Self {
-        Self { identity }
-    }
-
-    /// The arena-local identity minted for this occurrence.
-    pub fn identity(&self) -> crate::names::ColId {
-        self.identity
-    }
-
-    /// Return the arena scope shared by an entire heading.
-    ///
-    /// A partial or mixed heading is not evidence for one scope: every
-    /// column must carry an identity, and all of those identities must name
-    /// the same scope.
-    pub(crate) fn common_identity_scope(
-        columns: &[ColumnMetadata],
-        registry: &crate::names::Registry,
-    ) -> Option<crate::names::ScopeId> {
-        let mut scopes = columns
-            .iter()
-            .map(ColumnMetadata::identity)
-            .map(|column| registry.scope_of(column));
-        let first = scopes.next()?;
-        scopes.all(|scope| scope == first).then_some(first)
-    }
-}
-
-pub(crate) fn is_plainly_scalar_declaration(declaration: &str) -> bool {
-    const SCALAR_PREFIXES: &[&str] = &[
-        "int",
-        "bigint",
-        "smallint",
-        "tinyint",
-        "real",
-        "double",
-        "float",
-        "numeric",
-        "decimal",
-        "bool",
-        "date",
-        "time",
-        "timestamp",
-        "datetime",
-    ];
-    let lower = declaration.to_ascii_lowercase();
-    SCALAR_PREFIXES
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
-}
-
-impl PartialEq for ColumnMetadata {
-    fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity
-    }
-}
-
-impl ToLispy for ColumnMetadata {
-    fn to_lispy(&self) -> String {
-        format!("{:?}", self.identity)
-    }
-}
 
 // ============================================================================
 // Tests
@@ -458,29 +442,6 @@ mod tests {
     fn test_namespace_path_empty_identifier_rejected() {
         let result = NamespacePath::from_parts(vec!["schema".into(), "".into()]);
         assert!(matches!(result, Err(NamespaceError::EmptyIdentifier)));
-    }
-
-    #[test]
-    fn scalar_declaration_authority_distinguishes_numeric_from_text_carriers() {
-        for declaration in ["INT", "BIGINT", "decimal(10, 2)", "timestamp"] {
-            assert!(
-                is_plainly_scalar_declaration(declaration),
-                "{declaration} is a scalar declaration"
-            );
-        }
-        for declaration in [
-            "VARCHAR(500)",
-            "CHAR(20)",
-            "NVARCHAR(100)",
-            "CLOB",
-            "TEXT",
-            "JSON",
-        ] {
-            assert!(
-                !is_plainly_scalar_declaration(declaration),
-                "{declaration} can carry structured document text"
-            );
-        }
     }
 
     #[test]

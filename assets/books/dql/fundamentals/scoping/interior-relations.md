@@ -5,7 +5,7 @@ Interior relations create their own scope within the parentheses of a functor.
 
 
 ```delightql
-users( , age<20 |> (last_name))
+track( , milliseconds<60000 |> (name))
 ```
 
 An interior relation is constructed by authoring a relational continuation
@@ -18,18 +18,18 @@ surrounding scope's logic variables.  The final current pending relation
 
 
 ```delightql
-users(           //  ①
-  , age<20       //  ②
-  |> (last_name) //  ③
+track(                   //  ①
+  , milliseconds<60000   //  ②
+  |> (name)              //  ③
   )
-  //④  users.last_name
+  //④  Track.Name
   // is the only logic variable
 ```
 
 In the above example, a relational continuation is started at position one, and
 proceeds through to position three.   The closing of the interior relation
 publishes the last **CPR** of the interior relation as the columns of the relation
-named `users`.
+named `track`.
 
 The term **interior relation** is used for multiple manifestations:
 

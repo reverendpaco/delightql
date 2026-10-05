@@ -144,7 +144,7 @@ impl<'a> NameCollector<'a> {
     #[stacksafe::stacksafe]
     fn table(&mut self, table: &TableExpression) {
         match table {
-            TableExpression::Scope(scope) | TableExpression::QualifiedScope { scope, .. } => {
+            TableExpression::Scope(scope) => {
                 self.scope(*scope)
             }
             TableExpression::Entity { entity, alias } => {
@@ -167,12 +167,6 @@ impl<'a> NameCollector<'a> {
                 self.table(right);
                 match join_condition {
                     JoinCondition::On(expression) => self.expression(expression),
-                    JoinCondition::Merge(pairs) => {
-                        for pair in pairs {
-                            self.column(pair.left);
-                            self.column(pair.right);
-                        }
-                    }
                     JoinCondition::Cartesian => {}
                 }
             }
@@ -181,7 +175,6 @@ impl<'a> NameCollector<'a> {
             } => {
                 for argument in arguments {
                     match argument {
-                        TvfArgument::Literal(_) => {}
                         TvfArgument::Column(column) => self.column(*column),
                     }
                 }
@@ -228,17 +221,6 @@ impl<'a> NameCollector<'a> {
                 self.query(left);
                 self.query(right);
             }
-            QueryExpression::Values { rows } => {
-                for row in rows {
-                    for expression in row {
-                        self.expression(expression);
-                    }
-                }
-            }
-            QueryExpression::WithCte { ctes, query } => {
-                self.ctes(ctes);
-                self.query(query);
-            }
         }
     }
 
@@ -270,11 +252,6 @@ pub fn statement_names(statement: &SqlStatement, identities: &Registry) -> crate
         }
         SqlStatement::CreateTempTable {
             table,
-            with_clause,
-            query,
-        }
-        | SqlStatement::CreateTempView {
-            view: table,
             with_clause,
             query,
         } => {
@@ -340,8 +317,7 @@ fn cte_names(ctes: &Option<Vec<super::Cte>>, names: &mut NameCollector<'_>) {
 
 fn target_names(target: &super::statements::RelationTarget, names: &mut NameCollector<'_>) {
     match target {
-        super::statements::RelationTarget::Scope(scope)
-        | super::statements::RelationTarget::QualifiedScope { scope, .. } => names.scope(*scope),
+        super::statements::RelationTarget::Scope(scope) => names.scope(*scope),
         super::statements::RelationTarget::Entity(_) => {}
     }
 }

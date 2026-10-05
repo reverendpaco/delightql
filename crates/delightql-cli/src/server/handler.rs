@@ -78,7 +78,6 @@ pub fn serve_connection(
                 }
             }
             ClientMessage::Control(ControlOp::Reset) => {
-                delightql_core::session_cwd::set(None);
                 // A server session is a Core world plus what the client
                 // mounts. Its handle was opened under the server profile,
                 // which carries no client namespaces and no capability to
@@ -91,9 +90,15 @@ pub fn serve_connection(
                     )),
                 }
             }
+            // The session's own base directory, over the one the server
+            // stated at boot; a reset returns it to the boot value.
             ClientMessage::Control(ControlOp::Cwd(path)) => {
-                delightql_core::session_cwd::set(Some(path));
-                ServerMessage::Control(ControlResult::Ok)
+                match relay.set_session_setting(delightql_core::api::BASE_DIRECTORY, Some(&path)) {
+                    Ok(()) => ServerMessage::Control(ControlResult::Ok),
+                    Err(e) => ServerMessage::Control(ControlResult::Error(
+                        delightql_protocol::WireError::of(&e),
+                    )),
+                }
             }
             ClientMessage::Control(ControlOp::Shutdown) => {
                 shutdown.store(true, Ordering::Relaxed);

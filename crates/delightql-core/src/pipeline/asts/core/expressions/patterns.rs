@@ -8,6 +8,13 @@
 //! has a derivation here and no consumer asks whether the value function it
 //! is holding "happens to be curly".
 //!
+//! A BOUND PATTERN OWNS ITS PUBLICATIONS. After resolution every member
+//! that publishes holds the occurrence it publishes beside the key, reach or
+//! iteration that extracts it, so the member IS the pairing of a heading
+//! position with its value. A consumer realizes a member into the member's
+//! own occurrence; nothing pairs extractions with positions by counting,
+//! by walking order, or by a table kept beside the pattern.
+//!
 //! MIRROR LAW: this vocabulary mirrors `Enclyph`'s member for member, and
 //! `~>` means *aggregate into* there and *iterate over* here. The licensed
 //! differences are exactly the ones the grammar states — path members, the
@@ -18,7 +25,6 @@ use super::super::{Phase, Unresolved};
 use super::paths::Path;
 use crate::pipeline::asts::vocabulary::Vec1;
 use crate::{lispy::ToLispy, ToLispy};
-use delightql_types::SqlIdentifier;
 
 /// `{…}` binds by key; `[…]` binds by index.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
@@ -26,7 +32,7 @@ pub enum TreePattern<P: Phase = Unresolved> {
     #[lispy("tree_pattern:record")]
     Record(RecordPattern<P>),
     #[lispy("tree_pattern:array")]
-    Array(ArrayPattern),
+    Array(ArrayPattern<P>),
 }
 
 /// `pattern_member (',' pattern_member)*` — nonempty by construction.
@@ -36,72 +42,121 @@ pub struct RecordPattern<P: Phase = Unresolved> {
     pub members: Vec1<RecordPatternMember<P>>,
 }
 
-/// `indexed_binding (',' indexed_binding)*` — nonempty by construction.
+/// A nonempty indexed tuple/path pattern.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("array_pattern")]
-pub struct ArrayPattern {
-    pub members: Vec1<ArrayPatternMember>,
+pub struct ArrayPattern<P: Phase = Unresolved> {
+    pub members: Vec1<ArrayPatternMember<P>>,
+}
+
+/// A pattern owned by an iteration. The scalar-array binder exists only in
+/// this carrier, so no normalized state can give `[item]` scalar semantics.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum IterationPattern<P: Phase = Unresolved> {
+    #[lispy("iteration_pattern:tree")]
+    Tree(TreePattern<P>),
+    #[lispy("iteration_pattern:scalar_array")]
+    ScalarArray(P::Binder),
+}
+
+/// The complete destructure act. Cardinality and target are one value rather
+/// than a mode flag that can be paired with an unlawful pattern.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum DestructurePattern<P: Phase = Unresolved> {
+    #[lispy("destructure_pattern:scalar")]
+    Scalar(TreePattern<P>),
+    #[lispy("destructure_pattern:iterate")]
+    Iterate(IterationPattern<P>),
+}
+
+/// What a keyed nested member does with the value under its key.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+pub enum NestedPattern<P: Phase = Unresolved> {
+    #[lispy("nested_pattern:navigate")]
+    Navigate(TreePattern<P>),
+    #[lispy("nested_pattern:iterate")]
+    Iterate(IterationPattern<P>),
 }
 
 /// The six things a record pattern may hold, and nothing else.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum RecordPatternMember<P: Phase = Unresolved> {
-    /// `{first_name}` — binds the like-named key.
+    /// `{first_name}` — binds the like-named key. Binding writes it as the
+    /// keyed member it abbreviates, so only the authored phase holds one.
     #[lispy("pattern_member:binder")]
-    Binder(P::Binder),
+    Binder(P::PatternBinder),
     /// `{"json_key": name}` — a rename: the key is the JSON key, the binder
     /// is the column it publishes. Nested structure is kept as-is.
     #[lispy("pattern_member:keyed")]
     Keyed { key: String, binder: P::Binder },
-    /// `"k": {…}` nests; `"k": ~> {…}` iterates. One marker, two
-    /// cardinalities — and the target is a PATTERN by type, so a bare value
-    /// standing there is unconstructible.
+    /// `"k": {…}` nests; `"k": ~> {…}` iterates. The target owns the
+    /// cardinality operation, so a scalar-array binder cannot be paired with
+    /// navigation.
     #[lispy("pattern_member:nested")]
     Nested {
         key: String,
-        iteration: bool,
-        pattern: Box<TreePattern<P>>,
+        target: Box<NestedPattern<P>>,
     },
     /// `{.a.b}` / `{.a.b as ab}` — a reach without matching. It publishes the
     /// underscore-flattened spelling unless `as` renamed it.
     #[lispy("pattern_member:path")]
-    Path(PathBinding),
-    /// `country:~> {…}` / `country:~> _` — the object's KEYS become this
-    /// column's values, and the target says whether the contents are bound
-    /// or disregarded.
+    Path(PathBinding<P>),
+    /// `country:~> {…}` / `country:~> city:~> {…}` / `country:~> _` — the
+    /// object's KEYS become this column's values, and the target says what
+    /// stands under them.
     #[lispy("pattern_member:metadata")]
-    Metadata {
-        key: P::Binder,
-        target: PatternTarget<P>,
-    },
+    Metadata(MetadataBinding<P>),
+
     /// `{_}` — the anaphor: iterate the interior, bind nothing. Sole-member
     /// only, which the grammar is what enforces.
     #[lispy("pattern_member:disregarded")]
     Disregarded,
 }
 
-/// What a metadata binding does with the values under its keys.
+/// `key_column ':~>' target` — one metadata level of a pattern: the keys of
+/// the object standing here become `key`'s values, and `target` reads what
+/// stands under each key.
+///
+/// MIRROR of the construction side's `MetadataGroup`: the levels chain the
+/// same way, and the bottom of a chain is a collector pattern or nothing.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("metadata_binding")]
+pub struct MetadataBinding<P: Phase = Unresolved> {
+    pub key: P::Binder,
+    pub target: PatternTarget<P>,
+}
+
+/// What stands under the keys of a metadata level. Three shapes, each the
+/// inverse of what the matching construction put there — and they are
+/// DIFFERENT shapes, so a level reads exactly what its mirror wrote.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum PatternTarget<P: Phase = Unresolved> {
+    /// `g:~> {…}` — under each key, the ROWS the collector gathered: a
+    /// sequence to iterate, each row read by the pattern.
     #[lispy("pattern_target:pattern")]
-    Pattern(Box<TreePattern<P>>),
+    Pattern(Box<IterationPattern<P>>),
+    /// `g:~> k:~> …` — under each key, ANOTHER LEVEL: an object keyed by
+    /// data, read by the nested binding. No sequence stands between the
+    /// two levels, because the construction `g:~> k:~> {…}` put none there.
+    #[lispy("pattern_target:binding")]
+    Binding(Box<MetadataBinding<P>>),
     /// `g:~> _` — keys only, one row per key.
     #[lispy("pattern_target:disregarded")]
     Disregarded,
 }
 
 /// `[.0 as x]` — a positional bind, with the reach that may follow the
-/// index. A pattern member holds a path and a name, and a path is a spec:
-/// nothing in it changes across phases.
+/// index. A path is a spec: nothing in it changes across phases.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("array_pattern_member")]
-pub struct ArrayPatternMember {
+pub struct ArrayPatternMember<P: Phase = Unresolved> {
     /// Opens on the member's own index; a reach after it continues the same
     /// path.
     pub path: Path,
-    /// The name this member publishes. Absent only where the bare index
-    /// keeps whatever the array member was already called.
-    pub naming: Option<SqlIdentifier>,
+    /// Authored: the name this member publishes, absent only where the bare
+    /// index keeps whatever the array member was already called. Bound: the
+    /// occurrence it publishes.
+    pub binder: P::ReachBinder,
 }
 
 /// `.a.b as ab` — the record side's reach. Same two fields as the array
@@ -109,9 +164,9 @@ pub struct ArrayPatternMember {
 /// different member enums and neither may stand in the other's list.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("path_binding")]
-pub struct PathBinding {
+pub struct PathBinding<P: Phase = Unresolved> {
     pub path: Path,
-    pub naming: Option<SqlIdentifier>,
+    pub binder: P::ReachBinder,
 }
 
 impl PathBinding {
@@ -119,7 +174,7 @@ impl PathBinding {
     /// spelling of what it reached. ONE authority — narrowing members and
     /// destructure members both ask here.
     pub fn published_name(&self) -> String {
-        self.naming
+        self.binder
             .as_ref()
             .map_or_else(|| self.path.flattened(), ToString::to_string)
     }
@@ -129,7 +184,7 @@ impl ArrayPatternMember {
     /// The same question the record side's reach answers, asked of a
     /// positional member.
     pub fn published_name(&self) -> String {
-        self.naming
+        self.binder
             .as_ref()
             .map_or_else(|| self.path.flattened(), ToString::to_string)
     }

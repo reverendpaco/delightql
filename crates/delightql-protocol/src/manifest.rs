@@ -114,6 +114,7 @@ mod tests {
             position: pos,
             name: b(name),
             descriptor: b(desc),
+            naming: Naming::Authored,
         }
     }
 
@@ -127,7 +128,7 @@ mod tests {
     fn round_trip_client_version() {
         let term = ClientTerm::Version {
             max_message_size: 1_000_000,
-            protocol_version: b("relay0"),
+            protocol_version: PROTOCOL_VERSION.to_vec(),
             lease_ms: 300_000,
             orientations: vec![Orientation::Rows, Orientation::Columns],
         };
@@ -224,7 +225,7 @@ mod tests {
     fn round_trip_server_version() {
         let term = ServerTerm::Version {
             max_message_size: 1_000_000,
-            protocol_version: b("relay0"),
+            protocol_version: PROTOCOL_VERSION.to_vec(),
             lease_ms: 300_000,
             orientations: vec![Orientation::Rows],
         };

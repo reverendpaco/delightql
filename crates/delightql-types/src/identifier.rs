@@ -77,6 +77,13 @@ impl SqlIdentifier {
         }
     }
 
+    /// The canonical form as text: the key a catalog matches the identifier
+    /// by, read from the same bytes equality, hashing and ordering compare.
+    pub fn canonical(&self) -> String {
+        String::from_utf8(self.canonical_bytes().collect())
+            .expect("ASCII folding of UTF-8 text is UTF-8")
+    }
+
     /// The canonical bytes used for equality/hash/ordering: ASCII-folded iff
     /// unstropped, verbatim iff stropped. The single source of truth so that
     /// Eq, Hash, and Ord cannot disagree.

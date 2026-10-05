@@ -1,12 +1,23 @@
 // Declared GLR forks. Each entry names a set of productions that share a
 // prefix and are told apart by a LATER token — never by classifying content.
 module.exports = $ => [
+  // A bare singleton's value may end a statement, and statements are not
+  // separated by a token: a following word either continues the value
+  // (`x not in (…)`) or names the next statement (`not(*)`).
+  [$.bare_singleton, $.probe],
+  // After a bare singleton's value, `;` either writes a second row — the
+  // refusal witness — or joins the chain to a relation operand.
+  [$.bare_singleton],
+  // A literal word in a bare singleton's column is the literal, as in a
+  // header, and the identifier reading loses the tie.
+  [$._keyword_as_identifier, $.bare_singleton],
   // The subject now stands OUTSIDE the heading, so every named form shares the
   // bare `predicate_identifier` prefix and forks on the token after it.
   [$.fact_form, $.fact_function, $.fo_rule, $.ho_fact_form, $.ho_rule, $.relation_name, $.sigma_rule],
   // A query-scoped binding's head and a relation read share the bare name;
   // the group after it — heading, or parameter group — tells them apart.
-  [$.relation_name, $.standard_cte, $.ho_cte],
+  [$.relation_name, $.standard_cte, $.ho_cte, $.sigma_cte],
+  [$.standard_cte, $.sigma_cte],
   [$.rule_param, $.declared_relation_param, $.open_relation_param, $.predicate_identifier],
   [$.callee, $.relation_name],
   [$.mutation_source],
@@ -48,6 +59,7 @@ module.exports = $ => [
   // settled by what closes it.
   [$.head_term, $.non_infix_application],
   [$.head_term, $.scalar_param, $.sigma_rule],
+  [$.head_term, $.scalar_param, $.sigma_cte],
   // `p(x)…` in a let block: a heading term and a scalar formal share the
   // name; the group after the parens decides.
   [$.head_term, $.scalar_param],
@@ -64,7 +76,9 @@ module.exports = $ => [
   [$.fact_datum, $.head_term, $.non_infix_application],
   [$.fact_datum, $.head_term, $.ho_param, $.non_infix_application],
   [$.fact_function, $.head_term, $.named_reference, $.scalar_param, $.sigma_rule],
+  [$.fact_function, $.head_term, $.named_reference, $.scalar_param, $.sigma_cte],
   [$.fact_function, $.sigma_rule],
+  [$.fact_function, $.sigma_cte],
   [$.named_out_item],
   // `~> k:~> {…} as n` — the name belongs to what the reduction publishes,
   // not to the stage the chain is in. Both readings parse; the fork is here.
@@ -79,7 +93,6 @@ module.exports = $ => [
   [$.composition_input, $.landing],
   [$.domain_hole, $.non_infix_application],
   [$.domain_activate, $.glob],
-  [$.identifier, $.scalar_parameter_reference],
   // KEYWORD-SPELLED IDENTIFIERS. Every keyword WORD is also an identifier,
   // so wherever a keyword's own production and a name are both admissible
   // the parser forks and the LATER token decides: `as` after a relation is

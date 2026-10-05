@@ -145,4 +145,12 @@ pub enum Er {
     #[leaf("transitive_outer", class = Syntax, summary = "A transitive chain carried an outer marker.")]
     #[error("Validation error: {message}")]
     TransitiveOuter { message: String },
+
+    /// An edge's term names, where the edge is used, a different relation
+    /// than the one the edge's declaring body reads under that spelling.
+    /// The edge applies only where the two are one relation: name the
+    /// declaring namespace's relation explicitly.
+    #[leaf("term_world", class = Syntax, summary = "An edge term names another relation where the edge is used.")]
+    #[error("Validation error: {message}")]
+    TermWorld { message: String },
 }

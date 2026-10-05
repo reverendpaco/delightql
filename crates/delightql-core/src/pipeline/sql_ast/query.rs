@@ -16,17 +16,6 @@ pub enum QueryExpression {
         left: Box<QueryExpression>,
         right: Box<QueryExpression>,
     },
-
-    /// VALUES clause (for inline data)
-    Values { rows: Vec<Vec<DomainExpression>> },
-
-    /// Nested WITH clause (for CTEs within CTEs)
-    /// Generates: WITH cte1 AS (...), cte2 AS (...) SELECT ...
-    /// This allows tree groups (which generate intermediate CTEs) to be bound as CTEs themselves
-    WithCte {
-        ctes: Vec<super::Cte>,
-        query: Box<QueryExpression>,
-    },
 }
 
 /// The one set operator this AST can spell.
@@ -48,6 +37,41 @@ pub enum SetOperator {
     UnionAll,
 }
 
+impl QueryExpression {
+    /// The occurrence behind each column this expression produces. A set
+    /// operation takes its column names from its first branch, and a
+    /// `VALUES` list takes the engine's.
+    ///
+    /// A `*` standing for no occurrence is what a layer publishing nothing
+    /// writes, and SQL still answers every column its FROM carries: those
+    /// columns are read through it. `None` when some of them come from a
+    /// source the compiler never saw the heading of — a relation outside
+    /// this statement, or a table function the catalog does not describe —
+    /// since their width and names are the source's own.
+    #[stacksafe::stacksafe]
+    pub fn heading(&self) -> Option<Vec<Option<crate::names::ColId>>> {
+        match self {
+            QueryExpression::Select(select) => {
+                let mut heading = Vec::new();
+                for item in &select.select_list {
+                    match item.publishes() {
+                        Publishes::One(col) => heading.push(Some(col)),
+                        Publishes::Run([]) => {
+                            for table in select.from.as_deref().unwrap_or_default() {
+                                heading.extend(table.heading()?);
+                            }
+                        }
+                        Publishes::Run(cols) => heading.extend(cols.iter().copied().map(Some)),
+                        Publishes::Nothing => heading.push(None),
+                    }
+                }
+                Some(heading)
+            }
+            QueryExpression::SetOperation { left, .. } => left.heading(),
+        }
+    }
+}
+
 impl SetOperator {
     /// The keyword this operator writes.
     pub fn keyword(&self) -> &'static str {
@@ -55,6 +79,19 @@ impl SetOperator {
             SetOperator::UnionAll => "UNION ALL",
         }
     }
+}
+
+/// How a statement groups its whole input as ONE group that exists only
+/// when the input has a row. Targets disagree on which SQL says that
+/// (`SqlDialect::whole_input_grouping`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WholeInputGrouping {
+    /// `GROUP BY NULL`: a key every row shares, which the target reads as a
+    /// value. Any result columns may stand beside it.
+    SharedKey,
+    /// No GROUP BY and `HAVING count(*) > 0`: the standard makes a HAVING
+    /// without GROUP BY one group of the whole input.
+    InhabitedHaving,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,7 +115,8 @@ pub struct SelectStatement {
     /// GROUP BY clause
     pub(super) group_by: Option<Vec<DomainExpression>>,
 
-    /// HAVING clause (only valid with GROUP BY)
+    /// HAVING clause. Without GROUP BY it judges the one group the whole
+    /// input forms, a shape only `retain_group_keys` writes.
     pub(super) having: Option<DomainExpression>,
 
     /// ORDER BY clause
@@ -105,83 +143,82 @@ impl SelectStatement {
         &self.select_list
     }
 
-    /// Re-publish this statement into `into`: rewrite what each slot names to
-    /// the occurrence given for it, re-stamp the result scope, and record the
-    /// fact that is then true of it.
-    ///
-    /// A statement that becomes a subquery body produces the columns of the
-    /// FROM alias naming it, not the ones it produced standing alone — the
-    /// alias is what every consumer reads it through. Scope and outputs move
-    /// together or the statement says two different things, so there is no
-    /// road that moves one: this door moves both, and the evidence with them.
-    ///
-    /// `target` answers for one output at a time and may refuse; the statement
-    /// is left untouched unless every slot is answered, because a body halfway
-    /// through this is exactly the state the pairing exists to rule out.
-    pub(in crate::pipeline) fn republish(
-        &mut self,
-        into: crate::names::ScopeId,
-        mut target: impl FnMut(crate::names::ColId) -> std::result::Result<crate::names::ColId, String>,
-    ) -> std::result::Result<(), String> {
-        // A star names its run as surely as an alias names one output, so it
-        // is republished too: a star left holding the occurrences it stood
-        // for inside is a body claiming a heading its wrapper no longer has.
-        let renamed = self
-            .select_list
-            .iter()
-            .map(|item| match item.publishes() {
-                Publishes::One(output) => target(output).map(|target| vec![target]),
-                Publishes::Run(expansion) => {
-                    expansion.iter().map(|output| target(*output)).collect()
-                }
-                Publishes::Nothing => Ok(Vec::new()),
-            })
-            .collect::<std::result::Result<Vec<_>, String>>()?;
-
-        let prior = std::mem::take(&mut self.select_list);
-        self.select_list = prior
-            .into_iter()
-            .zip(renamed)
-            .flat_map(|(item, rename)| match item {
-                SelectItem::Publishing { expr, .. } => {
-                    vec![SelectItem::Publishing {
-                        expr,
-                        slot: rename[0],
-                        printed: true,
-                    }]
-                }
-                SelectItem::Scaffolding { expr, slot } => {
-                    // A bare column reference publishes under its own name;
-                    // republishing it means spelling the new one out.
-                    match rename.first() {
-                        Some(target) => vec![SelectItem::Publishing {
-                            expr,
-                            slot: *target,
-                            printed: true,
-                        }],
-                        None => vec![SelectItem::Scaffolding { expr, slot }],
-                    }
-                }
-                SelectItem::Star { reads, .. } if reads.is_empty() => {
-                    vec![SelectItem::star_over_nothing()]
-                }
-                SelectItem::Star { reads, .. } => reads
-                    .into_iter()
-                    .zip(rename)
-                    .map(|(source, target)| SelectItem::Publishing {
-                        expr: super::DomainExpression::Column(source),
-                        slot: target,
-                        printed: true,
-                    })
-                    .collect(),
-            })
-            .collect();
-        self.at = into;
-        Ok(())
-    }
-
     pub fn from(&self) -> Option<&[TableExpression]> {
         self.from.as_deref()
+    }
+
+    /// The select list, to rewrite VALUES in place. A rewrite that changes
+    /// which occurrence a position realizes builds a new item and says so.
+    pub(in crate::pipeline) fn select_list_mut(&mut self) -> &mut Vec<SelectItem> {
+        &mut self.select_list
+    }
+
+    pub(in crate::pipeline) fn where_clause_mut(&mut self) -> Option<&mut DomainExpression> {
+        self.where_clause.as_mut()
+    }
+
+    pub(in crate::pipeline) fn group_by_mut(&mut self) -> Option<&mut [DomainExpression]> {
+        self.group_by.as_deref_mut()
+    }
+
+    pub(in crate::pipeline) fn having_mut(&mut self) -> Option<&mut DomainExpression> {
+        self.having.as_mut()
+    }
+
+    pub(in crate::pipeline) fn order_by_mut(&mut self) -> Option<&mut [OrderTerm]> {
+        self.order_by.as_deref_mut()
+    }
+
+    /// Keep the ordering terms `orders` answers for. An ordering left with
+    /// no term is no ordering: SQL has no empty ORDER BY.
+    pub(in crate::pipeline) fn retain_order_terms(
+        &mut self,
+        orders: impl FnMut(&OrderTerm) -> bool,
+    ) {
+        if let Some(terms) = &mut self.order_by {
+            terms.retain(orders);
+            if terms.is_empty() {
+                self.order_by = None;
+            }
+        }
+    }
+
+    /// Keep the grouping keys `partitions` answers for.
+    ///
+    /// A grouping is more than its keys. Over an input with no row it has no
+    /// group, where an ungrouped aggregate still answers one row; so a
+    /// grouping left with no key still groups its whole input as one group
+    /// that exists only when the input had a row, written as `whole` says.
+    pub(in crate::pipeline) fn retain_group_keys(
+        &mut self,
+        partitions: impl FnMut(&DomainExpression) -> bool,
+        whole: WholeInputGrouping,
+    ) {
+        let Some(keys) = &mut self.group_by else {
+            return;
+        };
+        keys.retain(partitions);
+        if !keys.is_empty() {
+            return;
+        }
+        match whole {
+            WholeInputGrouping::SharedKey => {
+                keys.push(DomainExpression::literal(
+                    crate::pipeline::asts::core::LiteralValue::Null,
+                ));
+            }
+            WholeInputGrouping::InhabitedHaving => {
+                self.group_by = None;
+                let inhabited = DomainExpression::function("count", vec![DomainExpression::star()])
+                    .gt(DomainExpression::literal(
+                        crate::pipeline::asts::core::LiteralValue::integer(0),
+                    ));
+                self.having = Some(match self.having.take() {
+                    Some(having) => DomainExpression::and(vec![inhabited, having]),
+                    None => inhabited,
+                });
+            }
+        }
     }
 
     pub fn from_mut(&mut self) -> Option<&mut [TableExpression]> {

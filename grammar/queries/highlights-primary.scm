@@ -36,8 +36,8 @@
 ;; Params
 (head_term (identifier)@variable.parameter)
 (plain_param (identifier)@variable.parameter)
-(ho_rule (scalar_param)@variable.parameter.input)
-; (ho_cte (scalar_param)@variable.parameter.input)
+(ho_rule head: (ho_heading (scalar_param)@variable.parameter.input))
+; (ho_cte head: (ho_heading (scalar_param)@variable.parameter.input))
 (fact_function inputs:(identifier) @variable.parameter)
 (fact_function outputs:(identifier) @variable.parameter)
 (record "{" @function.call "}" @function.call)
@@ -47,6 +47,7 @@
 (binder (identifier)@variable.parameter)
 (composition_input)@variable.parameter
 (lambda_binder (identifier)@variable.parameter)
+(parameter_reference (parameter_sigil) @variable.parameter.input name: (_) @variable.parameter.input)
 (named_reference name:(identifier ) @variable.parameter)
 (anchored_case (named_reference name:(identifier ) @variable.parameter.case_input))
 

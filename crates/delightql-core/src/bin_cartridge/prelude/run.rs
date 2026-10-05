@@ -48,16 +48,16 @@ impl BinEntity for RunPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for RunPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         _arguments: &[DomainExpression],
@@ -105,16 +105,16 @@ impl BinEntity for RunNamespacePredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for RunNamespacePredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         _arguments: &[DomainExpression],

@@ -6,28 +6,28 @@ Case search evaluates conditions rather than matching values. Two syntaxes exist
 **Condition-first notation** uses -> pointing to the return value:
 
 ```delightql
-students(*)
-    |> %(  _:( grade > 90              ->  "A";
-            grade > 80, grade <=90  ->  "B";
-            grade > 70, grade <=80  ->  "C";
-            grade > 60, grade <=70  ->  "D";
-            _                       ->  "F") as score
+invoice(*)
+    |> %(  _:( total > 15              ->  "A";
+            total > 10, total <= 15  ->  "B";
+            total > 5,  total <= 10  ->  "C";
+            total > 2,  total <= 5   ->  "D";
+            _                        ->  "F") as tier
             ~> count:(*) )
-    |>  #(score)
+    |>  #(tier)
 ```
 
 
 Conditions can be conjoined with `,`{.delightql .sigil} (and). For disjunction, use the keyword **or**:
 
 ```{.delightql .numberLines }
-students(*)
-    |> %(  _:( grade > 90  or apple_given="true" -> "A";
-              grade > 80, grade <=90            -> "B";
-              grade > 70, grade <=80            -> "C";
-              grade > 60, grade <=70            -> "D";
-              _                                 -> "F") as score
+invoice(*)
+    |> %(  _:( total > 15  or billing_country = "USA" -> "A";
+              total > 10, total <= 15                -> "B";
+              total > 5,  total <= 10                -> "C";
+              total > 2,  total <= 5                 -> "D";
+              _                                      -> "F") as tier
             ~> count:(*) )
-    |>  #(score)
+    |>  #(tier)
 ```
 
 Like SQL's `CASE`, the first matching clause wins.
@@ -35,16 +35,16 @@ Like SQL's `CASE`, the first matching clause wins.
 
 :::::{.widen}
 ```delightql
-members(*)
-    |> (  profile_nm,
-          account_nm,
-          location,
+customer(*)
+    |> (  first_name,
+          last_name,
+          country,
           _:(
-             "north india m" | location in ("in";"rajkot"), profile_nm="sally";
-             "north india f" | location in ("in";"rajkot");
-             "pakistan f"    | location in ("pk"; "france"), profile_nm="sally";
-             "pakistan m"    | location in ("in";"rajkot")
-          ) as continent )
-    |>  #(profile_nm,account_nm)
+             country in ("USA";"Canada"), state in ("CA";"BC") -> "north america west";
+             country in ("USA";"Canada")                        -> "north america";
+             country in ("Brazil";"Argentina";"Chile")          -> "south america";
+             country in ("Spain";"Portugal")                    -> "iberia"
+          ) as region )
+    |>  #(first_name,last_name)
 ```
 ::::::

@@ -49,7 +49,7 @@ fn an_always_stop_predicate_cancels() {
 }
 
 /// The submission road frames exactly as the uncancellable one: marked text
-/// takes the utility entrance, unmarked text takes the prompt wrap.
+/// takes the utility entrance, unmarked text is canonical.
 #[test]
 fn the_submission_road_keeps_the_framing_law() {
     let mut never = |_: usize| false;
@@ -61,10 +61,17 @@ fn the_submission_road_keeps_the_framing_law() {
         }
         CancellableParse::Cancelled { .. } => panic!("must complete"),
     }
-    match Parser::new().parse_submission_cancellable("users(*)", &mut never) {
+    match Parser::new().parse_submission_cancellable("?- users(*)", &mut never) {
         CancellableParse::Completed(tree) => {
             assert_eq!(tree.entrance(), Root::DefinitionFile);
             assert!(!tree.has_defects());
+        }
+        CancellableParse::Cancelled { .. } => panic!("must complete"),
+    }
+    match Parser::new().parse_submission_cancellable("users(*)", &mut never) {
+        CancellableParse::Completed(tree) => {
+            assert_eq!(tree.entrance(), Root::DefinitionFile);
+            assert!(tree.has_defects(), "a naked query is not canonical text");
         }
         CancellableParse::Cancelled { .. } => panic!("must complete"),
     }
@@ -137,7 +144,7 @@ fn measure_prompt_parse_costs() {
 }
 
 /// The framing-road answer matches what parse_submission does, without a
-/// parse: unmarked → prompt wrap; authored header → utility entrance; a
+/// parse: unmarked → canonical; authored header → utility entrance; a
 /// MISPLACED header still names the utility entrance (the author said which
 /// world the text is in, in the wrong place).
 #[test]
@@ -156,7 +163,7 @@ fn submission_road_matches_the_framing_law() {
 }
 
 /// A cancelled submission parse reports the road it was on — the utility
-/// entrance for marked bytes, the prompt wrap for unmarked.
+/// entrance for marked bytes, the canonical root for unmarked.
 #[test]
 fn a_cancelled_submission_reports_its_entrance() {
     let large_marked = format!("#!dql query-sequence\n{}", "users(*)\n".repeat(30_000));

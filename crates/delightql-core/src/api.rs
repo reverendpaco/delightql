@@ -18,6 +18,8 @@
 pub use delightql_protocol::Handler;
 
 // Re-export QueryHandle — opaque to the CLI
+pub use crate::settings::{BootSettings, BASE_DIRECTORY, DIALECT};
+pub use delightql_protocol::Naming;
 pub use delightql_protocol::QueryHandle;
 
 // --- Traits (the compiler-enforced boundary) ---
@@ -39,6 +41,18 @@ pub trait DqlHandle: Send {
         &mut self,
         hooks: SessionHooks,
     ) -> Result<Box<dyn DqlSession + '_>, String>;
+
+    /// Create an OBSERVING session: a pure statement runs and answers
+    /// exactly as under `session()`, and a statement that would execute an
+    /// effect — an effect-chain entry, an inline DDL block, or an executing
+    /// demand — is refused before any dispatcher runs
+    /// (`semantic/effect/observation`). A host's inspection, fingerprint
+    /// and hash roads are built on this session and nothing else. Default:
+    /// unsupported — a host without an observation road cannot observe,
+    /// and never executes in its place.
+    fn observation_session(&mut self) -> Result<Box<dyn DqlSession + '_>, String> {
+        Err("observation sessions are not supported by this host".to_string())
+    }
 
     /// Create a relay for raw protocol handling (server use).
     fn create_relay(&mut self) -> Result<Box<dyn ServerRelay + '_>, String>;
@@ -127,7 +141,10 @@ pub struct SessionRecovery {
 /// Created via `DqlHandle::session()`. The session borrows the handle
 /// for its lifetime.
 pub trait DqlSession {
-    /// Send a DQL query. Returns column metadata + an opaque handle.
+    /// Send one submission: canonical text, or text that names its own
+    /// entrance. A goal carries its `?-` marker — a host sending what a user
+    /// typed at a prompt writes it (`delightql_cst::prompt_wrap`). Returns
+    /// column metadata + an opaque handle.
     fn query(&mut self, text: &str) -> Result<QueryResult, ApiError>;
 
     /// Fetch rows from an open query handle.
@@ -176,6 +193,16 @@ impl From<&str> for ApiError {
     }
 }
 
+impl From<crate::error::DelightQLError> for ApiError {
+    fn from(error: crate::error::DelightQLError) -> Self {
+        ApiError {
+            identity: Some(error.error_uri()),
+            kind: Some(error.class().into()),
+            message: error.to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match (&self.identity, self.kind) {
@@ -198,6 +225,15 @@ pub trait ServerRelay: Handler {
     /// typed diagnostic that occurred: the server projects it onto the
     /// control wire, never as authored prose.
     fn handle_reset(&mut self) -> Result<(), crate::error::DelightQLError>;
+
+    /// Set a setting for this session, over the value the host stated at
+    /// boot. Only a key declared settable per session is accepted; a reset
+    /// returns every key to its boot value.
+    fn set_session_setting(
+        &mut self,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), crate::error::DelightQLError>;
 }
 
 // --- Session hooks (plain data across the boundary) ---
@@ -225,6 +261,9 @@ pub struct ColumnInfo {
     pub name: String,
     pub descriptor: String,
     pub position: usize,
+    /// Whether anyone chose `name`. A minted name is output only: its
+    /// spelling moves between compilations, so a host must not key on it.
+    pub naming: Naming,
 }
 
 /// Result of a successful `DqlSession::query()`.

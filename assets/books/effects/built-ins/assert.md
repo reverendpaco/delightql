@@ -31,7 +31,7 @@ and runs the input relation through the judgment rule.  If the judgement returns
 
 > Example Failing
 >
-> ```delightql
+> ```{.delightql .bad}
 > _(a@10;22;42)
 >   !> assert!(
 >        same_bag(
@@ -40,7 +40,7 @@ and runs the input relation through the judgment rule.  If the judgement returns
 >   |> ( a*2 as post_assert)
 > ```
 >
-> Error: [delightql-error://runtime/assertion] : Anon tables should match
+> Error: [delightql-error://authored/abort] Permission: Anon tables should match
 
 ## Judgment Rules {.dqlh}
 
@@ -48,14 +48,14 @@ A judgment rule is any higher-order rule that takes
 a table parameter as its last parameter. Structurally, this is denoted
 in higher-order parameter syntax as `P(... T(*))(*)`.
 
-```delightql
+```{.delightql .am}
 at_least(n,T(*))(*) :-
     T(*) ~> count:(*) as count,
-    count >= n
+    count >= $.n
 
-is_greater(n, T())(*) :-
+is_greater(n, T(*))(*) :-
     T(*) ~> count:(*) as count,
-    count > n
+    count > $.n
 
 not_empty(T(*))(*) :-
     T(*) ~> count:(*) as count,
@@ -63,12 +63,12 @@ not_empty(T(*))(*) :-
 
 greater_than(n, T(*))(*) :-
     T(*) ~> count:(*) as count,
-    count > n
+    count > $.n
 
 count_between(lo, hi, T(*))(*) :-
     T(*) ~> count:(*) as count,
-    count >= lo,
-    count <= hi
+    count >= $.lo,
+    count <= $.hi
 ```
 
 A judgment rule **should** encode some simple logic about
@@ -81,12 +81,12 @@ the chain to continue.
 
 The assert rule is assumed to obey the following denotation:
 
-```dql
+```{.delightql .am}
 assert!(P(... T(*))(*), label, I(*))(*) :-
     I(*) |> P(*) : witness
     witness(*) + : judgment
     judgment(*), met=1 |> returning_other!(I(*))(*) : pass!
-    judgment(*), met!=1, abort!(label) : fail!
+    judgment(*), met!=1, abort!($.label) : fail!
 
     fail!(*); pass!(*)
 ```

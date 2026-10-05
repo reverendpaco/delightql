@@ -8,7 +8,7 @@ the definition head:
 |------------------|------------------------------|---------------------------------|
 | `T(*)`           | table, nominally accessed    | glob parameter functor          |
 | `T(a, b)`        | table, positionally accessed | argumentative parameter functor |
-| `n`              | scalar value                 | scalar parameter                |
+| `n`              | scalar value, read as `$.n`  | scalar parameter                |
 | `f:()`           | function value               | function parameter              |
 | `P(... T(*))(*)` | higher-order residual rule   | rule-valued parameter           |
 

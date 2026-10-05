@@ -104,10 +104,16 @@ pub const QUERY_SEQUENCE_HEADER: &str = "#!dql query-sequence";
 const QUERY_SEQUENCE_FRAME: &str = "#!dql query-sequence\n";
 
 /// The host-only selectors. Each is text the HOST writes to name a category it
-/// already knows, in the `?-` prompt wrap's family — never authored DelightQL,
-/// and never visible in an authored coordinate.
+/// already knows — never authored DelightQL, and never visible in an authored
+/// coordinate.
 const CONSTRAINT_CELL_SELECTOR: &str = "@constraint-cell ";
 const DEFAULT_CELL_SELECTOR: &str = "@default-cell ";
+
+/// The prompt wrap: the goal marker a host writes in front of what a user
+/// typed. It is authored DelightQL — a submitting host sends it as the
+/// submission's own bytes ([`prompt_wrap`]); only [`Parser::parse_prompt`],
+/// for a reader that hosts the text itself, keeps it outside the authored
+/// coordinates the way a selector is kept.
 const PROMPT_SELECTOR: &str = "?- ";
 
 /// Where a submission's utility header stands, judged before parsing.
@@ -592,12 +598,29 @@ pub enum CancellableParse {
 /// The road [`Parser::parse_submission`] will take for this source, from
 /// the same framing law, without parsing: marked text (an authored header,
 /// misplaced included — a submission that says which world it is in has
-/// said so) is the utility entrance; unmarked text is one interactive
-/// submission at the prompt wrap.
+/// said so) is the utility entrance; unmarked text is canonical, read at the
+/// definition-file root.
 pub fn submission_road(source: &str) -> Root {
     match framing(source) {
         Framing::Synthetic => Root::DefinitionFile,
         Framing::Authored | Framing::Misframed(_) => Root::QuerySequence,
+    }
+}
+
+/// The submission a HOST sends for what a user typed at a prompt.
+///
+/// The prompt wrap is the host's convenience, not the reader's: the host
+/// knows the text is one goal, so it writes the goal marker, and the
+/// submission it sends is canonical text. Text that names its own entrance —
+/// an authored header, or a misplaced one — goes as written, so a
+/// submission is never framed twice.
+///
+/// The marker is authored bytes of the submission: a position the reader
+/// reports counts it.
+pub fn prompt_wrap(typed: &str) -> std::borrow::Cow<'_, str> {
+    match framing(typed) {
+        Framing::Synthetic => std::borrow::Cow::Owned(format!("{PROMPT_SELECTOR}{typed}")),
+        Framing::Authored | Framing::Misframed(_) => std::borrow::Cow::Borrowed(typed),
     }
 }
 
@@ -654,17 +677,31 @@ impl Parser {
     /// A MISPLACED HEADER STILL NAMES THIS ENTRANCE. It is a defect IN a query
     /// sequence, not a reason to read the file as something else: a submission
     /// that says which world it is in has said so even when it said it in the
-    /// wrong place, and reading it as an interactive prompt would replace the
-    /// author's placement error with an unrelated syntax error. Only genuinely
-    /// unmarked text is one interactive submission and takes the prompt wrap.
+    /// wrong place, and reading it as canonical text would replace the
+    /// author's placement error with an unrelated syntax error.
+    ///
+    /// UNMARKED TEXT IS CANONICAL. It is read at the definition-file root as
+    /// written: a goal is a goal because it carries its marker, which the
+    /// host writes for text a user typed at a prompt ([`prompt_wrap`]).
     ///
     /// The three framing states reach exactly two roads here, and the tree
     /// records which one it took — [`SyntaxTree::entrance`] is the answer, so
     /// no caller downstream scans for the header a second time.
     pub fn parse_submission(&mut self, source: &str) -> SyntaxTree {
         match framing(source) {
-            Framing::Synthetic => self.parse_prompt(source),
+            Framing::Synthetic => self.parse_with("", source, Root::DefinitionFile),
             marked => self.frame_query_sequence(marked, source),
+        }
+    }
+
+    /// What a user typed at a prompt, read as the submission [`prompt_wrap`]
+    /// makes of it — with the wrap's bytes outside every authored
+    /// coordinate. For a reader that is itself the host of the text: a
+    /// relation whose argument is prompt text by its contract.
+    pub fn parse_prompt_submission(&mut self, typed: &str) -> SyntaxTree {
+        match framing(typed) {
+            Framing::Synthetic => self.parse_prompt(typed),
+            marked => self.frame_query_sequence(marked, typed),
         }
     }
 
@@ -687,9 +724,9 @@ impl Parser {
         }
     }
 
-    /// One interactive submission. The prompt wraps its input as a top-level
-    /// goal, which keeps interactive convenience outside the grammar while the
-    /// parser still receives canonical text.
+    /// What a user typed at a prompt, as one goal: the wrap keeps interactive
+    /// convenience outside the grammar while the parser still receives
+    /// canonical text, and its bytes stay outside every authored coordinate.
     pub fn parse_prompt(&mut self, submission: &str) -> SyntaxTree {
         self.parse_with(PROMPT_SELECTOR, submission, Root::DefinitionFile)
     }
@@ -730,7 +767,9 @@ impl Parser {
         should_cancel: &mut dyn FnMut(usize) -> bool,
     ) -> CancellableParse {
         match framing(source) {
-            Framing::Synthetic => self.parse_prompt_cancellable(source, should_cancel),
+            Framing::Synthetic => {
+                self.parse_with_cancellation("", source, Root::DefinitionFile, should_cancel)
+            }
             Framing::Authored => {
                 self.parse_with_cancellation("", source, Root::QuerySequence, should_cancel)
             }
@@ -767,10 +806,14 @@ impl Parser {
         let parsed = format!("{selector}{source}");
         let selector_len = selector.len();
         let mut last_progress_byte: Option<usize> = None;
-        let mut progress = |state: &tree_sitter::ParseState| -> bool {
+        let mut progress = |state: &tree_sitter::ParseState| -> std::ops::ControlFlow<()> {
             let authored = state.current_byte_offset().saturating_sub(selector_len);
             last_progress_byte = Some(authored);
-            should_cancel(authored)
+            if should_cancel(authored) {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
         };
         let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
         let bytes = parsed.as_bytes();

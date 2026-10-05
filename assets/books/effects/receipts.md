@@ -24,7 +24,14 @@ Every receipt GUARANTEES exactly two things:
 `'insert!'`),
 
 Every remaining column is a **declared addition**: a typed column
-recorded in the directive's contract.
+recorded in the directive's contract. A creation receipt (`table!`,
+`temp_table!`, `temp_view!`) declares `target`, the fully qualified data
+namespace target the designator selected, and `created`, the exact catalog
+path of the object created; they coincide for `table!`:
+
+success | operation | target | created
+--------|-----------|--------|--------
+1 | temp_table! | main.staged | sys::shadow::main.staged
 
 
 success | operation | ... | ...
@@ -39,13 +46,13 @@ Those receipts that embed a table within a table assigned to the name `returned`
 a syntactic sugar for exploding out the table within and removing the receipts columns.
 
 ```delightql
-foo(*) !> bar!(*)
+employee(*), title = "IT Staff" !> assert!(count_is(2), "two IT staff")(*)
 ```
 
 is exactly equivalent to the interior-drill form:
 
 ```delightql
-foo(*) |> bar!(*) |> .returned(*)
+employee(*), title = "IT Staff" |> assert!(count_is(2), "two IT staff")(*) |> .returned(*)
 ```
 
 

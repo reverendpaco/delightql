@@ -21,18 +21,19 @@
 mod alias;
 mod compile;
 pub(crate) mod consult;
-mod consult_tree;
+pub(crate) mod consult_tree;
 mod delist;
 mod doc;
 mod enlist;
 mod explain_run;
 mod ground;
-mod imprint;
+pub(crate) mod imprint;
 mod mount;
 mod mount_new;
-mod mount_tree;
+pub(crate) mod mount_tree;
 mod reconsult;
 mod refresh;
+mod retract;
 mod run;
 mod sql_comparison;
 mod unconsult;
@@ -53,7 +54,9 @@ pub use mount_new::MountNewPredicate;
 pub use mount_tree::MountTreePredicate;
 pub use reconsult::ReconsultPredicate;
 pub use refresh::RefreshPredicate;
+pub use retract::RetractPredicate;
 pub use run::{RunNamespacePredicate, RunPredicate};
+pub(crate) use sql_comparison::strict_comparison_operands;
 pub use sql_comparison::{SqlEqPredicate, SqlNePredicate};
 pub use unconsult::UnconsultPredicate;
 pub use unmount::UnmountPredicate;
@@ -62,6 +65,38 @@ use super::{BinCartridge, BinCartridgeMetadata, BinEntity};
 use crate::enums::Language;
 use crate::pipeline::asts::unresolved::*;
 use std::sync::Arc;
+
+/// The prelude's private admission to combine the unresolved rows returned by
+/// its pure compile executable. It is not a general anonymous-relation
+/// extraction capability; only the prelude result accumulator can construct
+/// it.
+pub(crate) struct CompileResultCombinationAuthority {
+    _private: (),
+}
+
+fn compile_result_combination_authority() -> CompileResultCombinationAuthority {
+    CompileResultCombinationAuthority { _private: () }
+}
+
+/// The only product that authorizes an anonymous receipt to avoid ordinary
+/// bare-header reuse. Its constructor lives with the receipt authority, and
+/// the value remains attached to the relation after construction, so a
+/// different Core producer cannot claim receipt isolation by choosing a flag
+/// or by re-pairing the value with another table.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReceiptIsolation(());
+
+impl ReceiptIsolation {
+    fn new() -> Self {
+        Self(())
+    }
+}
+
+impl crate::lispy::ToLispy for ReceiptIsolation {
+    fn to_lispy(&self) -> String {
+        "receipt_isolation".to_string()
+    }
+}
 
 /// The descriptor-declared receipt heading for a built-in directive
 /// Descriptor authority: entities' `output_schema`
@@ -120,9 +155,7 @@ fn core_receipt_result(
             .map(|(name, _)| DomainExpression::lvar_builder(name.to_string()).build()),
     );
     let mut values = vec![
-        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Number(
-            "1".to_string(),
-        ))),
+        DomainExpression::Application(FunctionApplication::Ground(LiteralValue::integer(1))),
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(
             operation.to_string(),
         ))),
@@ -133,11 +166,15 @@ fn core_receipt_result(
             None => LiteralValue::Null,
         }))
     }));
-    GroundForm::Literal(AnonRelation {
-        table: AnonTable::from_values(Some(headers), vec![values])
-            .expect("an effect receipt has one nonempty row"),
-        alias: alias.map(|s| s.into()),
-        outer: false,
+    // A generated receipt is an independent act, even when it sits beside
+    // another receipt. The compiler-owned name policy isolates its heading
+    // without inventing a public qualifier. An authored alias remains the
+    // only name that crosses the boundary.
+    let table = AnonTable::from_values(Some(headers), vec![values])
+        .expect("an effect receipt has one nonempty row");
+    GroundForm::Literal(match alias {
+        Some(alias) => AnonRelation::authored_receipt(table, alias.into(), ReceiptIsolation::new()),
+        None => AnonRelation::receipt(table, ReceiptIsolation::new()),
     })
 }
 
@@ -147,10 +184,10 @@ fn core_receipt_result(
 /// table and `returned` carries the directive's produced result.
 ///
 /// The receipt is CONSTRUCTED through the ordinary operators — two
-/// tree-groups (`~> {*} as input` / `as returned`) joined, widened with
-/// the guaranteed core, reordered — exactly what a programmer could
-/// write, so the resolver derives the interior schemas and
-/// drill/narrow/brace release work with no receipt-special machinery.
+/// packagings (`~> {*} as input` / `as returned`, each holding every row
+/// supplied) joined, widened with the guaranteed core, reordered — so the
+/// resolver derives the interior schemas and drill/narrow/brace release
+/// work with no receipt-special machinery.
 /// The whole construction is wrapped in an inner relation so it splices
 /// wherever a Relation sits.
 pub(crate) fn interior_receipt_result(
@@ -173,11 +210,11 @@ pub(crate) fn interior_receipt_result(
 }
 
 /// A descriptor-driven receipt with flat echoes AND a `returned`
-/// tree-group payload (the tree directives): echo
+/// packaged payload (the tree directives): echo
 /// NAMES come from the descriptor's declared `receipt_echoes`; the
 /// caller supplies echo VALUES in ledger order plus the payload's
 /// heading and rows (one interior row per member of the produced
-/// collection — an all-NULL row elides to the empty `[]`).
+/// collection; no rows is the empty `[]`).
 pub(crate) fn descriptor_tree_receipt(
     bare_name: &str,
     echo_values: &[Option<String>],
@@ -235,81 +272,29 @@ fn receipt_with_interiors(
 ) -> GroundForm {
     use crate::pipeline::asts::core::expressions::relational::InnerRelationPattern;
     use crate::pipeline::asts::core::metadata::NamespacePath;
-    use crate::pipeline::asts::core::specs::{GroupSpec, OneOut, OutItem, ReductionItem};
+    use crate::pipeline::asts::core::specs::{OneOut, OutItem};
     use crate::pipeline::asts::core::FunctionApplication;
-    use crate::pipeline::asts::core::RecordMember;
     use crate::pipeline::asts::core::{Glob, GroundForm, Spread, Step};
+    use crate::pipeline::asts::package::{host_rows, package};
 
-    let anon = |heading: &[&str], rows: &[Vec<Option<String>>]| {
-        AnonTable::from_values(
-            Some(
-                heading
-                    .iter()
-                    .map(|h| DomainExpression::lvar_builder(h.to_string()).build())
-                    .collect(),
-            ),
-            rows.iter()
-                .map(|vals| {
-                    vals.iter()
-                        .map(|v| {
-                            DomainExpression::Application(FunctionApplication::Ground(match v {
-                                Some(s) => LiteralValue::String(s.clone()),
-                                // An all-NULL contributor row elides to the
-                                // empty interior `[]` (finding 1: an empty
-                                // lift still reaches the callee once).
-                                None => LiteralValue::Null,
-                            }))
-                        })
-                        .collect()
-                })
-                .collect(),
-        )
-        .expect("an interior receipt has a nonempty heading and body")
-    };
     let pipe = |source: Chain, operator: PipeOp| {
         source.then(Step::authored(Continuation::Pipe {
             operator: operator,
             named: None,
         }))
     };
-    let grouped = |source: AnonTable, interior_name: &str| {
-        pipe(
-            Chain::authored(GroundForm::Literal(AnonRelation::plain(source))),
-            PipeOp::Group(GroupSpec::Reduce {
-                plan: ReductionPlan::empty(),
-                keys: Vec::new(),
-                reductions: crate::pipeline::asts::vocabulary::Vec1::new(ReductionItem::Out(
-                    OutItem::One(OneOut::authored(
-                        DomainExpression::Application(FunctionApplication::Enclyph(
-                            crate::pipeline::asts::core::Enclyph::Record(
-                                crate::pipeline::asts::core::Record::plain(
-                                    crate::pipeline::asts::vocabulary::Vec1::new(
-                                        RecordMember::Spread(
-                                            crate::pipeline::asts::core::Spread::Glob(
-                                                crate::pipeline::asts::core::Glob::whole(),
-                                            ),
-                                        ),
-                                    ),
-                                ),
-                            ),
-                        )),
-                        Some(interior_name.into()),
-                    )),
-                )),
-            }),
-        )
-    };
 
-    // One-row groups (one per declared interior) cross-join left to right.
+    // One-row packagings (one per declared interior) cross-join left to
+    // right; each holds exactly the rows the host supplied.
     let mut groups = interiors
         .iter()
-        .map(|(col, heading, rows)| grouped(anon(heading, rows), col));
+        .map(|(col, heading, rows)| package(host_rows(heading, rows), col));
     let mut joined = groups.next().expect("at least one declared interior");
     for right in groups {
         joined = joined.then(Step::authored(Continuation::Member {
             rhs: right,
             correlation: None,
-            join_type: None,
+            join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
         }));
     }
     let named = |expr, naming: delightql_types::SqlIdentifier| {
@@ -318,9 +303,7 @@ fn receipt_with_interiors(
     let mut widening = vec![
         OutItem::Many(Spread::Glob(Glob::whole())),
         named(
-            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Number(
-                "1".to_string(),
-            ))),
+            DomainExpression::Application(FunctionApplication::Ground(LiteralValue::integer(1))),
             "success".into(),
         ),
         named(
@@ -381,7 +364,6 @@ fn receipt_with_interiors(
             subquery: Box::new(ordered),
         },
         alias: alias.map(Into::into),
-        outer: false,
     })
 }
 
@@ -463,6 +445,7 @@ fn directive_realization(
         K::Ground => Some(Arc::new(GroundPredicate)),
         K::Enlist => Some(Arc::new(EnlistPredicate)),
         K::Delist => Some(Arc::new(DelistPredicate)),
+        K::Retract => Some(Arc::new(RetractPredicate)),
         K::Alias => Some(Arc::new(AliasPredicate)),
         K::Doc => Some(Arc::new(DocPredicate)),
         K::Imprint => Some(Arc::new(ImprintPredicate)),
@@ -554,11 +537,11 @@ mod descriptor_agreement {
 
     #[test]
     fn the_declaration_carries_the_ruled_category_counts() {
-        assert_eq!(DIRECTIVE_DESCRIPTORS.len(), 31);
+        assert_eq!(DIRECTIVE_DESCRIPTORS.len(), 32);
         let mut names: Vec<&str> = DIRECTIVE_DESCRIPTORS.iter().map(|d| d.name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 31, "descriptor names must be unique");
+        assert_eq!(names.len(), 32, "descriptor names must be unique");
 
         let count = |want: fn(&DirectiveCategory) -> bool| {
             DIRECTIVE_DESCRIPTORS
@@ -566,7 +549,7 @@ mod descriptor_agreement {
                 .filter(|d| want(&d.category))
                 .count()
         };
-        assert_eq!(count(|c| matches!(c, DirectiveCategory::Session)), 15);
+        assert_eq!(count(|c| matches!(c, DirectiveCategory::Session)), 16);
         assert_eq!(count(|c| matches!(c, DirectiveCategory::Ddl)), 5);
         assert_eq!(count(|c| matches!(c, DirectiveCategory::Dml(_))), 3);
         assert_eq!(count(|c| matches!(c, DirectiveCategory::Execution)), 2);
@@ -634,10 +617,10 @@ mod descriptor_agreement {
         // DECLARES both interior additions where the entities ship them.
         use crate::pipeline::asts::effects::{descriptor, ReceiptPayload};
         let consult = descriptor("consult").unwrap();
-        assert!(consult.receipt_input_echo);
+        assert_eq!(consult.receipt_input_echo, &["path", "namespace"]);
         assert_eq!(consult.receipt_payload, ReceiptPayload::Namespaces);
         let doc = descriptor("doc").unwrap();
-        assert!(doc.receipt_input_echo);
+        assert!(doc.receipt_input_echo.is_empty());
         assert_eq!(doc.receipt_payload, ReceiptPayload::None);
     }
 
@@ -662,5 +645,32 @@ mod descriptor_agreement {
         assert!(registry
             .lookup_qualified_entity(&["std", "prelude"], "enlist!")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod receipt_name_policy {
+    use super::*;
+
+    #[test]
+    fn generated_receipts_are_isolated_and_only_authored_aliases_are_public() {
+        let generated = descriptor_core_receipt("alias", &[None, None], None);
+        let GroundForm::Literal(generated) = generated else {
+            panic!("a core receipt must be an anonymous relation literal");
+        };
+        assert!(generated.is_receipt_isolated());
+        assert!(generated.table().is_none());
+        let renamed = generated.set_authored_name("receipt".into());
+        assert!(renamed.is_receipt_isolated());
+        assert!(renamed.has_authored_name());
+        assert!(renamed.table().is_none());
+
+        let authored = descriptor_core_receipt("alias", &[None, None], Some("alias".to_string()));
+        let GroundForm::Literal(authored) = authored else {
+            panic!("an authored receipt must be an anonymous relation literal");
+        };
+        assert!(authored.has_authored_name());
+        assert!(authored.is_receipt_isolated());
+        assert!(authored.table().is_none());
     }
 }

@@ -282,23 +282,27 @@ fn run() -> Result<()> {
         }
     }
 
-    // --dialect is sugar for DQL_DIALECT (consumed at pipeline construction).
-    // The flag is clap-validated (args.rs::parse_dialect); an externally set
-    // DQL_DIALECT is validated here, once, loudly: an ignored explicit
+    // The dialect this invocation states at boot: --dialect, else
+    // DQL_DIALECT. The flag is clap-validated (args.rs::parse_dialect); the
+    // variable is validated here, once, loudly: an ignored explicit
     // override is a silent-wrong — same principle as the DQL_FATBOY_DIR
-    // hard pin.
-    if let Some(ref dialect) = args.dialect {
-        std::env::set_var("DQL_DIALECT", dialect);
-    } else if let Ok(v) = std::env::var("DQL_DIALECT") {
-        if !delightql_core::is_known_dialect_family(v.trim()) {
-            anyhow::bail!(
+    // hard pin. Stated before any handle opens.
+    let dialect = match args.dialect.clone() {
+        Some(dialect) => Some(dialect),
+        None => match std::env::var("DQL_DIALECT") {
+            Ok(v) if delightql_core::is_known_dialect_family(v.trim()) => {
+                Some(v.trim().to_string())
+            }
+            Ok(v) => anyhow::bail!(
                 "unknown DQL_DIALECT '{}'. Valid dialects: sqlite, postgres \
                  (alias: postgresql), mysql, sqlserver, duckdb — unset the \
                  variable to derive the dialect from the connection",
                 v
-            );
-        }
-    }
+            ),
+            Err(_) => None,
+        },
+    };
+    delightql_cli::connection::state_dialect(dialect);
 
     // Store error prefix for use in main() error handler
     CLI_FLAGS.with(|f| {
@@ -935,7 +939,7 @@ mod tests {
         };
 
         // Agreement 1: bare `dql book` lists exactly book_meta's books.
-        let books: Vec<String> = query("book_meta(*) |> #(book_name) |> (book_name)")
+        let books: Vec<String> = query("book_meta(*) |> (book_name) |> #(book_name)")
             .into_iter()
             .map(|row| row[0].clone())
             .collect();
@@ -973,14 +977,15 @@ mod tests {
         // Agreement 3: for every placement whose stored content begins
         // with an ATX heading, the emission contains that same line with
         // the placement's shift applied (marked headings shift; unmarked
-        // pass through verbatim). Derived from the bundle, never authored
-        // into the test.
+        // pass through verbatim), in ordinal order. Derived from the
+        // bundle, never authored into the test.
         let placements = query(&format!(
             "book(*), base_content(*.(slug)), book_name = \"{flagship}\" \
-             |> #(ordinal) |> (heading_shift, hex:(substr:(content, 1, 400)))"
+             |> (heading_shift, hex:(substr:(content, 1, 400)), ordinal) |> #(ordinal)"
         ));
         assert!(!placements.is_empty());
         let mut sampled = 0;
+        let mut cursor = 0;
         for placement in &placements {
             let shift: usize = placement[0].parse().unwrap();
             let head = unhex(&placement[1]);
@@ -994,10 +999,15 @@ mod tests {
             } else {
                 first.to_string()
             };
-            assert!(
-                markdown.contains(&expected),
-                "book {flagship}: emission lacks {expected:?} (shift {shift})"
-            );
+            // Searching from just past the previous placement's line also
+            // refuses an emission out of ordinal order.
+            let found = markdown[cursor..].find(&expected).unwrap_or_else(|| {
+                panic!(
+                    "book {flagship}: emission lacks {expected:?} (shift {shift}) \
+                     after byte {cursor}"
+                )
+            });
+            cursor += found + expected.len();
             sampled += 1;
         }
         assert!(sampled > 0, "book {flagship}: nothing sampled");
@@ -1013,7 +1023,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(exported.status.success());
-        let image_names: Vec<String> = query("image(*) |> #(name) |> (name)")
+        let image_names: Vec<String> = query("image(*) |> (name) |> #(name)")
             .into_iter()
             .map(|row| row[0].clone())
             .collect();
@@ -1585,15 +1595,12 @@ mod tests {
     fn test_bare_dql_is_sugar_for_query() {
         use std::io::Write;
         let cli_path = get_cli_path();
-        // Byte-equality is the claim, so the two runs must be comparable
-        // byte for byte: a heading nobody authored is DRAWN per compilation,
-        // and two processes are two draws. The canonical policy renders the
-        // same invented names as `<mint:N>`, which is what lets this test go
-        // on asserting the road rather than a spelling.
+        // Byte-equality is the claim, so the query names its columns: a
+        // heading nobody authored is DRAWN per compilation, and two
+        // processes would be two draws.
         let run_piped = |args: &[&str], stdin: &str| {
             let mut child = std::process::Command::new(&cli_path)
                 .args(args)
-                .env("DQL_NAME_POLICY", "canonical")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -1609,8 +1616,8 @@ mod tests {
         };
 
         // Piped source executes — byte-equal to `dql query`.
-        let bare = run_piped(&[], "_(1,2;3,4)");
-        let query = run_piped(&["query"], "_(1,2;3,4)");
+        let bare = run_piped(&[], "_(a, b @ 1, 2; 3, 4)");
+        let query = run_piped(&["query"], "_(a, b @ 1, 2; 3, 4)");
         assert!(bare.status.success());
         assert_eq!(bare.stdout, query.stdout, "bare dql must BE dql query");
         assert!(String::from_utf8_lossy(&bare.stdout).contains('3'));

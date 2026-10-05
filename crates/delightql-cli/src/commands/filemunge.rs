@@ -78,54 +78,14 @@ fn parse_table_spec(spec_part: &str, path: &str) -> Result<TableSpec> {
 
 fn load_csv_table(conn: &Connection, spec: &TableSpec, delimiter: u8) -> Result<()> {
     let data = read_file(&spec.path)?;
-
-    let mut rdr = csv::ReaderBuilder::new()
-        .has_headers(spec.has_headers)
-        .delimiter(delimiter)
-        .from_reader(data.as_slice());
-
-    let col_names: Vec<String> = if spec.has_headers {
-        rdr.headers()?.iter().map(|h| h.to_string()).collect()
-    } else {
-        let width = match rdr.records().next() {
-            Some(Ok(ref rec)) => rec.len(),
-            Some(Err(e)) => return Err(e.into()),
-            None => anyhow::bail!("No records in '{}'", spec.path),
-        };
-        (1..=width).map(|i| format!("c{}", i)).collect()
-    };
-
-    if col_names.is_empty() {
-        anyhow::bail!("Zero columns in '{}'", spec.path);
-    }
-
-    let col_defs: Vec<String> = col_names.iter().map(|n| strop(n)).collect();
-    let table_name = strop(&spec.name);
-    conn.execute(
-        &format!("CREATE TABLE {} ({})", table_name, col_defs.join(", ")),
-        [],
-    )?;
-
-    let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
-    let insert_sql = format!(
-        "INSERT INTO {} VALUES ({})",
-        table_name,
-        placeholders.join(", ")
-    );
-
-    // Re-read for noheader mode (first record consumed during width detection)
-    if !spec.has_headers {
-        drop(rdr);
-        let mut rdr2 = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .delimiter(delimiter)
-            .from_reader(data.as_slice());
-        insert_records(conn, &insert_sql, col_names.len(), rdr2.records())?;
-    } else {
-        insert_records(conn, &insert_sql, col_names.len(), rdr.records())?;
-    }
-
-    Ok(())
+    super::csv_table::stage_csv_table(
+        conn,
+        &spec.name,
+        spec.has_headers,
+        delimiter,
+        &data,
+        &format!("'{}'", spec.path),
+    )
 }
 
 fn load_json_singleton_table(conn: &Connection, spec: &TableSpec) -> Result<()> {
@@ -155,21 +115,6 @@ fn read_file(path: &str) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     Ok(buf)
-}
-
-fn insert_records(
-    conn: &Connection,
-    insert_sql: &str,
-    ncols: usize,
-    records: csv::StringRecordsIter<&[u8]>,
-) -> Result<()> {
-    let mut stmt = conn.prepare(insert_sql)?;
-    for rec in records {
-        let rec = rec?;
-        let params: Vec<Option<&str>> = (0..ncols).map(|i| rec.get(i)).collect();
-        stmt.execute(rusqlite::params_from_iter(params.iter()))?;
-    }
-    Ok(())
 }
 
 pub fn handle_filemunge_command(
@@ -217,20 +162,30 @@ pub fn handle_filemunge_command(
     let output_format = format.unwrap_or(OutputFormat::Table);
 
     let mut handle = connection::open_handle(connection::SessionProfile::client())?;
-    let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
+    {
+        let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
+        // A higher-order directive writes both groups: `(arguments)(receipt
+        // access)`. A lone group is receipt access by position, so dropping
+        // the `(*)` binds zero arguments and the demand refuses on arity.
+        crate::exec_ng::run_dql_query(
+            &format!("mount!(\"{}\", \"main\")(*)", db_path_str),
+            &mut *session,
+        )?;
+    }
 
-    // A higher-order directive writes both groups: `(arguments)(receipt
-    // access)`. A lone group is receipt access by position, so dropping the
-    // `(*)` binds zero arguments and the demand refuses on arity.
-    crate::exec_ng::run_dql_query(
-        &format!("mount!(\"{}\", \"main\")(*)", db_path_str),
-        &mut *session,
-    )?;
+    let result = crate::exec_ng::execute_query(
+        query,
+        &mut *handle,
+        to,
+        crate::exec_ng::Rendering {
+            format: output_format,
+            no_headers: false,
+            no_sanitize: false,
+        },
+        crate::exec_ng::ShippedSets::Discarded,
+        false,
+    );
 
-    let result =
-        crate::exec_ng::execute_query(query, &mut *session, to, output_format, false, false, false);
-
-    drop(session);
     drop(handle);
     let _ = std::fs::remove_file(&temp_path);
 

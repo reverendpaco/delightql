@@ -53,16 +53,16 @@ impl BinEntity for MountPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for MountPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],
@@ -100,9 +100,10 @@ impl EffectExecutable for MountPredicate {
         // blueprint-inertness change).
         system.mount_database(&db_path, &namespace)?;
 
-        Ok(EntityResult::Relation(super::descriptor_core_receipt(
-            "mount",
-            &[Some(db_path.clone()), Some(namespace.clone())],
+        Ok(EntityResult::Relation(super::input_receipt_result(
+            "mount!",
+            &["path", "namespace"],
+            &[vec![Some(db_path.clone()), Some(namespace.clone())]],
             alias,
         )))
     }

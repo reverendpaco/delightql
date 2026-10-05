@@ -63,10 +63,6 @@ impl BinEntity for BetweenPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        false
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn crate::bin_cartridge::EffectExecutable> {
         None
     }

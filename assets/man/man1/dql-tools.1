@@ -36,10 +36,33 @@ Without
 .B \-\-has\-headers
 the columns are named
 .BR c1 ", " c2 ", ..."
+.PP
+CSV carries no types; each field acquires its value when it is staged.
+Every column is declared with SQLite's NUMERIC affinity: a field that is a
+well-formed integer or real literal is stored as that number and any other
+field as text, so
+.B "age > 26"
+compares the values and a text literal compared with such a column is
+converted the same way
+.RB ( "age = \(dq30\(dq"
+matches the number 30). An empty field is an absent value and is stored
+as NULL; it qualifies for no comparison. A blank line in a one\-column
+input is one empty field and therefore one NULL record; in a wider input a
+blank line is not a record and is skipped. The affinity is the engine's
+reading: it also converts
+.BR 007 ", " "\(dq 30 \(dq"
+and
+.B 1e3
+to numbers, and a column mixing numeric and non-numeric spellings compares
+each cell by its own storage class.
 .SS filemunge
 Loads one relation per
 .B \-\-table
-spec from files, then runs the query against them.
+spec from files, then runs the query against them. CSV and TSV tables are
+staged under the same value law as
+.BR csvstruct ;
+a json\-singleton table is
+.BR name(j\ TEXT) .
 .SH OPTIONS
 .TP
 .BI \-\-table " SPEC PATH"
@@ -66,8 +89,12 @@ the default here is
 .BR table .
 .TP
 .BI \-\-to " STAGE"
-Stop at an intermediate compilation stage; same values as
-.BR dql-query (1).
+Inspect instead of executing; same values and the same law as
+.BR dql-query (1):
+a compile stage renders, a digest stage runs only an effect-free query,
+and
+.B results
+(the default) executes.
 .SH EXAMPLES
 .EX
 $ echo '[{"name":"Alice","age":30}]' | dql tools jstruct 'j(j)'

@@ -57,7 +57,8 @@ fn a_script_replays_through_the_real_prompt() {
     let state = dir.path().join("state");
     let db = dir.path().join("t.db");
     let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (7);").unwrap();
+    conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (7);")
+        .unwrap();
     drop(conn);
     let script = dir.path().join("replay-script.1");
     std::fs::write(
@@ -76,26 +77,48 @@ fn a_script_replays_through_the_real_prompt() {
         .output()
         .expect("run the replay");
     let transcript = strip_ansi(&String::from_utf8_lossy(&out.stdout));
-    assert_eq!(out.status.code(), Some(0), "{transcript}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{transcript}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(transcript.contains("Goodbye!"), "{transcript}");
-    assert!(transcript.contains("resolution/table"), "the refusal shows: {transcript}");
+    assert!(
+        transcript.contains("resolution/table"),
+        "the refusal shows: {transcript}"
+    );
     assert!(transcript.contains("│ 7"), "the rows show: {transcript}");
 
     // The CHILD's files: an interactive session, on the rich road, with
     // the four blocks in its ledger and the refusal in its log.
     let (_, context) = read_one(&state, "context.");
     assert!(context.contains("\"mode\": \"repl\""), "{context}");
-    assert!(context.contains("\"editor_road\": \"rich\""), "the per-keystroke hooks ran: {context}");
+    assert!(
+        context.contains("\"editor_road\": \"rich\""),
+        "the per-keystroke hooks ran: {context}"
+    );
     let (_, log) = read_one(&state, "error.log.");
-    assert!(log.contains("\"input\": \"nosuch(*)\""), "{log}");
+    // Core's finding carries the submission it received: the host's wrap
+    // of what was typed.
+    assert!(log.contains("\"input\": \"?- nosuch(*)\""), "{log}");
     let (_, ledger) = read_one(&state, "replay-script.");
     assert!(ledger.contains("# 1 dql\nt(*)\n"), "{ledger}");
-    assert!(ledger.contains("t(*)\n  |> (x)\n"), "a multi-line block pasted whole: {ledger}");
+    assert!(
+        ledger.contains("t(*)\n  |> (x)\n"),
+        "a multi-line block pasted whole: {ledger}"
+    );
     assert!(ledger.contains("dot_command\n.exit\n"), "{ledger}");
     // The DRIVER wrote nothing of its own: one session on disk.
     let sessions = std::fs::read_dir(&state)
         .unwrap()
-        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("context."))
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("context.")
+        })
         .count();
     assert_eq!(sessions, 1);
 }
@@ -108,27 +131,36 @@ fn a_tarball_replays_with_its_recorded_arguments_and_extracted_database() {
     std::env::set_var("DQL_STATE_DIR", &original_state);
     let user_db = dir.path().join("orders.db");
     let conn = rusqlite::Connection::open(&user_db).unwrap();
-    conn.execute_batch("CREATE TABLE orders (id INTEGER); INSERT INTO orders VALUES (1);").unwrap();
+    conn.execute_batch("CREATE TABLE orders (id INTEGER); INSERT INTO orders VALUES (1);")
+        .unwrap();
     drop(conn);
 
     // A recorded session: argv names the database; the ledger queries it.
     let db = Arc::new(ClientDatabase::open_on(Mode::Other).unwrap());
     let mut handle = open_handle(SessionProfile::Client(Some(db.clone()))).expect("handle");
     let (id, _) = db.record_input(InputKind::Dql, "orders(*)");
-    db.close_input(id, InputOutcome::Succeeded, None, None, Some(1.0));
-    let report = delightql_cli::client::bug::write_bug_report(&db, &mut *handle, None, Some(&user_db))
-        .expect("bug report");
+    db.close_input(id, InputOutcome::Succeeded, None, Some(1.0));
+    let report =
+        delightql_cli::client::bug::write_bug_report(&db, &mut *handle, None, Some(&user_db))
+            .expect("bug report");
     // The recorded argv is this test harness's; give the tarball the argv
     // a REPL session would have carried.
     let (context_name, context) = read_one(&report.files.directory, "context.");
     let mut rows: Vec<String> = context.lines().map(|l| l.to_string()).collect();
     rows.retain(|l| !l.contains("\"relation\": \"argument\""));
-    for (i, v) in ["dql", "query", "--db", user_db.to_str().unwrap()].iter().enumerate() {
+    for (i, v) in ["dql", "query", "--db", user_db.to_str().unwrap()]
+        .iter()
+        .enumerate()
+    {
         rows.push(format!(
             "{{\"relation\": \"argument\", \"ordinal\": \"{i}\", \"value\": \"{v}\"}}"
         ));
     }
-    std::fs::write(report.files.directory.join(&context_name), rows.join("\n") + "\n").unwrap();
+    std::fs::write(
+        report.files.directory.join(&context_name),
+        rows.join("\n") + "\n",
+    )
+    .unwrap();
     // Rebuild the tarball with the edited context.
     let stamp = report.files.stamp;
     let tgz = dir.path().join("bug.tgz");
@@ -142,10 +174,14 @@ fn a_tarball_replays_with_its_recorded_arguments_and_extracted_database() {
             context_name.clone(),
             format!("replay-script.{stamp}"),
         ] {
-            tar.append_path_with_name(report.files.directory.join(&name), format!("{prefix}/{name}"))
-                .unwrap();
+            tar.append_path_with_name(
+                report.files.directory.join(&name),
+                format!("{prefix}/{name}"),
+            )
+            .unwrap();
         }
-        tar.append_path_with_name(&user_db, format!("{prefix}/db/orders.db")).unwrap();
+        tar.append_path_with_name(&user_db, format!("{prefix}/db/orders.db"))
+            .unwrap();
         tar.into_inner().unwrap().finish().unwrap();
     }
     // The original database goes away: only the extracted copy can serve.
@@ -160,9 +196,20 @@ fn a_tarball_replays_with_its_recorded_arguments_and_extracted_database() {
         .output()
         .expect("run the replay");
     let transcript = strip_ansi(&String::from_utf8_lossy(&out.stdout));
-    assert_eq!(out.status.code(), Some(0), "{transcript}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert!(transcript.contains("/db/orders.db"), "the extracted copy is mounted: {transcript}");
-    assert!(transcript.contains("│ 1"), "the recorded query answers from it: {transcript}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{transcript}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        transcript.contains("/db/orders.db"),
+        "the extracted copy is mounted: {transcript}"
+    );
+    assert!(
+        transcript.contains("│ 1"),
+        "the recorded query answers from it: {transcript}"
+    );
     let (_, context) = read_one(&replay_state, "context.");
     assert!(context.contains("\"mode\": \"repl\""), "{context}");
 }

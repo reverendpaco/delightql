@@ -10,14 +10,14 @@ Within the context of delightql a functor is *usually* understood to be a **tabl
 and **always** understood to be a *predicate* (as predicates generalize tables).
 
 ```delightql
-// Access the table foo and its three columns
+// Access the table Album and its three columns
 // which we call a,b, and c
-foo(a,b,c)
+album(a,b,c)
 ```
 
 ```delightql
-// Access the table bar and all its columns
-bar(*)
+// Access the table Artist and all its columns
+artist(*)
 ```
 
 In the context of delightql and most logic languages, the functor notation is self-denoting.
@@ -30,7 +30,7 @@ This means several things, but practically we can say the following:
 In contrast, most other programming languages use functor syntax
 to denote a *function* and/or (perhaps) a *subroutine*.
 
-```
+```text
     foo(a,b,c)
 ```
 
@@ -57,11 +57,12 @@ relation: a functor with a colon `:` between the identifier and the pair of
 parentheses, which we will call a **function functor**.
 
 ```delightql
-    count:(*)
-    length:(last_name)
-    foo:(x,y,z)
+    employee(*)
+      |> %(title ~> count:(*) as n,
+                    max:(length:(last_name)) as longest,
+                    min:(substr:(last_name, 1, 3)) as prefix)
 ```
 
-  The colon asks us to read `foo of x
-and y and z` or `length of last_name`.
+  The colon asks us to read `substr of last_name
+and 1 and 3` or `length of last_name`.
 

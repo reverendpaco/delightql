@@ -3,14 +3,14 @@
 The EMBED operator `+(  )`{.delightql .sigil} adds a new column to a relation, placed after existing columns:
 
 ```delightql
-employee_2019(*)
-  |> +(  strftime:('%Y',BirthDate) - 2 as two_years_before_birth )
+employee(*)
+  |> +(  strftime:("%Y",birth_date) - 2 as two_years_before_birth )
 ```
 
 ```sql
 select
     *,
-    strftime('%Y',BirthDate) - 2 as two_years_before_birth
+    strftime('%Y',birth_date) - 2 as two_years_before_birth
 from employee;
 ```
 

@@ -52,16 +52,16 @@ impl BinEntity for AliasPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for AliasPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],

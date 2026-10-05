@@ -58,8 +58,10 @@ Attach an external database.
 .SS Compilation
 .TP
 .BI \-\-to " STAGE"
-Stop at an intermediate stage and print its representation instead of
-executing. Stages, in pipeline order:
+Inspect instead of executing. Every value but
+.B results
+(the default, the executing road) is an INSPECTION. Stages, in pipeline
+order:
 .BR cst ,
 .BR ast\-unresolved ,
 .BR ast\-resolved ,
@@ -70,21 +72,66 @@ executing. Stages, in pipeline order:
 (default),
 .BR fingerprint ,
 .BR hash ,
-.BR bhash ,
 .BR totalhash .
 .RB ( recursion\-depth
 is deprecated; use sys::execution.stack(*) instead.)
+.IP
+A compile stage renders the statement's representation and executes
+nothing. A digest stage runs the statement only if the compiler classifies
+it effect-free and prints a digest of its result; a statement that would
+execute an effect \(em a DML or DDL directive, a run, a session
+directive such as
+.BR mount! ,
+an inline DDL block \(em is refused before anything runs
+.RI ( semantic/effect/observation ),
+and under
+.B \-\-sequential
+every statement of the sequence is judged. To execute a statement and
+digest its result, keep the executing road and choose the digest as the
+format:
+.BR "\-\-to results \-f hash" .
 .IP
 .B hash
 prints a column-name-independent data hash;
 .B totalhash
 includes column names;
-.B bhash
-is the byte-level, platform-independent hash of the rendered values
-(an INTEGER 5 and a TEXT '5' hash identically \(em it fingerprints data
-content, not column types);
 .B fingerprint
-prints result-fingerprint JSON for semantic comparison.
+prints result-fingerprint JSON for semantic comparison, naming the digest
+version in its
+.I digest
+field. The same three digests are available as
+.B \-f
+formats on the executing road.
+.IP
+Every digest reads the cells the result delivered, never their display:
+SQL NULL, an empty value, and the text NULL are three different cells,
+and a BLOB contributes its exact bytes. Row order does not matter; a
+repeated row counts each time. A cell carries no type, so an INTEGER 5
+and a TEXT '5' digest identically.
+.IP
+A name the compiler invented \(em for an unnamed computation such as
+.BR "age + 1" ,
+or for columns whose names collide \(em is drawn fresh on every run: the
+authored name the column lost, if it lost one, then the mark \(pp, then,
+for a column nobody named, a word saying where its value came from, then
+sixteen hexadecimal digits, as in
+.I id\(pp80c43d5c2a8b6cd9
+for a collision and
+.I \(ppexpr_1b845432a344564f
+for a computed value
+.RI ( anon_
+marks an unnamed anonymous-table cell). Printed headings and generated
+SQL show the drawn spelling, so they differ between two runs of the same
+query whenever the result holds one. This is deliberate: nothing may
+depend on an invented name. The digests do not move:
+.B totalhash
+and
+.B fingerprint
+read each invented column as
+.IR <mint:N> ,
+numbering the invented columns of the heading left to right, and
+.B hash
+ignores names.
 .IP
 A query that fails to compile under
 .B \-\-to
@@ -125,8 +172,18 @@ Output format. One of
 .BR csv ,
 .BR tsv ,
 .BR list ,
-.BR raw .
-The default is tab-separated values with a header row.
+.BR raw ,
+and the digests
+.BR hash ,
+.BR totalhash ,
+.BR fingerprint .
+The default is tab-separated values with a header row. A digest format
+prints one machine value for the executed result \(em the statement runs,
+effects included \(em and ships no mid-run
+.B stdout!
+set to the console; it is the executing counterpart of the
+.B \-\-to
+digest inspections, which refuse an effect.
 .B json
 emits one array;
 .B jsonl
@@ -149,6 +206,43 @@ type identically. A genuinely mixed column remains order-dependent
 (election picks one class; off-class values demote per-value) \(em
 declare the column (or cast) when a consumer depends on it. Keys keep the
 relation's column order.
+.B csv
+and
+.B tsv
+are also machine formats: each has one representation of absence a reader
+can tell from any text. Like every format but the JSON pair, their text is
+sanitized for a terminal unless
+.B \-\-no\-sanitize
+is given \(em a dangerous control byte is spelled
+.B \exHH
+before the format\(aqs own escaping, and a cell that itself spells
+.B \ex
+has its backslashes doubled so the spelling stays unambiguous; the default
+output is a display of the value, the opt\-out its faithful serialization,
+and both are injective. Tab, newline, carriage return, quotes and absence
+are left to the encodings below, which distinguish the same values either
+way. In
+.B csv
+SQL NULL is the empty unquoted field, the empty text is
+.BR \(dq\(dq ,
+and a field holding a comma, a quote, or a line break is quoted with its
+quotes doubled. In
+.B tsv
+SQL NULL is
+.BR \eN ,
+and text escapes its own alphabet \(em a backslash as
+.BR \e\e ,
+a tab as
+.BR \et ,
+a newline as
+.BR \en ,
+a carriage return as
+.BR \er
+\(em so the text
+.B NULL
+stays
+.B NULL
+and every other byte is literal.
 .B table
 and
 .B box
@@ -263,7 +357,8 @@ for the full story.
 $ dql query --db app.db 'users(*), age > 30 |> (id, first_name)'
 $ echo 'users(*) ~> count:(*)' | dql query --db app.db
 $ dql query --db app.db --to sql -f list 'users(*), age > 30'
-$ dql query --db app.db --to bhash 'orders(*)'   # regression pin
+$ dql query --db app.db --to hash 'orders(*)'   # inspect: a pure query's data hash
+$ dql query --db app.db -f hash 'rows(*) |> insert!(t(*))(*)'  # execute, then digest
 $ dql query -f json '_(name, age @ "Ada", 36)'   # no db needed
 $ dql query --db app.db --to sql -f raw 'users(*)'  # bare pasteable SQL
 .EE

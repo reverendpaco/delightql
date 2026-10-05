@@ -4,8 +4,8 @@ Interior relations unify `EXISTS`, `NOT EXISTS`, scalar subqueries, and lateral 
 
 An interior relation is a query continuation inside a functor's parentheses:
 
-```dql
-users(|> (last_name,first_name))
+```delightql
+customer(|> (last_name,first_name))
 ```
 
 > **Query Continuation**
@@ -23,9 +23,9 @@ users(|> (last_name,first_name))
 Interior relations appear wherever tables are allowed. When uncorrelated,
 they're equivalent to exterior execution:
 
-```dql
-users(*) |> (last_name,first_name)
-// equivalent to: users(|> (last_name,first_name))
+```delightql
+customer(*) |> (last_name,first_name)
+// equivalent to: Customer(|> (last_name,first_name))
 ```
 
 
@@ -33,9 +33,9 @@ Consider positional union all `||`{.delightql .sigil}
 where interiority crafts the proper alignment and projection:
 
 ```delightql
-users_2024(|> (last_name,first_name,age))
+customer(|> (first_name,last_name,company))
   ||
-users_2023(|> (LastName,First,Age))
+employee(|> (first_name,last_name,title))
 ```
 
 
@@ -52,13 +52,13 @@ Interior relations are used in the following:
 Scalar subqueries use interior notation:
 
 ```{.delightql .numberLines}
-employee(*) as e
-    |> (FirstName,
-        LastName,
-        Salary,
-        employee:( ~> avg:(Salary)) as AvgSalary,
-        employee:( , DepartmentName=e.DepartmentName
-                   ~> avg:(Salary)) as AvgSalaryInDept)
+invoice(*) as i
+    |> (invoice_id,
+        billing_country,
+        total,
+        invoice:( ~> avg:(total)) as avg_total,
+        invoice:( , billing_country=i.billing_country
+                  ~> avg:(total)) as avg_total_in_country)
 ```
 
 In the above example, two query continuations started with `~>`{.delightql
@@ -71,39 +71,45 @@ In the above example, two query continuations started with `~>`{.delightql
 The `+`{.delightql .sigil} and `\+`{.delightql .sigil} prefixes with interior notation create `(NOT) EXISTS`:
 
 
-```dql
-users(*), orders(*),
-  users.id = orders.user_id,
-  \+order_items(, orders.id = order_items.order_id)
+```delightql
+album(*), track(*),
+  album.album_id = track.album_id,
+  \+invoice_line(, track.track_id = invoice_line.track_id)
 ```
+
+The `EXISTS` observer asks whether a row matched; it does not change the
+matching condition. A comparison between an inner and an enclosing row
+uses correspondence equality (`=` in SQL), including when the same
+interior is observed as a scalar subquery. A local test within the inner
+row keeps its ordinary null-safe meaning.
 
 
 ## Simple Shadowing {.dqlh}
 
 Uncorrelated interior relations are simple shadowing -- useful for reshaping before set operations:
 
-```dql
-users(|> (last_name,first_name))
+```delightql
+customer(|> (last_name,first_name))
 ```
 
 but especially for set operators:
 
 ```delightql
-users_2024(|> (last_name,first_name,age))
+customer(|> (first_name,last_name,company))
   ||
-users_2023(|> (LastName,First,Age))
+employee(|> (first_name,last_name,title))
 ```
 
 ```delightql
-users_2024(|> *(last_name as LastName,first_name as First,age as Age))
+employee_2025(|> *(job_title as title,manager_id as reports_to))
   |;|
-users_2023(*)
+employee_2024(*)
 ```
 
 ```delightql
-users_2024(; users_2023(*)) as combined,
-  org(*), combined.departments=org.dept
-  |> (last_name,org.dept)
+employee_2024(; employee_2025(*)) as staff,
+  customer(*), staff.employee_id=customer.support_rep_id
+  |> (staff.last_name,customer.email)
 ```
 
 ## Correlated Table (Lateral Join) {.dqlh}
@@ -122,75 +128,72 @@ Lateral joins may be broken down into three sub-types:
 subqueries; rarely advantageous over a regular join.
 
 ```delightql
-orders(*) ,
-  users(, users.id=user_id
-        |> (last_name,first_name,email)) as u
-  |> (orders.*,last_name,first_name,email)
+invoice(*) ,
+  customer(, c.customer_id=invoice.customer_id
+        |> (last_name,first_name,email)) as c
+  |> (invoice.*,last_name,first_name,email)
 ```
 
 ```sql
-SELECT orders.*, last_name , first_name , email
-  FROM (
-  SELECT *
-    FROM orders
+SELECT invoice.*, last_name , first_name , email
+  FROM invoice
   INNER JOIN (
     SELECT last_name , first_name , email ,
-      id  -- promote out of subquery for joining
-    FROM users
-  ) AS users ON users.id IS NOT DISTINCT FROM user_id
-);
+      customer_id  -- promote out of subquery for joining
+    FROM customer
+  ) AS c ON c.customer_id = invoice.customer_id;
 ```
 
 **Aggregate Lateral**. Replaces multiple aggregate scalar subqueries.
 Advantageous when the aggregate key matches the join key.
 
-```dql
-users(*) as u,
-  orders(, orders.user_id = u.id |>
-            %(user_id
+```delightql
+customer(*) as c,
+  invoice(, invoice.customer_id = c.customer_id |>
+            %(customer_id
               ~> sum:(total) as total_spent,
-                 sum:(tax_amount) as total_tax_amount))
+                 count:(*) as invoice_count))
 ```
 
 ```sql
 SELECT
   *
-FROM users AS u
+FROM customer AS c
   INNER JOIN (
-    SELECT user_id , sum(total) AS total_spent, sum(tax_amount) AS total_tax_amount
-    FROM orders
-    GROUP BY user_id
-  ) AS orders
-ON orders.user_id IS NOT DISTINCT FROM u.id;
+    SELECT customer_id , sum(total) AS total_spent, count(*) AS invoice_count
+    FROM invoice
+    GROUP BY customer_id
+  ) AS invoice
+ON invoice.customer_id = c.customer_id;
 ```
 
 **Top-N Lateral**. Returns the top N correlated rows per outer row, avoiding explicit window functions.
 
-```dql
-users(*) as u,
-  orders(, orders.user_id = u.id |> #(total desc), #<3)
+```delightql
+customer(*) as c,
+  invoice(, invoice.customer_id = c.customer_id |> #(total desc), #<3)
 ```
 
 ```sql
 SELECT *
-FROM users AS u
+FROM customer AS c
 JOIN (SELECT
-  id, order_id, user_id, customer_id, total,
-  tax_amount, shipping_cost, status, created_at,
-  shipped_at, delivered_at
+  invoice_id, customer_id, invoice_date, billing_address,
+  billing_city, billing_state, billing_country,
+  billing_postal_code, total
 FROM (SELECT
-  id, order_id, user_id, customer_id, total,
-  tax_amount, shipping_cost, status, created_at,
-  shipped_at, delivered_at,
+  invoice_id, customer_id, invoice_date, billing_address,
+  billing_city, billing_state, billing_country,
+  billing_postal_code, total,
   ROW_NUMBER() OVER (
     PARTITION BY
-      user_id
+      customer_id
     ORDER BY total DESC
   ) AS __dql_rn
-FROM orders) AS orders_with_rn
+FROM invoice) AS invoices_with_rn
 WHERE
-  orders_with_rn.__dql_rn <= 3) AS orders
-  ON orders.user_id IS NOT DISTINCT FROM u.id;
+  invoices_with_rn.__dql_rn <= 3) AS invoice
+  ON invoice.customer_id = c.customer_id;
 ```
 
 Note how the windowing function above partitions by the correlation
@@ -204,7 +207,7 @@ all places where delightql uses interiority.
 Only the tree labeled `interior relations` consists
 of expressions that are used as actual relations/tables.
 
-```
+```text
   Interiority:
   ├── interior relations:
   │   ├── correlated (lateral):

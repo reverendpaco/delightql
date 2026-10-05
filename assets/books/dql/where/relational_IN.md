@@ -1,30 +1,36 @@
 
 # Relational `in` {.dqlh}
 
-The literal form tests membership in a fixed list. The relational form tests
-membership in the result of a query -- SQL's `IN (SELECT ...)`.
+The literal form tests candidates in a fixed list. The relational form tests
+candidate rows from a query. Both are existence observations over the
+ordinary row-correspondence match, not a promise to emit SQL's
+three-valued `IN (SELECT ...)`.
 
 The right-hand side is any DQL relation (a table access, a pipe chain, or an
 anonymous table):
 
 ```delightql
-employee(*), DepartmentId in department(|> (DepartmentId))
+customer(*), support_rep_id in employee(|> (employee_id))
 ```
 
 ```sql
-SELECT * FROM employee
-  WHERE DepartmentId IN (SELECT DepartmentId FROM department);
+SELECT * FROM customer
+  WHERE EXISTS (SELECT 1 FROM employee AS e
+                WHERE e.employee_id = customer.support_rep_id);
 ```
 
 When the relation already has exactly one column, projection is unnecessary:
 
 ```delightql
-employee(*), State in valid_states(*)
+customer(*) |> %(support_rep_id) : support_rep
+employee(*), employee_id in support_rep(*)
 ```
 
 ```sql
+WITH support_rep AS (SELECT DISTINCT support_rep_id FROM customer)
 SELECT * FROM employee
-  WHERE State IN (SELECT State FROM valid_states);
+  WHERE EXISTS (SELECT 1 FROM support_rep AS r
+                WHERE r.support_rep_id = employee.employee_id);
 ```
 
 
@@ -36,26 +42,34 @@ to relations. The relation must produce exactly as many columns as the
 left-hand tuple:
 
 ```delightql
-employee(*), (State, Department) in valid_combos(|> (State, Department))
+customer(*), (city, country) in employee(|> (city, country))
 ```
 
 ```sql
-SELECT * FROM employee
-  WHERE (State, Department) IN
-    (SELECT State, Department FROM valid_combos);
+SELECT * FROM customer
+  WHERE EXISTS (SELECT 1 FROM employee AS e
+                WHERE e.city = customer.city
+                  AND e.country = customer.country);
 ```
 
 
 ### Negation: `not in` {.dqlh}
 
 ```delightql
-employee(*), DepartmentId not in terminated_depts(|> (DepartmentId))
+employee(*), employee_id not in employee(|> (reports_to))
 ```
 
 ```sql
 SELECT * FROM employee
-  WHERE DepartmentId NOT IN (SELECT DepartmentId FROM terminated_depts);
+  WHERE NOT EXISTS (SELECT 1 FROM employee AS m
+                    WHERE m.reports_to = employee.employee_id);
 ```
+
+The negative form is anti-existence, not SQL `NOT IN`: a NULL candidate
+does not poison a nonmatching probe. A NULL employee key corresponds to
+no candidate key, including another NULL; positive `in` then fails and
+negative `not in` succeeds for that row. A wholly ground test such as
+`null in (null)` is a local null-safe value comparison and succeeds.
 
 
 > **Arity rule**
@@ -70,4 +84,3 @@ SELECT * FROM employee
 > [above](#semi-joins-and-anti-joins).
 > `col in R(|> (c))` desugars to `+R(, col = c)`;
 > `col not in R(|> (c))` desugars to `\+R(, col = c)`.
-

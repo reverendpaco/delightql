@@ -5,7 +5,7 @@ An **argumentative paramter functor** `T(a, b)` is **positionally typed**:
 the input must have exactly two columns, and they are renamed to `a` and
 `b` inside the body.  The caller's original column names are overwritten.
 
-```delightql
+```{.delightql .am}
 foo(T(label, value))(*) :-
   T(*), value > 10 |> (label)
 ```
@@ -38,14 +38,15 @@ foo(_("first", 2; "second", 20))(*)
 but still allows pipe invocation:
 
 ```delightql
-two_column_table(*)
+// genre_2025 is (name, genre_id): name binds label, genre_id binds value
+genre_2025(*)
   |> foo(*)
 ```
 
 Or explicit functor invocation:
 
 ```delightql
-foo(two_column_table(*))(*)
+foo(genre_2025(*))(*)
 ```
 
 Scalar lifting requires a positional contract -- a glob parameter functor

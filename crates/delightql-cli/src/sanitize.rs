@@ -25,9 +25,34 @@ fn is_dangerous(c: char) -> bool {
     }
 }
 
-/// Fast check: does any character need escaping?
+/// Where the sanitized text goes, which decides what a carriage return is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sink {
+    /// A console: CR+LF displays as one line break and a bare CR, which
+    /// would rewrite the line, is spelled out.
+    Display,
+    /// A record format that encodes CR itself (TSV as `\r`, CSV inside
+    /// quotes): CR is the format's business and passes through.
+    Record,
+}
+
+/// THE SAFETY SPELLING IS RESERVED. A dangerous byte is spelled `\xHH`,
+/// and that spelling may not be mistakable for authored text: a cell that
+/// spells `\x` itself, or that needs the spelling, has every backslash
+/// doubled first — so ESC renders `\x1B` and the authored text `\x1B`
+/// renders `\\x1B`. Every other cell is itself, so an ordinary backslash
+/// (a path, a regex) is untouched and the mapping is still injective: a
+/// sanitized cell always contains `\x`, and an untouched one never does.
+fn needs_the_spelling(value: &str, sink: Sink) -> bool {
+    value.contains("\\x")
+        || value
+            .chars()
+            .any(|c| is_dangerous(c) && !(sink == Sink::Record && c == '\r'))
+}
+
+/// Fast check: does the console display of `value` differ from `value`?
 pub fn needs_sanitization(value: &str) -> bool {
-    value.chars().any(|c| is_dangerous(c))
+    needs_the_spelling(value, Sink::Display)
 }
 
 /// Sanitize a cell value for terminal-safe display.
@@ -36,14 +61,28 @@ pub fn needs_sanitization(value: &str) -> bool {
 /// Returns Cow::Owned with \xHH escaping for values with control chars.
 /// Bare CR is escaped; CR+LF pairs pass through as LF (CR stripped).
 pub fn sanitize_cell(value: &str) -> Cow<'_, str> {
-    if !needs_sanitization(value) {
+    sanitize(value, Sink::Display)
+}
+
+/// Sanitize text bound for a record format under the same reserved
+/// spelling, leaving carriage returns to the format's own encoding.
+pub fn sanitize_record_text(value: &str) -> Cow<'_, str> {
+    sanitize(value, Sink::Record)
+}
+
+fn sanitize(value: &str, sink: Sink) -> Cow<'_, str> {
+    if !needs_the_spelling(value, sink) {
         return Cow::Borrowed(value);
     }
 
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\r' {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if c == '\r' && sink == Sink::Record {
+            out.push('\r');
+        } else if c == '\r' {
             if chars.peek() == Some(&'\n') {
                 // CR+LF → emit just LF (strip CR)
                 chars.next();
@@ -151,6 +190,19 @@ mod tests {
         assert!(needs_sanitization(v));
         let result = sanitize_cell(v);
         assert_eq!(result, "\\x1B[31mRED\\x1B[0m");
+    }
+
+    /// The reserved spelling: authored `\x` text doubles its backslashes,
+    /// an ordinary backslash stays, and the two sides never meet.
+    #[test]
+    fn the_safety_spelling_cannot_be_authored() {
+        assert_eq!(sanitize_cell("\x1b[31mRED"), "\\x1B[31mRED");
+        assert_eq!(sanitize_cell("\\x1B[31mRED"), "\\\\x1B[31mRED");
+        assert_eq!(sanitize_cell("\\\\x1B"), "\\\\\\\\x1B");
+        assert!(matches!(sanitize_cell("C:\\path\\to"), Cow::Borrowed(_)));
+        assert_eq!(sanitize_cell("C:\\path\x00"), "C:\\\\path\\x00");
+        assert_eq!(sanitize_record_text("a\r\nb\\c"), "a\r\nb\\c");
+        assert_eq!(sanitize_record_text("a\rb\x1b"), "a\rb\\x1B");
     }
 
     #[test]

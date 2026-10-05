@@ -142,6 +142,10 @@ pub fn initialize_bootstrap_db(conn: &Connection) -> Result<()> {
 
     // Step 1: Execute schema DDL
     conn.execute_batch(BOOTSTRAP_SCHEMA)?;
+    conn.execute_batch(&crate::pipeline::aggregate_catalog::seed_script(
+        "aggregates",
+    ))?;
+    conn.execute_batch(&crate::pipeline::type_classes::seed_script("type_classes"))?;
 
     // Step 2: Seed enum tables from Rust definitions (SINGLE SOURCE OF TRUTH)
     seed_enum_tables(conn)?;
@@ -168,9 +172,8 @@ pub fn initialize_bootstrap_db(conn: &Connection) -> Result<()> {
 /// This is not the place for performance pragmas: a setting is admitted
 /// here only when its semantics are required of every bootstrap connection.
 pub fn configure_connection(conn: &Connection) -> crate::error::Result<()> {
-    conn.execute_batch("PRAGMA foreign_keys = ON;").map_err(|e| {
-        Runtime::catalog("configure bootstrap connection", e.to_string())
-    })?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(|e| Runtime::catalog("configure bootstrap connection", e.to_string()))?;
     Ok(())
 }
 
@@ -424,7 +427,6 @@ mod tests {
 // world; their rows are session state and exist only in one instance.
 // ---------------------------------------------------------------------------
 
-#[cfg(not(target_arch = "wasm32"))]
 /// Create the assertions table on the bootstrap connection.
 ///
 /// This table records assertion verdicts for querying via sys.assertions(*).
@@ -454,7 +456,6 @@ pub fn setup_assertions_table_on_bootstrap(
     Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 /// Create the danger gates table on the bootstrap connection.
 ///
 /// This table records the current state of each danger gate for querying via sys.danger(*).
@@ -505,7 +506,6 @@ pub fn setup_danger_table_on_bootstrap(conn: &rusqlite::Connection) -> crate::er
     Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 /// Create the session's finding table on the bootstrap connection,
 /// published as `sys::diagnostics.finding`.
 ///

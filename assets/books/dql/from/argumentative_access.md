@@ -4,11 +4,11 @@
 Arguments within the functor bring columns into scope by position.
 
 ```{.delightql .widen}
-employee(EmployeeId  , LastName ,
-         FirstName   , Title    , ReportsTo,
-         BirthDate   , HireDate , Address, City,
-         State       , Country  , PostalCode,
-         Phone       , Fax      , Email )
+employee(employee_id  , last_name ,
+         first_name   , title    , reports_to,
+         birth_date   , hire_date , address, city,
+         state       , country  , postal_code,
+         phone       , fax      , email )
 ```
 
 This binds each identifier to the column at that ordinal position in the table

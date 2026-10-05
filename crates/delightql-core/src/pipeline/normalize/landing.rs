@@ -35,6 +35,7 @@ use crate::pipeline::ast_visit::{
     walk_visit_domain, walk_visit_standard_application, AstVisit, Descent,
 };
 use crate::pipeline::asts::core::operators::HoArgument;
+use crate::pipeline::asts::core::expressions::ValueTemplatePart;
 use crate::pipeline::asts::core::{
     Callable, DomainExpression, FunctionApplication, StandardApplication, Unresolved,
 };
@@ -114,7 +115,7 @@ fn is_hole(expression: &DomainExpression<Unresolved>) -> bool {
 /// A NESTED CALLABLE OWNS ITS OWN SLOT, and that is now the type's doing:
 /// a callable is not a value, so one can only stand under `Callable`, and
 /// the walk stops there. Every other depth is the outer form's — the hole
-/// stands at any value depth, so `x /-> upper:(trim:(@))` lands inside
+/// stands at any value depth, so `x >> upper:(trim:(@))` lands inside
 /// `trim`.
 struct HoleCount {
     holes: usize,
@@ -146,8 +147,8 @@ pub(crate) fn holes_in(values: &[Domex]) -> Result<usize> {
 ///
 /// An application has value positions in three places: the arguments, the
 /// window it is modified by, and the guard it is filtered by. The hole stands
-/// wherever a value stands, so `x /-> row_number:() <~ %(@)` writes its
-/// landing in the partition and `x /-> sum:(| @ > 0)` writes it in the guard.
+/// wherever a value stands, so `x >> row_number:() <~ %(@)` writes its
+/// landing in the partition and `x >> sum:(| @ > 0)` writes it in the guard.
 /// Reading only the argument row would take the implicit landing over the
 /// author's head and leave the written hole unspent.
 pub(crate) fn holes_in_application(application: &StandardApplication<Unresolved>) -> Result<usize> {
@@ -199,6 +200,84 @@ pub(crate) fn spend_in_application(
 ) -> Result<StandardApplication<Unresolved>> {
     let mut spender = SpendHole { flowing };
     transform_standard_application(&mut spender, application)
+}
+
+/// A CALLABLE, APPLIED: the one place the value level spends a landing,
+/// for the function pipe and for each cell a cover applies its callable to.
+///
+/// The slot was judged where the callable was built, so this only spends
+/// it: a form with an argument row and no written slot takes the default
+/// landing, and everything else receives the value where the author wrote
+/// it.
+pub(crate) fn land(callable: Callable<Unresolved>, flowing: &Domex) -> Result<Domex> {
+    match callable {
+        Callable::Functor(application) => Ok(DomainExpression::Application(FunctionApplication::Standard(
+            land_in_application(application, flowing)?,
+        ))),
+        Callable::String(template) => {
+            let parts = template.into_parts();
+            let spent = spend(
+                parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ValueTemplatePart::Interpolation(value) => Some((**value).clone()),
+                        ValueTemplatePart::Text(_) => None,
+                    })
+                    .collect(),
+                flowing,
+            )?;
+            let mut spent = spent.into_iter();
+            let parts = parts
+                .into_iter()
+                .map(|part| match part {
+                    ValueTemplatePart::Interpolation(_) => ValueTemplatePart::Interpolation(Box::new(
+                        spent.next().expect("one spent value per interpolation"),
+                    )),
+                    text => text,
+                })
+                .collect();
+            Ok(DomainExpression::Application(FunctionApplication::Template(
+                crate::pipeline::asts::core::ValueTemplate::interpolating(parts)
+                    .expect("the build already proved an interpolation is present"),
+            )))
+        }
+        // A binder was already spent into its uses, so what stands here is a
+        // body with slots — one if the author wrote the bare hole, however
+        // many the binder named.
+        Callable::Lambda(lambda) => {
+            let mut spent = spend(vec![*lambda.body], flowing)?;
+            Ok(spent.pop().expect("one value in, one value out"))
+        }
+    }
+}
+
+/// The landing a form WITH an argument row takes.
+fn land_in_application(
+    mut application: StandardApplication<Unresolved>,
+    flowing: &Domex,
+) -> Result<StandardApplication<Unresolved>> {
+    match holes_in_application(&application)? {
+        // ZERO HOLES: the default landing, the row's final place. This is
+        // why `x >> upper:(y)` means `upper(y, x)`.
+        0 => {
+            use crate::pipeline::asts::core::operators::{CallArguments, ScalarArgument};
+            let call = application.call_mut();
+            let arguments = match std::mem::replace(&mut call.arguments, CallArguments::None) {
+                CallArguments::Scalar(members) => members,
+                CallArguments::None => Vec::new(),
+                other @ CallArguments::HigherOrder(_) => {
+                    call.arguments = other;
+                    return Err(crate::diagnostic::Internal::invariant(
+                        "normalize::landing",
+                        "a scalar application carries a scalar argument row",
+                    ));
+                }
+            };
+            call.arguments = CallArguments::Scalar(land_final(ScalarArgument::plain(flowing.clone()), arguments));
+            Ok(application)
+        }
+        _ => spend_in_application(application, flowing),
+    }
 }
 
 /// THE SLOT IS ONE. A second bare hole spells the flowing value twice under

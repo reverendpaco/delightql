@@ -13,8 +13,8 @@ An inchoate fuctor is the literal reference
 to a ground relation GRELEX having nothing
 internal to its parentheses.
 
-```delighql
-users()
+```delightql
+employee()
 ```
 
 ## Argumentative  {.dqlh}

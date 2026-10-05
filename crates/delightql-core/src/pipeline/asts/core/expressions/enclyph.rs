@@ -13,7 +13,6 @@ use super::super::{Phase, Unresolved};
 use super::domain::DomainExpression;
 use super::references::NamedReference;
 use super::spreads::Spread;
-use crate::pipeline::asts::vocabulary::Vec1;
 use crate::{lispy::ToLispy, ToLispy};
 
 /// `{…}` or `[…]` — one nested value in value position, a table of them in
@@ -23,9 +22,12 @@ use crate::{lispy::ToLispy, ToLispy};
 pub enum Enclyph<P: Phase = Unresolved> {
     #[lispy("enclyph:record")]
     Record(Record<P>),
-    /// A record spread may address no columns. The authored record remains
-    /// nonempty; this is the generated value left after resolution spends
-    /// that record's last member.
+    /// A record spread may address no columns. This is the generated value
+    /// left after resolution spends the last member of a record the author
+    /// wrote WITH members. It is not the authored `{}`, which is a `Record`
+    /// with no members: whether a spread that addresses nothing may stand
+    /// for the empty constructor is undecided, and the two carriers keep
+    /// that question open.
     #[lispy("enclyph:empty_record")]
     EmptyRecord(P::EmptyRecord),
     /// Boxed because a tuple's elements are unboxed values and a value can
@@ -34,18 +36,19 @@ pub enum Enclyph<P: Phase = Unresolved> {
     Tuple(Box<Tuple<P>>),
 }
 
-/// `{ … }` — by name. Nonempty by construction: `record_member+`.
+/// `{ … }` — by name. `{}` is the empty record: a value, not NULL and not
+/// text, with no members.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("record")]
 pub struct Record<P: Phase = Unresolved> {
-    pub members: Vec1<RecordMember<P>>,
+    pub members: Vec<RecordMember<P>>,
 }
 
-/// `[ … ]` — by position. Nonempty by construction.
+/// `[ … ]` — by position. `[]` is the empty tuple.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("tuple")]
 pub struct Tuple<P: Phase = Unresolved> {
-    pub elements: Vec1<TupleElement<P>>,
+    pub elements: Vec<TupleElement<P>>,
 }
 
 /// One position of a tuple: a value, or a spread standing for the several
@@ -127,7 +130,7 @@ pub enum RecordMember<P: Phase = Unresolved> {
 impl<P: Phase> Record<P> {
     /// A record with nothing promoted and nothing analyzed — what a
     /// normalizer builds and what a rewrite rebuilds.
-    pub fn plain(members: Vec1<RecordMember<P>>) -> Self {
+    pub fn plain(members: Vec<RecordMember<P>>) -> Self {
         Self { members }
     }
 }
@@ -135,7 +138,7 @@ impl<P: Phase> Record<P> {
 impl<P: Phase> Enclyph<P> {
     /// A record's members, when this enclyph is one. A tuple has members of
     /// a different kind, so there is nothing to hand back.
-    pub fn record_members(&self) -> Option<&Vec1<RecordMember<P>>> {
+    pub fn record_members(&self) -> Option<&[RecordMember<P>]> {
         match self {
             Self::Record(record) => Some(&record.members),
             Self::EmptyRecord(_) => None,

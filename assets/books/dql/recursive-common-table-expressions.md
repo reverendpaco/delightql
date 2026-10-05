@@ -28,9 +28,8 @@ then recursive case with termination condition.
 Non-recursive CTEs can have multiple clauses that combine via UNION ALL:
 
 ```delightql
-users_2022(*) |> (first_name, last_name) : names
-users_2023(*) |> (first_name, last_name) : names
-users_2024(*) |> (first_name, last_name) : names
+customer(*) |> (first_name, last_name) : names
+employee(*) |> (first_name, last_name) : names
 names(*)
 ```
 

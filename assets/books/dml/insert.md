@@ -7,34 +7,41 @@ a subset of the schema of the mutation target.  Any extra or erroneously
 named columns are an error.
 
 ```delightql
-_(LastName, FirstName, age @ "eklund", "daniel", 20)
+_(last_name, first_name, title @ "Eklund", "Daniel", "IT Staff")
   |> insert!(employee(*))(*)
 ```
 
 ```sql
-INSERT INTO hr.employee (LastName, FirstName, age)
-VALUES ('eklund', 'daniel', 20);
+INSERT INTO employee (last_name, first_name, title)
+VALUES ('Eklund', 'Daniel', 'IT Staff');
 ```
 
 You may union tables and prediacte their tuples to provide input tuples:
 
 ```delightql
-hr.employee(*)
-  |;| new_hires(*)
-  |;| transfers(, effective_date = today:())
-  |> insert!(employee(*))(*)
+mount!("etl.sqlite", "etl")(*)
+// the target: an empty table shaped like the loads
+etl.partner_sale_2025_06_30(*), #<0 |> table!(etl.partner_sale_line(*))(*)
+
+etl.partner_sale_2025_06_30(*)
+  |;| etl.partner_sale_2025_07_31(, received_at >= "2025-07-01")
+  |> insert!(etl.partner_sale_line(*))(*)
 ```
 
 
 ```delightql
-candidates(*),
-  score > 90 |> (name, Department, start_date)
-  |> insert!(hr.employee(*))(*)
+mount!("etl.sqlite", "etl")(*)
+// the target: an empty table shaped like the loads
+etl.partner_sale_2025_06_30(*), #<0 |> table!(etl.partner_sale_line(*))(*)
+
+etl.partner_sale_2025_07_31(*),
+  quantity > 0 |> (sale_id, line_no, track_id, unit_price, quantity)
+  |> insert!(etl.partner_sale_line(*))(*)
 ```
 
 ```sql
-INSERT INTO hr.employee (name, Department, start_date)
-SELECT name, Department, start_date
-FROM candidates
-WHERE score > 90;
+INSERT INTO etl.partner_sale_line (sale_id, line_no, track_id, unit_price, quantity)
+SELECT sale_id, line_no, track_id, unit_price, quantity
+FROM etl.partner_sale_2025_07_31
+WHERE quantity > 0;
 ```

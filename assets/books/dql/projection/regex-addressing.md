@@ -4,22 +4,49 @@ A regular expression can select columns by name pattern:
 
 ```delightql
 employee(*)
-  |> ( /Date/ )
+  |> ( /date/ )
 ```
 
 ```sql
 select
-    BirthDate,   -- matches Regex /Date/
-    HireDate     -- matches Regex /Date/
+    birth_date,   -- matches /date/
+    hire_date     -- matches /date/
 from employee;
 ```
 
-Both `BirthDate` and `HireDate` match the pattern `/Date/`. The regex applies only to
-column names (not namespaces or indexes). Delightql uses UNIX BRE syntax within
-the REGEX sigil `/  /`{.delightql .sigil}. Append `i` for case-insensitive matching: `/date/i`.
+The pattern matches anywhere in a column's name, and it ignores case, as a
+column reference does: `(Birth_Date)` and `/BIRTH/` both find
+`birth_date`. The regex applies only to column names, not namespaces or
+indexes.
 
-**Restrictions**. Regex column addressing may only appear in **PROJECT-IN**, **PROJECT-OUT**, or the second parentheses of **MAP-COVER**. It cannot:
+To match case exactly, add the flag `c` after the closing slash:
 
-- Be followed by `as`
-- Be passed directly to a function
-- Appear in **EMBED** `+(  )`, **BASIC-COVER** `$$(  ),` **RENAME-COVER** `*(  )`, or **GROUP-MODULO**
+```delightql
+employee(*)
+  |> ( /date/c )
+```
+
+Every column in the example database is lowercase, so `/date/c` still
+finds `birth_date` and `hire_date`, while `/Date/c` finds nothing and
+refuses.
+
+`c` is the only flag. `/date/i` refuses, because ignoring case is already
+the default. Ignoring case applies inside character classes too, so
+`/^[A-Z]/` matches `birth_date`, while `/^[A-Z]/c` matches nothing here.
+
+The pattern language is a small subset of POSIX basic regular expressions:
+`^` and `$` anchor, `.` matches any character, `*` repeats, `[...]` is a
+character class, and `\+` and `\?` repeat one-or-more and zero-or-one.
+There are no groups and no alternation.
+
+**Positions.** A regex stands wherever a list of columns is enumerated:
+**PROJECT-IN** `( )`, **PROJECT-OUT** `-( )`, the second parentheses of
+**MAP-COVER**, the source of a **RENAME-COVER** `*(/date/ as :"d_{@}")`,
+**GROUP-MODULO** keys, function arguments, and record members. A
+project-in that matches no column refuses; a project-out may match none.
+
+It cannot:
+
+- Be followed by `as`; rename the matched columns with a name template
+- Stand as a single value: an operand, a function-pipe step, or a slot
+- Add columns in **EMBED** `+(  )`, since it names only columns that already exist

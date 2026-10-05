@@ -1,5 +1,5 @@
 generator(ns)(*) :-
-  sys::ns.namespace(*) as n, n.fq_name = ns
+  sys::ns.namespace(*) as n, n.fq_name = $.ns
   , sys::ns.activated_entity(*) as ae, ae.namespace_id = n.id
   , sys::entities.entity(*) as e, e.id = ae.entity_id
   , sys::entities.entity_type_enum(*) as t, e.type = t.id
@@ -8,11 +8,11 @@ generator(ns)(*) :-
   |> %(~> {name, type, doc, "columns": ~> {col_name, col_type, col_pos}} as entities)
   : ent_cte
 
-  sys::ns.namespace(*) as parent, parent.fq_name = ns
+  sys::ns.namespace(*) as parent, parent.fq_name = $.ns
   , sys::ns.namespace(*) as child, child.pid = parent.id
   |> (child.name, child.fq_name as path)
   |> %(~> {name, path} as namespaces)
   : ns_cte
 
   ent_cte(*), ns_cte(*)
-  |> +(ns as name)
+  |> +($.ns as name)

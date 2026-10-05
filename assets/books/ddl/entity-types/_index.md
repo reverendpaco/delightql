@@ -2,7 +2,7 @@
 
 The syntax of rules obey the general form:
 
-```
+```text
   <HEAD>  <NECK>  <BODY>
 ```
 
@@ -22,25 +22,27 @@ relations; functions define the special subset of relations that are functions.
 
 A rule's **arity** is the number of arguments in its head.
 
-```delightql
-add:(x) :- x + 1        // arity 1
+```{.delightql .am}
+inc:(x) :- x + 1        // arity 1
 add:(x, y) :- x + y     // arity 2
 
 
-employee(id, name) :- ... // arity 2
-employee(*)  // arity determined by body
+contact(customer_id, email) :- customer(*) // arity 2
+band(*) :- artist(*)  // arity determined by body
 ```
 
 All definitions -- functions, sigma predicates, higher-order rulesviews, tables, facts -- must have the same fixed arity.
 
 The following are forbidden:
 
-```delightql
+```{.delightql .am .bad}
 add:(x) :- x + 1        // arity 1
 add:(x, y) :- x + y     // arity 2
+```
 
-employee(id, name) :- ...
-employee(id,name,age)  :- ...
+```{.delightql .am .bad}
+contact(customer_id, email) :- customer(*)
+contact(customer_id, email, phone)  :- customer(*)
 ```
 
 If you can write `foo(*)`, all `foo` definitions must agree on

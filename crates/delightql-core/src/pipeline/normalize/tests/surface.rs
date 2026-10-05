@@ -172,9 +172,15 @@ const REFUSED_BY_LAW: &[(&str, usize)] = &[
     ("delightql-error://semantic/assertion/equals_context", 3),
     // The `!` on a binding ASSERTS the body is effectful; it cannot make it so.
     ("delightql-error://semantic/effect/cte/pure_mark", 5),
-    // A SCALAR PARAMETER IS CODE: a bound naming an unbound identifier has
-    // nothing to be substituted with.
+    // A SCALAR PARAMETER IS CODE: a bound whose formal has no literal actual
+    // has nothing to be substituted with.
     ("delightql-error://semantic/limit/value", 3),
+    // `$.x` reads a formal of a relational or effect higher-order clause the
+    // reference stands in; outside every such clause it names nothing.
+    ("delightql-error://semantic/resolution/parameter", 2),
+    // A named scalar formal no clause of its family reads refuses where the
+    // family is declared: the cells whose subject is a dead parameter.
+    ("delightql-error://semantic/ddl/head/unused_scalar", 4),
     // A duplicate formal makes its earlier namesake unreachable: every
     // binding to either lands on one frame slot. Judged by the identifier
     // law at the definition.
@@ -221,6 +227,10 @@ const REFUSED_BY_LAW: &[(&str, usize)] = &[
     ("delightql-error://semantic/set/correlation/unnamed_arm", 3),
     // One goal declares one expected error.
     ("delightql-error://parse/error_hook/repeated", 3),
+    // A utility program cannot be consumed as a consulted definition file.
+    // The declaration in its header makes this an authored category mismatch,
+    // not a disagreement between parser and normalizer internals.
+    ("delightql-error://parse/file_category", 1),
     // A danger gate is a NAMED behavior: an unrecognized name refuses rather
     // than becoming a silent no-op.
     ("delightql-error://parse/danger/unknown", 5),
@@ -252,11 +262,22 @@ const REFUSED_BY_LAW: &[(&str, usize)] = &[
     // A TABLE HAS ONE HEADING: a row of another width has cells belonging to
     // no column, and every reader downstream would have to decide which.
     ("delightql-error://parse/anon", 3),
+    // A BARE SINGLETON IS ONE ROW OF ONE NAMED COLUMN: a second row, a
+    // qualified column and a literal word are its grammar's refusal witnesses.
+    ("delightql-error://parse/anon/singleton_rows", 2),
+    ("delightql-error://parse/anon/singleton_qualified", 1),
+    ("delightql-error://parse/anon/singleton_literal", 3),
+    // A COLUMN REGEX IGNORES CASE: `i` restates the default, and `c` is the
+    // only flag.
+    ("delightql-error://parse/regex_ignore_case", 2),
+    ("delightql-error://parse/regex_flag", 1),
     // TWO OFFERS, ONE POSITION. A stacked fact's header and a datum's own
     // `as` label both offer the position a name; disagreeing, they have no
     // rule for choosing, and choosing anyway makes the public name depend on
     // which offer was read first.
-    ("delightql-error://semantic/ddl/head/name_conflict", 3),
+    // The same refusal names the clauses of a query-local parameterized rule
+    // that offer one position two names.
+    ("delightql-error://semantic/ddl/head/name_conflict", 4),
     // A parameterized fact's heading is its header; a datum label with no
     // header has no verbose-form equivalent, so it refuses toward the
     // header spelling rather than silently disappearing.
@@ -296,16 +317,46 @@ const REFUSED_BY_LAW: &[(&str, usize)] = &[
     // exact access shape, so malformed directive calls reach one judgment.
     ("delightql-error://semantic/directive/binding/arity", 4),
     ("delightql-error://semantic/directive/invocation/access", 9),
-    // CLAUSE AGREEMENT reaches the query-scoped parameterized rule too: the
-    // repeated heads of one common higher-order expression are clauses of ONE
-    // definition, and they meet at the same assembler every consulted
-    // definition crosses. The inventory includes the ordinary heading
-    // disagreement and both clause orders of a rule-valued contract
-    // disagreement; changing clause order must not turn either one green.
+    // CLAUSE AGREEMENT: the repeated heads of a query-local definition are
+    // clauses of ONE definition, and they meet at the same assembler every
+    // consulted definition crosses, refusing under the leaf that names the
+    // law. A rule-valued contract disagreement refuses in both clause orders
+    // (third_order); a parameter row disagreeing in arity, role or context
+    // capture is `param_arity` (cfe_guards' value-function pair, and
+    // common_definition_engine's effect mirror and relational CHOE pair
+    // whose clauses give one position a relation and a value); a value
+    // function's repeated or misplaced fallback breaks the ordered-clause
+    // law (cfe_guards).
+    ("delightql-error://semantic/ddl/head/rule_contract", 2),
+    ("delightql-error://semantic/ddl/head/param_arity", 5),
     (
-        "delightql-error://semantic/resolution/choe/head_agreement",
-        3,
+        "delightql-error://semantic/ddl/head/unguarded_multiplicity",
+        1,
     ),
+    ("delightql-error://semantic/ddl/head/unguarded_position", 1),
+    // EVERY CLAUSE OF ONE TARGET WEARS THE SAME BADGE, and the clauses of a
+    // common higher-order expression meet at the assembler as its block is
+    // read. The witness is common_definition_engine's CHOE mixed-badge cell.
+    ("delightql-error://semantic/recursion/mixed_badge", 1),
+    // AN EFFECT RULE DOES NOT RECURSE: an effect mirror whose body demands
+    // itself refuses where it is declared, used (rec--13) or not (decl--02).
+    ("delightql-error://semantic/effect/rule/recursion", 2),
+    // THE EFFECT-BODY LAWS are judged where an effect mirror is declared, as
+    // they are where its consulted twin is consulted: a body that does not
+    // end in a directive, or that demands a session directive or `run!`,
+    // refuses whether or not anything demands the mirror.
+    ("delightql-error://semantic/effect/rule/ending", 2),
+    (
+        "delightql-error://semantic/effect/body/session_directive",
+        2,
+    ),
+    ("delightql-error://semantic/effect/body/run", 1),
+    // `main!` is single-clause on either neck: an effect mirror named `main`
+    // with two clauses refuses where it is declared, used or not.
+    ("delightql-error://semantic/effect/main/multi_clause", 2),
+    // A guard on a curried code parameter of an HO-CFE has no value to
+    // filter and refuses where the head is read.
+    ("delightql-error://semantic/cfe/guard/position", 1),
     // An edge body outside the simple shape refuses at declaration. The
     // witnesses: er_composition's nineteen refusal cells, grounding's seven,
     // the query-local-binding cell in cte_heads, and the bare-declaration

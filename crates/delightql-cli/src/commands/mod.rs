@@ -8,6 +8,7 @@
 //! - jstruct: JSON destructuring from stdin (dql tools jstruct)
 
 pub mod book;
+pub mod csv_table;
 pub mod csvstruct;
 pub mod delegate;
 pub mod editor;

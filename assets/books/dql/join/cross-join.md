@@ -2,11 +2,11 @@
 # Cross Join {.dqlh}
 
 ```delightql
-employee(*), department(*)
+media_type(*), genre(*)
 ```
 
 ```sql
-SELECT * FROM employee CROSS JOIN department;
+SELECT * FROM media_type CROSS JOIN genre;
 ```
 
 Two relations joined with no condition produce a Cartesian product. The

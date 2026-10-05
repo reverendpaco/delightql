@@ -14,8 +14,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::id::{ColId, EntityId, FnId, ScopeId};
+use super::mint::{Mark, Mint};
 use super::origin::{Addressing, CteRole, FnOrigin, ScopeKind, WrapReason};
-use super::policy::{Mint, NamePolicy};
 use super::registry::Registry;
 use super::sink::IdentSink;
 
@@ -108,13 +108,10 @@ impl Bundle<OpenNames> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BaptismError {
     /// A column is referenced whose scope was never named.
     DanglingScope { col: ColId, scope: ScopeId },
-    /// `DQL_NAME_POLICY` names a policy the mint does not have. Falling back
-    /// would report a heading contract nobody asked for.
-    UnknownNamePolicy,
 }
 
 /// The capability to spell a minted thing.
@@ -138,6 +135,12 @@ pub struct Baptised<'r> {
 }
 
 impl Baptised<'_> {
+    /// Whether the mint drew `c`'s emitted name — a name nobody chose, or
+    /// an authored one that lost an ambiguity.
+    pub fn drew(&self, c: ColId) -> bool {
+        self.drawn.contains(&c)
+    }
+
     pub fn write_scope<W: IdentSink>(&self, s: ScopeId, w: &mut W) {
         if let Some(name) = self.scopes.get(&s) {
             w.push_ident(name, false);
@@ -152,27 +155,16 @@ impl Baptised<'_> {
 
     /// A column reported as a VALUE: the exact name the occurrence has in
     /// the emitted heading. A column emitting the name its author wrote
-    /// reports that name; a NEVER-NAMED column reports the characters the
-    /// mint drew for it — the same ones the heading displays, drawn per
+    /// reports that name; a column whose name the mint drew — never named,
+    /// or an authored name an ambiguity took — reports the drawn
+    /// characters, the same ones the heading displays, drawn per
     /// compilation and unforgeable, exactly like an unnamed relation's
-    /// scope report. An ordinal is not a naming authority.
+    /// scope report. An ordinal is an address, never a column's name.
     ///
-    /// The one exception is an AUTHORED spelling that lost an ambiguity:
-    /// its drawn emission characters carry no meaning the author chose, so
-    /// it reports the qualified ordinal reference that still reaches it.
-    ///
-    /// The emission spelling is reported as plain CHARACTERS — it is what a
-    /// client matches the heading against, not a reference anyone types, so
-    /// it carries no stropping. The ordinal road is the opposite: what it
-    /// writes IS a reference, and its qualifier keeps the bit that makes it
-    /// one.
+    /// The spelling is reported as plain CHARACTERS — it is what a client
+    /// matches the heading against, not a reference anyone types, so it
+    /// carries no stropping.
     pub fn write_column_report<W: IdentSink>(&self, c: ColId, w: &mut W) {
-        if self.drawn.contains(&c)
-            && self.reg.published(c).is_some()
-            && self.reg.write_ordinal_report(c, w)
-        {
-            return;
-        }
         if let Some((name, _stropped)) = self.cols.get(&c) {
             w.push_ident(name, false);
         }
@@ -277,26 +269,49 @@ impl Baptised<'_> {
 /// owner scope was listed.
 ///
 /// Only a RESERVED bundle enters: `baptise(&open_bundle)` is a compile
-/// error, because no entrance accepts `Bundle<OpenNames>`.
+/// error, because no entrance accepts `Bundle<OpenNames>`. Production
+/// baptises through [`baptise_decided`].
+#[cfg(test)]
 pub fn baptise<'r>(
     reg: &'r Registry,
     bundle: &Bundle<NamesReserved>,
 ) -> Result<Baptised<'r>, BaptismError> {
-    baptise_with_policy(
-        reg,
-        bundle,
-        NamePolicy::from_env().map_err(|()| BaptismError::UnknownNamePolicy)?,
-    )
+    baptise_with_mint(reg, bundle, Mint::new())
 }
 
-/// The same, under an explicit policy — the test entrance for laws that
-/// need deterministic draws without touching process environment.
-pub(super) fn baptise_with_policy<'r>(
+/// The same, drawing from a given mint — the test entrance for laws about a
+/// collision with a spelling the mint would draw.
+#[cfg(test)]
+pub(super) fn baptise_with_mint<'r>(
     reg: &'r Registry,
     bundle: &Bundle<NamesReserved>,
-    policy: NamePolicy,
+    mint: Mint,
 ) -> Result<Baptised<'r>, BaptismError> {
-    let mut mint = Mint::new(policy);
+    baptise_answering(reg, bundle, mint, &|heading| reg.heading_names(heading))
+}
+
+/// Baptism of a bundle whose name status its producer decided: each
+/// published position answers to its own published name. The producer
+/// guarantees no heading publishes one name twice.
+pub(crate) fn baptise_decided<'r>(
+    reg: &'r Registry,
+    bundle: &Bundle<NamesReserved>,
+) -> Result<Baptised<'r>, BaptismError> {
+    baptise_answering(reg, bundle, Mint::new(), &|heading| {
+        heading
+            .iter()
+            .map(|c| (reg.addressing(*c) != Addressing::Hygienic).then(|| reg.published_sym(*c)).flatten())
+            .collect()
+    })
+}
+
+/// `answers` gives, for one heading, the name each position answers to.
+fn baptise_answering<'r>(
+    reg: &'r Registry,
+    bundle: &Bundle<NamesReserved>,
+    mut mint: Mint,
+    answers: &dyn Fn(&[ColId]) -> Vec<Option<super::id::Sym>>,
+) -> Result<Baptised<'r>, BaptismError> {
     // ALIAS ALWAYS PRE-EMPTS A MINT: every authored reservation — made at
     // position admission and completed by the bundle seal — stands in the
     // collision universe before the first invention is allocated.
@@ -348,7 +363,6 @@ pub(super) fn baptise_with_policy<'r>(
     // siblings are related under both.
     let mut minted: HashMap<ColId, String> = HashMap::new();
     let mut drawn: HashSet<ColId> = HashSet::new();
-    let mut invented = 0u32;
     let mut authored_used: HashSet<Vec<u8>> = HashSet::new();
     // Local to this call. Not a static, so nothing about an emitted name
     // can depend on how many queries this process compiled earlier.
@@ -379,7 +393,6 @@ pub(super) fn baptise_with_policy<'r>(
 
     // A scope that appears in several statements is named once, which is
     // what makes a plan-lifetime object agree with itself everywhere.
-    let mut reported = 0u32;
     for scope in scope_order {
         let authored = reg.answer_spelling(scope);
         // A relation that answers to nothing still has to be able to say
@@ -388,8 +401,7 @@ pub(super) fn baptise_with_policy<'r>(
         // shared mark — the distinction meta-ize exists to publish.
         if authored.is_none() {
             let report = loop {
-                reported += 1;
-                let candidate = mint.spell(reported);
+                let candidate = mint.spell(Mark::Origin("unnamed"));
                 if !authored_reserved.contains(&canonical_key(&candidate)) {
                     break candidate;
                 }
@@ -501,11 +513,21 @@ pub(super) fn baptise_with_policy<'r>(
     for stmt in &bundle.statements {
         for heading in &stmt.headings {
             let published = |c: &ColId| reg.published(*c).map(|sp| reg.spelling_text(sp));
-            let mut carried: HashMap<Vec<u8>, u32> = HashMap::new();
-            for c in heading
+            // WHICH NAMES THIS HEADING STILL ANSWERS TO is the registry's
+            // judgment — contested here, or lost upstream — and baptism does
+            // not restate it. What baptism adds is the engine's: SQL folds
+            // case, so two answering spellings the identifier law keeps apart
+            // (`` `A` `` beside `a`) still cannot both be emitted as written.
+            // A position answering to nothing is drawn, and a drawn name is
+            // unique, so it folds with nothing.
+            let answers: HashMap<ColId, Option<super::id::Sym>> = heading
                 .iter()
-                .filter(|c| reg.addressing(**c) != Addressing::Hygienic)
-            {
+                .copied()
+                .zip(answers(heading))
+                .collect();
+            let answering = |c: &ColId| answers.get(c).copied().flatten().is_some();
+            let mut carried: HashMap<Vec<u8>, u32> = HashMap::new();
+            for c in heading.iter().filter(|c| answering(c)) {
                 if let Some((text, _)) = published(c) {
                     *carried.entry(canonical_key(&text)).or_insert(0) += 1;
                 }
@@ -526,15 +548,8 @@ pub(super) fn baptise_with_policy<'r>(
                 // legible in the SQL that carries it.
                 let contested = |text: &str| {
                     reg.addressing(*c) != Addressing::Hygienic
-                        && (carried.get(&canonical_key(text)).copied().unwrap_or(0) > 1
-                            // AUTHORED-NAME LOSS IS MONOTONIC. An
-                            // occurrence whose name lost an ambiguity
-                            // upstream is drawn HERE too, even where
-                            // nothing in this heading collides — otherwise
-                            // a projection that leaves one of the repeated
-                            // positions standing publishes a name the
-                            // repetition took away.
-                            || reg.name_lost(*c))
+                        && (!answering(c)
+                            || carried.get(&canonical_key(text)).copied().unwrap_or(0) > 1)
                 };
                 match published(c) {
                     Some((text, stropped)) if !contested(&text) => {
@@ -550,10 +565,27 @@ pub(super) fn baptise_with_policy<'r>(
                         };
                         cols.insert(*c, (name, stropped));
                     }
-                    _ => {
+                    lost => {
                         // Drawn once per port, never suffixed: the suffix is
                         // arbitration between two spellings, and there is only
                         // ever one occurrence of one value to arbitrate for.
+                        // A contested name reaches here still spelled, and the
+                        // mint keeps it left of its mark; a column nobody
+                        // named says where its value came from instead.
+                        let lost =
+                            lost.map(|(text, _)| text)
+                                .or_else(|| match reg.facts(*c).provenance {
+                                    super::Provenance::Dimension(name) => {
+                                        Some(reg.spelling_text(name).0)
+                                    }
+                                    _ => None,
+                                });
+                        let mark = match (&lost, reg.facts(*c).provenance) {
+                            (Some(name), _) => Mark::Lost(name),
+                            (None, super::Provenance::Computed) => Mark::Origin("expr"),
+                            (None, super::Provenance::AnonymousCell) => Mark::Origin("anon"),
+                            (None, _) => Mark::Bare,
+                        };
                         let value = *c;
                         let name = match minted.get(&value) {
                             Some(drawn) => drawn.clone(),
@@ -561,8 +593,7 @@ pub(super) fn baptise_with_policy<'r>(
                                 // A drawn spelling an authored name owns is
                                 // skipped: the author got there first.
                                 let drawn = loop {
-                                    invented += 1;
-                                    let candidate = mint.spell(invented);
+                                    let candidate = mint.spell(mark);
                                     if !authored_reserved.contains(&canonical_key(&candidate)) {
                                         break candidate;
                                     }

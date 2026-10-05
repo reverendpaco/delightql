@@ -12,7 +12,8 @@
 //! The effects ball's util--36_stdout_passthrough pins the SEMANTIC half
 //! (stdout! passes its relation through unchanged); these tests pin the
 //! CONTENT half: the printed set reaches the console, in run order, before
-//! the final result — and does NOT leak into machine outputs (`--to hash`).
+//! the final result — and does NOT leak into a digest rendering (`-f hash`
+//! on the executing road; a `--to hash` inspection refuses the run instead).
 
 use std::io::Write;
 use std::path::Path;
@@ -22,14 +23,18 @@ fn dql_bin() -> &'static str {
     env!("CARGO_BIN_EXE_dql")
 }
 
-/// Run `dql query --sequential` with `stdin = query`, cwd = `dir`.
+/// Run `dql query --sequential --to <to>` with `stdin = query`, cwd = `dir`.
 fn run_dql(dir: &Path, db: &str, to: &str, query: &str) -> (bool, String, String) {
+    run_dql_args(dir, db, &["--to", to], query)
+}
+
+/// Run `dql query --sequential <args>` with `stdin = query`, cwd = `dir`.
+fn run_dql_args(dir: &Path, db: &str, args: &[&str], query: &str) -> (bool, String, String) {
     let mut cmd = Command::new(dql_bin());
     cmd.arg("query")
         .arg("--db")
         .arg(db)
-        .arg("--to")
-        .arg(to)
+        .args(args)
         .arg("--sequential")
         .current_dir(dir)
         .stdin(Stdio::piped())
@@ -112,11 +117,36 @@ fn stdout_ship_prints_on_the_cli_console() {
     );
 }
 
-/// Machine outputs stay machine-readable: `--to hash` prints EXACTLY the
-/// hash line — the console sink must not corrupt it (the ball runner and
-/// run-one.py read this stream as a single hex value).
+/// Machine outputs stay machine-readable: the executing road's digest
+/// rendering (`-f hash`) prints EXACTLY the hash line — the console sink
+/// must not corrupt it (run-one.py reads this stream as a single hex
+/// value).
 #[test]
 fn stdout_ship_does_not_leak_into_hash_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    fixture(tmp.path());
+
+    let (ok, stdout, stderr) = run_dql_args(
+        tmp.path(),
+        "w.sqlite",
+        &["--to", "results", "-f", "hash"],
+        "consult!(\"ddl/script.dql\", \"fx\")(*)\n\nrun_namespace!(fx)(*)\n",
+    );
+    assert!(ok, "run failed: {}", stderr);
+    let trimmed = stdout.trim();
+    assert!(
+        !trimmed.is_empty()
+            && trimmed.lines().count() == 1
+            && trimmed.chars().all(|c| c.is_ascii_hexdigit()),
+        "-f hash output is not a single hex line:\n{:?}",
+        stdout
+    );
+}
+
+/// The same run under a `--to hash` INSPECTION is refused at its first
+/// statement: an inspection observes, and a consult shapes the session.
+#[test]
+fn stdout_ship_run_is_refused_under_hash_inspection() {
     let tmp = tempfile::tempdir().unwrap();
     fixture(tmp.path());
 
@@ -126,15 +156,9 @@ fn stdout_ship_does_not_leak_into_hash_output() {
         "hash",
         "consult!(\"ddl/script.dql\", \"fx\")(*)\n\nrun_namespace!(fx)(*)\n",
     );
-    assert!(ok, "run failed: {}", stderr);
-    let trimmed = stdout.trim();
-    assert!(
-        !trimmed.is_empty()
-            && trimmed.lines().count() == 1
-            && trimmed.chars().all(|c| c.is_ascii_hexdigit()),
-        "--to hash output is not a single hex line:\n{:?}",
-        stdout
-    );
+    assert!(!ok, "an inspection executed a run: {stdout}");
+    assert!(stderr.contains("semantic/effect/observation"), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout:?}");
 }
 
 /// Session-scope sanity (task §3.3 item 5): a second run on the SAME

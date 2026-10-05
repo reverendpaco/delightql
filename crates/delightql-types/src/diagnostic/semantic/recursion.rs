@@ -29,18 +29,35 @@ pub enum Recursion {
     #[error("Validation error: {message}")]
     ArgumentativeBinding { message: String },
 
-    /// While inlining a consulted definition, the resolver re-encountered a
-    /// name it was already expanding — the self-reference did not resolve
-    /// as the in-progress recursive CTE, so expansion would never terminate.
-    /// The common cause: in a consulted rules file, the recursive clause
-    /// appears BEFORE the base clause — clause order matters; a
-    /// self-reference is only recursive once a prior clause has established
-    /// the name. Put the base (non-recursive) clause first. If the cycle
-    /// runs through another view (a uses v, v uses a), break the cycle. The
-    /// error message shows the expansion chain. RECURSION-CONTRACT.md B5.
-    #[leaf("consulted_clause_order", class = Syntax, summary = "Circular consulted-definition expansion (recursive clause before base, or an indirect view cycle).")]
+    /// A definition whose name can see itself — a CHOE or a consulted rule,
+    /// whose head declares the name before any clause body is read — reached
+    /// itself before any base clause established its fixpoint. Names resolve
+    /// left to right, so the anchor comes first: every recursive definition
+    /// has at least one base clause, and every base clause precedes the
+    /// recursive ones. Put the base (non-recursive) clause first.
+    /// SEMANTICS/recursion-contract-law.md, THE ANCHOR COMES FIRST.
+    #[leaf("anchor_first", class = Syntax, summary = "A self-reference stands before any base clause.")]
     #[error("Validation error: {message}")]
-    ConsultedClauseOrder { message: String },
+    AnchorFirst { message: String },
+
+    /// Recursion is over relations. A value function that reaches itself —
+    /// with the same actual, a changed one, or through other value
+    /// functions — has no fixpoint to re-enter. Define the relation and
+    /// ground the argument instead: `fib(k, v)` as a recursive relation,
+    /// `fib(5, v)` to read the point. SEMANTICS/recursion-contract-law.md,
+    /// RELATION-FORM ONLY.
+    #[leaf("function-form", class = Syntax, summary = "A value function recurses.")]
+    #[error("Validation error: {message}")]
+    FunctionForm { message: String },
+
+    /// A truth rule that cites itself — with any actual, directly or through
+    /// other truth rules — is an existence test with no fixpoint to re-enter,
+    /// whether or not it has a base clause. Write the recursion as a
+    /// relational rule and test the relation.
+    /// SEMANTICS/recursion-contract-law.md, RELATION-FORM ONLY.
+    #[leaf("truth-form", class = Syntax, summary = "A truth rule recurses.")]
+    #[error("Validation error: {message}")]
+    TruthForm { message: String },
 
     /// Mutual recursion is not supported. Each recursive definition may
     /// re-enter only its own established frontier; reaching an earlier open

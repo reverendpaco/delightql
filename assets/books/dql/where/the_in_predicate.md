@@ -2,41 +2,48 @@
 # The `in` Predicate {.dqlh}
 
 ```delightql
-employee(*), +_(State@"MA";"TX";"AK";"AR")
+customer(*), +_(state@"MA";"TX";"CA";"ON")
 ```
 
 Syntactic sugar provides the familiar form:
 
 ```delightql
-employee(*), State in ("MA";"TX";"AK";"AR")
+customer(*), state in ("MA";"TX";"CA";"ON")
 ```
 
-Both transpile to:
+Both ask whether the customer's state corresponds to one candidate.
+With these non-NULL constants, the filtering SQL can be written:
 
 ```sql
 select
   *
-from employee where State in ('MA','TX','AK','AR');
+from customer where state in ('MA','TX','CA','ON');
 ```
 
 
 The unsugared form generalizes to multi-column comparisons:
 
 ```delightql
-employee(*), +_( State, Department @
-                 "MA","Engineering";
-                 "TX","Engineering";
-                 "CA","Sales")
+customer(*), +_( country, state @
+                 "USA","CA";
+                 "USA","TX";
+                 "Canada","ON")
 ```
 
 ```sql
 SELECT *
-FROM employee
+FROM customer
 WHERE
-  ('MA' IS NOT DISTINCT FROM State
-  AND 'Engineering' IS NOT DISTINCT FROM Department)
-  OR ('TX' IS NOT DISTINCT FROM State
-  AND 'Engineering' IS NOT DISTINCT FROM Department)
-  OR ('CA' IS NOT DISTINCT FROM State
-  AND 'Sales' IS NOT DISTINCT FROM Department);
+  ('USA' = country
+  AND 'CA' = state)
+  OR ('USA' = country
+  AND 'TX' = state)
+  OR ('Canada' = country
+  AND 'ON' = state);
 ```
+
+`+_` is an existential observer of the same anonymous table an unmarked
+comma member would join. When a column from one row is matched to a
+candidate row, NULL never establishes correspondence, even under `+`.
+For example, `_(a @ null), +_(a @ null)` has no answer. A wholly ground
+`null in (null)` is a local value test instead and remains true.

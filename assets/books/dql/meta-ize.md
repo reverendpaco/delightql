@@ -8,20 +8,18 @@ rows of metadata.
 ## Schema as Relation (`^`) {.dqlh}
 
 ```delightql
-users(^)
+album(^)
 ```
 
-This returns one row per column in `users`:
+This returns one row per column in `album`:
 
 | scope  | column_name   | ordinal  |
 | ------ | ------------- | -------- |
-| users  | id            | 1        |
-| users  | first_name    | 2        |
-| users  | last_name     | 3        |
-| users  | email         | 4        |
-| users | age           | 5        |
+| album  | album_id      | 1        |
+| album  | title         | 2        |
+| album  | artist_id     | 3        |
 
-: Output of `users(^)`
+: Output of `album(^)`
 
 The `^`{.delightql .sigil} operator belongs to the unary continuation operator family
 -- unary operators that transform table access:
@@ -35,23 +33,23 @@ The `^`{.delightql .sigil} operator belongs to the unary continuation operator f
 
 : Table continuation operators
 
-These operators compose freely: `users(*.(id))` means "qualified + USING on id."
+These operators compose freely: `album(*.(artist_id))` means "qualified + USING on artist_id."
 
 
 ## Postfix Form {.dqlh}
 
-`users(^)`{.delightql} is sugar for `users() ^`{.delightql}. The
+`album(^)`{.delightql} is sugar for `album() ^`{.delightql}. The
 postfix form works on any relational expression, not just base tables:
 
 ```delightql
--- schema of a projection (2 rows)
-users(*) |> (first_name, age) ^
+// schema of a projection (2 rows)
+album(*) |> (title, artist_id) ^
 
--- schema of a join
-users(*), products(*) ^
+// schema of a join
+album(*), artist(*.(artist_id)) ^
 
--- schema of an aggregation
-users(*) |> %(country ~> count:(*) as n) ^
+// schema of an aggregation
+album(*) |> %(artist_id ~> count:(*) as n) ^
 ```
 
 The postfix `^`{.delightql .sigil} applies to the entire expression
@@ -64,13 +62,13 @@ operations apply -- filtering, projection, pipes, joins, and set
 operators:
 
 ```delightql
--- text columns only
-users(^), coltype = "TEXT" |> (column_name)
+// key columns only
+track(^), +like(column_name, "%_id") |> (column_name)
 ```
 
 ```delightql
--- columns shared between two year-partitioned tables
-users_2024(^) |;| users_2023(^), x.* = y.*
+// columns shared between two tables
+customer(^) as x |;| employee(^) as y, x.column_name = y.column_name
 ```
 
 

@@ -11,6 +11,8 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 delightql-core = { path = "../delightql-core" }
+delightql-cst = { path = "../delightql-cst" }
+delightql-protocol = { path = "../delightql-protocol" }
 delightql-types = { path = "../delightql-types" }
 delightql-backends = { path = "../delightql-backends", default-features = false, features = ["sqlite"] }
 delightql-sqlite-relay = { path = "../delightql-sqlite-relay" }
@@ -21,3 +23,4 @@ tree-sitter.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+serde_json.workspace = true

@@ -12,8 +12,8 @@ use super::support::{file, queries};
 use crate::pipeline::asts::core::InlineDdlSpec;
 
 fn the_block(normalized: &crate::pipeline::normalize::Normalized) -> &InlineDdlSpec {
-    assert_eq!(normalized.declared.ddl_blocks.len(), 1);
-    &normalized.declared.ddl_blocks[0]
+    assert_eq!(normalized.blocks.leading.len(), 1);
+    &normalized.blocks.leading[0]
 }
 
 /// A block holds MANY subjects: the carrier is file-shaped, not
@@ -22,17 +22,12 @@ fn the_block(normalized: &crate::pipeline::normalize::Normalized) -> &InlineDdlS
 fn a_multi_definition_body_carries_every_clause_typed() {
     let normalized =
         queries("(~~ddl v(*) :- users(*)\nw(*) :- v(*)\nf(a, b ---- 1, 2) ~~) users(*)");
-    let block = &normalized
-        .queries()
-        .nth(0)
-        .expect("a goal")
-        .declared
-        .ddl_blocks[0];
+    let block = &normalized.queries().nth(0).expect("a goal").blocks.leading[0];
     let names: Vec<String> = block
         .body
         .definitions
         .iter()
-        .map(|clause| clause.front.name())
+        .map(|clause| clause.front().name())
         .collect();
     assert_eq!(names, ["v", "w", "f"]);
     assert!(block.body.ddl_blocks.is_empty());
@@ -49,13 +44,13 @@ fn nested_blocks_arrive_typed_through_three_levels() {
     );
     let l1 = the_block(&normalized);
     assert_eq!(l1.namespace.as_deref(), Some("l1"));
-    assert_eq!(l1.body.definitions[0].front.name(), "a");
+    assert_eq!(l1.body.definitions[0].front().name(), "a");
     let l2 = &l1.body.ddl_blocks[0];
     assert_eq!(l2.namespace.as_deref(), Some("l2"));
-    assert_eq!(l2.body.definitions[0].front.name(), "b");
+    assert_eq!(l2.body.definitions[0].front().name(), "b");
     let l3 = &l2.body.ddl_blocks[0];
     assert_eq!(l3.namespace.as_deref(), Some("l3"));
-    assert_eq!(l3.body.definitions[0].front.name(), "c");
+    assert_eq!(l3.body.definitions[0].front().name(), "c");
     assert!(l3.body.ddl_blocks.is_empty());
 }
 
@@ -95,12 +90,7 @@ fn an_empty_block_is_lawful_and_carries_an_empty_body() {
 #[test]
 fn a_named_child_namespace_travels_on_the_spec() {
     let normalized = queries("(~~ddl:\"chz\" v(*) :- users(*) ~~) users(*)");
-    let block = &normalized
-        .queries()
-        .nth(0)
-        .expect("a goal")
-        .declared
-        .ddl_blocks[0];
+    let block = &normalized.queries().nth(0).expect("a goal").blocks.leading[0];
     assert_eq!(block.namespace.as_deref(), Some("chz"));
 }
 
@@ -112,12 +102,12 @@ fn block_definitions_do_not_leak_into_the_file_s_own() {
     let normalized = file("v(*) :- users(*)\n(~~ddl w(*) :- v(*) ~~)\nu(*) :- v(*)");
     let names: Vec<String> = normalized
         .definitions()
-        .map(|clause| clause.front.name())
+        .map(|clause| clause.front().name())
         .collect();
     assert_eq!(names, ["v", "u"], "the file owns exactly its own subjects");
     let block = the_block(&normalized);
     assert_eq!(block.body.definitions.len(), 1);
-    assert_eq!(block.body.definitions[0].front.name(), "w");
+    assert_eq!(block.body.definitions[0].front().name(), "w");
 }
 
 /// Malformed inner syntax refuses the SUBMISSION: the grammar owns the body,
@@ -169,12 +159,7 @@ fn a_normalization_error_inside_the_body_is_submission_owned() {
 #[test]
 fn sibling_agreement_is_not_judged_at_normalization() {
     let normalized = queries("(~~ddl q(a) :- _(a @ 1)\nq(a, b) :- _(a, b @ 1, 2) ~~) users(*)");
-    let block = &normalized
-        .queries()
-        .nth(0)
-        .expect("a goal")
-        .declared
-        .ddl_blocks[0];
+    let block = &normalized.queries().nth(0).expect("a goal").blocks.leading[0];
     assert_eq!(block.body.definitions.len(), 2, "both clauses travel");
 }
 
@@ -187,11 +172,11 @@ fn a_doc_slot_block_inside_a_body_lands_in_that_body() {
         queries("(~~ddl v(*) :-\n  (~~ddl:\"aside\" w(*) :- _(x @ 1) ~~)\n  users(*) ~~) users(*)");
     let goal = &normalized.queries().nth(0).expect("a goal");
     assert_eq!(
-        goal.declared.ddl_blocks.len(),
+        goal.blocks.leading.len(),
         1,
         "the enclosing goal sees ONE block — the outer one"
     );
-    let outer = &goal.declared.ddl_blocks[0];
+    let outer = &goal.blocks.leading[0];
     assert_eq!(outer.body.definitions.len(), 1);
     assert_eq!(
         outer.body.ddl_blocks.len(),
@@ -213,8 +198,8 @@ fn inner_declarations_do_not_reach_the_enclosing_goal() {
             .queries()
             .nth(0)
             .expect("a goal")
-            .declared
-            .ddl_blocks
+            .blocks
+            .leading
             .len()
             == 1
             && with_block

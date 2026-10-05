@@ -37,9 +37,9 @@
 //!   this same derivation and admission.
 //!
 //! ADMISSION judges every recorded reference of every derivative by THE
-//! judgment body opening applies — [`super::select::judge_link_on`] under
-//! the derivative's own declaration reach, and
-//! [`super::select::select_qualified_on`] for a qualified name — so a name
+//! judgment body opening applies — the new middle's selection
+//! (`pipeline::middle::api`) at the derivative family's own body
+//! site, its link/hole judgment for a bare name — so a name
 //! the reach answers is a lexical link, a name nothing answers is a data
 //! hole the data world must answer uniquely, and a qualified name must
 //! select where it points. A qualified reference that reaches a derivable
@@ -57,9 +57,6 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use crate::error::{DelightQLError, Result};
 use rusqlite::OptionalExtension;
 
-use super::environment::reach;
-use super::select::{Link, Selected, Selection};
-use super::CatalogRead;
 
 /// One derivative: the exact source namespace it derives and the grounded
 /// namespace it derives it into.
@@ -138,10 +135,12 @@ impl DerivedWorld {
             families: 0,
         };
         world.record(conn, &root)?;
-        let (cartridge, families) = world.copy_families(conn, &root)?;
-        world.root_cartridge = cartridge;
+        let (deriv_of, families) = world.copy_families(conn, &root)?;
+        // Any of the root's derivation loads homes the load-less manifest
+        // companions; a family-less root mints one on demand instead.
+        world.root_cartridge = deriv_of.values().next().copied();
         world.root_families = families;
-        world.copy_edges(conn, &root)?;
+        world.copy_edges(conn, &root, &deriv_of)?;
         Ok(world)
     }
 
@@ -282,19 +281,8 @@ impl DerivedWorld {
     /// deriving what a qualified reference reaches, until no derivative
     /// remains unadmitted. Consumes the world — an admitted world is the
     /// catalog's, an unadmitted one is nobody's.
-    pub(crate) fn admit(
-        mut self,
-        conn: &rusqlite::Connection,
-        catalog: CatalogRead<'_>,
-    ) -> Result<()> {
-        while let Some(source_id) = self.unadmitted.pop_front() {
-            let member = self
-                .members
-                .get(&source_id)
-                .cloned()
-                .expect("an unadmitted source is a member");
-            self.admit_member(conn, catalog, &member)?;
-        }
+    pub(crate) fn admit(mut self, conn: &rusqlite::Connection) -> Result<()> {
+        self.walk(conn, Admission::Judge)?;
         // Only now is the closure complete — admission may have derived
         // what a qualified reference reaches — so only now can a
         // previously held derivative be known to have no source left to
@@ -304,6 +292,30 @@ impl DerivedWorld {
             self.members.values().map(|m| m.derived_id).collect();
         for stale in self.previous.iter().filter(|id| !kept.contains(id)) {
             destroy_derivative(conn, *stale)?;
+        }
+        Ok(())
+    }
+
+    /// CLOSE the world without judging it: derive everything a qualified
+    /// reference of any derivative reaches, as admission does, and judge no
+    /// reference. For a world whose data is not all there yet — an
+    /// imprint's, whose entities are created from it — where every
+    /// reference an entity reaches is judged when that entity is compiled.
+    /// The world stays unpublishable: a closed world is only ever discarded.
+    pub(crate) fn close(mut self, conn: &rusqlite::Connection) -> Result<()> {
+        self.walk(conn, Admission::Close)
+    }
+
+    /// Visit every derivative until none remains unvisited; a visit may
+    /// derive further.
+    fn walk(&mut self, conn: &rusqlite::Connection, admission: Admission) -> Result<()> {
+        while let Some(source_id) = self.unadmitted.pop_front() {
+            let member = self
+                .members
+                .get(&source_id)
+                .cloned()
+                .expect("an unadmitted source is a member");
+            self.admit_member(conn, &member, admission)?;
         }
         Ok(())
     }
@@ -380,8 +392,8 @@ impl DerivedWorld {
             derived_fq,
         };
         self.record(conn, &member)?;
-        self.copy_families(conn, &member)?;
-        self.copy_edges(conn, &member)?;
+        let (deriv_of, _) = self.copy_families(conn, &member)?;
+        self.copy_edges(conn, &member, &deriv_of)?;
         Ok(derived_id)
     }
 
@@ -404,20 +416,25 @@ impl DerivedWorld {
         Ok(())
     }
 
-    /// Copy the source's families into the derivative, under one cartridge
-    /// naming the derivation. Answers the cartridge and the family count —
-    /// and NO cartridge for a family-less source: the lifecycle finds a
-    /// cartridge through the entities activated under it, so an empty one
-    /// would be a row nothing can ever remove.
+    /// Copy the source's families into the derivative, EACH UNDER A
+    /// DERIVATION CARTRIDGE THAT STANDS FOR ITS SOURCE LOAD — one
+    /// derivation cartridge per distinct source cartridge, so a family
+    /// derived from the `a`-capturing load and one from the `b`-capturing
+    /// load land under different loads and keep their captures apart (the
+    /// grounding may not union two loads' lexical worlds). Answers the
+    /// source-load → derivation-load map and the family count; the map is
+    /// empty for a family-less source (a facade), whose imports carry a NULL
+    /// load instead, because the lifecycle finds a cartridge only through
+    /// the entities activated under it.
     fn copy_families(
         &mut self,
         conn: &rusqlite::Connection,
         member: &Derivative,
-    ) -> Result<(Option<i32>, usize)> {
-        let entities: Vec<(i32, String, bool, i32, Option<String>)> = {
+    ) -> Result<(std::collections::HashMap<i64, i32>, usize)> {
+        let entities: Vec<(i32, String, bool, i32, Option<String>, i64)> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT e.id, e.name, e.name_stropped, e.type, e.doc
+                    "SELECT e.id, e.name, e.name_stropped, e.type, e.doc, e.cartridge_id
                      FROM entity e
                      JOIN activated_entity ae ON ae.entity_id = e.id
                      WHERE ae.namespace_id = ?1
@@ -432,6 +449,7 @@ impl DerivedWorld {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 })
                 .map_err(|e| Runtime::catalog("list source families", e.to_string()))?
@@ -440,75 +458,127 @@ impl DerivedWorld {
             rows
         };
         if entities.is_empty() {
-            return Ok((None, 0));
+            return Ok((std::collections::HashMap::new(), 0));
         }
-        let cartridge_id = derivation_cartridge(conn, &member.source_fq, &self.data_fq)?;
-        for (old_entity_id, name, stropped, kind, doc) in &entities {
+        let mut deriv_of: std::collections::HashMap<i64, i32> = std::collections::HashMap::new();
+        for (old_entity_id, name, stropped, kind, doc, source_cartridge) in &entities {
+            let derivation_cartridge = match deriv_of.get(source_cartridge) {
+                Some(id) => *id,
+                None => {
+                    let id = derivation_cartridge(conn, &member.source_fq, &self.data_fq)?;
+                    deriv_of.insert(*source_cartridge, id);
+                    id
+                }
+            };
             conn.execute(
                 "INSERT INTO entity (name, name_stropped, type, cartridge_id, doc)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![name, stropped, kind, cartridge_id, doc],
+                rusqlite::params![name, stropped, kind, derivation_cartridge, doc],
             )
             .map_err(|e| Runtime::catalog(format!("derive family '{name}'"), e.to_string()))?;
             let new_entity_id = conn.last_insert_rowid() as i32;
-            crate::system::DelightQLSystem::copy_entity_subtables(
-                conn,
-                *old_entity_id,
-                new_entity_id,
-            )?;
+            crate::system::entity_rows::copy(conn, *old_entity_id, new_entity_id)?;
             conn.execute(
                 "INSERT INTO activated_entity (entity_id, namespace_id, cartridge_id)
                  VALUES (?1, ?2, ?3)",
-                rusqlite::params![new_entity_id, member.derived_id, cartridge_id],
+                rusqlite::params![new_entity_id, member.derived_id, derivation_cartridge],
             )
             .map_err(|e| {
                 Runtime::catalog(format!("activate derived family '{name}'"), e.to_string())
             })?;
         }
         self.families += entities.len();
-        Ok((Some(cartridge_id), entities.len()))
+        Ok((deriv_of, entities.len()))
     }
 
     /// Copy the source's declared lexical graph onto the derivative, every
-    /// derivable target rewired to its derivative.
-    fn copy_edges(&mut self, conn: &rusqlite::Connection, member: &Derivative) -> Result<()> {
-        let enlists = id_list(
+    /// derivable target rewired to its derivative. `deriv_of` pairs each
+    /// SOURCE LOAD with the derivation load its families were copied under.
+    fn copy_edges(
+        &mut self,
+        conn: &rusqlite::Connection,
+        member: &Derivative,
+        deriv_of: &std::collections::HashMap<i64, i32>,
+    ) -> Result<()> {
+        // THE DERIVATIVE'S CAPTURED IMPORTS are the source's, PER LOAD:
+        // each source load's captured imports are rewired and written under
+        // the derivation load its families were copied under, so a derived
+        // family opened by its cartridge reads exactly the capture of the
+        // source family it derives — two source loads never merge into one
+        // widened capture. A source's facade imports (a NULL load) carry a
+        // NULL load onto the derivative too, read by namespace as the
+        // facade derivative's sole load.
+        for (source_cartridge, derivation_cartridge) in deriv_of {
+            let imports = id_list(
+                conn,
+                "SELECT imported_namespace_id FROM lexical_import
+                 WHERE cartridge_id = ?1 ORDER BY imported_namespace_id",
+                *source_cartridge,
+            )?;
+            for target in imports {
+                let target = self.rewired(conn, target)?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO lexical_import \
+                     (namespace_id, cartridge_id, imported_namespace_id)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![member.derived_id, derivation_cartridge, target],
+                )
+                .map_err(|e| Runtime::catalog("derive an import", e.to_string()))?;
+            }
+        }
+        // The source's facade imports (no load) — present when the source
+        // is itself a definition-free facade.
+        let facade_imports = id_list(
             conn,
-            "SELECT enlisted_namespace_id FROM namespace_local_enlist WHERE namespace_id = ?1
-             ORDER BY enlisted_namespace_id",
+            "SELECT imported_namespace_id FROM lexical_import
+             WHERE namespace_id = ?1 AND cartridge_id IS NULL ORDER BY imported_namespace_id",
             member.source_id,
         )?;
-        for target in enlists {
+        for target in facade_imports {
             let target = self.rewired(conn, target)?;
             conn.execute(
-                "INSERT OR IGNORE INTO namespace_local_enlist (namespace_id, enlisted_namespace_id)
-                 VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO lexical_import \
+                 (namespace_id, cartridge_id, imported_namespace_id)
+                 VALUES (?1, NULL, ?2)",
                 rusqlite::params![member.derived_id, target],
             )
-            .map_err(|e| Runtime::catalog("derive an enlistment", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("derive a facade import", e.to_string()))?;
         }
-        let aliases: Vec<(String, i64)> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT alias, target_namespace_id FROM namespace_local_alias
-                     WHERE namespace_id = ?1 ORDER BY alias",
+        // THE DERIVATIVE'S CAPTURED ALIASES follow the same per-load rule
+        // as its imports, each rewired to the derivative of its target.
+        for (source_cartridge, derivation_cartridge) in deriv_of {
+            let aliases = alias_list(
+                conn,
+                "SELECT alias, target_namespace_id FROM namespace_local_alias
+                 WHERE cartridge_id = ?1 ORDER BY alias",
+                *source_cartridge,
+            )?;
+            for (alias, target) in aliases {
+                let target = self.rewired(conn, target)?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO namespace_local_alias \
+                     (namespace_id, cartridge_id, alias, target_namespace_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![member.derived_id, derivation_cartridge, alias, target],
                 )
-                .map_err(|e| Runtime::catalog("prepare alias listing", e.to_string()))?;
-            let rows = stmt
-                .query_map([member.source_id], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| Runtime::catalog("list aliases", e.to_string()))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| Runtime::catalog("decode an alias", e.to_string()))?;
-            rows
-        };
-        for (alias, target) in aliases {
+                .map_err(|e| Runtime::catalog("derive an alias", e.to_string()))?;
+            }
+        }
+        let facade_aliases = alias_list(
+            conn,
+            "SELECT alias, target_namespace_id FROM namespace_local_alias
+             WHERE namespace_id = ?1 AND cartridge_id IS NULL ORDER BY alias",
+            member.source_id,
+        )?;
+        for (alias, target) in facade_aliases {
             let target = self.rewired(conn, target)?;
             conn.execute(
-                "INSERT OR IGNORE INTO namespace_local_alias (namespace_id, alias, target_namespace_id)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO namespace_local_alias \
+                 (namespace_id, cartridge_id, alias, target_namespace_id)
+                 VALUES (?1, NULL, ?2, ?3)",
                 rusqlite::params![member.derived_id, alias, target],
             )
-            .map_err(|e| Runtime::catalog("derive an alias", e.to_string()))?;
+            .map_err(|e| Runtime::catalog("derive a facade alias", e.to_string()))?;
         }
         let exposures = id_list(
             conn,
@@ -539,22 +609,24 @@ impl DerivedWorld {
         }
     }
 
-    /// Judge every recorded reference of one derivative.
+    /// Visit every recorded reference of one derivative: derive what a
+    /// qualified one reaches and, when admitting, judge each.
     fn admit_member(
         &mut self,
         conn: &rusqlite::Connection,
-        catalog: CatalogRead<'_>,
         member: &Derivative,
+        admission: Admission,
     ) -> Result<()> {
-        let mut reach = reach::capture_on(conn, &member.derived_fq, reach::World::Declaration)?;
-
         // Every reference every derived definition recorded, in a
         // deterministic order so a refusal names the same reference every
-        // time.
-        let references: Vec<(String, String, Option<String>)> = {
+        // time. Each carries its CONTAINING FAMILY's entity id, from which
+        // the sealed (namespace, load) pair is minted — so a reference is
+        // judged under the reach of the load it belongs to, never a sibling
+        // load's widened world.
+        let references: Vec<(i64, String, String, Option<String>)> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT e.name, re.name, re.namespace
+                    "SELECT re.containing_entity_id, e.name, re.name, re.namespace
                      FROM referenced_entity re
                      JOIN entity e ON e.id = re.containing_entity_id
                      JOIN activated_entity ae ON ae.entity_id = e.id
@@ -566,7 +638,7 @@ impl DerivedWorld {
                 })?;
             let rows = stmt
                 .query_map([member.derived_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })
                 .map_err(|e| Runtime::catalog("Failed to run grounding admission", e.to_string()))?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -579,93 +651,67 @@ impl DerivedWorld {
             rows
         };
 
-        for (entity_name, ref_name, ref_namespace) in references {
+        use crate::pipeline::middle::api::{self, Reached, Road};
+        for (containing_entity_id, entity_name, ref_name, ref_namespace) in references {
+            // THE DERIVATIVE FAMILY'S STANDPOINT: its own namespace under the
+            // load it was derived into, read from the containing entity's own
+            // activation row at each question, so a member derived by an
+            // earlier qualified reference is already in the closure.
             let entity = format!("{}.{}", member.source_fq, entity_name);
-            match ref_namespace {
-                None => {
-                    match super::select::judge_link_on(
-                        conn,
-                        catalog,
-                        &reach,
-                        Some(&self.data_fq),
-                        &ref_name,
-                        false,
-                    )? {
-                        // The reach answers: a lexical link — and every
-                        // authored family it reaches must already stand
-                        // inside this world, because the derivative's edges
-                        // are the rewired ones.
-                        Link::Lexical(candidates) => {
-                            for candidate in candidates {
-                                self.reached_inside(conn, &candidate.into_selected())?;
-                            }
-                        }
-                        Link::Hole(Some(Selection::Unique(_))) => {}
-                        Link::Hole(Some(Selection::Ambiguous(candidates))) => {
-                            return Err(super::select::ambiguity_refusal(&ref_name, &candidates));
-                        }
-                        Link::Hole(Some(Selection::Missing)) | Link::Hole(None) => {
-                            return Err(DelightQLError::from(Ground::UnresolvedReference {
-                                message: format!(
-                                    "ground!() validation failed: entity '{entity}' references \
-                                     '{ref_name}' which does not exist in data namespace '{}'",
-                                    self.data_fq
-                                ),
-                            }));
-                        }
+            if let Some(spelled) = &ref_namespace {
+                // A system-reserved surface (sys::*, std::*) is the
+                // engine's to serve and is not judged here.
+                if crate::namespace::is_within(spelled, "sys") || crate::namespace::is_within(spelled, "std") {
+                    continue;
+                }
+                // A qualified reference reaches a namespace exactly as a
+                // declared edge does: a derivable target it routes to
+                // joins the closure before the reference is judged.
+                let qualifier = crate::pipeline::asts::vocabulary::Qualifier::from_spelled(spelled);
+                if let Some(target) = api::route_in_body(conn, containing_entity_id, &qualifier)? {
+                    if !self.members.contains_key(&target) && derivable(conn, target)?.is_some() {
+                        self.member_of(conn, target)?;
                     }
                 }
-                Some(display) => {
-                    // The reference catalog stores a path's DISPLAY rendering
-                    // (leaf-first, dot-joined); recover the fq spelling.
-                    let fq = {
-                        let mut parts: Vec<&str> = display.split('.').collect();
-                        parts.reverse();
-                        parts.join("::")
-                    };
-                    // A system-reserved surface (sys::*, std::*) is the
-                    // engine's to serve and is not judged here.
-                    if fq == "sys"
-                        || fq.starts_with("sys::")
-                        || fq == "std"
-                        || fq.starts_with("std::")
-                    {
-                        continue;
-                    }
-                    // A qualified reference reaches a namespace exactly as
-                    // a declared edge does: a derivable target it names
-                    // joins the closure, and the reach is recaptured so the
-                    // world's closure holds the new derivative.
-                    if let Some(target) = super::select::qualifier_target(conn, &reach, &fq)? {
-                        if !self.members.contains_key(&target.id)
-                            && derivable(conn, target.id)?.is_some()
-                        {
-                            self.member_of(conn, target.id)?;
-                            reach = reach::capture_on(
-                                conn,
-                                &member.derived_fq,
-                                reach::World::Declaration,
-                            )?;
-                        }
-                    }
-                    match super::select::select_qualified_on(
-                        conn, catalog, &ref_name, false, &fq, &reach,
-                    )? {
-                        Selection::Unique(selected) => self.reached_inside(conn, &selected)?,
-                        Selection::Ambiguous(candidates) => {
-                            return Err(super::select::ambiguity_refusal(&ref_name, &candidates));
-                        }
-                        Selection::Missing => {
-                            return Err(DelightQLError::from(Ground::UnresolvedReference {
-                                message: format!(
-                                    "ground!() validation failed: entity '{entity}' \
-                                     references '{fq}.{ref_name}', which resolves to \
-                                     nothing in this session. Strict validation covers \
-                                     qualified references too — nothing is created."
-                                ),
-                            }));
-                        }
-                    }
+            }
+            if admission == Admission::Close {
+                continue;
+            }
+            match api::recorded_mention(conn, containing_entity_id, &ref_name, ref_namespace.as_deref())? {
+                (_, Reached::Ambiguous(refusal)) => return Err(refusal),
+                // The tiers answer: a lexical link, and every authored family
+                // it reaches must already stand inside this world, because
+                // the derivative's edges are the rewired ones; so must the
+                // family a qualified reference routes to.
+                (Road::Link | Road::Route, Reached::Authored { namespace }) => {
+                    self.reached_inside(conn, &ref_name, &namespace)?
+                }
+                (Road::Link, Reached::Missing) => {
+                    return Err(Internal::invariant(
+                        "defuse::grounded_world",
+                        "a lexical link answered with a miss",
+                    ));
+                }
+                (Road::Link | Road::Route, Reached::Served) | (Road::Hole, Reached::Authored { .. } | Reached::Served) => {}
+                (Road::Hole, Reached::Missing) => {
+                    return Err(DelightQLError::from(Ground::UnresolvedReference {
+                        message: format!(
+                            "ground!() validation failed: entity '{entity}' references \
+                             '{ref_name}' which does not exist in data namespace '{}'",
+                            self.data_fq
+                        ),
+                    }));
+                }
+                (Road::Route, Reached::Missing) => {
+                    let spelled = ref_namespace.as_deref().unwrap_or_default();
+                    return Err(DelightQLError::from(Ground::UnresolvedReference {
+                        message: format!(
+                            "ground!() validation failed: entity '{entity}' \
+                             references '{spelled}.{ref_name}', which resolves to \
+                             nothing in this session. Strict validation covers \
+                             qualified references too — nothing is created."
+                        ),
+                    }));
                 }
             }
         }
@@ -681,26 +727,15 @@ impl DerivedWorld {
     /// scratch, another grounded world); a derivable source is neither,
     /// and its membership as a SOURCE of this closure proves nothing about
     /// what selection handed back.
-    fn reached_inside(&self, conn: &rusqlite::Connection, selected: &Selected<'_>) -> Result<()> {
-        let Selected::Authored(family) = selected else {
-            return Ok(());
-        };
+    fn reached_inside(&self, conn: &rusqlite::Connection, name: &str, namespace: &str) -> Result<()> {
         let namespace_id: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM namespace WHERE fq_name = ?1",
-                [family.namespace()],
-                |row| row.get(0),
-            )
+            .query_row("SELECT id FROM namespace WHERE fq_name = ?1", [namespace], |row| row.get(0))
             .optional()
             .map_err(|e| Runtime::catalog("look up a reached namespace", e.to_string()))?;
         let Some(id) = namespace_id else {
             return Err(Internal::invariant(
                 "defuse::grounded_world",
-                format!(
-                    "corrupt catalog: '{}' selected from namespace '{}', which has no row",
-                    family.name(),
-                    family.namespace()
-                ),
+                format!("corrupt catalog: '{name}' selected from namespace '{namespace}', which has no row"),
             ));
         };
         let is_derivative = self.members.values().any(|member| member.derived_id == id);
@@ -710,14 +745,22 @@ impl DerivedWorld {
         Err(Internal::invariant(
             "defuse::grounded_world",
             format!(
-                "ground!() derivation defect: '{}' of the source '{}' was reached from '{}' \
+                "ground!() derivation defect: '{name}' of the source '{namespace}' was reached from '{}' \
                  instead of a derivative",
-                family.name(),
-                family.namespace(),
                 self.root.derived_fq
             ),
         ))
     }
+}
+
+/// What a walk of the world does with each recorded reference beyond
+/// deriving what it reaches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Judge it: the world is being published.
+    Judge,
+    /// Leave it to the compile that reaches it: the world is discarded.
+    Close,
 }
 
 /// The cartridge a derivation registers families under: one per
@@ -746,13 +789,9 @@ pub(crate) fn derivation_cartridge(
 /// published together — and re-admit each. The token is minted only by
 /// the road that completes a load, so no rebuild can read a source whose
 /// edges are still to come.
-pub(crate) fn rebuild_dependents(
-    conn: &rusqlite::Connection,
-    catalog: CatalogRead<'_>,
-    load: &crate::system::PublishedLoad,
-) -> Result<()> {
+pub(crate) fn rebuild_dependents(conn: &rusqlite::Connection, load: &crate::system::PublishedLoad) -> Result<()> {
     for root_id in roots_deriving_from(conn, load.namespace_id())? {
-        DerivedWorld::rebuild(conn, root_id)?.admit(conn, catalog)?;
+        DerivedWorld::rebuild(conn, root_id)?.admit(conn)?;
     }
     Ok(())
 }
@@ -777,35 +816,19 @@ pub(crate) fn roots_bound_to(conn: &rusqlite::Connection, data_id: i64) -> Resul
     )
 }
 
-/// The closure `namespace_id` belongs to, as (source, derivative) pairs;
-/// empty when the namespace is no derivative.
-pub(in crate::defuse) fn closure_of(
-    conn: &rusqlite::Connection,
-    namespace_id: i64,
-) -> Result<Vec<(i64, i64)>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT lib_namespace_id, grounded_namespace_id FROM grounding
-             WHERE root_namespace_id = (SELECT root_namespace_id FROM grounding
-                                        WHERE grounded_namespace_id = ?1)",
-        )
-        .map_err(|e| Runtime::catalog("prepare closure lookup", e.to_string()))?;
-    let rows = stmt
-        .query_map([namespace_id], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(|e| Runtime::catalog("look up the closure", e.to_string()))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| Runtime::catalog("decode the closure", e.to_string()))?;
-    Ok(rows)
-}
-
 /// Whether a namespace is DERIVABLE — a lexical definition world publishing
 /// no data binding of its own — answering its fq name when it is. A data
 /// namespace, a system module, a structural container, an already-grounded
 /// world, a scratch namespace with an ambient world, and an archived
 /// blueprint are not derived: their names stand for themselves.
 fn derivable(conn: &rusqlite::Connection, namespace_id: i64) -> Result<Option<String>> {
+    use crate::namespace::NamespaceKind as K;
     let (fq, kind, default_data_ns) = namespace_facts(conn, namespace_id)?;
-    if default_data_ns.is_some() || !matches!(kind.as_str(), "lib" | "scratch" | "unknown") {
+    let lexical = match kind {
+        K::Lib | K::Scratch | K::Unknown => true,
+        K::System | K::Container | K::Data | K::Grounded | K::Blueprint => false,
+    };
+    if default_data_ns.is_some() || !lexical {
         return Ok(None);
     }
     if crate::ddl::lifecycle::blueprint_shadowing(conn, &fq)?.is_some() {
@@ -817,18 +840,33 @@ fn derivable(conn: &rusqlite::Connection, namespace_id: i64) -> Result<Option<St
 fn namespace_facts(
     conn: &rusqlite::Connection,
     namespace_id: i64,
-) -> Result<(String, String, Option<String>)> {
-    conn.query_row(
-        "SELECT fq_name, kind, default_data_ns FROM namespace WHERE id = ?1",
-        [namespace_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )
-    .map_err(|e| {
-        Internal::invariant(
-            "defuse::grounded_world",
-            format!("corrupt catalog: namespace id {namespace_id} has no row: {e}"),
+) -> Result<(String, crate::namespace::NamespaceKind, Option<String>)> {
+    let (fq, kind, default_data_ns): (String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT fq_name, kind, default_data_ns FROM namespace WHERE id = ?1",
+            [namespace_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-    })
+        .map_err(|e| {
+            Internal::invariant(
+                "defuse::grounded_world",
+                format!("corrupt catalog: namespace id {namespace_id} has no row: {e}"),
+            )
+        })?;
+    let kind = crate::namespace::NamespaceKind::decode(&fq, kind.as_deref())?;
+    Ok((fq, kind, default_data_ns))
+}
+
+fn alias_list(conn: &rusqlite::Connection, sql: &str, param: i64) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| Runtime::catalog("prepare an alias listing", e.to_string()))?;
+    let rows = stmt
+        .query_map([param], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| Runtime::catalog("run an alias listing", e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| Runtime::catalog("decode an alias listing", e.to_string()))?;
+    Ok(rows)
 }
 
 fn id_list(conn: &rusqlite::Connection, sql: &str, param: i64) -> Result<Vec<i64>> {
@@ -848,7 +886,7 @@ fn id_list(conn: &rusqlite::Connection, sql: &str, param: i64) -> Result<Vec<i64
 fn destroy_derivative(conn: &rusqlite::Connection, derived_id: i64) -> Result<()> {
     for sql in [
         "DELETE FROM namespace_local_alias WHERE namespace_id = ?1 OR target_namespace_id = ?1",
-        "DELETE FROM namespace_local_enlist WHERE namespace_id = ?1 OR enlisted_namespace_id = ?1",
+        "DELETE FROM lexical_import WHERE namespace_id = ?1 OR imported_namespace_id = ?1",
         "DELETE FROM enlisted_namespace WHERE from_namespace_id = ?1 OR to_namespace_id = ?1",
         "DELETE FROM exposed_namespace WHERE exposing_namespace_id = ?1 OR exposed_namespace_id = ?1",
         "DELETE FROM namespace_alias WHERE target_namespace_id = ?1",

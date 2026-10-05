@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-use crate::ddl::manifest::{ConstraintRow, DefaultRow, SchemaRow};
+use crate::ddl::manifest_contract::{ConstraintRow, DefaultRow, SchemaRow};
 use crate::diagnostic::{Constraint, DelightQLError, Manifest};
-use crate::pipeline::asts::core::Unresolved;
 use crate::Result;
 
-use super::asts::{ColumnDef, CreateTableDef, DdlDefault, GeneratedKind};
+use super::asts::{ColumnDef, CreateTableDef};
 use super::builder;
 
 fn db_err(msg: impl std::fmt::Display) -> crate::DelightQLError {
@@ -14,7 +13,7 @@ fn db_err(msg: impl std::fmt::Display) -> crate::DelightQLError {
     })
 }
 
-/// Build a `CreateTableDef<Unresolved>` from manifest data.
+/// Build a `CreateTableDef` from manifest data.
 ///
 /// Mirrors `assemble_create_table_def()` but reads parameters directly
 /// instead of querying companion sys tables.
@@ -24,7 +23,7 @@ pub fn assemble_from_manifest(
     schema_rows: &[SchemaRow],
     constraint_rows: &[ConstraintRow],
     default_rows: &[DefaultRow],
-) -> Result<CreateTableDef<Unresolved>> {
+) -> Result<CreateTableDef> {
     if schema_rows.is_empty() {
         return Err(db_err(format!(
             "No schema rows for '{}' — cannot assemble CREATE TABLE",
@@ -46,7 +45,7 @@ pub fn assemble_from_manifest(
         }
     }
 
-    let mut columns: Vec<ColumnDef<Unresolved>> = Vec::new();
+    let mut columns: Vec<ColumnDef> = Vec::new();
     for sr in schema_rows {
         // Collect constraints for this column
         let mut constraints = Vec::new();
@@ -60,20 +59,7 @@ pub fn assemble_from_manifest(
         let default = default_rows
             .iter()
             .find(|dr| dr.column == sr.name)
-            .map(|dr| -> Result<DdlDefault<Unresolved>> {
-                if let Some(gen_kind) = &dr.generated {
-                    let base = builder::build_default(&dr.default_val)?;
-                    match base {
-                        DdlDefault::Value { expr } => {
-                            let kind = GeneratedKind::parse(gen_kind)?;
-                            Ok(DdlDefault::Generated { expr, kind })
-                        }
-                        other => Ok(other),
-                    }
-                } else {
-                    builder::build_default(&dr.default_val)
-                }
-            })
+            .map(|dr| builder::build_default(&dr.default_val))
             .transpose()?;
 
         columns.push(ColumnDef {
@@ -109,6 +95,7 @@ mod tests {
         let schema = [SchemaRow {
             name: "age".to_string(),
             col_type: "INTEGER".to_string(),
+            ordinal: crate::ddl::manifest_contract::OrdinalCell::Integer(1),
         }];
         let constraints = [ConstraintRow {
             column: "agee".to_string(),

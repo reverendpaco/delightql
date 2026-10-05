@@ -11,18 +11,18 @@ A column parenthesisized and then postfixed by the F-OVER sigil `<~`{.delightql 
 followed by an explicit ordering criteria.
 
 ```delightql
-users(*)
-  |> %(country ~> count:(*) as n, (first_name) <~ #(balance desc))
+track(*)
+  |> %(genre_id ~> count:(*) as n, (name) <~ #(milliseconds desc))
 ```
 
 With an empty ordering (bare `<~`) the delegate row is **arbitrary**:
 
 ```delightql
-users(*)
-  |> %(country
+track(*)
+  |> %(genre_id
         ~> count:(*) as n,
-        (first_name as highest_balance) <~ #(balance desc),
-        (first_name as arbitray)<~ )
+        (name as longest) <~ #(milliseconds desc),
+        (name as arbitrary)<~ )
 ```
 
 Some Sql vendors implement this functionality directly with dedicated syntax -- the `DISTINCT ON` syntax.

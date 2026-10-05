@@ -8,9 +8,9 @@ multi-clause entities combine.
 
 ### Glob head {.dqlh}
 
-```delightql
+```{.delightql .am}
 young(*)
-  :- people(*), age > 20
+  :- employee(*), birth_date > "1970-01-01"
 ```
 
 The glob `*` passes through whatever the body produces. The entity
@@ -19,13 +19,13 @@ the head makes no claim about column names or count.
 
 ### Argumentative head {.dqlh}
 
-```delightql
-young(name, age)
-  :- people(*), age > 20
+```{.delightql .am}
+young(last_name, birth_date)
+  :- employee(*), birth_date > "1970-01-01"
 ```
 
-The head declares the entity's output schema: exactly `name` and
-`age`, in that order. Every clause must satisfy this contract -- the
+The head declares the entity's output schema: exactly `last_name` and
+`birth_date`, in that order. Every clause must satisfy this contract -- the
 body must produce columns with those names (among possibly others).
 
 The body may be wider than the head. The head *projects* from the body
@@ -38,9 +38,9 @@ column named in the head, then it is an error.
 A head position can hold a ground term (a literal) instead of a free
 variable (a column name).
 
-```delightql
-bracket("old", last_name, first_name)
-  :- people(*), age > 40
+```{.delightql .am}
+bracket("old" as tag, last_name, first_name)
+  :- employee(*), birth_date < "1960-01-01"
 ```
 
 Ground terms in the head inject constants into the output and
@@ -48,13 +48,13 @@ provide choice semantics for multi-clause disjunctive rules.
 
 ## Multi-Clause Rules {.dqlh}
 
-```delightql
+```{.delightql .am}
 bracket("old", last_name, first_name)
-  :- people(*), age > 40
-bracket("toddler", last_name, first_name)
-  :- people(*), age < 4
-bracket(category, last_name, first_name)
-  :- people(*)
+  :- employee(*), birth_date < "1960-01-01"
+bracket("young", last_name, first_name)
+  :- employee(*), birth_date > "1970-01-01"
+bracket(title, last_name, first_name)
+  :- employee(*)
 ```
 
 Multi-headed rules with the exact same named and shaped head are
@@ -75,18 +75,22 @@ The meaning of multi-headed clauses is exactly **UNION ALL**.
 All clauses of the same entity must use the same head form -- either
 all glob or all argumentative. Mixing is an error:
 
-```delightql
--- OK: all glob
-data(*) :- source_a(*)
-data(*) :- source_b(*)
+```{.delightql .am}
+// OK: all glob
+place(*) :- customer(*) |> (city, country)
+place(*) :- employee(*) |> (city, country)
+```
 
--- OK: all argumentative
-data(x, y) :- source_a(*)
-data(x, y) :- source_b(*)
+```{.delightql .am}
+// OK: all argumentative
+place(city, country) :- customer(*)
+place(city, country) :- employee(*)
+```
 
--- ERROR: mixed head forms
-data(*) :- source_a(*)
-data(x, y) :- source_b(*)
+```{.delightql .am .bad}
+// ERROR: mixed head forms
+place(*) :- customer(*) |> (city, country)
+place(city, country) :- employee(*)
 ```
 
 ## Disjunctive Rules: Union Semantics by head form {.dqlh}
@@ -112,20 +116,22 @@ column name for a position. Free variables provide names. The rules:
   clauses are compatible (they provide a value but no name).
 - Conflicting names at the same position is an error.
 
-```delightql
--- OK: "category" names position 1; constants in other clauses are compatible
+```{.delightql .am}
+// OK: title names position 1; constants in other clauses are compatible
 bracket("old", last_name, first_name)
-  :- people(*), age > 40
-bracket("toddler", last_name, first_name)
-  :- people(*), age < 4
-bracket(category, last_name, first_name)
-  :- people(*)
+  :- employee(*), birth_date < "1960-01-01"
+bracket("young", last_name, first_name)
+  :- employee(*), birth_date > "1970-01-01"
+bracket(title, last_name, first_name)
+  :- employee(*)
+```
 
--- ERROR: position 1 named "motto" in one clause, "city" in another
+```{.delightql .am .bad}
+// ERROR: position 1 named title in one clause, city in another
 bracket("old", last_name, first_name)
-  :- people(*), age > 40
-bracket(motto, last_name, first_name)
-  :- people(*)
+  :- employee(*), birth_date < "1960-01-01"
+bracket(title, last_name, first_name)
+  :- employee(*)
 bracket(city, last_name, first_name)
-  :- people(*)
+  :- employee(*)
 ```

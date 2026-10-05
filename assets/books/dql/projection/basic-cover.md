@@ -4,26 +4,26 @@ The BASIC-COVER operator `$$(  )`{.delightql .sigil} transforms individual colum
 
 ```delightql
 employee(*)
-  |> $$( "--------" as Phone, upper:(State) as State)
+  |> $$( "--------" as phone, upper:(state) as state)
 ```
 
 ```sql
 select
-    EmployeeId,
-    LastName,
-    FirstName,
-    Title,
-    ReportsTo,
-    BirthDate,
-    HireDate,
-    Address,
-    City,
-    upper(State) as State,
-    Country,
-    PostalCode,
+    employee_id,
+    last_name,
+    first_name,
+    title,
+    reports_to,
+    birth_date,
+    hire_date,
+    address,
+    city,
+    upper(state) as state,
+    country,
+    postal_code,
     '--------' as Phone,
-    Fax,
-    Email
+    fax,
+    email
 from employee;
 ```
 

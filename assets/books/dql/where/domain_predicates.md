@@ -2,49 +2,50 @@
 
 
 ```delightql
-employee(*), Salary > 50000
+invoice(*), total > 10
 ```
 
 ```sql
-select * from employee where Salary > 50000;
+select * from invoice where total > 10;
 ```
 
 Multiple predicates conjoin naturally:
 
 ```delightql
-  employee(*), Salary > 50000,
-    trim:(lower:(Department))="engineering"
+  invoice(*), total > 10,
+    trim:(lower:(billing_country))="usa"
 ```
 
 ```sql
-select * from employee
-  where Salary > 50000
-    and trim(lower(Department))
-      IS NOT DISTINCT FROM 'engineering';
+select * from invoice
+  where total > 10
+    and trim(lower(billing_country))
+      IS NOT DISTINCT FROM 'usa';
 ```
 
 **Scope restricts commutativity**. Predicates can only reference columns already in scope. This is invalid:
 
 ```{.delightql .bad}
-// WONT WORK because Salary is not yet in scope
-  Salary > 50000,
-    trim:(lower:(Department))="engineering",
-    employee(*)
+// WONT WORK because Total is not yet in scope
+  customer(*),
+    total > 10,
+    trim:(lower:(billing_country))="usa",
+    invoice(*)
 ```
 
 But once columns are in scope, predicates may be reordered:
 
 
 ```delightql
-employee(*),
-  Salary > 50000,
-  trim:(lower:(Department))="engineering"
+invoice(*),
+  total > 10,
+  trim:(lower:(billing_country))="usa"
 
 // commutativity allowed when all LVars are in scope
 
-employee(*),
-  trim:(lower:(Department))="engineering",
-  Salary > 50000
+invoice(*),
+  trim:(lower:(billing_country))="usa",
+  total > 10
 ```
 
 
@@ -53,17 +54,17 @@ sigil for the SQL comparison operator `IS NOT DISTINCT FROM`{.sql}.  To use the
 traditional (dangerous) equality in SQL, use `+sql_eq(x,y)`.
 
 ```delightql
-employee(*), Salary > 50000,
-    trim:(lower:(Department))="engineering",
-    +sql_eq(LastName,"John")
+invoice(*), total > 10,
+    trim:(lower:(billing_country))="usa",
+    +sql_eq(billing_state,"CA")
 ```
 
 ```sql
-select * from employee
-  where Salary > 50000
-    and trim(lower(Department))
-      IS NOT DISTINCT FROM 'engineering'
-    and LastName='John';
+select * from invoice
+  where total > 10
+    and trim(lower(billing_country))
+      IS NOT DISTINCT FROM 'usa'
+    and billing_state='CA';
 ```
 
 > **Three-Valued Logic**
@@ -95,7 +96,7 @@ select * from employee
 >
 > shows many odd results
 >
-> ```
+> ```text
 > null=null                              =  null
 > null is null                           =  1
 > null is not null                       =  0
@@ -123,31 +124,27 @@ If a programmer requires the use of the traditional Sql `=`
 they can use the named functor: `+sql_eq(left,right)`.
 Likewise, for SQL's `!=` there is `+sql_ne(left,right)`
 
-> **The join-position exception**.
+> **The row-correspondence exception**.
 >
-> The table above describes equality in *filter position* -- conditions
-> referencing columns from zero or one relation. In *join position*
-> conditions correlating columns from two or more relations compile to SQL `=`.
+> The table above describes local value tests -- conditions comparing values
+> within one row or against a ground term. An ordinary comparison matching
+> two relation row occurrences uses SQL `=`, whether the matches feed a
+> multiplying join, an EXISTS/NOT EXISTS, or a correlated scalar subquery.
 >
-> This is the only safe default for joins as `IS NOT DISTINCT FROM` in a join
-> condition would treat NULL as a matchable value and explode cardinality.
+> `IS NOT DISTINCT FROM` in correspondence would treat NULL as a matchable
+> value and can explode cardinality. Suppressing the extra rows with EXISTS
+> does not make that correspondence correct.
 >
 > Joins establish *structural correspondence* -- "these rows belong
 > together." NULL means absence, and absence
 > does not make a correspondence. Filters test *value equality*, where
 > null-safety matters because rows should not silently disappear.
 >
-> The compiler already distinguishes these contexts: a condition
-> referencing two relations becomes an ON clause; a condition referencing
-> one relation becomes a WHERE clause. The equality semantics ride on
-> this same distinction.
+> SQL clause placement is not the equality rule: a correlated EXISTS often
+> has an inner WHERE, and still matches two row occurrences. A local
+> `inner.x = null` beside its correlation stays null-safe.
 >
-> To opt into null-matching joins (the rare case where NULL-to-NULL
-> correspondence is desired), use a danger gate:
->
-> ```delightql
-> employee(*) as e (~~danger://cardinality/nulljoin ON~~),
->   department(*) as d,
->   e.DepartmentId = d.DepartmentId
-> ```
+> There is no `cardinality/nulljoin` gate. If an absent key has a real
+> matchable meaning, first map both sides to an explicit non-NULL key and
+> match those keys. The NULL itself never establishes correspondence.
 >

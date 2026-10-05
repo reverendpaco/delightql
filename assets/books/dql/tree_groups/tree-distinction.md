@@ -4,12 +4,12 @@
 Tree structures can serve as grouping columns, enabling aggregation alongside
 hierarchical output:
 ```delightql
-employee(*)
-  |> %( { Title,
-          "people": ~> {FirstName, LastName},
-          State } as people_by_title_and_state
+invoice(*)
+  |> %( { billing_country,
+          "invoices": ~> {invoice_id, invoice_date},
+          billing_city } as invoices_by_country_and_city
           ~>
-        sum:(Salary), count:(*) )
+        sum:(total), count:(*) )
 ```
 
 
@@ -17,20 +17,20 @@ employee(*)
 explicit grouping columns:
 
 ```{.delightql .bad}
-// INVALID: LastName appears in tree group and as grouping column
-employee(*)
-  |> %( { Title, "people": ~> {FirstName, LastName}, State } as tree,
-        LastName
+// INVALID: invoice_date appears in tree group and as grouping column
+invoice(*)
+  |> %( { billing_country, "invoices": ~> {invoice_id, invoice_date}, billing_city } as tree,
+        invoice_date
           ~>
-        sum:(Salary) )
+        sum:(total) )
 ```
 
 Columns not referenced in the tree may be added:
 ```delightql
-employee(*)
-  |> %( { Title, "people": ~> {FirstName, LastName}, State } as tree,
-        DepartmentId
+invoice(*)
+  |> %( { billing_country, "invoices": ~> {invoice_id, invoice_date}, billing_city } as tree,
+        customer_id
           ~>
-        sum:(Salary), count:(*) )
+        sum:(total), count:(*) )
 ```
 

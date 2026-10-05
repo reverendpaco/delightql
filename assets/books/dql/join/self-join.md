@@ -2,11 +2,11 @@
 
 Aliases distinguish multiple references to the same table:
 ```delightql
-employee(*) as e, employee(*) as mgr, e.ManagerId = mgr.Id
-  |> (e.Name as Employee, mgr.Name as Manager)
+employee(*) as e, employee(*) as mgr, e.reports_to = mgr.employee_id
+  |> (e.last_name as employee, mgr.last_name as Manager)
 ```
 ```sql
-SELECT e.Name AS Employee, mgr.Name AS Manager
+SELECT e.last_name AS employee, mgr.last_name AS Manager
 FROM employee e
-  JOIN employee mgr ON e.ManagerId = mgr.Id;
+  JOIN employee mgr ON e.reports_to = mgr.employee_id;
 ```

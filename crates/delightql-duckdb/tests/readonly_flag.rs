@@ -64,7 +64,7 @@ fn run_via_binary(db: &std::path::Path, readonly: bool, sql: &str) -> Result<Vec
     let VersionResult::Accepted(mut session) = client
         .version(
             1_000_000,
-            b"relay0".to_vec(),
+            delightql_protocol::PROTOCOL_VERSION.to_vec(),
             300_000,
             vec![Orientation::Rows],
         )

@@ -9,7 +9,6 @@
 // the kind); canonical_danger_uri() normalizes.
 
 use crate::diagnostic::{DelightQLError, Parse};
-use std::collections::HashMap;
 
 use super::asts::core::{DangerSpec, DangerState};
 
@@ -34,47 +33,7 @@ const KNOWN_DANGERS: &[(&str, DangerState, bool)] = &[
         DangerState::Off,
         false,
     ), // semantic — inline-only
-    // TWO LIVE SCOPES NEVER SHARE A NAME: acknowledging admits the
-    // ambiguous co-activation. Guardrail class — it changes what the
-    // session permits, not what an operator means — so CLI override is
-    // allowed.
-    ("delightql-danger://scope/duplicate", DangerState::Off, true),
 ];
-
-/// A map of danger URIs to their current states. A gate is named exactly:
-/// lookup is by canonical URI, so opening `cardinality/` opens nothing.
-#[derive(Debug, Clone)]
-pub struct DangerGateMap {
-    gates: HashMap<String, DangerState>,
-}
-
-impl DangerGateMap {
-    pub fn with_defaults() -> Self {
-        let gates = KNOWN_DANGERS
-            .iter()
-            .map(|(uri, state, _cli)| (uri.to_string(), *state))
-            .collect();
-        Self { gates }
-    }
-
-    pub fn apply_overrides(&mut self, specs: &[DangerSpec]) {
-        for spec in specs {
-            self.gates.insert(spec.uri.clone(), spec.state);
-        }
-    }
-
-    pub fn is_enabled(&self, uri: &str) -> bool {
-        match self.get(uri) {
-            Some(DangerState::On) => true,
-            Some(DangerState::Severity(n)) if *n > 0 => true,
-            _ => false,
-        }
-    }
-
-    pub fn get(&self, uri: &str) -> Option<&DangerState> {
-        self.gates.get(uri)
-    }
-}
 
 /// The danger badge scheme's URI prefix.
 pub const DANGER_URI_SCHEME: &str = "delightql-danger://";
@@ -209,8 +168,3 @@ mod cli_danger_spec_tests {
     }
 }
 
-impl Default for DangerGateMap {
-    fn default() -> Self {
-        Self::with_defaults()
-    }
-}

@@ -13,9 +13,10 @@
 //! a per-compilation draw from a per-process one, and a suite that could not
 //! tell them apart would pass over a mint seeded once at startup.
 //!
-//! The canonical policy is the other side of the same acceptance: the same
-//! two processes must agree exactly, or no contract lane could pin emitted
-//! SQL at all.
+//! The other side of the same acceptance is the Header: it marks each
+//! invented name minted, and a digest that includes column names reads a
+//! minted column by position rather than by spelling. So two processes that
+//! disagree on every invented name still agree on the digest.
 
 use std::process::Command;
 
@@ -26,56 +27,40 @@ fn dql_bin() -> &'static str {
 /// Four invented names in one heading and nothing else to depend on.
 const QUERY: &str = "_(v @ 1) |> (v + 1, v + 2, v + 3, v + 4)";
 
-fn sql_from_a_fresh_process(policy: Option<&str>) -> String {
-    let mut cmd = Command::new(dql_bin());
-    cmd.args(["query", "--to", "sql", QUERY]);
-    match policy {
-        Some(policy) => cmd.env("DQL_NAME_POLICY", policy),
-        None => cmd.env_remove("DQL_NAME_POLICY"),
-    };
-    let out = cmd.output().expect("spawn dql");
+fn from_a_fresh_process(args: &[&str]) -> String {
+    let out = Command::new(dql_bin())
+        .args(["query"])
+        .args(args)
+        .arg(QUERY)
+        .output()
+        .expect("spawn dql");
     assert!(
         out.status.success(),
         "dql refused: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8(out.stdout).expect("utf-8 sql")
+    String::from_utf8(out.stdout).expect("utf-8 output")
 }
 
 #[test]
 fn two_fresh_processes_draw_different_names() {
-    let first = sql_from_a_fresh_process(None);
-    let second = sql_from_a_fresh_process(None);
+    let first = from_a_fresh_process(&["--to", "sql"]);
+    let second = from_a_fresh_process(&["--to", "sql"]);
     assert_ne!(
         first, second,
-        "the shipped policy must draw invented names fresh; identical SQL from \
-         two processes means something is dependable that was ruled not to be"
+        "invented names must be drawn fresh; identical SQL from two processes \
+         means something is dependable that was ruled not to be"
     );
 }
 
 #[test]
-fn two_fresh_processes_agree_on_canonical_names() {
-    let first = sql_from_a_fresh_process(Some("canonical"));
-    let second = sql_from_a_fresh_process(Some("canonical"));
-    assert_eq!(
-        first, second,
-        "canonical SQL is what a contract lane pins; it must not move between runs"
-    );
-    assert!(
-        first.contains("<mint:1>") && first.contains("<mint:4>"),
-        "canonical names are numbered per heading: {first}"
-    );
-}
-
-#[test]
-fn an_unknown_policy_refuses_rather_than_falling_back() {
-    let mut cmd = Command::new(dql_bin());
-    cmd.args(["query", "--to", "sql", QUERY])
-        .env("DQL_NAME_POLICY", "canonicalish");
-    let out = cmd.output().expect("spawn dql");
-    assert!(
-        !out.status.success(),
-        "a misspelled policy that fell back to the default would report a \
-         contract nobody asked for"
-    );
+fn two_fresh_processes_agree_on_a_name_bearing_digest() {
+    for digest in ["totalhash", "fingerprint"] {
+        let first = from_a_fresh_process(&["-f", digest]);
+        let second = from_a_fresh_process(&["-f", digest]);
+        assert_eq!(
+            first, second,
+            "{digest} reads a minted column by position, so it must not move between runs"
+        );
+    }
 }

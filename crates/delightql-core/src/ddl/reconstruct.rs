@@ -13,14 +13,12 @@
 //! consolidated grammar and the one normalization; the only thing that makes
 //! it a reconstruction rather than a parse is where the bytes came from.
 
-use crate::diagnostic::{Constraint, Internal};
-use crate::error::{DelightQLError, Result};
+use crate::diagnostic::Internal;
+use crate::error::Result;
 
 use crate::pipeline::asts::core::Query;
-use crate::pipeline::asts::ddl::{ClauseDecl, DdlBody, DefinitionGroup};
+use crate::pipeline::asts::ddl::{Clause, ClauseDecl};
 use crate::pipeline::normalize::Normalized;
-use crate::pipeline::query_features::HoParamBindings;
-use crate::pipeline::syntax::{cst, SyntaxTree, TypedNode};
 use std::rc::Rc;
 
 /// One subject's clauses, read from the source the catalog stored.
@@ -28,122 +26,26 @@ use std::rc::Rc;
 /// The source holds the clauses of ONE subject in authored order — that is
 /// what `entity_clause` keeps and what a group's reconstruction asks for.
 pub fn clauses(source: &str) -> Result<Vec<ClauseDecl>> {
-    normalized(source, None).map(Normalized::into_definitions)
+    normalized(source).map(Normalized::into_definitions)
+}
+
+/// The same, with the danger and option annotations the source states
+/// beside its clauses (a definition's own declarations).
+pub fn clauses_declared(source: &str) -> Result<(Vec<ClauseDecl>, crate::pipeline::normalize::Sidecars)> {
+    normalized(source).map(|mut normalized| {
+        let declared = std::mem::take(&mut normalized.declared);
+        (normalized.into_definitions(), declared)
+    })
 }
 
 /// The same, assembled. Every clause law runs in `DefinitionGroup::assemble`,
-/// before a caller can register a name or mint a scope.
-///
-/// MEMOIZED FOR THE LIFE OF ONE COMPILATION. A subject asked for five times in
-/// one compilation is read once; the memo is opened and closed by
-/// [`Compilation`], so nothing built under one compilation's arena can be
-/// handed to the next.
-pub fn group(source: &str) -> Result<DefinitionGroup> {
-    if let Some(hit) = Compilation::cached(source) {
-        return Ok(hit);
-    }
-    let built = assemble(source)?;
-    Compilation::remember(source, &built);
-    Ok(built)
-}
-
-fn assemble(source: &str) -> Result<DefinitionGroup> {
-    let decls = clauses(source)?;
-    if decls.is_empty() {
-        return Err(Internal::invariant(
-            "ddl::reconstruct",
-            format!(
-                "No definition found in source: '{}'",
-                crate::pipeline::parse::truncate_for_display(source, 60)
-            ),
-        ));
-    }
-    DefinitionGroup::assemble(decls)
-}
-
-thread_local! {
-    /// Open memos, innermost last. A compilation may open another inside
-    /// itself — a consulted definition's instantiation is one — and each
-    /// keeps its own, so nothing
-    /// a nested compilation read outlives it.
-    static MEMOS: std::cell::RefCell<Vec<(u64, std::collections::HashMap<String, DefinitionGroup>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    static NEXT_MEMO: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// The reconstruction memo's scope: ONE compilation.
-///
-/// A reconstructed group is built with its own fresh identity arena, exactly
-/// as an unmemoized read would be — the memo saves the READING, never the
-/// arena. Holding it in a guard rather than in a static is what makes the
-/// boundary a thing that ends: the guard drops, the memo goes, and the next
-/// compilation reads the stored source for itself.
-pub struct Compilation {
-    id: u64,
-}
-
-impl Compilation {
-    /// Open a memo for the compilation about to run.
-    pub fn open() -> Compilation {
-        let id = NEXT_MEMO.with(|next| {
-            let id = next.get().wrapping_add(1);
-            next.set(id);
-            id
-        });
-        MEMOS.with(|memos| {
-            memos
-                .borrow_mut()
-                .push((id, std::collections::HashMap::new()))
-        });
-        Compilation { id }
-    }
-
-    fn cached(source: &str) -> Option<DefinitionGroup> {
-        MEMOS.with(|memos| {
-            memos
-                .borrow()
-                .last()
-                .and_then(|(_, memo)| memo.get(source).cloned())
-        })
-    }
-
-    fn remember(source: &str, group: &DefinitionGroup) {
-        MEMOS.with(|memos| {
-            if let Some((_, memo)) = memos.borrow_mut().last_mut() {
-                memo.insert(source.to_string(), group.clone());
-            }
-        });
-    }
-}
-
-impl Drop for Compilation {
-    /// Removed BY IDENTITY, not by position: two compilations' lifetimes may
-    /// overlap without nesting, and popping the top would then retire the
-    /// wrong one's memo.
-    fn drop(&mut self) {
-        let id = self.id;
-        MEMOS.with(|memos| {
-            memos.borrow_mut().retain(|(open, _)| *open != id);
-        });
-    }
-}
-
-/// ONE CLAUSE's body, normalized with the call site's bindings in hand.
-///
-/// Substitution is a CST-to-AST judgment — a formal in relation position
-/// becomes the supplied relation, a formal in a bound becomes the supplied
-/// integer — so the bindings are supplied at the entrance rather than applied
-/// to a built tree, which would have to re-decide from the AST which positions
-/// were formals.
-///
-/// The stored source is a whole clause; what an expansion wants is the body it
-/// binds. Reading the body off the reconstructed clause is what keeps the neck
-/// a PARSED node rather than a substring — searching text for `:-` finds one
-/// inside a string literal, a comment, or a nested definition, and the "body"
-/// that follows is bytes that were never a body.
-pub fn bound_body(source: &str, bindings: HoParamBindings) -> Result<Query> {
-    let decls = normalized(source, Some(bindings))?.into_definitions();
-    let Some(decl) = decls.into_iter().next() else {
+/// before a caller can register a name or mint a scope. A stored source is
+/// ONE subject's clauses — what `entity_clause` keeps.
+#[cfg(test)]
+pub fn group(source: &str) -> Result<crate::pipeline::asts::ddl::DefinitionGroup> {
+    let Some(family) =
+        crate::pipeline::asts::ddl::ClauseFamily::gather_one(clauses(source)?)?
+    else {
         return Err(Internal::invariant(
             "ddl::reconstruct",
             format!(
@@ -152,129 +54,36 @@ pub fn bound_body(source: &str, bindings: HoParamBindings) -> Result<Query> {
             ),
         ));
     };
-    match decl.body {
-        DdlBody::Relational(query) => Ok(query),
-        DdlBody::FactFunction(_) => Err(DelightQLError::from(Constraint::General {
-            message: "a fact-function mode is not a higher-order relational body".to_string(),
-        })),
-        DdlBody::Scalar(_) => Err(DelightQLError::from(Constraint::General {
-            message: format!(
-                "'{}' is a value rule; its body is not relational",
-                crate::pipeline::parse::truncate_for_display(source, 60)
-            ),
-        })),
-        DdlBody::Truth(_) => Err(DelightQLError::from(Constraint::General {
-            message: format!(
-                "'{}' is a truth rule; its body is not relational",
-                crate::pipeline::parse::truncate_for_display(source, 60)
-            ),
-        })),
-        // A body still awaiting substitution, handed bindings that did not
-        // supply what it waits for. Saying so is the honest propagation.
-        DdlBody::Deferred { source } => Err(Internal::invariant(
+    crate::pipeline::asts::ddl::DefinitionGroup::assemble(family)
+}
+
+/// ONE PARAMETERIZED CLAUSE'S BODY, read again from its text before any
+/// use — the reference census's reading.
+pub fn analysis_clause_body(clause: &Clause) -> Result<Query> {
+    reread(clause)
+}
+
+fn reread(clause: &Clause) -> Result<Query> {
+    let text = clause.body_text.as_ref().ok_or_else(|| {
+        Internal::invariant(
             "ddl::reconstruct",
-            format!(
-                "the body '{}' still awaits substitution",
-                crate::pipeline::parse::truncate_for_display(&source, 60)
-            ),
-        )),
-    }
-}
-
-/// ONE BARE BODY, normalized with the call site's bindings in hand.
-///
-/// A deferred payload holds the authored characters of a BODY, not of a
-/// clause — the front matter was complete without them. The entrance is
-/// therefore the utility one: the caller knows which of the two it is holding,
-/// and the entrances OVERLAP, so nothing here guesses.
-pub fn bound_relex(body_source: &str, bindings: HoParamBindings) -> Result<Query> {
-    let tree = crate::pipeline::parse::query_sequence(body_source)?;
+            "a parameterized clause is read again only from the text its reading recorded",
+        )
+    })?;
+    let tree = crate::pipeline::parse::query_sequence(&text.source)?;
     let registry = Rc::new(crate::names::Registry::new(&[]));
-    let normalized = crate::pipeline::normalize::bound_query_sequence(&tree, registry, bindings)?;
-    let mut queries = normalized.into_queries();
-    if queries.len() != 1 {
-        return Err(DelightQLError::from(Constraint::General {
-            message: format!(
-                "a body is one relational expression: '{}'",
-                crate::pipeline::parse::truncate_for_display(body_source, 60)
-            ),
-        }));
-    }
-    Ok(queries.remove(0).query)
+    crate::pipeline::normalize::reread_body(
+        &tree,
+        registry,
+        text.enclosing.clone(),
+        clause.params(),
+    )
 }
 
-fn normalized(source: &str, bindings: Option<HoParamBindings>) -> Result<Normalized> {
+fn normalized(source: &str) -> Result<Normalized> {
     let tree = crate::pipeline::parse::definition_file(source)?;
     let registry = Rc::new(crate::names::Registry::new(&[]));
-    match bindings {
-        Some(bindings) => {
-            crate::pipeline::normalize::stored_bound_definition_file(&tree, registry, bindings)
-        }
-        None => crate::pipeline::normalize::stored_definition_file(&tree, registry),
-    }
-}
-
-/// The BODY of a stored clause, in the author's own bytes.
-///
-/// A definition's neck is a PARSED node, never a substring: searching text for
-/// `:-` reads a neck out of a string literal, a comment, or a body's own nested
-/// definition, and the "body" that follows is bytes that were never a body. The
-/// grammar knows where the neck is, so it is asked.
-///
-/// Text that is not a definition is already a body (`x * 2`, `_( … )`) and
-/// comes back unchanged — callers receive whole clauses from the catalog and
-/// bare bodies from the compiler alike. A `(~~docs ~~)` annotation is the
-/// definition's own `doc`, so the span already excludes it.
-pub fn body_text(source: &str) -> String {
-    let Ok(tree) = crate::pipeline::parse::definition_file(source) else {
-        return strip_docs_block(source.trim()).to_string();
-    };
-    let found = crate::pipeline::syntax::walk(&tree)
-        .find_map(|node| cst::EntityDefinition::cast(node.node()))
-        .and_then(|definition| body_span(&tree, definition));
-    match found {
-        Some(body) => body,
-        None => strip_docs_block(source.trim()).to_string(),
-    }
-}
-
-/// One arm per definition form, so a form that gains a body cannot quietly
-/// fall through to the whole-source fallback.
-fn body_span(tree: &SyntaxTree, definition: cst::EntityDefinition<'_>) -> Option<String> {
-    let text = |range: Option<std::ops::Range<usize>>| {
-        range.map(|range| tree.source()[range].trim().to_string())
-    };
-    match definition {
-        cst::EntityDefinition::RuleForm(rule) => match rule {
-            cst::RuleForm::FoRule(rule) => text(rule.body().and_then(|b| tree.byte_range(b))),
-            cst::RuleForm::HoRule(rule) => text(rule.body().and_then(|b| tree.byte_range(b))),
-            cst::RuleForm::FunctionRule(rule) => text(rule.body().and_then(|b| tree.byte_range(b))),
-            cst::RuleForm::ConstantRule(rule) => text(rule.body().and_then(|b| tree.byte_range(b))),
-            cst::RuleForm::SigmaRule(rule) => text(rule.body().and_then(|b| tree.byte_range(b))),
-            cst::RuleForm::EffectRule(rule) => text(rule.body().and_then(|b| tree.byte_range(b))),
-        },
-        cst::EntityDefinition::FactLike(fact) => match fact {
-            cst::FactLike::FactForm(fact) => text(fact.body().and_then(|b| tree.byte_range(b))),
-            cst::FactLike::HoFactForm(fact) => text(fact.body().and_then(|b| tree.byte_range(b))),
-        },
-        // A fact function's arms ARE its body, and it has no body field to
-        // point at: the whole form is the answer.
-        cst::EntityDefinition::FactFunction(function) => text(tree.byte_range(function)),
-        cst::EntityDefinition::EdgeDeclaration(edge) => {
-            text(edge.body().and_then(|b| tree.byte_range(b)))
-        }
-    }
-}
-
-/// Strip a leading `(~~docs … ~~)` from body text the grammar could not place.
-fn strip_docs_block(text: &str) -> &str {
-    let trimmed = text.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("(~~docs") {
-        if let Some(end) = rest.find("~~)") {
-            return rest[end + 3..].trim_start();
-        }
-    }
-    trimmed
+    crate::pipeline::normalize::stored_definition_file(&tree, registry)
 }
 
 #[cfg(test)]
@@ -451,27 +260,33 @@ mod tests {
 
     /// A deferred BODY is not an absent GROUP.
     ///
-    /// A higher-order template whose text the body parser cannot read until
-    /// its parameters are substituted still assembles into a group: a
-    /// subject, a kind, an arity, and a head are all written LEFT of the
-    /// neck, so reading them waits on no argument.
+    /// A higher-order template whose bound names a scalar formal is read
+    /// where it is declared: the bound records the formal it names, and the
+    /// group assembles: a subject, a kind, an arity, and a head are all
+    /// written LEFT of the neck.
     #[test]
-    fn a_deferred_body_still_assembles_its_group() {
-        // The premise this test rests on: a bound naming a scalar formal has
-        // no integer to be until a call site supplies one. If normalization
-        // learns to read it unbound, the assertion fails loudly rather than
-        // the test quietly ceasing to exercise the deferral.
-        const TEMPLATE: &str = "T(*), #<n";
+    fn a_bound_naming_a_formal_reads_and_assembles_its_group() {
+        const TEMPLATE: &str = "T(*), #<$.n";
 
         let one = reconstruct::group(&format!("pick(T(*), n)(a, b) :- {TEMPLATE}"))
-            .expect("a deferred body still builds a group");
-        assert!(
-            matches!(one.first().body, DdlBody::Deferred { .. }),
-            "the premise: the body defers"
-        );
+            .expect("a body whose bound names a formal builds a group");
+        let DdlBody::Relational(query) = &one.first().body else {
+            panic!("the body is read, not deferred");
+        };
+        let bounds: Vec<_> = query
+            .body
+            .steps()
+            .iter()
+            .flat_map(|step| step.form().bound_formals())
+            .collect();
+        assert_eq!(bounds.len(), 1, "the bound records the formal it names");
         assert_eq!(one.name(), "pick");
         assert_eq!(one.kind(), DefKind::HoView);
-        assert_eq!(one.bound_param_names().len(), 2, "the fronts are complete");
+        assert_eq!(
+            one.first().head.bound_param_names().len(),
+            2,
+            "the fronts are complete"
+        );
 
         // And the laws ran over it: two clauses offering different names at
         // position 1 refuse, with nothing but their heads to decide on.
@@ -486,8 +301,7 @@ mod tests {
     }
 
     /// The clause laws run in the ONE door, before any caller can register
-    /// a name: mixed kinds, disagreeing arity, and the head algebra all
-    /// refuse at build.
+    /// a name: mixed kinds and the head algebra refuse at build.
     #[test]
     fn the_group_door_runs_the_clause_laws() {
         let mixed_kind = reconstruct::group("foo:(x) :- x + 1\nfoo(x) :- x > 0")
@@ -495,15 +309,6 @@ mod tests {
         assert_eq!(
             mixed_kind.error_uri(),
             "delightql-error://semantic/ddl/head/mixed_kind"
-        );
-
-        let param_arity = reconstruct::group(
-            "empty(column) :- null = column\nempty(column, other) :- trim:(column) = other",
-        )
-        .expect_err("clauses must agree on how many positions there are");
-        assert_eq!(
-            param_arity.error_uri(),
-            "delightql-error://semantic/ddl/head/param_arity"
         );
 
         let head_forms =
@@ -533,7 +338,7 @@ mod tests {
         assert_eq!(group.clauses().len(), 1);
 
         assert_eq!(group.kind(), DefKind::Function);
-        let params = group.params();
+        let params = group.first().params();
         assert_eq!(params.len(), 1);
         assert_eq!(scalar_param(&params[0]), ("x".to_string(), false));
     }
@@ -754,7 +559,7 @@ mod probe {
 
 /// A compilation's depth budget reaches the definitions it reads back.
 ///
-/// Reconstruction is not a tooling entrance: `group`, `bound_body` and their
+/// Reconstruction is not a tooling entrance: `group`, `bound_clause_body` and their
 /// siblings are called during resolution, grounding, effect transformation and
 /// consulted-view expansion, inside a compilation that has already armed. If
 /// these parses asked process policy again, a host moving that policy could
@@ -882,16 +687,22 @@ mod armed_depth_tests {
         let _running = Running::under(std::rc::Rc::new(ArmedLimits::from_policy()));
         NESTING.set(HIGHER);
 
+        let held = crate::pipeline::asts::ddl::Clause {
+            head: crate::pipeline::asts::core::definitions::Head::glob(),
+            body: crate::pipeline::asts::ddl::DdlBody::Deferred,
+            full_source: source.clone(),
+            doc: None,
+            body_text: Some(crate::pipeline::asts::ddl::BodyText {
+                source: bare,
+                enclosing: Default::default(),
+            }),
+        };
         for (entrance, error) in [
             ("clauses", super::clauses(&source).expect_err("clauses")),
             ("group", super::group(&source).expect_err("group")),
             (
-                "bound_body",
-                super::bound_body(&source, Default::default()).expect_err("bound_body"),
-            ),
-            (
-                "bound_relex",
-                super::bound_relex(&bare, Default::default()).expect_err("bound_relex"),
+                "analysis_clause_body",
+                super::analysis_clause_body(&held).expect_err("analysis_clause_body"),
             ),
         ] {
             let refused = refused_budget(&error);
@@ -903,84 +714,21 @@ mod armed_depth_tests {
     }
 }
 
-/// FACT ELABORATION (R4.2.7): a fact elaborates once, during definition
-/// assembly, into the ordinary ground relational clause shape — pinned at
-/// the same door the catalog's stored sources re-enter, so registration and
-/// reconstruction cannot drift.
+/// A family holding facts reaches registration as authored: the assembler
+/// decides its kind and leaves its clause agreement to the compile road's
+/// family judgment.
 #[cfg(test)]
-mod fact_elaboration_pins {
+mod fact_family_pins {
     use super::*;
-    use crate::pipeline::asts::ddl::{DdlBody, DefKind, Supply};
-
-    fn canonical(group: &DefinitionGroup) -> Vec<String> {
-        group
-            .canonical_names()
-            .expect("an elaborated fact group has a settled heading")
-            .iter()
-            .map(|name| name.to_string())
-            .collect()
-    }
-
-    /// A standard fact becomes one ground-headed clause per row over a unit
-    /// body, and a fact-only definition's unoffered positions receive the
-    /// canonical fact name `subject|N|`.
-    #[test]
-    fn a_standard_fact_elaborates_per_row_with_canonical_names() {
-        let built = group("person(0, \"Gusti\")\nperson(1, \"Diane\")").unwrap();
-        assert_eq!(built.kind(), DefKind::Fact);
-        assert_eq!(built.clauses().len(), 2);
-        assert_eq!(canonical(&built), vec!["person|1|", "person|2|"]);
-        for clause in built.clauses() {
-            let items = clause.head.items.listed().expect("a ground head");
-            assert_eq!(items.len(), 2);
-            assert!(items
-                .iter()
-                .all(|item| matches!(item.supply, Supply::Ground(_))));
-            assert!(matches!(clause.body, DdlBody::Relational(_)));
-        }
-    }
-
-    /// A multi-row standard fact splits per ROW: each row is its own clause,
-    /// so a duplicate row is a duplicate clause and stays a duplicate proof
-    /// through the ordinary UNION ALL combination.
-    #[test]
-    fn multi_row_and_duplicate_rows_are_clauses_and_proofs() {
-        let built = group(r#"b("foo","X"; "bar","Y")"#).unwrap();
-        assert_eq!(built.clauses().len(), 2);
-
-        let duplicates = group("d(7)\nd(7)").unwrap();
-        assert_eq!(duplicates.clauses().len(), 2, "two proofs of one row");
-    }
-
-    /// Heading offers settle once for the complete definition: an offer
-    /// names the position and a bare value abstains — the RULINGS example.
-    #[test]
-    fn offers_settle_once_and_abstentions_do_not_defeat_them() {
-        let built = group("f(1 as a, 2 as b)\nf(3, 4)").unwrap();
-        assert_eq!(canonical(&built), vec!["a", "b"]);
-    }
-
-    /// A stacked fact stays ONE clause: the header names the positions, the
-    /// head plumbs them, and the table remains the body.
-    #[test]
-    fn a_stacked_fact_is_one_clause_plumbing_its_header() {
-        let built = group(r#"employee(Id, Name --- 0, "Gusti"; 1, "Diane")"#).unwrap();
-        assert_eq!(built.kind(), DefKind::Fact);
-        assert_eq!(built.clauses().len(), 1);
-        assert_eq!(canonical(&built), vec!["Id", "Name"]);
-        let items = built.clauses()[0].head.items.listed().expect("plumb head");
-        assert!(items.iter().all(|item| item.supply.is_reference()));
-    }
+    use crate::pipeline::asts::ddl::DefKind;
 
     /// Mixed fact and relational clauses are the one ruled kind union: the
-    /// group is a relational definition and rule names win where facts
-    /// abstain.
+    /// group is a relational definition. Any other mix is two kinds under
+    /// one spelling.
     #[test]
     fn mixed_fact_and_rule_clauses_are_one_relational_definition() {
         let built = group("b(\"seed\", \"X\")\nb(tag, x) :- _(tag, x ---- \"r\", \"Y\")").unwrap();
         assert_eq!(built.kind(), DefKind::View);
-        assert_eq!(canonical(&built), vec!["tag", "x"]);
-        // Any OTHER mix is still two kinds under one spelling.
         for other in ["b(1)\nb:(x) :- x + 1", "b(1)\nb(x) :- x > 0"] {
             let err = group(other).unwrap_err();
             assert_eq!(
@@ -990,46 +738,15 @@ mod fact_elaboration_pins {
         }
     }
 
-    /// The refusal identities: offer disagreement, width disagreement, and
-    /// the Ground-Position rule — which the FACT spelling authenticates and
-    /// the rule spelling does not.
+    /// The Ground-Position rule still binds a rule's head: a ground head
+    /// position nobody names refuses.
     #[test]
-    fn the_fact_refusal_identities() {
-        let disagreement = group("g(1 as a)\ng(2 as z)").unwrap_err();
-        assert_eq!(
-            disagreement.error_uri(),
-            "delightql-error://semantic/ddl/head/name_conflict"
-        );
-
-        let width = group("w(1, 2)\nw(3)").unwrap_err();
-        assert_eq!(
-            width.error_uri(),
-            "delightql-error://semantic/ddl/head/arity"
-        );
-
-        // Fact syntax authenticates its positions…
-        assert!(group(r#"b("c", "d")"#).is_ok());
-        // …and the ordinary rule spelling of the same data still refuses.
+    fn a_rule_head_ground_position_must_be_named() {
         let rule = group(r#"b("c" as c, "d") :- _(1)"#).unwrap_err();
         assert_eq!(
             rule.error_uri(),
             "delightql-error://semantic/ddl/head/unnamed_ground_position"
         );
-    }
-
-    /// Identity is the identifier law's: an unstropped spelling folds to one
-    /// name; a strop is a different name and conflicts.
-    #[test]
-    fn offers_agree_by_identifier_not_characters() {
-        let folded = group("r(1 as TAG)\nr(2 as tag)").unwrap();
-        assert_eq!(folded.canonical_names().unwrap().len(), 1);
-
-        let stropped = group("q(1 as `Tag`)\nq(2 as tag)").unwrap_err();
-        assert_eq!(
-            stropped.error_uri(),
-            "delightql-error://semantic/ddl/head/name_conflict"
-        );
-        assert!(stropped.to_string().contains("`Tag`"));
     }
 
     /// A headerless parameterized fact's datum label has no verbose-form

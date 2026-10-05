@@ -2,14 +2,14 @@
 
 Sigma rules encapsulate reusable boolean logic:
 
-```delightql
+```{.delightql .am}
 is_high_value(amount) :- amount > 1000
 ```
 
 ```delightql
-orders(*),
-  +is_high_value(total),
-  +like(description, '%ipod')
+track(*),
+  +is_high_value(milliseconds / 1000),
+  +like(name, "%Pt. 1")
 ```
 
 
@@ -26,21 +26,21 @@ empty(column) :- +no_data(upper:(column))
 ```
 
 ```delightql
-employee(*),
-  +empty(LastName),
-  +empty(FirstName)
+customer(*),
+  +empty(company),
+  +empty(state)
 ```
 
 ```sql
 SELECT *
-FROM employee
-WHERE (LastName IS NULL
-       OR trim(LastName) = ''
-       OR upper(LastName)
+FROM customer
+WHERE (company IS NULL
+       OR trim(company) = ''
+       OR upper(company)
         IN ('NA', 'N/A', 'UNKNOWN'))
-  AND (FirstName IS NULL
-       OR trim(FirstName) = ''
-       OR upper(FirstName)
+  AND (state IS NULL
+       OR trim(state) = ''
+       OR upper(state)
         IN ('NA', 'N/A', 'UNKNOWN'));
 ```
 
@@ -57,7 +57,7 @@ To create a sigma rule:
 
 > Sigma predicates include:
 >
-> - Infix comparisons: `age < 20`, `LastName = 'Johnson'`
+> - Infix comparisons: `age < 20`, `last_name = 'Johnson'`
 > - Functor predicates: `+like(description, 'ipod%')`, `+between(Salary, 50000, 100000)`
 > - `in` statements: `state in ("MA"; "TX"; "CA")`
 > - Existence tests: `+other_table(...)`, `\+other_table(...)`

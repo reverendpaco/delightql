@@ -253,10 +253,8 @@ mod tests {
                 continue;
             };
             let name = &rest[..end];
-            let shaped = !name.is_empty()
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_');
+            let shaped =
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
             if shaped {
                 found.insert(name.to_string());
             }
@@ -295,7 +293,10 @@ mod tests {
         let found = workspace_consulted();
         let declared: BTreeSet<String> =
             WORKSPACE_CONSULTED.iter().map(|s| s.to_string()).collect();
-        assert_eq!(found, declared, "WORKSPACE_CONSULTED drifted from the source");
+        assert_eq!(
+            found, declared,
+            "WORKSPACE_CONSULTED drifted from the source"
+        );
         let mut sorted = WORKSPACE_CONSULTED.to_vec();
         sorted.sort_unstable();
         assert_eq!(sorted, WORKSPACE_CONSULTED, "keep the census sorted");
@@ -303,7 +304,10 @@ mod tests {
         deps.sort_unstable();
         assert_eq!(
             deps,
-            DEPENDENCY_CONSULTED.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            DEPENDENCY_CONSULTED
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>(),
             "keep the dependency census sorted"
         );
         assert!(
@@ -316,7 +320,10 @@ mod tests {
     fn capture_records_unset_variables_as_rows() {
         let context = ProcessContext::capture(Mode::Other);
         let names: BTreeSet<&str> = context.environment.iter().map(|r| r.name).collect();
-        assert!(names.contains("DQL_TEST_PANIC"), "an unset variable is still a row");
+        assert!(
+            names.contains("DQL_TEST_PANIC"),
+            "an unset variable is still a row"
+        );
         assert_eq!(
             names.len(),
             WORKSPACE_CONSULTED.len() + DEPENDENCY_CONSULTED.len()

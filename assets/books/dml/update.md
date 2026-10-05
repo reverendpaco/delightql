@@ -20,15 +20,15 @@ continues through `|>`. The full receipt algebra is normative in
 `SEMANTICS/effect-algebra-law.md` §3.
 
 ```delightql
-hr.employee!!(*)
-  , Department = "Executive"
-  |> $$("-------" as ssn)
-  |> update!(hr.employee(*))(*)
+employee!!(*)
+  , title = "IT Staff"
+  |> $$("-------" as phone)
+  |> update!(employee(*))(*)
 ```
 
 ```sql
-UPDATE hr.employee
-SET ssn = '-------'
-WHERE Department = 'Executive';
+UPDATE employee
+SET phone = '-------'
+WHERE title = 'IT Staff';
 ```
 

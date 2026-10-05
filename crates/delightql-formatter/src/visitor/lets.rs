@@ -17,6 +17,7 @@ impl<'t> Formatter<'t> {
                     cst::Cte::StandardCte(standard) => self.standard_cte(standard)?,
                     cst::Cte::LabelCte(label) => self.label_cte(label)?,
                     cst::Cte::HoCte(ho) => self.ho_cte(ho)?,
+                    cst::Cte::SigmaCte(sigma) => self.sigma_cte(sigma)?,
                 },
                 cst::LetBlockChild::EffectCte(effect) => {
                     match effect {
@@ -60,30 +61,18 @@ impl<'t> Formatter<'t> {
         Ok(())
     }
 
-    /// `name(params)(head): body` — the common higher-order expression. Both
-    /// groups belong to the subject, so they stand with the name whatever the
-    /// style does with the body; the body lays out exactly as a standard
+    /// `name(params)(head): body` — the common higher-order expression. The
+    /// heading belongs to the subject, so it stands with the name whatever
+    /// the style does with the body; the body lays out exactly as a standard
     /// binding's does.
     fn ho_cte(&mut self, cte: cst::HoCte<'t>) -> Result<()> {
         if let Some(name) = cte.name() {
             self.echo(name);
         }
-        self.output.write("(");
-        for child in cte.children() {
-            match child {
-                cst::HoCteChild::HoParam(param) => self.echo(param),
-                cst::HoCteChild::CommaSigil(_) => self.output.write(", "),
-            }
+        if let Some(head) = cte.head() {
+            self.echo(head);
         }
-        self.output.write(")(");
-        for item in cte.head() {
-            match item {
-                cst::HoCteHead::HeadTerm(term) => self.echo(term),
-                cst::HoCteHead::Glob(glob) => self.echo(glob),
-                cst::HoCteHead::CommaSigil(_) => self.output.write(", "),
-            }
-        }
-        self.output.write("): ");
+        self.output.write(": ");
         let outer = self.base_indent;
         if self.config.cte_style == CteStyle::Traditional {
             self.base_indent = self.config.cte_indent;
@@ -93,6 +82,14 @@ impl<'t> Formatter<'t> {
             self.let_free_relex(body)?;
         }
         self.base_indent = outer;
+        self.output.newline();
+        Ok(())
+    }
+
+    /// `name(params): truth` — a common sigma expression's truth-only
+    /// shadow-neck form.
+    fn sigma_cte(&mut self, cte: cst::SigmaCte<'t>) -> Result<()> {
+        self.echo(cte);
         self.output.newline();
         Ok(())
     }

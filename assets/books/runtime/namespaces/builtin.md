@@ -1,5 +1,5 @@
 
-# Builtin Namespaces {.dqlh}
+# Built-in Namespaces {.dqlh}
 
 Delightql guarantees the following namespaces:
 

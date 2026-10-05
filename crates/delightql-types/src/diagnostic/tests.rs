@@ -291,6 +291,10 @@ fn every_emitted_identity_is_registered() {
             message: String::new(),
         }
         .into(),
+        Configuration::BootTable {
+            problems: String::new(),
+        }
+        .into(),
         Authored::Abort {
             label: String::new(),
             observation_failure: None,

@@ -13,10 +13,13 @@ path = "src/main.rs"
 [dependencies]
 delightql-buildinfo = { path = "../delightql-buildinfo" }
 delightql-protocol = { path = "../delightql-protocol" }
-# The syntax front door. The runner splits a submission at the boundaries the
-# sequence root already draws; a second parser here would be a second answer.
+# The statement splitter. The runner divides a submission with core's own
+# `split_queries`, the one the CLI and the C ABI use; a second splitter here
+# would be a second answer.
+delightql-core = { path = "../delightql-core" }
+# The prompt wrap: a test's statement is what a user typed at a prompt, and
+# the host that sends it writes the goal marker.
 delightql-cst = { path = "../delightql-cst" }
 clap.workspace = true
 rusqlite.workspace = true
-sha2 = "0.10"
 zstd.workspace = true

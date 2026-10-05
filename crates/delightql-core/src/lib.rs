@@ -3,52 +3,40 @@
 pub mod api;
 pub(crate) mod bin_cartridge;
 pub(crate) mod compiler_limits;
+pub(crate) mod creation_target;
 pub(crate) mod ddl;
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod ddl_pipeline;
+pub(crate) mod definition_catalog;
 pub(crate) mod defuse;
 pub mod diagnostics;
 pub(crate) mod enums;
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod external_effects;
+pub(crate) mod host;
 pub(crate) mod lispy;
 pub(crate) mod names;
 pub(crate) mod namespace;
 pub(crate) mod pipeline;
-pub(crate) mod probe;
 pub(crate) mod refinement_budget;
 pub(crate) mod relation;
 pub(crate) mod resolution;
-pub(crate) mod seed_manifest;
-pub mod session_cwd;
+pub(crate) mod settings;
 pub(crate) mod sexp_formatter;
-pub(crate) mod sql_binding;
 pub(crate) mod stdlib_manifest;
 pub mod term_spec;
 pub mod uri_registry;
 
-// Modules that depend on rusqlite (native only)
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod bootstrap;
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod bootstrap_schema;
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod import;
 
-// open and relay: available on all targets (relay cfg-gates rusqlite internally)
 pub(crate) mod open;
 pub(crate) mod relay;
+pub(crate) mod system_vocabulary;
 
-// System module: full version for native, minimal version for WASM
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod system;
 
 #[cfg(test)]
 mod mount_lifecycle_tests;
-#[cfg(target_arch = "wasm32")]
-pub(crate) mod wasm_system;
-#[cfg(target_arch = "wasm32")]
-pub(crate) use wasm_system as system;
 
 // Re-export error types from delightql-types (needed at crate root for macros/ergonomics)
 pub use delightql_types::diagnostic;

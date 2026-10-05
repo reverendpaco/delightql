@@ -17,16 +17,15 @@ The path `.config.server.port` extracts the value directly.
 
 Instead of matching the full structure:
 ```delightql
-j ~= { name, "config": { "server": { port, host }, "database": { url } } }
+partner_sale(*), payload ~= { partner_order, "buyer": { email, country } }
 ```
 
 Path directly to what you need:
 ```delightql
-j ~= {
-  name,
-  .config.server.port,
-  .config.server.host,
-  .config.database.url
+partner_sale(*), payload ~= {
+  partner_order,
+  .buyer.email,
+  .buyer.country
 }
 ```
 
@@ -34,26 +33,26 @@ j ~= {
 
 Combine pathing with `as` to name the output column:
 ```delightql
-user_data ~= ~> {
-  country,
-  .name_info.last_name as ln,
-  .name_info.first_name as fn
-}
+partner_sale(*) |> (sale_id, payload:{.items} as items)
+  , items ~= ~> {
+      track_id,
+      .rights.territories as territories
+    }
 ```
 
 **Mixed matching and pathing:**
 
 Structural matching and pathing can combine in a single pattern:
 ```delightql
-j ~= {
-  name,
-  version,
-  .dependencies.react,
-  .dependencies.next
+partner_sale(*), payload ~= {
+  partner_order,
+  payout,
+  .buyer.email,
+  .buyer.country
 }
 ```
 
-Here `name` and `version` match top-level keys directly; the `.dependencies.*`
+Here `partner_order` and `payout` match top-level keys directly; the `.buyer.*`
 paths reach into nested structure.
 
 **Pathing in projection:**

@@ -47,13 +47,11 @@ module.exports = grammar({
   extras: $ => [
     /\s/,
     $.comment,
-    // Session tools: surface without semantics. They attach by position at
-    // build, like annotations, but unlike annotations their admitted
-    // positions are not law — spelling them at every continuation anchor
-    // would multiply the grammar without adding a distinction.
+    // A smart comment is surface without semantics. It attaches by position
+    // at build, like an annotation, but its admitted positions are not law —
+    // spelling it at every continuation anchor would multiply the grammar
+    // without adding a distinction.
     $.smart_comment,
-    $.stop_point,
-    $.debug_point,
   ],
 
   word: $ => $._classic_ident,
@@ -111,7 +109,6 @@ module.exports = grammar({
     $.open_expression,
     $.annotation,
     $.definition_annotation,
-    $.companion_cell,
     $.constraint_cell,
     $.operand,
     $.probe,
@@ -224,10 +221,20 @@ module.exports = grammar({
 
     namespace_qual: $ => seq($.namespace, token.immediate('.')),
 
+    // A namespace path is EXACT: it names a top-level namespace (or an
+    // explicit alias) and descends by `::`. The one relative form is the
+    // self-relative child route `.::child`, rooted at the primary definition
+    // context of the world the mention stands in — `home` at the prompt, a
+    // definition's own namespace inside its body. Nothing else is relative:
+    // an unmarked qualifier never searches the children of `home`, of the
+    // primary namespace, or of an enlisted namespace.
     namespace: $ => seq(
+      optional($.self_relative),
       $.identifier,
       repeat(seq(token.immediate('::'), $.identifier)),
     ),
+
+    self_relative: $ => '.::',
 
     // THE SLASH RIDES THE NAME, and it has to. A `/` of its own wins the
     // lexer race against division on length, so `x/2.2` — which no engine
@@ -315,7 +322,7 @@ module.exports = grammar({
     // RELATIONAL members, because a predicate or a bound completes nothing.
     outer_peer: $ => seq($.comma_sigil, field('member', $.grelex_like_member)),
 
-    grelex: $ => choice($.named_grelex, $.anon_grelex),
+    grelex: $ => choice($.named_grelex, $.anon_grelex, $.bare_singleton),
 
     named_grelex: $ => choice(
       $.inchoate_functor,
@@ -365,6 +372,25 @@ module.exports = grammar({
 
     anon_grelex: $ => seq('_(', $.anon_body, ')'),
 
+    // `name@expr` IS `_(name@expr)`: one row, one column. It is a grelex
+    // because the written anonymous table is one, so it stands wherever that
+    // does and nowhere else. A value is one domain expression and extends as
+    // far as one can.
+    //
+    // THREE REFUSAL WITNESSES, each refused at normalization with teaching
+    // rather than as a syntax error whose recovery splits the statement. The
+    // column is read as a reference so that a qualified name arrives; as a
+    // literal where a header would read one (`true`, `false`, `null` — the
+    // keyword's own production wins exactly as it does in `_(true @ 2)`), so
+    // that a ground never becomes a binder by losing its wrapper; and further
+    // `;` rows are read so that `a@1;2` arrives whole.
+    bare_singleton: $ => seq(
+      field('column', choice($.named_reference, $.boolean, $.null)),
+      $.singleton_sigil,
+      field('value', $.domain_expression),
+      repeat(seq(';', field('refused_row', $.domain_expression))),
+    ),
+
     interior: $ => repeat1($.continuation),
 
     // =====================================================================
@@ -410,7 +436,6 @@ module.exports = grammar({
       $.grelex,
       $.outer_grelex,
       $.outer_anon_grelex,
-      $.exists_anon_grelex,
     ),
 
     union_like_continuation: $ => choice(
@@ -441,16 +466,11 @@ module.exports = grammar({
     // evaluated.
     destructure_relex: $ => seq(
       field('source', $.domain_expression),
-      field('mode', $.destructure_mode),
-      // The pattern is a member LIST; braces belong to the NESTING form, so
-      // a metadata binding standing alone at the top of a destructure is the
-      // whole pattern and needs none.
-      field('pattern', choice($.tree_pattern, $.metadata_binding)),
-    ),
-
-    destructure_mode: $ => seq(
       $.destructure_sigil,
-      optional($.reduction_sigil),
+      // Iteration owns its target. This keeps the scalar-array binder under
+      // the `~>` that gives it one-row-per-element meaning; a non-iterating
+      // destructure can construct only an ordinary tree pattern.
+      field('pattern', choice($.tree_pattern, $.metadata_binding, $.iteration)),
     ),
 
     // ONE name; '?' marks the access as outer.
@@ -529,6 +549,7 @@ module.exports = grammar({
       $.residual_designator,
       $.grelex,
       $.ho_argument_reference,
+      $.parameter_reference,
       $.ground,
       $.relation_hole,
     ),
@@ -616,7 +637,7 @@ module.exports = grammar({
     // CTE may stand in a pure query is a judgment over the built block.
     let_block: $ => repeat1(choice($.cte, $.cfe, $.effect_cte, $.ddl_annotation)),
 
-    cte: $ => choice($.standard_cte, $.label_cte, $.ho_cte),
+    cte: $ => choice($.standard_cte, $.label_cte, $.ho_cte, $.sigma_cte),
 
     // A query-scoped label is a BARE name — no namespace. It outranks the
     // head-first reading: `users(*) : adults` is the labelling shorthand, not
@@ -640,23 +661,29 @@ module.exports = grammar({
       field('body', $.let_free_relex),
     ),
 
-    // The COMMON HIGHER-ORDER EXPRESSION: the consulted `ho_rule`'s head with
-    // the SHADOW-NECK — a parameterized rule that lives for the query. The
-    // parameter group and the head group are the rule's own (`ho_param`,
-    // `head_term`), so a formal admitted in a file is admitted here; the
+    // The COMMON HIGHER-ORDER EXPRESSION: the consulted `ho_rule`'s heading
+    // with the SHADOW-NECK — a parameterized rule that lives for the query.
+    // The heading is the rule's own production, so a formal admitted in a
+    // file is admitted here and the badge stands where it stands there; the
     // body is the query's own text and stays a `let_free_relex` like every
-    // other binding's. No badge position: a query-scoped parameterized
-    // fixpoint has no ruling to stand on.
+    // other binding's.
     ho_cte: $ => seq(
       field('name', $.predicate_identifier),
-      '(',
-      commaSep1($, $.ho_param),
-      ')',
-      '(',
-      field('head', choice(commaSep1($, $.head_term), $.glob)),
-      ')',
+      field('head', $.ho_heading),
       ':',
       field('body', $.let_free_relex),
+    ),
+
+    // The COMMON SIGMA EXPRESSION: the consulted sigma rule's truth head
+    // with the SHADOW-NECK. Its body is truth-only, so ordinary sigma
+    // argument binding and polarity remain the only observation road.
+    sigma_cte: $ => seq(
+      field('name', $.predicate_identifier),
+      '(',
+      commaSep1($, $.identifier),
+      ')',
+      ':',
+      field('body', $.sigma_body),
     ),
 
     // The deduplicating fixpoint; legal only on a recursive target.
@@ -688,6 +715,19 @@ module.exports = grammar({
       ')',
     ),
 
+    // The PARAMETERIZED heading payload: the badge, the inbound parameter
+    // row and the output head. The consulted rule and the query-scoped one
+    // share it, so the badge has one position on both necks.
+    ho_heading: $ => seq(
+      optional($.fixpoint_badge),
+      '(',
+      commaSep1($, $.ho_param),
+      ')',
+      '(',
+      field('output', choice(commaSep1($, $.head_term), $.glob)),
+      ')',
+    ),
+
     // One list: a query-scoped function. Two: HO-CFE — the first list holds
     // the curried (function-valued) params.
     cfe: $ => seq(
@@ -702,7 +742,10 @@ module.exports = grammar({
 
     cfe_params: $ => commaSep1($, $.cfe_param),
 
-    cfe_param: $ => choice($.context_marker, $.callable_param, $.plain_param),
+    // A scalar parameter may carry a guard exactly as a consulted value-
+    // function parameter does; repeated same-name heads form one ordered
+    // clause family at the block that admits them.
+    cfe_param: $ => choice($.context_marker, $.callable_param, $.guarded_param, $.plain_param),
 
     callable_param: $ => seq(field('name', $.identifier), ':(', ')'),
     plain_param: $ => $.identifier,
@@ -753,7 +796,12 @@ module.exports = grammar({
     // FN.22 (amended): a metadata group may stand as an induced member's
     // body — `"by_country": ~> country:~> {sales}` iterates into the keyed
     // group.
-    iteration: $ => seq($.reduction_sigil, choice($.tree_pattern, $.metadata_binding)),
+    iteration: $ => seq($.reduction_sigil, choice($.iteration_pattern, $.metadata_binding)),
+
+    // The target an iteration licenses. Structural patterns are lawful both
+    // with and without iteration; the scalar-array binder is lawful only
+    // here, where the cardinality-changing operation owns it.
+    iteration_pattern: $ => choice($.tree_pattern, $.scalar_array_pattern),
 
     // Reach without matching. A path binding publishes the underscore-
     // flattened spelling; `as` renames.
@@ -773,9 +821,15 @@ module.exports = grammar({
     metadata_binding: $ => seq(
       field('key_column', $.key_column),
       $.metadata_sigil,
-      choice($.tree_pattern, $.metadata_binding, $.disregarded),
+      choice($.iteration_pattern, $.metadata_binding, $.disregarded),
     ),
 
+    // A scalar-array binder is a target of iteration, never a general tree
+    // pattern. Its brackets are the wrapped-binder spelling, not positional
+    // array destructuring.
+    scalar_array_pattern: $ => seq('[', $.binder, ']'),
+
+    // Positional array destructuring remains available without iteration.
     array_pattern: $ => seq('[', commaSep1($, $.indexed_binding), ']'),
 
     // A pattern, never a domain expression. The `.` opens a member wherever
@@ -886,14 +940,6 @@ module.exports = grammar({
 
     smart_comment: $ => seq('(/*', optional($._opaque_comment_text), '*/)'),
     _opaque_comment_text: $ => /([^*]|\*[^\/]|\*\/[^)])+/,
-
-    stop_point: $ => choice(
-      '(!)',
-      seq('(/!', $._opaque_stop_text, '!/)'),
-    ),
-    _opaque_stop_text: $ => /([^!]|![^\/]|!\/[^)])+/,
-
-    debug_point: $ => '>>>',
 
     // =====================================================================
     // Effects
@@ -1149,12 +1195,7 @@ module.exports = grammar({
 
     ho_rule: $ => seq(
       field('name', $.predicate_identifier),
-      '(',
-      commaSep1($, $.ho_param),
-      ')',
-      '(',
-      field('head', choice(commaSep1($, $.head_term), $.glob)),
-      ')',
+      field('head', $.ho_heading),
       $.definition_neck,
       optional($.doc_slot),
       field('body', $.relex),
@@ -1674,20 +1715,29 @@ module.exports = grammar({
     // A SCALAR PARAMETER IS CODE, NOT DATA. The reference arm names a
     // definition parameter whose value is substituted to an integer before the
     // ordinary resolved query exists — it never becomes a dynamic heading or a
-    // bind parameter. Which names qualify is a resolution judgment; that the
-    // term is a bare name and nothing row-dependent is this layer's, and it is
-    // why no column expression, application or literal-bearing operand
-    // derives here.
-    compile_time_integer: $ => choice($.number, $.scalar_parameter_reference),
+    // bind parameter. Which formal it names is a normalization judgment; that
+    // the term is a marked formal and nothing row-dependent is this layer's,
+    // and it is why no column expression, application or literal-bearing
+    // operand derives here.
+    compile_time_integer: $ => choice($.number, $.parameter_reference),
 
-    // A lone `_` is the disregarded anaphor, not a name, so it cannot stand
-    // here: the parameter spelling admits every identifier EXCEPT that one.
-    scalar_parameter_reference: $ => choice(
-      alias($._parameter_name, $.identifier),
-      $.stropped_form,
+    // A DEFINITION-OWNED SCALAR REFERENCE: `$.x` addresses the scalar formal
+    // `x` of the nearest enclosing relational or effect higher-order clause
+    // that declares one. A bare name in such a body is a column, never a
+    // formal, so the two binding spaces never compete. The name is glued to
+    // the sigil: `$. x` has no derivation, and the covers' `$(`, `+$(` and
+    // `$$(` differ from it at the character after `$`. A lone `_` is the
+    // disregarded anaphor and names no formal.
+    parameter_reference: $ => seq(
+      $.parameter_sigil,
+      field('name', choice(
+        alias($._parameter_name, $.identifier),
+        alias($._parameter_strop, $.stropped_form),
+      )),
     ),
 
-    _parameter_name: $ => token(/(_[a-zA-Z0-9_]+|[a-zA-Z][a-zA-Z0-9_]*)/),
+    _parameter_name: $ => token.immediate(/(_[a-zA-Z0-9_]+|[a-zA-Z][a-zA-Z0-9_]*)/),
+    _parameter_strop: $ => token.immediate(seq('`', /[^`]+/, '`')),
 
     // THE SPREAD IS A MULTI-DOMEX — an authored multi-reference that EXPANDS
     // at resolution into the columns it addresses, admitted in ENUMERATING
@@ -1742,7 +1792,7 @@ module.exports = grammar({
       $.parenthesized_operand,
       // The flowing value stands wherever a value does, at any depth: the CST
       // admits zero or many holes and the BUILDER judges the count once
-      // (`x /-> upper:(trim:(@))` needs the inner one). Refusing a second hole
+      // (`x >> upper:(trim:(@))` needs the inner one). Refusing a second hole
       // here would put that judgment in two places.
       $.composition_input,
       $.ground,
@@ -1753,6 +1803,7 @@ module.exports = grammar({
       $.relation_like,
       $.enclyph_like,
       $.json_access,
+      $.parameter_reference,
     ),
 
     // Every callable has exactly ONE open slot — a BUILD JUDGMENT over one CST
@@ -1777,7 +1828,7 @@ module.exports = grammar({
     ),
 
     // Zero holes: the flowing value lands at the row's final place, which
-    // is why `x /-> upper:(y)` means `upper(y, x)`.
+    // is why `x >> upper:(y)` means `upper(y, x)`.
     open_functor: $ => seq(
       field('callee', $.callee),
       ':(',
@@ -2066,14 +2117,10 @@ module.exports = grammar({
       seq(':"', repeat($.template_part), token.immediate('"')),
     ),
 
-    // A TEMPLATE'S TEXT IS TEXT. The session tools are extras — legal
-    // between any two tokens — and `>>>` is one of them, so without a
-    // lexical precedence a template ending `…{@}>>>` loses its tail to a
-    // debug point. Nothing inside a template is a session tool.
     template_part: $ => choice($.template_text, $.interpolation),
-    template_text: $ => token.immediate(prec(1, /[^{"]+/)),
+    template_text: $ => token.immediate(/[^{"]+/),
     triple_template_part: $ => choice($.triple_template_text, $.interpolation),
-    triple_template_text: $ => token.immediate(prec(1, /([^{"]|"[^{"]|""[^{"])+/)),
+    triple_template_text: $ => token.immediate(/([^{"]|"[^{"]|""[^{"])+/),
     interpolation: $ => seq('{', $.domain_expression, '}'),
 
     // Value position: ONE nested value; reduction position: an interior table.
@@ -2114,10 +2161,13 @@ module.exports = grammar({
     // Compound constructs
     // =====================================================================
 
-    record: $ => seq('{', commaSep1($, $.record_member), '}'),
+    // `{}` is the empty record and `[]` the empty tuple: constructors with
+    // zero members, values in their own right. The PATTERN curlies below
+    // stay nonempty — an empty pattern binds no heading.
+    record: $ => seq('{', optional(commaSep1($, $.record_member)), '}'),
     // A tuple position takes the record's spread spellings (FN.28),
     // expanding as FN.35 states.
-    tuple: $ => seq('[', commaSep1($, choice($.domain_expression, $.spread)), ']'),
+    tuple: $ => seq('[', optional(commaSep1($, choice($.domain_expression, $.spread))), ']'),
 
     record_member: $ => choice(
       $.keyed_value,
@@ -2223,6 +2273,7 @@ module.exports = grammar({
     _non_infix_truth: $ => choice(
       $.negation,
       $.existence,
+      $.exists_anon_grelex,
       $.sigma_application,
       $.parenthesized_truth,
     ),
@@ -2397,17 +2448,21 @@ module.exports = grammar({
     // inferred. The marker is a host-side root selector, the `?-` prepend's
     // cousin, and is never authored DelightQL.
     //
+    // THE MARKER SELECTS. Each marker admits exactly its own cell category,
+    // so a value where a constraint belongs, or a truth where a default
+    // belongs, is a parse defect at the cell's own bytes — never a tree of
+    // the other category for a reader to discover afterwards.
+    //
     // The column self-reference `@` reaches this sub-language through
     // `operand`'s composition_input: the bytes and the position are identical
     // to a value-level hole, so the CST records one node and the ROOT supplies
     // the category — which is exactly what FN.3 asks for.
     // =====================================================================
 
-    companion_cell_root: $ => seq($.companion_root_marker, $.companion_cell),
-
-    companion_root_marker: $ => choice('@constraint-cell', '@default-cell'),
-
-    companion_cell: $ => choice($.constraint_cell, $.default_cell),
+    companion_cell_root: $ => choice(
+      seq(alias('@constraint-cell', $.companion_root_marker), $.constraint_cell),
+      seq(alias('@default-cell', $.companion_root_marker), $.default_cell),
+    ),
 
     constraint_cell: $ => choice(
       $.primary_key_sigil,

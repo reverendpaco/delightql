@@ -6,13 +6,13 @@ octothorpe-prefixed functor `#()`{.delightql .sigil} applied after a pipe:
 
 ```delightql
 employee(*)
-    |>  #(FirstName,LastName)
+    |>  #(first_name,last_name)
 ```
 
-```Sql
+```sql
 select
   *
-from employee order by FirstName, LastName;
+from employee order by first_name, last_name;
 ```
 
 Columns appear in the SQL in the order given. Collation modifiers work as in
@@ -20,14 +20,14 @@ SQL--with keywords:
 
 ```delightql
 employee(*)
-    |>  #(Salary descending,LastName ascending)
+    |>  #(hire_date descending,last_name ascending)
 ```
 
 
-```Sql
+```sql
 select
   *
-from employee order by Salary desc, LastName asc;
+from employee order by hire_date desc, last_name asc;
 ```
 
 > `Order By` has no meaning in pure relational algebra, where relations are

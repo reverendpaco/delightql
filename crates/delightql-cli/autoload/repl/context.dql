@@ -1,0 +1,3 @@
+session(*) :- repl::data.session(*)
+argument(*) :- repl::data.argument(*)
+environment(*) :- repl::data.environment(*)

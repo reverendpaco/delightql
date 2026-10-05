@@ -27,8 +27,8 @@ table definition        | rule
 view definition         | rule
 join                    | logical and
 join                    | conjunction
-exists (semijoin)       | provable
-not exists (antijoin)   | not provable
+exists (semi-join)      | provable
+not exists (anti-join)  | not provable
 union                   | logical or
 union                   | disjunction
 union                   | predicate rule with multiple clauses
@@ -37,7 +37,7 @@ delete row              | retract a fact
 update row              | retract and assert fact
 number of columns       | predicate arity
 number of columns       | predicate dimensionality
-table-valued function   | higher order predicate
+table-valued function   | higher-order predicate
 : SQL and logic programming terminology equivalences
 
 

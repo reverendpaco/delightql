@@ -3,7 +3,7 @@
 //! Bin Cartridge Registry
 //!
 //! The registry maintains an index of all registered bin cartridges and their entities,
-//! providing fast O(1) lookup by entity name for the effect executor.
+//! providing fast O(1) lookup by entity name.
 
 use super::{BinCartridge, BinEntity};
 use std::collections::HashMap;
@@ -26,8 +26,8 @@ pub struct BinCartridgeRegistry {
     /// contain `::` — the old single-string index allowed exactly that
     /// bypass for `sys::execution.compile`.
     ///
-    /// We store Arc so the effect executor can clone the reference and release
-    /// the registry borrow before executing.
+    /// We store Arc so a caller can clone the reference and release the
+    /// registry borrow before executing.
     entity_index: HashMap<(String, String), Arc<dyn BinEntity>>,
 
     /// Namespaces whose entities are visible UNQUALIFIED, in registration
@@ -120,6 +120,23 @@ impl BinCartridgeRegistry {
             .cloned()
     }
 
+    /// Qualified counterpart to [`lookup_entities_with_namespace`].
+    pub(crate) fn lookup_qualified_entity_with_namespace<S: AsRef<str>>(
+        &self,
+        namespace_path: &[S],
+        name: &str,
+    ) -> Option<(String, Arc<dyn BinEntity>)> {
+        let namespace = namespace_path
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>()
+            .join("::");
+        self.entity_index
+            .get(&(namespace.clone(), name.to_string()))
+            .cloned()
+            .map(|entity| (namespace, entity))
+    }
+
     /// Get all registered cartridges
     ///
     /// Used for lifecycle management (calling on_registered, on_shutdown)
@@ -182,13 +199,13 @@ mod tests {
                 output_schema: OutputSchema::Relation(vec![]),
             }
         }
-
-        fn has_side_effects(&self) -> bool {
-            true
-        }
     }
 
     impl EffectExecutable for TestEntity {
+        fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+            crate::bin_cartridge::ExecutionClass::Effect
+        }
+
         fn execute(
             &self,
             _arguments: &[DomainExpression],

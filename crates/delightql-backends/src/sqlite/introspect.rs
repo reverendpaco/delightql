@@ -86,10 +86,12 @@ pub fn introspect_sqlite_database(
     Ok(entities)
 }
 
-/// Introspect columns for a specific table using PRAGMA table_info
+/// Introspect columns for a specific table using PRAGMA table_xinfo
 ///
-/// Internal helper function that queries SQLite's PRAGMA table_info to discover
-/// column metadata for a given table or view.
+/// Internal helper function that queries SQLite's PRAGMA table_xinfo to discover
+/// column metadata for a given table or view. A generated column is a column
+/// of the table's heading (`hidden` 2 or 3); a virtual table's hidden column
+/// (`hidden` 1) is not.
 ///
 /// # Arguments
 /// * `conn` - SQLite connection
@@ -109,7 +111,10 @@ pub(super) fn introspect_table_columns(
     // rusqlite's pragma helper quotes both the schema identifier and table
     // argument. This function is also used for an authored passthrough name,
     // so constructing PRAGMA text from either string is not safe.
-    conn.pragma(schema, "table_info", table_name, |row| {
+    conn.pragma(schema, "table_xinfo", table_name, |row| {
+        if row.get::<_, i32>(6)? == 1 {
+            return Ok(());
+        }
         let position = row.get::<_, i32>(0)?;
         let name = row.get::<_, String>(1)?;
         let data_type = row.get::<_, String>(2)?;

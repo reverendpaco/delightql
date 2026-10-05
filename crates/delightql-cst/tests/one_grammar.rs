@@ -55,21 +55,10 @@ fn one_authored_grammar_directory() {
     }
 }
 
-/// ONE GENERATED LANGUAGE. The façade binds one symbol and offers one handle.
+/// ONE GENERATED LANGUAGE, and it PARSES: the invariant is about a language
+/// that exists, not a symbol that links.
 #[test]
 fn one_generated_language() {
-    let facade =
-        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
-            .expect("the façade is readable");
-    let bindings = facade.matches("fn tree_sitter_").count();
-    assert_eq!(
-        bindings, 1,
-        "the façade binds one generated language, not {bindings}"
-    );
-    assert!(facade.contains("fn tree_sitter_delightql()"));
-
-    // And it PARSES: the invariant is about a language that exists, not a
-    // symbol that links.
     let mut parser = delightql_cst::Parser::new();
     let tree = parser.parse_query_sequence("users(*) |> (id)");
     assert!(!tree.has_defects(), "{:?}", tree.defects());

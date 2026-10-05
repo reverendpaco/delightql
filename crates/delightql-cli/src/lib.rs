@@ -6,19 +6,18 @@
 // Core modules (always available)
 pub mod args;
 pub mod attach;
+pub mod cli_surface;
 pub mod client;
 pub mod commands;
 pub mod connection;
 pub mod connection_factory;
-pub mod exec;
-pub mod exec_ng;
 pub mod embedded_db;
+pub mod exec_ng;
+pub mod fatboy_exec;
 pub mod file_inputs; // File input tracking with auto-numbering
+pub mod man_scrub;
 pub mod modifiers; // Modifier parsing for CSV/TSV files
 pub mod output_format;
-pub mod fatboy_exec;
-pub mod cli_surface;
-pub mod man_scrub;
 pub mod pipe_exec;
 pub mod sanitize;
 pub mod server;

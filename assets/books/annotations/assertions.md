@@ -5,7 +5,7 @@ relation at the authored point, abort the current run when the property
 answers NO, and otherwise release the exact relation that was checked.
 
 ```delightql
-at_least(n, T(*))(*) : T(*) ~> count:(*) as count, count >= n
+at_least(n, T(*))(*) : T(*) ~> count:(*) as count, count >= $.n
 
 users(*), age < 20
   !> assert!(at_least(2), "at least two young users")(*)

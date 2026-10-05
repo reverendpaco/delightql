@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! `semantic/effect/…` — the effect algebra's discipline.
+//! `semantic/effect/…` — the receipt algebra's discipline.
 
 use super::Semantic;
 use crate::diagnostic::{DelightQLError, Taxon};
@@ -61,6 +61,13 @@ pub enum Effect {
     #[leaf("landing/nowhere", class = Syntax, summary = "A directive's input landed nowhere.")]
     #[error("Validation error: {message}")]
     LandingNowhere { message: String },
+
+    /// An observing session — one opened to inspect, fingerprint or hash a
+    /// result — was handed a statement that would execute an effect. The
+    /// refusal is made before any dispatcher runs.
+    #[leaf("observation", class = Permission, summary = "An observation demanded an effect.")]
+    #[error("Validation error: {message}")]
+    Observation { message: String },
 
     /// One ledger release mixes `!>` payload reads of different receipt
     /// shapes.
@@ -175,12 +182,6 @@ pub enum EffectBody {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Taxon)]
 #[taxon(lineage(DelightQLError::Semantic, Semantic::Effect, Effect::Cte))]
 pub enum EffectCte {
-    /// A binding's label must agree with its body: an effect body under a
-    /// pure label, or a pure body under an effect label.
-    #[leaf("label", class = Syntax, summary = "A binding's label disagrees with its body.")]
-    #[error("Validation error: {message}")]
-    Label { message: String },
-
     /// The pure mark on a binding whose body demands an effect.
     #[leaf("pure_mark", class = Syntax, summary = "A pure mark on an effectful binding.")]
     #[error("Validation error: {message}")]
@@ -220,6 +221,20 @@ pub enum EffectDdl {
     #[leaf("target_namespace", class = Syntax, summary = "A DDL effect's target namespace is not writable.")]
     #[error("Validation error: {message}")]
     TargetNamespace { message: String },
+
+    /// A session creation's physical temp name is held on the same
+    /// connection for another durable namespace: one connection has one
+    /// temp name pool.
+    #[leaf("temp_name_held", class = Syntax, summary = "A session creation's temp name is held for another namespace on its connection.")]
+    #[error("Validation error: {message}")]
+    TempNameHeld { message: String },
+
+    /// A creation would leave a durable object and a session object of one
+    /// name on a connection whose engine cannot spell the durable object
+    /// past the session one, so an exact read of it could never be served.
+    #[leaf("unaddressable_durable", class = Syntax, summary = "A creation would leave a durable object its engine cannot address past a same-named session object.")]
+    #[error("Validation error: {message}")]
+    UnaddressableDurable { message: String },
 }
 
 /// `semantic/effect/main/…`
@@ -273,11 +288,6 @@ pub enum EffectRule {
     #[error("Validation error: {message}")]
     Arguments { message: String },
 
-    /// An effect rule's body is not in the grammar an effect body admits.
-    #[leaf("body_grammar", class = Syntax, summary = "An effect rule's body is not an effect body.")]
-    #[error("Validation error: {message}")]
-    BodyGrammar { message: String },
-
     /// An effect rule must end in a terminal or a demanded effect; this
     /// one ends in a relation nothing demands.
     #[leaf("ending", class = Syntax, summary = "An effect rule does not end in an effect.")]
@@ -288,11 +298,6 @@ pub enum EffectRule {
     #[leaf("name_collision", class = Syntax, summary = "An effect rule's name collides with a functor's.")]
     #[error("Validation error: {message}")]
     NameCollision { message: String },
-
-    /// An effect rule was demanded from a pure position.
-    #[leaf("purity", class = Syntax, summary = "An effect rule was demanded from a pure position.")]
-    #[error("Validation error: {message}")]
-    Purity { message: String },
 
     /// An effect rule reaches itself; effect rules do not recurse.
     #[leaf("recursion", class = Syntax, summary = "An effect rule recurses.")]

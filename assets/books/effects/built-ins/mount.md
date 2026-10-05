@@ -14,13 +14,12 @@ schema that becomes the system of record
 ## mount! {.dqlh}
 
 ```delightql
-mount!("prod.db", "data::prod")(*)
-  ->
+mount!("etl.sqlite", "data::prod")(*)
 ```
 
 success | operation | path | namespace
 --------|-----------|------|----------
-1 | mount! | prod.db | data::prod
+1 | mount! | etl.sqlite | data::prod
 
 The directive `mount!` is a higher-order directive. It takes a pair of
 higher-order parameters both of which are strings:
@@ -33,6 +32,7 @@ The namespace must not exist prior to the mount call.
 ## unmount! {.dqlh}
 
 ```delightql
+mount!("etl.sqlite", "data::prod")(*)
 unmount!("data::prod")(*)
 ```
 
@@ -48,6 +48,7 @@ discover new or changed entities.  Use this when other
 programs may modify the database entities underneath you.
 
 ```delightql
+mount!("etl.sqlite", "data::prod")(*)
 refresh!("data::prod")(*)
 ```
 

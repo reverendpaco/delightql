@@ -34,7 +34,7 @@ disjunction operator:
 _(1,2;10,20)
 ```
 
-```Sql
+```sql
 select 1,2
   UNION ALL
 select 10,20;
@@ -60,7 +60,7 @@ provides syntax for naming columns.
 ```
 
 
-```Sql
+```sql
 select 1 as first ,2 as second
   UNION ALL
 select 10,20
@@ -122,14 +122,16 @@ A sparse fill uses anonymous table syntax `_(col @ val)` to assign a value to
 a named sparse column. Fills appear after the positional values in a data row:
 
 ```delightql
-// Single fill
-"id", "INT", _(primary_key @ "true")
+_(column, type, nullable?, primary_key?
+  -------------------------------------
+  // Single fill
+  "id", "INT", _(primary_key @ "true") ;
 
-// Multiple separate fills
-"id", "INT", _(primary_key @ "true"), _(nullable @ "false")
+  // Multiple separate fills
+  "id", "INT", _(primary_key @ "true"), _(nullable @ "false") ;
 
-// Combined fill: multiple sparse columns in one expression
-"id", "INT", _(primary_key, nullable @ "true", "false")
+  // Combined fill: multiple sparse columns in one expression
+  "id", "INT", _(primary_key, nullable @ "true", "false"))
 ```
 
 In a combined fill, column names and values are matched positionally:

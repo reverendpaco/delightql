@@ -11,3 +11,8 @@ repository.workspace = true
 delightql-types = { path = "../delightql-types" }
 serde.workspace = true
 rmp-serde.workspace = true
+# The result digest (`digest`).
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json.workspace = true

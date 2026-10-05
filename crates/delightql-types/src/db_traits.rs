@@ -58,6 +58,18 @@ impl DbValue {
         matches!(self, DbValue::Null)
     }
 
+    /// The engine storage class this value carries, as a result descriptor
+    /// spells it. NULL declares nothing about its column and reports "".
+    pub fn storage_class(&self) -> &'static str {
+        match self {
+            DbValue::Null => "",
+            DbValue::Integer(_) => "INTEGER",
+            DbValue::Real(_) => "REAL",
+            DbValue::Text(_) => "TEXT",
+            DbValue::Blob(_) => "BLOB",
+        }
+    }
+
     /// The bytes this value carries to a consumer that speaks bytes;
     /// `None` is SQL NULL.
     ///

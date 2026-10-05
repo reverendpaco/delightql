@@ -55,14 +55,14 @@ fn shape(source: &str) -> String {
 #[test]
 fn the_argument_row_takes_the_default_landing_at_its_final_place() {
     // ZERO HOLES: the flowing value lands at the row's FINAL place. This is
-    // why `x /-> max:(0)` means `max(0, x)`.
-    no_hole_survives("_(x@1;2) |> (x /-> max:(0) as m)");
+    // why `x >> max:(0)` means `max(0, x)`.
+    no_hole_survives("_(x@1;2) |> (x >> max:(0) as m)");
 
     // THE PIPED SPELLING IS THE DIRECT ONE. The landing is spent at build,
     // so a step and the call it denotes normalize to the same shape and
     // nothing downstream can tell which was written.
     assert_eq!(
-        shape("_(x@1;2) |> (x /-> max:(0) as m)"),
+        shape("_(x@1;2) |> (x >> max:(0) as m)"),
         shape("_(x@1;2) |> (max:(0, x) as m)"),
         "a function-pipe step IS the application with the flowing value last"
     );
@@ -71,7 +71,7 @@ fn the_argument_row_takes_the_default_landing_at_its_final_place() {
     // orders are different applications, so the equality above is a fact
     // about the landing, not about `max` being symmetric here.
     assert_ne!(
-        shape("_(x@1;2) |> (x /-> max:(0) as m)"),
+        shape("_(x@1;2) |> (x >> max:(0) as m)"),
         shape("_(x@1;2) |> (max:(x, 0) as m)"),
     );
 }
@@ -81,7 +81,7 @@ fn the_argument_row_takes_the_default_landing_at_its_final_place() {
 #[test]
 fn several_written_arguments_keep_their_order_before_the_landing() {
     assert_eq!(
-        shape("_(x@1;2) |> (x /-> coalesce:(0, 50) as m)"),
+        shape("_(x@1;2) |> (x >> coalesce:(0, 50) as m)"),
         shape("_(x@1;2) |> (coalesce:(0, 50, x) as m)"),
     );
 }
@@ -90,8 +90,8 @@ fn several_written_arguments_keep_their_order_before_the_landing() {
 fn a_written_hole_takes_the_landing_from_the_argument_row() {
     // One written `@` overrides the implicit landing wherever it stands,
     // including under another application.
-    no_hole_survives("_(x@1;2) |> (x /-> max:(@, 0) as m)");
-    no_hole_survives("_(x@1;2) |> (x /-> max:(abs:(@), 0) as m)");
+    no_hole_survives("_(x@1;2) |> (x >> max:(@, 0) as m)");
+    no_hole_survives("_(x@1;2) |> (x >> max:(abs:(@), 0) as m)");
 }
 
 #[test]
@@ -100,8 +100,8 @@ fn a_window_position_is_a_landing_site() {
     // the landing the author wrote is in the PARTITION, and reading only
     // the argument row would insert the value there and leave this one
     // standing.
-    no_hole_survives("_(x@1;2) |> (x /-> row_number:(<~ %(@)) as rn)");
-    no_hole_survives("_(x@1;2) |> (x /-> row_number:(<~ #(@)) as rn)");
+    no_hole_survives("_(x@1;2) |> (x >> row_number:(<~ %(@)) as rn)");
+    no_hole_survives("_(x@1;2) |> (x >> row_number:(<~ #(@)) as rn)");
 }
 
 #[test]
@@ -109,15 +109,15 @@ fn a_guard_position_is_a_landing_site() {
     // A guard is a value position too — the truth it holds compares values,
     // and one of them may be what flows in. THE SLOT IS ONE, so the form
     // that wants the value in BOTH places names it.
-    no_hole_survives("_(x@1;2) |> (x /-> sum:(| @ > 0) as s)");
-    no_hole_survives("_(x@1;2) |> (x /-> :(|v| sum:(v | v > 0)) as s)");
+    no_hole_survives("_(x@1;2) |> (x >> sum:(| @ > 0) as s)");
+    no_hole_survives("_(x@1;2) |> (x >> :(|v| sum:(v | v > 0)) as s)");
 }
 
 #[test]
 fn the_slot_is_one() {
     // One value flows in and `@` names nothing, so a second bare hole has
     // no reading. The refusal names the spelling that does name it.
-    let refusal = refusal("_(x@1;2) |> (x /-> sum:(@ | @ > 0) as s)");
+    let refusal = refusal("_(x@1;2) |> (x >> sum:(@ | @ > 0) as s)");
     assert!(
         refusal.contains("writes '@' 2 times"),
         "a second bare hole refuses, counting them: {refusal}"
@@ -132,13 +132,13 @@ fn the_slot_is_one() {
 fn the_binder_names_the_flow() {
     // With a binder the NAME is the flowing value, so it may stand at as
     // many places as the author writes it — and at none is a discard.
-    no_hole_survives("_(x@1;2) |> (x /-> :(|v| v - v) as d)");
+    no_hole_survives("_(x@1;2) |> (x >> :(|v| v - v) as d)");
     assert!(
-        refusal("_(x@1;2) |> (x /-> :(|v| 1) as d)").contains("never uses it"),
+        refusal("_(x@1;2) |> (x >> :(|v| 1) as d)").contains("never uses it"),
         "a binder that stands nowhere receives nothing"
     );
     assert!(
-        refusal("_(x@1;2) |> (x /-> :(|v| v + @) as d)").contains("the binder IS the flow"),
+        refusal("_(x@1;2) |> (x >> :(|v| v + @) as d)").contains("the binder IS the flow"),
         "a binder beside a hole spells the flow twice"
     );
 }
@@ -170,8 +170,8 @@ fn a_form_with_no_argument_row_must_write_its_hole() {
     // A lambda and an open string have nowhere to put the value, so a
     // hole-less one would discard it. The refusal names both repairs.
     for source in [
-        "_(x@1;2) |> (x /-> :(3) as c)",
-        "_(x@1;2) |> (x /-> :\"hi\" as c)",
+        "_(x@1;2) |> (x >> :(3) as c)",
+        "_(x@1;2) |> (x >> :\"hi\" as c)",
     ] {
         let tree = crate::pipeline::syntax::Parser::new().parse_query_sequence(source);
         let refused = crate::pipeline::normalize::query_sequence(

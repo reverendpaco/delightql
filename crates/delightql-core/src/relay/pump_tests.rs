@@ -59,6 +59,12 @@ impl EagerSqliteHandler {
 
     fn run_query(&mut self, sql: &str) -> ServerTerm {
         self.sql_log.lock().unwrap().push(sql.to_string());
+        // The backend speaks SQLite: a PostgreSQL-dialect session's bracket
+        // opens here as SQLite's.
+        let sql = match sql {
+            "BEGIN ISOLATION LEVEL REPEATABLE READ" => "BEGIN",
+            other => other,
+        };
         // All connection work happens in this scope so the guard (and the
         // statement borrowing it) are gone before `store` borrows self.
         let executed: Result<(Vec<Dimension>, Vec<Vec<Cell>>), String> = (|| {
@@ -78,6 +84,7 @@ impl EagerSqliteHandler {
                     position: i as u64,
                     name: name.as_bytes().to_vec(),
                     descriptor: b"TEXT".to_vec(),
+                    naming: delightql_protocol::Naming::Authored,
                 })
                 .collect();
             let mapped = stmt
@@ -203,11 +210,33 @@ pub(super) fn relay_over(
     relay_over_with_log(system, conn).0
 }
 
+/// A relay over `conn` whose session OBSERVES: a statement that would
+/// execute an effect is refused before anything runs.
+pub(super) fn observing_relay_over(
+    system: &mut ReadySystem,
+    conn: Arc<Mutex<rusqlite::Connection>>,
+) -> TestRelay<'_> {
+    let (session, _) = backend_session(conn);
+    RelayParty::observing(system, session)
+}
+
 /// `relay_over` plus a clone of the backend's SQL log (for the peek pins).
 fn relay_over_with_log(
     system: &mut ReadySystem,
     conn: Arc<Mutex<rusqlite::Connection>>,
 ) -> (TestRelay<'_>, Arc<Mutex<Vec<String>>>) {
+    let (session, sql_log) = backend_session(conn);
+    (RelayParty::new(system, session), sql_log)
+}
+
+/// The in-process backend session a test relay runs its SQL on, with a
+/// clone of its SQL log.
+fn backend_session(
+    conn: Arc<Mutex<rusqlite::Connection>>,
+) -> (
+    Session<DirectTransport<EagerSqliteHandler>>,
+    Arc<Mutex<Vec<String>>>,
+) {
     let handler = EagerSqliteHandler::new(conn);
     let sql_log = Arc::clone(&handler.sql_log);
     let transport = DirectTransport::new(handler);
@@ -215,7 +244,7 @@ fn relay_over_with_log(
     let session: Session<DirectTransport<EagerSqliteHandler>> = match client
         .version(
             1_000_000,
-            b"relay0".to_vec(),
+            delightql_protocol::PROTOCOL_VERSION.to_vec(),
             300_000,
             vec![Orientation::Rows],
         )
@@ -226,7 +255,15 @@ fn relay_over_with_log(
             panic!("test backend rejected version: {}", error.message_str())
         }
     };
-    (RelayParty::new(system, session), sql_log)
+    (session, sql_log)
+}
+
+/// A statement as a host sends it: what a user typed at a prompt, behind
+/// the host's wrap.
+pub(super) fn statement(typed: &str) -> ClientTerm {
+    ClientTerm::Query {
+        text: delightql_cst::prompt_wrap(typed).into_owned().into_bytes(),
+    }
 }
 
 pub(super) fn shared_sqlite() -> Arc<Mutex<rusqlite::Connection>> {
@@ -309,17 +346,9 @@ fn post_run_unsupported_registration_is_a_quarantine_invariant_breach() {
     )
     .expect("fresh postgres system should build");
     let mut relay = relay_over(&mut system, Arc::clone(&conn));
-    let p = CompiledPlan {
-        entries: vec![ship("SELECT 1 AS value")],
-        exit_probe_sql: None,
-        created_objects: vec![crate::pipeline::compiled_query::PlanCreatedObject {
-            name: "created".to_string(),
-            is_view: false,
-            connection_id: None,
-            interior_positions: Vec::new(),
-        }],
-        typed: None,
-    };
+    let p = creating_plan(created_object(
+        crate::pipeline::asts::effects::DirectiveKind::Table,
+    ));
 
     let response = relay.play_plan_with_catalog(&p, &CatalogShouldNotRun);
     let (identity, message) = error_message(response);
@@ -346,12 +375,62 @@ pub(super) fn plan(entries: Vec<PlanEntry>) -> CompiledPlan {
     CompiledPlan {
         entries,
         exit_probe_sql: None,
-        created_objects: Vec::new(),
         typed: None,
     }
 }
 
 struct CatalogShouldNotRun;
+
+/// A plan-created object on the primary: a durable one on an engine with
+/// no probe for an unspelled schema is the invariant-breach branch's input.
+fn created_object(
+    directive: crate::pipeline::asts::effects::DirectiveKind,
+) -> crate::pipeline::compiled_query::PlanCreatedObject {
+    crate::pipeline::compiled_query::PlanCreatedObject::planned(
+        crate::creation_target::CreationTarget::for_test(
+            "main",
+            6,
+            2,
+            crate::creation_target::DurablePlacement::EngineDefault,
+            "created",
+            crate::pipeline::compiled_query::Materialization::of_directive(directive)
+                .expect("a materializing directive"),
+        ),
+        Vec::new(),
+    )
+}
+
+/// A one-run typed plan that returns `SELECT 1 AS value` and claims to
+/// have created `created` — created objects belong to the run that commits
+/// them.
+fn creating_plan(created: crate::pipeline::compiled_query::PlanCreatedObject) -> CompiledPlan {
+    use crate::pipeline::compiled_query::{EffectAction, EffectRun, EffectStep, TypedEffectPlan};
+    let typed = TypedEffectPlan {
+        setup: None,
+        runs: vec![EffectRun {
+            connection_id: None,
+            bracketed: true,
+            steps: vec![EffectStep {
+                occurrence: "return".to_string(),
+                operation: "return".to_string(),
+                route: None,
+                requirements: Vec::new(),
+                action: EffectAction::Return {
+                    statements: Vec::new(),
+                    ship: Some(PlanStatement::bare("SELECT 1 AS value")),
+                },
+            }],
+            created_objects: vec![created],
+        }],
+        cleanup: None,
+        guards: Vec::new(),
+    };
+    CompiledPlan {
+        entries: typed.flatten(),
+        exit_probe_sql: None,
+        typed: Some(typed),
+    }
+}
 
 impl CreatedObjectCatalog for CatalogShouldNotRun {
     fn reconcile(
@@ -449,17 +528,9 @@ fn created_object_registration_failure_retires_the_unsent_final_handle() {
     let conn = shared_sqlite();
     let mut system = fresh_system();
     let mut relay = relay_over(&mut system, Arc::clone(&conn));
-    let p = CompiledPlan {
-        entries: vec![ship("SELECT 1 AS value")],
-        exit_probe_sql: None,
-        created_objects: vec![crate::pipeline::compiled_query::PlanCreatedObject {
-            name: "created".to_string(),
-            is_view: false,
-            connection_id: None,
-            interior_positions: Vec::new(),
-        }],
-        typed: None,
-    };
+    let p = creating_plan(created_object(
+        crate::pipeline::asts::effects::DirectiveKind::TempTable,
+    ));
 
     let response = relay.play_plan_with_catalog(&p, &CatalogShouldNotRun);
     let (identity, message) = error_message(response);
@@ -499,6 +570,7 @@ fn routes_entries_per_connection() {
             sql: sql.to_string(),
             connection_id: Some(1),
             comment: None,
+            naming: None,
         })
     };
     let p = plan(vec![
@@ -508,6 +580,7 @@ fn routes_entries_per_connection() {
             sql: "SELECT v FROM pump_route_probe".to_string(),
             connection_id: Some(1),
             comment: None,
+            naming: None,
         }),
     ]);
     let resp = relay.handle_plan(&p);
@@ -522,8 +595,8 @@ fn routes_entries_per_connection() {
 // ---------------------------------------------------------------------
 
 use crate::pipeline::compiled_query::{
-    AbortProvenance, EffectAction, EffectStep, GuardDefinition, GuardPolarity, Requirement,
-    TerminalAction, TypedEffectPlan,
+    AbortProvenance, EffectAction, EffectRun, EffectStep, GuardDefinition, GuardPolarity,
+    Requirement, TerminalAction, TypedEffectPlan,
 };
 
 fn step(action: EffectAction, occurrence: &str, requirements: Vec<Requirement>) -> EffectStep {
@@ -554,29 +627,34 @@ fn bracketed_typed_plan(
     exit_probe_sql: Option<&str>,
     cleanup: Vec<PlanStatement>,
 ) -> CompiledPlan {
-    let mut steps = vec![step(
-        EffectAction::Begin {
-            connection_id: None,
-        },
-        "begin",
-        vec![],
-    )];
-    steps.extend(body_steps);
-    steps.push(step(
-        EffectAction::Commit {
-            connection_id: None,
-        },
-        "commit",
-        vec![],
-    ));
-    if !cleanup.is_empty() {
-        steps.push(step(EffectAction::Cleanup(cleanup), "cleanup", vec![]));
-    }
-    let typed = TypedEffectPlan { steps, guards };
+    runs_typed_plan(vec![body_steps], guards, exit_probe_sql, cleanup)
+}
+
+/// One typed plan of several runs, each its own bracket, in order.
+fn runs_typed_plan(
+    runs: Vec<Vec<EffectStep>>,
+    guards: Vec<GuardDefinition>,
+    exit_probe_sql: Option<&str>,
+    cleanup: Vec<PlanStatement>,
+) -> CompiledPlan {
+    let typed = TypedEffectPlan {
+        setup: None,
+        runs: runs
+            .into_iter()
+            .map(|steps| EffectRun {
+                connection_id: None,
+                steps,
+                created_objects: Vec::new(),
+                bracketed: true,
+            })
+            .collect(),
+        cleanup: (!cleanup.is_empty())
+            .then(|| step(EffectAction::Cleanup(cleanup), "cleanup", vec![])),
+        guards,
+    };
     CompiledPlan {
         entries: typed.flatten(),
         exit_probe_sql: exit_probe_sql.map(str::to_string),
-        created_objects: Vec::new(),
         typed: Some(typed),
     }
 }
@@ -852,9 +930,8 @@ fn read_effect_run(system: &DelightQLSystem) -> Vec<(i64, String)> {
 }
 
 /// D3a contract: an UNTYPED plan (hand-built, degenerate) has no exit
-/// machinery and no edge sampling — every entry simply runs. The
-/// transformer always attaches the typed layer; exit semantics live
-/// there.
+/// machinery and no edge sampling — every entry simply runs. A compiled
+/// program always attaches the typed layer; exit semantics live there.
 #[test]
 fn untyped_plans_have_no_exit_machinery() {
     let conn = shared_sqlite();
@@ -872,7 +949,6 @@ fn untyped_plans_have_no_exit_machinery() {
             ship("SELECT count(*) AS n FROM t"),
         ],
         exit_probe_sql: Some("SELECT count(*) FROM temp.__exit".to_string()),
-        created_objects: Vec::new(),
         typed: None,
     };
     let resp = relay.handle_plan(&p);
@@ -1300,6 +1376,70 @@ fn committed_run_survives_abort_and_the_session_remains_usable() {
     assert_eq!(rows, vec![vec!["committed".to_string()]]);
 }
 
+/// ONE plan, three runs: the first commits, the second aborts and rolls back
+/// alone, the third never starts — and the pump says one run committed. The
+/// separately-built-plans test above is a control; this is the one-plan
+/// shape a `;` statement compiles to.
+#[test]
+fn one_plan_commits_each_run_before_a_later_abort() {
+    let conn = shared_sqlite();
+    conn.lock()
+        .unwrap()
+        .execute_batch("CREATE TABLE t (v TEXT);")
+        .unwrap();
+    let mut system = fresh_system();
+    let mut relay = relay_over(&mut system, Arc::clone(&conn));
+    let write = |value: &str| {
+        step(
+            EffectAction::Stage(stmts(&[&format!("INSERT INTO t VALUES ('{value}')")])),
+            "write",
+            vec![],
+        )
+    };
+    let runs = runs_typed_plan(
+        vec![
+            vec![write("committed")],
+            vec![
+                write("rolled back"),
+                step(
+                    EffectAction::Terminal(TerminalAction::Abort {
+                        provenance: AbortProvenance::Authored {
+                            label: "stop".to_string(),
+                        },
+                        statements: Vec::new(),
+                        probe: PlanStatement::bare("SELECT 1"),
+                    }),
+                    "abort",
+                    vec![],
+                ),
+            ],
+            vec![write("never started")],
+        ],
+        vec![],
+        None,
+        vec![],
+    );
+    let played = relay.play(&runs);
+    assert_eq!(played.committed_runs, 1);
+    let (identity, _) = error_message(played.term);
+    assert_eq!(identity, b"delightql-error://authored/abort".to_vec());
+
+    let persisted: Vec<String> = conn
+        .lock()
+        .unwrap()
+        .prepare("SELECT v FROM t ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(persisted, vec!["committed".to_string()]);
+
+    let response = relay.handle_plan(&plan(vec![ship("SELECT count(*) AS n FROM t")]));
+    let (_, rows) = fetch_all(&mut relay, response);
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
 #[test]
 fn abort_probe_execution_error_keeps_the_runtime_execution_identity() {
     let conn = shared_sqlite();
@@ -1332,21 +1472,15 @@ fn authored_abort_reaches_only_on_nonempty_input_and_keeps_the_session_usable() 
     let mut system = fresh_system();
     let mut relay = relay_over(&mut system, conn);
 
-    let empty = relay.handle(ClientTerm::Query {
-        text: b"_(x @ 1), x = 99 |> abort!(\"empty\")(*)".to_vec(),
-    });
+    let empty = relay.handle(statement("_(x @ 1), x = 99 |> abort!(\"empty\")(*)"));
     let _ = fetch_all(&mut relay, empty);
 
-    let reached = relay.handle(ClientTerm::Query {
-        text: b"_(x @ 1) |> abort!(\"reached\")(*)".to_vec(),
-    });
+    let reached = relay.handle(statement("_(x @ 1) |> abort!(\"reached\")(*)"));
     let (identity, message) = error_message(reached);
     assert_eq!(identity, b"delightql-error://authored/abort".to_vec());
     assert!(message.contains("reached"));
 
-    let usable = relay.handle(ClientTerm::Query {
-        text: b"_(x @ 2)".to_vec(),
-    });
+    let usable = relay.handle(statement("_(x @ 2)"));
     let (_, rows) = fetch_all(&mut relay, usable);
     assert_eq!(rows, vec![vec!["2".to_string()]]);
 }
@@ -1357,18 +1491,17 @@ fn qualified_builtin_identity_is_preserved_at_the_runtime_entry() {
     let mut system = fresh_system();
     let mut relay = relay_over(&mut system, conn);
 
-    let standard = relay.handle(ClientTerm::Query {
-        text: b"#!dql query-sequence\n\
+    let standard = relay.handle(statement(
+        "#!dql query-sequence\n\
                 nonempty(T(*))(*) : T(*)\n\
-                _(x @ 1) !> std::prelude.assert!(nonempty(*), \"standard\")(*) |> #(x)"
-            .to_vec(),
-    });
+                _(x @ 1) !> std::prelude.assert!(nonempty(*), \"standard\")(*) |> #(x)",
+    ));
     let (_, rows) = fetch_all(&mut relay, standard);
     assert_eq!(rows, vec![vec!["1".to_string()]]);
 
-    let standard_abort = relay.handle(ClientTerm::Query {
-        text: b"_(x @ 1), x = 2 |> std::prelude.abort!(\"runtime/unreached\")(*)".to_vec(),
-    });
+    let standard_abort = relay.handle(statement(
+        "_(x @ 1), x = 2 |> std::prelude.abort!(\"runtime/unreached\")(*)",
+    ));
     let _ = fetch_all(&mut relay, standard_abort);
 
     for source in [
@@ -1376,9 +1509,7 @@ fn qualified_builtin_identity_is_preserved_at_the_runtime_entry() {
         "_(x @ 1) |> bogus.abort!(\"runtime/must-not-run\")(*)",
         "_(x @ 1) |> bogus.insert!(sink(*))(*)",
     ] {
-        let (identity, message) = error_message(relay.handle(ClientTerm::Query {
-            text: source.as_bytes().to_vec(),
-        }));
+        let (identity, message) = error_message(relay.handle(statement(&source)));
         assert_ne!(identity, b"delightql-error://authored/abort".to_vec());
         assert_ne!(identity, b"delightql-error://runtime/must-not-run".to_vec());
         assert!(
@@ -1408,11 +1539,9 @@ fn configured_assert_releases_the_exact_rows_and_reports_one_pass() {
         ..RelayHooks::default()
     });
     let dql = "#!dql query-sequence\n\
-               at_least(n, T(*))(*) : T(*) ~> count:(*) as c, c >= n\n\
+               at_least(n, T(*))(*) : T(*) ~> count:(*) as c, c >= $.n\n\
                _(x @ 1; 2; 3) !> assert!(at_least(2), \"three rows\")(*) |> #(x)";
-    let response = relay.handle(ClientTerm::Query {
-        text: dql.as_bytes().to_vec(),
-    });
+    let response = relay.handle(statement(&dql));
     let (columns, rows) = fetch_all(&mut relay, response);
     assert_eq!(columns, vec!["x"]);
     assert_eq!(
@@ -1440,9 +1569,7 @@ fn direct_assert_receipt_exposes_the_witness_and_returned_occurrences() {
     let dql = "#!dql query-sequence\n\
                one(T(*))(*) : T(*), x = 1\n\
                assert!(one(*), \"direct\", _(x @ 1; 2))(*)";
-    let response = relay.handle(ClientTerm::Query {
-        text: dql.as_bytes().to_vec(),
-    });
+    let response = relay.handle(statement(&dql));
     let (columns, rows) = fetch_all(&mut relay, response);
     assert_eq!(
         columns,
@@ -1464,9 +1591,7 @@ fn volatile_assert_input_is_one_occurrence_in_witness_and_returned_payloads() {
                echo_property(T(*))(*) : T(*)\n\
                volatile(*) : _(seed @ 1) |> (random:() as token)\n\
                assert!(echo_property(*), \"volatile\", volatile(*))(*)";
-    let response = relay.handle(ClientTerm::Query {
-        text: dql.as_bytes().to_vec(),
-    });
+    let response = relay.handle(statement(&dql));
     let (_, rows) = fetch_all(&mut relay, response);
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -1483,9 +1608,7 @@ fn empty_assertion_witness_uses_authored_abort_and_explicit_label() {
     let dql = "#!dql query-sequence\n\
                none(T(*))(*) : T(*), x = 99\n\
                _(x @ 1) !> assert!(none(*), \"no 99\")(*)";
-    let response = relay.handle(ClientTerm::Query {
-        text: dql.as_bytes().to_vec(),
-    });
+    let response = relay.handle(statement(&dql));
     let (identity, message) = error_message(response);
     assert_eq!(identity, b"delightql-error://authored/abort".to_vec());
     assert!(message.contains("no 99"));
@@ -1507,9 +1630,7 @@ fn omitted_assert_label_uses_the_synthetic_effect_identity() {
     let dql = "#!dql query-sequence\n\
                one(T(*))(*) : T(*), x = 1\n\
                _(x @ 1) !> assert!(one(*))(*)";
-    let response = relay.handle(ClientTerm::Query {
-        text: dql.as_bytes().to_vec(),
-    });
+    let response = relay.handle(statement(&dql));
     let _ = fetch_all(&mut relay, response);
     assert!(label
         .lock()
@@ -1679,17 +1800,9 @@ fn recovery_replaces_a_quarantined_session_and_the_next_query_succeeds() {
     //    catalog registration fails after the run.
     {
         let mut relay = relay_over(&mut system, Arc::clone(&conn));
-        let p = CompiledPlan {
-            entries: vec![ship("SELECT 1 AS value")],
-            exit_probe_sql: None,
-            created_objects: vec![crate::pipeline::compiled_query::PlanCreatedObject {
-                name: "created".to_string(),
-                is_view: false,
-                connection_id: None,
-                interior_positions: Vec::new(),
-            }],
-            typed: None,
-        };
+        let p = creating_plan(created_object(
+            crate::pipeline::asts::effects::DirectiveKind::TempTable,
+        ));
         let response = relay.play_plan_with_catalog(&p, &CatalogShouldNotRun);
         let (identity, _message) = error_message(response);
         assert_eq!(
@@ -1698,9 +1811,7 @@ fn recovery_replaces_a_quarantined_session_and_the_next_query_succeeds() {
         );
         // The latch holds: an ordinary next query is refused, which is the
         // state a REPL must never wrap in another prompt.
-        let refused = relay.handle(ClientTerm::Query {
-            text: b"_(1)".to_vec(),
-        });
+        let refused = relay.handle(statement("_(1)"));
         let (identity, _message) = error_message(refused);
         assert_eq!(
             identity,
@@ -1724,9 +1835,7 @@ fn recovery_replaces_a_quarantined_session_and_the_next_query_succeeds() {
 
     // 4. ...and the replaced session answers an ordinary `_(1)`.
     let mut relay = relay_over(&mut system, conn);
-    let resp = relay.handle(ClientTerm::Query {
-        text: b"_(1)".to_vec(),
-    });
+    let resp = relay.handle(statement("_(1)"));
     let (_columns, rows) = fetch_all(&mut relay, resp);
     assert_eq!(rows, vec![vec!["1".to_string()]]);
 }
@@ -1775,9 +1884,7 @@ fn a_failed_recovery_retains_the_quarantine() {
     assert_eq!(operation, "liminal external-effect compensation");
 
     let mut relay = relay_over(&mut system, conn);
-    let refused = relay.handle(ClientTerm::Query {
-        text: b"_(1)".to_vec(),
-    });
+    let refused = relay.handle(statement("_(1)"));
     let (identity, _message) = error_message(refused);
     assert_eq!(
         identity,
@@ -1794,9 +1901,7 @@ fn an_ordinary_error_does_not_trigger_the_recovery_boundary() {
     let mut system = fresh_system();
     let mut relay = relay_over(&mut system, Arc::clone(&conn));
 
-    let response = relay.handle(ClientTerm::Query {
-        text: b"no_such_table(*)".to_vec(),
-    });
+    let response = relay.handle(statement("no_such_table(*)"));
     let (identity, _message) = error_message(response);
     assert_ne!(
         identity,
@@ -1804,9 +1909,7 @@ fn an_ordinary_error_does_not_trigger_the_recovery_boundary() {
     );
     assert!(relay.system.health_incident().is_none());
 
-    let resp = relay.handle(ClientTerm::Query {
-        text: b"_(1)".to_vec(),
-    });
+    let resp = relay.handle(statement("_(1)"));
     let (_columns, rows) = fetch_all(&mut relay, resp);
     assert_eq!(rows, vec![vec!["1".to_string()]]);
 }
@@ -1867,6 +1970,7 @@ mod foreign_ingress {
                         position: 1,
                         name: b"x".to_vec(),
                         descriptor: Vec::new(),
+                        naming: delightql_protocol::Naming::Authored,
                     }],
                 }),
                 ClientTerm::Fetch { .. } => self.on_fetch.take().unwrap_or(ServerTerm::End),
@@ -1889,7 +1993,7 @@ mod foreign_ingress {
         let session = match client
             .version(
                 1_000_000,
-                b"relay0".to_vec(),
+                delightql_protocol::PROTOCOL_VERSION.to_vec(),
                 300_000,
                 vec![Orientation::Rows],
             )
@@ -1904,9 +2008,7 @@ mod foreign_ingress {
     }
 
     fn findings(relay: &mut RelayParty<'_, DirectTransport<ForeignParty>>) -> Vec<String> {
-        let term = relay.handle(ClientTerm::Query {
-            text: b"sys::diagnostics.finding(*) |> (uri)".to_vec(),
-        });
+        let term = relay.handle(statement("sys::diagnostics.finding(*) |> (uri)"));
         let handle: Handle = match term {
             ServerTerm::Header { handle, .. } => handle,
             other => panic!("expected Header, got {other:?}"),
@@ -1946,9 +2048,7 @@ mod foreign_ingress {
             on_fetch: None,
         };
         let mut relay = relay_over_foreign(&mut system, party);
-        let (identity, message) = error_message(relay.handle(ClientTerm::Query {
-            text: b"_(x @ 1)".to_vec(),
-        }));
+        let (identity, message) = error_message(relay.handle(statement("_(x @ 1)")));
         assert_eq!(
             identity,
             b"delightql-error://runtime/relay/protocol".to_vec()
@@ -1978,9 +2078,7 @@ mod foreign_ingress {
             )),
         };
         let mut relay = relay_over_foreign(&mut system, party);
-        let handle = match relay.handle(ClientTerm::Query {
-            text: b"_(x @ 1)".to_vec(),
-        }) {
+        let handle = match relay.handle(statement("_(x @ 1)")) {
             ServerTerm::Header { handle, .. } => handle,
             other => panic!("expected Header, got {other:?}"),
         };
@@ -2014,9 +2112,7 @@ mod foreign_ingress {
             on_fetch: None,
         };
         let mut relay = relay_over_foreign(&mut system, party);
-        match relay.handle(ClientTerm::Query {
-            text: b"_(x @ 1)".to_vec(),
-        }) {
+        match relay.handle(statement("_(x @ 1)")) {
             ServerTerm::Error(wire) => {
                 assert_eq!(
                     wire.identity(),

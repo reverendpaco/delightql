@@ -15,13 +15,6 @@ pub enum Namespace {
     #[family("name", summary = "A namespace name hit the reserved-name guard.")]
     #[error(transparent)]
     Name(NamespaceName),
-
-    /// A plain (unqualified) namespace name that more than one namespace
-    /// answers to in the current lexical reach; the message lists them.
-    /// Qualify the name.
-    #[leaf("plain/ambiguous", class = Syntax, summary = "A plain namespace name is ambiguous.")]
-    #[error("Validation error: {message}")]
-    PlainAmbiguous { message: String },
 }
 
 /// `namespace/name/…`

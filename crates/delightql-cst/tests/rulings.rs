@@ -4,10 +4,11 @@
 //! The surface rulings the consolidated grammar carries.
 //!
 //! **A SCALAR PARAMETER IS CODE, NOT DATA.** A bound or an ordinal may read a
-//! definition parameter, because expansion substitutes it to an integer before
-//! the ordinary resolved query exists. Nothing row-dependent may reach either
-//! position: a column expression, an application, a bind parameter — none has
-//! a derivation, so cardinality can never be chosen by data.
+//! definition parameter, written `$.n`, because expansion substitutes it to an
+//! integer before the ordinary resolved query exists. Nothing row-dependent
+//! may reach either position: a column expression, an application, a bind
+//! parameter — none has a derivation, so cardinality can never be chosen by
+//! data. A bare name is a column, and no column has a derivation there.
 //!
 //! **A LEADING OUTER WAITS FOR ITS PEER.** An outer-marked access may begin a
 //! chain only when the following comma member completes the join. `?` is not
@@ -37,25 +38,22 @@ fn a_bound_takes_a_literal_or_a_scalar_parameter() {
     assert!(matches!(term, CompileTimeInteger::Number(_)));
     assert_eq!(literal.text(term), "3");
 
-    let parameter = admits("users(*), #<n");
+    let parameter = admits("users(*), #<$.n");
     let term = first::<CompileTimeInteger>(&parameter);
-    assert!(matches!(
-        term,
-        CompileTimeInteger::ScalarParameterReference(_)
-    ));
-    assert_eq!(parameter.text(term), "n");
+    assert!(matches!(term, CompileTimeInteger::ParameterReference(_)));
+    assert_eq!(parameter.text(term), "$.n");
 }
 
 /// The whole reason the idiom exists: a higher-order rule parameterized by its
 /// cardinality.
 #[test]
 fn a_parameterized_rule_may_bound_by_its_parameter() {
-    let tree = admits_file("top_n(T(*), n)(*) :- T(*), #<n");
+    let tree = admits_file("top_n(T(*), n)(*) :- T(*), #<$.n");
     assert_eq!(count::<HoRule>(&tree), 1);
     assert_eq!(count::<RowBound>(&tree), 1);
     assert!(matches!(
         first::<CompileTimeInteger>(&tree),
-        CompileTimeInteger::ScalarParameterReference(_)
+        CompileTimeInteger::ParameterReference(_)
     ));
 }
 
@@ -68,12 +66,21 @@ fn an_ordinal_takes_the_same_term() {
         CompileTimeInteger::Number(_)
     ));
 
-    let parameter = admits("users(*) |> (|n|)");
+    let parameter = admits("users(*) |> (|$.n|)");
     assert_eq!(count::<Ordinal>(&parameter), 1);
     assert!(matches!(
         first::<CompileTimeInteger>(&parameter),
-        CompileTimeInteger::ScalarParameterReference(_)
+        CompileTimeInteger::ParameterReference(_)
     ));
+}
+
+/// A BARE NAME IS A COLUMN, and a column has no derivation in a bound or an
+/// ordinal: the parameter is written `$.n`.
+#[test]
+fn a_bare_name_is_not_a_compile_time_integer() {
+    refuses("users(*), #<n");
+    refuses("users(*) |> (|n|)");
+    refuses_file("top_n(T(*), n)(*) :- T(*), #<n");
 }
 
 /// DATA NEVER CHOOSES A BOUND. Everything row-dependent refuses structurally —
@@ -88,7 +95,10 @@ fn data_never_chooses_a_cardinality() {
         "users(*), #<@",
         // A lone `_` is the disregarded anaphor, never a parameter name.
         "users(*), #<_",
+        "users(*), #<$._",
         "users(*) |> (|_|)",
+        // The marked name is glued to its sigil.
+        "users(*), #<$. n",
     ] {
         refuses(src);
     }
@@ -109,16 +119,16 @@ fn a_positional_span_stays_literal() {
     refuses("users(*) |> (|n:3|)");
 }
 
-/// `|x|` after `:(` is a lambda binder and `|n|` in value position is an
-/// ordinal. The position discriminates, as it always did — admitting a name in
-/// the ordinal did not blur them.
+/// `|x|` after `:(` is a lambda binder and `|$.n|` in value position is an
+/// ordinal. The position discriminates, as it always did — admitting a
+/// parameter in the ordinal did not blur them.
 #[test]
 fn the_binder_and_the_ordinal_stay_apart() {
     let lambda = admits("users(*) |> $(:(|x| x * x))(a)");
     assert_eq!(count::<LambdaBinder>(&lambda), 1);
     assert_eq!(count::<Ordinal>(&lambda), 0);
 
-    let ordinal = admits("users(*) |> (|n|)");
+    let ordinal = admits("users(*) |> (|$.n|)");
     assert_eq!(count::<Ordinal>(&ordinal), 1);
     assert_eq!(count::<LambdaBinder>(&ordinal), 0);
 }

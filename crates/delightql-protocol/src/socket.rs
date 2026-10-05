@@ -203,6 +203,7 @@ mod tests {
             position: pos,
             name: b(name),
             descriptor: b(desc),
+            naming: Naming::Authored,
         }
     }
 
@@ -221,7 +222,7 @@ mod tests {
             let responses = vec![
                 ServerMessage::Data(ServerTerm::Version {
                     max_message_size: 1_000_000,
-                    protocol_version: b("relay0"),
+                    protocol_version: PROTOCOL_VERSION.to_vec(),
                     lease_ms: 300_000,
                     orientations: vec![Orientation::Rows],
                 }),
@@ -248,7 +249,7 @@ mod tests {
 
         // Version handshake
         let session_result = client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .version(1_000_000, PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
             .unwrap();
         let mut session = match session_result {
             VersionResult::Accepted(s) => s,
@@ -306,7 +307,7 @@ mod tests {
                 &mut server_stream,
                 &ServerMessage::Data(ServerTerm::Version {
                     max_message_size: 1_000_000,
-                    protocol_version: b("relay0"),
+                    protocol_version: PROTOCOL_VERSION.to_vec(),
                     lease_ms: 300_000,
                     orientations: vec![Orientation::Rows],
                 }),
@@ -327,7 +328,7 @@ mod tests {
         let client = Client::new(transport);
 
         let mut session = match client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .version(1_000_000, PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
             .unwrap()
         {
             VersionResult::Accepted(s) => s,
@@ -358,7 +359,7 @@ mod tests {
                 &mut server_stream,
                 &ServerMessage::Data(ServerTerm::Version {
                     max_message_size: 1_000_000,
-                    protocol_version: b("relay0"),
+                    protocol_version: PROTOCOL_VERSION.to_vec(),
                     lease_ms: 300_000,
                     orientations: vec![Orientation::Rows],
                 }),
@@ -381,7 +382,7 @@ mod tests {
         let transport = SocketTransport::new(client_stream);
         let client = Client::new(transport);
         let mut session = match client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .version(1_000_000, PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
             .unwrap()
         {
             VersionResult::Accepted(s) => s,
@@ -417,7 +418,7 @@ mod tests {
                 &mut server_stream,
                 &ServerMessage::Data(ServerTerm::Version {
                     max_message_size: 1_000_000,
-                    protocol_version: b("relay0"),
+                    protocol_version: PROTOCOL_VERSION.to_vec(),
                     lease_ms: 300_000,
                     orientations: vec![Orientation::Rows],
                 }),
@@ -450,7 +451,7 @@ mod tests {
         let client = Client::new(transport);
 
         let mut session = match client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .version(1_000_000, PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
             .unwrap()
         {
             VersionResult::Accepted(s) => s,

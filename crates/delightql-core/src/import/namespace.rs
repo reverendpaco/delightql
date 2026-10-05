@@ -8,6 +8,8 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
+use crate::namespace::NamespaceKind;
+
 /// Namespace definition for batch creation
 #[derive(Debug, Clone)]
 pub struct NamespaceSpec {
@@ -19,8 +21,8 @@ pub struct NamespaceSpec {
     pub pid: Option<i32>,
     /// Fully-qualified name (e.g., "sys::cartridges")
     pub fq_name: String,
-    /// Namespace kind: system, container, data, lib, grounded, scratch, unknown
-    pub kind: String,
+    /// The producer's kind for the namespace
+    pub kind: NamespaceKind,
     /// How the namespace was created: bootstrap, file, uri, scratch, ground
     pub provenance: Option<String>,
     /// Original file path or URI (for refresh/reconsult)
@@ -39,7 +41,7 @@ pub struct NamespaceSpec {
 /// * `name` - Namespace segment name
 /// * `pid` - Parent namespace ID (None for root)
 /// * `fq_name` - Fully-qualified namespace path
-/// * `kind` - Namespace kind (system, container, data, lib, grounded, scratch, unknown)
+/// * `kind` - The producer's kind for the namespace
 /// * `provenance` - How it was created (bootstrap, file, uri, scratch, ground)
 /// * `source_path` - Original file path or URI
 /// * `writable` - Whether the namespace can accept new definitions
@@ -49,7 +51,7 @@ pub fn create_namespace(
     name: &str,
     pid: Option<i32>,
     fq_name: &str,
-    kind: &str,
+    kind: NamespaceKind,
     provenance: Option<&str>,
     source_path: Option<&str>,
     writable: bool,
@@ -62,7 +64,7 @@ pub fn create_namespace(
             name,
             pid,
             fq_name,
-            kind,
+            kind.spelling(),
             provenance,
             source_path,
             writable as i32
@@ -108,7 +110,7 @@ pub fn create_namespace_hierarchy(conn: &Connection, specs: &[NamespaceSpec]) ->
             &spec.name,
             spec.pid,
             &spec.fq_name,
-            &spec.kind,
+            spec.kind,
             spec.provenance.as_deref(),
             spec.source_path.as_deref(),
             spec.writable,
@@ -143,7 +145,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "_".into(),
             pid: None,
             fq_name: "_".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -153,7 +155,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "sys".into(),
             pid: Some(1),
             fq_name: "sys".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -163,7 +165,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "cartridges".into(),
             pid: Some(2),
             fq_name: "sys::cartridges".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -173,7 +175,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "entities".into(),
             pid: Some(2),
             fq_name: "sys::entities".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -183,7 +185,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "ns".into(),
             pid: Some(2),
             fq_name: "sys::ns".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -193,7 +195,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "main".into(),
             pid: Some(1),
             fq_name: "main".into(),
-            kind: "data".into(),
+            kind: NamespaceKind::Data,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -203,7 +205,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "std".into(),
             pid: Some(1),
             fq_name: "std".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -213,7 +215,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "predicates".into(),
             pid: Some(7),
             fq_name: "std::predicates".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -223,7 +225,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "meta".into(),
             pid: Some(2),
             fq_name: "sys::meta".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -233,7 +235,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "execution".into(),
             pid: Some(2),
             fq_name: "sys::execution".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -243,7 +245,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "identifiers".into(),
             pid: Some(2),
             fq_name: "sys::identifiers".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -253,7 +255,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "targeting".into(),
             pid: Some(2),
             fq_name: "sys::targeting".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -263,7 +265,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "connections".into(),
             pid: Some(2),
             fq_name: "sys::connections".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -275,7 +277,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "ho".into(),
             pid: Some(4),
             fq_name: "sys::entities::ho".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -285,7 +287,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "interior".into(),
             pid: Some(4),
             fq_name: "sys::entities::interior".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -302,7 +304,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "home".into(),
             pid: Some(1),
             fq_name: "home".into(),
-            kind: "lib".into(),
+            kind: NamespaceKind::Lib,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: true,
@@ -312,7 +314,7 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "format".into(),
             pid: Some(2),
             fq_name: "sys::format".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -324,7 +326,20 @@ pub fn create_bootstrap_namespaces(conn: &Connection) -> Result<()> {
             name: "diagnostics".into(),
             pid: Some(2),
             fq_name: "sys::diagnostics".into(),
-            kind: "system".into(),
+            kind: NamespaceKind::System,
+            provenance: Some("bootstrap".into()),
+            source_path: None,
+            writable: false,
+        },
+        // What the host stated at boot and what the session set since
+        // (sys::config.setting), and the keys core declares
+        // (sys::config.setting_key).
+        NamespaceSpec {
+            id: 20,
+            name: "config".into(),
+            pid: Some(2),
+            fq_name: "sys::config".into(),
+            kind: NamespaceKind::System,
             provenance: Some("bootstrap".into()),
             source_path: None,
             writable: false,
@@ -384,7 +399,7 @@ pub fn parse_namespace_path(conn: &Connection, namespace_path: &str) -> Result<V
             name: "_".to_string(),
             pid: None,
             fq_name: "_".to_string(),
-            kind: "unknown".into(),
+            kind: NamespaceKind::Unknown,
             provenance: None,
             source_path: None,
             writable: false,
@@ -422,7 +437,7 @@ pub fn parse_namespace_path(conn: &Connection, namespace_path: &str) -> Result<V
                 name: segment.to_string(),
                 pid: _parent_id,
                 fq_name: current_fq_path.clone(),
-                kind: "unknown".into(),
+                kind: NamespaceKind::Unknown,
                 provenance: None,
                 source_path: None,
                 writable: false,

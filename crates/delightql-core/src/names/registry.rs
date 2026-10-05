@@ -12,13 +12,13 @@
 //! handles and copied facts; not one of them returns characters. Characters
 //! leave only through [`IdentSink`](super::sink::IdentSink).
 
-use crate::diagnostic::Internal;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use super::id::{CallableCategory, CallableId, ColId, EntityId, FnId, ScopeId, Spelling, Sym};
 use super::origin::{
-    Addressing, FnOrigin, FunctionSpellingError, Hint, Intrinsic, ScopeKind, ValueFacts,
+    Addressing, FnOrigin, FunctionSpellingError, Hint, Intrinsic, ScopeKind,
+    ValueFacts,
 };
 use super::sink::IdentSink;
 
@@ -78,33 +78,25 @@ struct ColRecord {
     published: Option<Spelling>,
     addressing: Addressing,
     facts: ValueFacts,
-    /// Position at admission, used only to report an authored ordinal after
-    /// late naming. This is not a relation-interface reconstruction road.
+    /// Position at admission, used only to teach the ordinal reference that
+    /// reaches a column with no name. This is not a relation-interface
+    /// reconstruction road.
     ordinal: u32,
-    /// This occurrence's authored name LOST AN AMBIGUITY: its heading
-    /// published the same canonical name at another position too.
+    /// This occurrence's authored name LOST AN AMBIGUITY: a sealed heading
+    /// published the same canonical name at another position too, or a set
+    /// slot was opened by a position that answered to no name in its arm.
     ///
-    /// The spelling stays, because the heading that holds the ambiguity
-    /// still reports it as the qualified ordinal that reaches it. What
-    /// the mark governs is what happens NEXT: authored-name loss is
-    /// monotonic along the slot lineage, so carrying the occurrence across
-    /// a boundary carries no name, and only a new authored naming act
-    /// gives the position a name again.
+    /// The spelling stays, because the mint drawn for the position keeps
+    /// the name it lost. What the mark governs is what happens NEXT:
+    /// authored-name loss is monotonic along the slot lineage, so carrying
+    /// the occurrence across a boundary carries no name, and only a new
+    /// authored naming act gives the position a name again.
     name_lost: bool,
 }
 
 struct EntityRecord {
     canonical: Spelling,
     backend_schema: Option<Spelling>,
-}
-
-/// One catalog storage object, independent of how many entity handles looked
-/// it up. Constructed only from the catalog identity already bound to the
-/// entity; consumers cannot substitute a spelling or backend schema.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct CatalogStorageKey {
-    canonical: Sym,
-    backend_schema: Option<Sym>,
 }
 
 struct FunctionRecord {
@@ -128,35 +120,21 @@ struct Inner {
     /// drawn invention can never collide with a name an author owns
     /// (ALIAS ALWAYS PRE-EMPTS A MINT).
     authored_reserved: Vec<Sym>,
+    /// The database that STORES this compilation's SQL, when one does.
+    stored_in: Option<StoredIn>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CorrespondenceError {
-    /// More than one occurrence corresponds to the requested output slot.
-    Ambiguous,
-    /// An arm's dimensions cannot be enumerated, so there is nothing to
-    /// correspond BY. Pairing by name needs both names.
-    Opaque,
+/// A database that keeps a compilation's SQL, as a view keeps its body:
+/// every backend schema the catalog reaches it by (`None`: an unqualified
+/// read), and the name the primary database answers to from any other.
+#[derive(Clone)]
+struct StoredIn {
+    database: Vec<Option<Sym>>,
+    primary: Spelling,
 }
 
 pub struct Registry {
     inner: RefCell<Inner>,
-    /// What each relation of this compilation publishes.
-    ///
-    /// It lives here because a `Registry` IS one compilation, and it is
-    /// OPAQUE here: every method on it is private to `crate::relation`, so
-    /// holding this object gives a caller no way to record a relation, read
-    /// an interface, or close the epoch. The registry owns its lifetime and
-    /// the authority owns its meaning.
-    relations: crate::relation::RelationStore,
-    /// Where this compilation's semantic ports meet the columns its SQL
-    /// emits.
-    ///
-    /// Here for the reason `relations` is here, and OPAQUE the same way:
-    /// a binding elaborates semantic evidence, so the two cannot come from
-    /// two epochs, and every method on this object is private to
-    /// `crate::sql_binding`.
-    bindings: crate::sql_binding::SqlBindingMap,
     /// This compilation's ONE live scope environment.
     ///
     /// The compiler limits this compilation runs under: SHARED with the
@@ -178,6 +156,13 @@ pub struct Registry {
     /// process policy instead would report a number this compilation is not
     /// bounded by whenever a host moved the setting after the mint.
     limits: std::rc::Rc<crate::compiler_limits::ArmedLimits>,
+    /// This compilation's image of the target aggregate catalog, armed once
+    /// by the entrance that holds a host and shared by all nested work, so
+    /// every judgment the unit makes reads the same rows and a catalog
+    /// change reaches only the next compilation. Unarmed, the arena knows no
+    /// target aggregate.
+    aggregates:
+        std::cell::OnceCell<std::sync::Arc<crate::pipeline::aggregate_catalog::AggregateCatalog>>,
 }
 
 /// The bytes a spelling is compared by. One function, so that reading a name
@@ -196,9 +181,27 @@ impl Registry {
     /// A caller that passes no reservations does not receive catalog
     /// collision protection from this constructor.
     pub fn new(catalog_reserved: &[&str]) -> Self {
-        let relations = crate::relation::RelationStore::new();
-        let bindings =
-            crate::sql_binding::SqlBindingMap::new(crate::relation::epoch_of(&relations));
+        Self::armed(
+            catalog_reserved,
+            crate::compiler_limits::ArmedLimits::in_force(),
+        )
+    }
+
+    /// The same, for a compilation that OBSERVES: armed from process policy
+    /// with the observing admission, so no effect it or its nested work
+    /// reaches may execute. Minted by an observing session's entrance, which
+    /// is a top-level compilation and shares no running one.
+    pub fn observing(catalog_reserved: &[&str]) -> Self {
+        Self::armed(
+            catalog_reserved,
+            std::rc::Rc::new(crate::compiler_limits::ArmedLimits::observing()),
+        )
+    }
+
+    fn armed(
+        catalog_reserved: &[&str],
+        limits: std::rc::Rc<crate::compiler_limits::ArmedLimits>,
+    ) -> Self {
         let reg = Registry {
             inner: RefCell::new(Inner {
                 canon_index: HashMap::new(),
@@ -210,10 +213,10 @@ impl Registry {
                 functions: Vec::new(),
                 reserved: Vec::new(),
                 authored_reserved: Vec::new(),
+                stored_in: None,
             }),
-            limits: crate::compiler_limits::ArmedLimits::in_force(),
-            relations,
-            bindings,
+            limits,
+            aggregates: std::cell::OnceCell::new(),
         };
         for name in catalog_reserved {
             let s = reg.intern(name, false);
@@ -228,20 +231,26 @@ impl Registry {
         &self.limits
     }
 
-    /// This compilation's relation records.
-    ///
-    /// Handing out the object is not handing out a capability: nothing on
-    /// it is callable outside `crate::relation`.
-    pub(crate) fn relations(&self) -> &crate::relation::RelationStore {
-        &self.relations
+    /// Whether an entrance has armed this compilation's aggregate catalog.
+    pub(crate) fn has_aggregate_catalog(&self) -> bool {
+        self.aggregates.get().is_some()
     }
 
-    /// This compilation's physical bindings.
-    ///
-    /// Handing out the object is not handing out a capability: nothing on
-    /// it is callable outside `crate::sql_binding`.
-    pub(crate) fn bindings(&self) -> &crate::sql_binding::SqlBindingMap {
-        &self.bindings
+    /// Arm this compilation's aggregate catalog. The first arming stands:
+    /// nested work that finds the arena armed reads the unit's image, never a
+    /// newer one.
+    pub(crate) fn arm_aggregate_catalog(
+        &self,
+        catalog: std::sync::Arc<crate::pipeline::aggregate_catalog::AggregateCatalog>,
+    ) {
+        let _ = self.aggregates.set(catalog);
+    }
+
+    /// This compilation's aggregate catalog, when an entrance armed one.
+    pub(crate) fn aggregate_catalog(
+        &self,
+    ) -> Option<std::sync::Arc<crate::pipeline::aggregate_catalog::AggregateCatalog>> {
+        self.aggregates.get().cloned()
     }
 
     /// The same, as the shareable object. Nested compiler work is handed THIS
@@ -325,11 +334,47 @@ impl Registry {
         backend_schema: Option<Spelling>,
     ) {
         let mut inner = self.inner.borrow_mut();
+        let backend_schema = match &inner.stored_in {
+            None => backend_schema,
+            Some(stored) => {
+                let database =
+                    backend_schema.map(|schema| inner.spellings[schema.0 as usize].canon);
+                if stored.database.contains(&database) {
+                    None
+                } else {
+                    Some(backend_schema.unwrap_or(stored.primary))
+                }
+            }
+        };
         let record = &mut inner.entities[entity.0 as usize];
         if let Some(canonical) = canonical {
             record.canonical = canonical;
         }
         record.backend_schema = backend_schema;
+    }
+
+    /// THE STORED REALIZATION. This compilation's SQL is kept by one
+    /// database — reached by each backend schema in `database`, `None` being
+    /// an unqualified read — and read by whoever opens that file, so every
+    /// catalog object is spelled relative to it: an object of the storing
+    /// database unqualified, which the engine binds to the storing database
+    /// itself; an object of any other database with its qualifier — the
+    /// primary's is `primary` — so the engine refuses to store the SQL
+    /// rather than rebind the name to an object of the storing database.
+    /// The session's own attachment names never reach the stored text. Set
+    /// before any entity is bound.
+    pub(crate) fn store_in(&self, database: &[Option<&str>], primary: &str) {
+        let database = database
+            .iter()
+            .map(|schema| {
+                schema.map(|schema| {
+                    let spelling = self.intern(schema, false);
+                    self.canonical(spelling)
+                })
+            })
+            .collect();
+        let primary = self.intern(primary, false);
+        self.inner.borrow_mut().stored_in = Some(StoredIn { database, primary });
     }
 
     pub fn mint_function(&self, name: Spelling, namespace: Vec<Spelling>) -> FnId {
@@ -388,15 +433,6 @@ impl Registry {
 
     /// Mint a scope occurrence. `hint` is what baptism starts from; it is
     /// never the emitted name, because the emitted name does not exist yet.
-    /// How many scopes this compilation has minted.
-    ///
-    /// A COUNT, for the one property a caller can check about minting
-    /// without naming what was minted: that a refused act left nothing.
-    #[cfg(test)]
-    pub(crate) fn scopes_minted(&self) -> usize {
-        self.inner.borrow().scopes.len()
-    }
-
     pub(super) fn mint_scope(
         &self,
         kind: ScopeKind,
@@ -406,7 +442,6 @@ impl Registry {
         let (answers_to, emission_prefix, emission_name) = match hint {
             Hint::User(sp) => (Some(sp), None, None),
             Hint::Prefix(prefix) => (None, Some(prefix), None),
-            Hint::Exact(sp) => (None, None, Some(sp)),
             Hint::None => (None, None, None),
         };
         let mut inner = self.inner.borrow_mut();
@@ -456,58 +491,85 @@ impl Registry {
         self.inner.borrow().scopes[scope.0 as usize].truth_witness
     }
 
-    /// AUTHORED-NAME LOSS IS MONOTONIC. Seal one finished heading: any
-    /// canonical name it publishes at more than one position is an
-    /// ambiguity, and every position holding it loses the name.
+    /// AUTHORED-NAME LOSS IS MONOTONIC. Seal one finished heading: every
+    /// position whose name the heading does not answer to — by
+    /// [`heading_names`](Self::heading_names), the one judgment — keeps that
+    /// answer as a record.
     ///
-    /// The spelling itself stays on the occurrence, because the heading
-    /// that HOLDS the ambiguity still reports each position as the
-    /// qualified ordinal that reaches it — the one licensed ordinal
-    /// report. What the seal governs is the future: a later boundary
-    /// carrying one of these occurrences carries no name with it, so a
-    /// projection that leaves one position standing cannot recover a name
-    /// the repetition took away. Only a new authored naming act can.
+    /// The spelling itself stays on the occurrence: the mint drawn for it
+    /// keeps the lost name left of its mark. What the seal governs is the
+    /// future: a later boundary carrying one of these occurrences carries
+    /// no name with it, so a projection that leaves one position standing
+    /// cannot recover a name the repetition took away. Only a new authored
+    /// naming act can.
     pub fn seal_heading_ambiguities(&self, heading: &[ColId]) {
-        let mut names: Vec<(Sym, usize)> = Vec::new();
-        for column in heading {
-            let Some(name) = self.published_sym(*column) else {
-                continue;
-            };
-            match names.iter_mut().find(|(seen, _)| *seen == name) {
-                Some((_, count)) => *count += 1,
-                None => names.push((name, 1)),
-            }
-        }
-        let contested: Vec<Sym> = names
-            .into_iter()
-            .filter(|(_, count)| *count > 1)
-            .map(|(name, _)| name)
-            .collect();
-        if contested.is_empty() {
-            return;
-        }
+        let answers = self.heading_names(heading);
         let mut inner = self.inner.borrow_mut();
-        for column in heading {
-            let record = &inner.cols[column.0 as usize];
-            let Some(published) = record.published else {
-                continue;
-            };
-            let canonical = inner.spellings[published.0 as usize].canon;
-            if contested.contains(&canonical) {
-                inner.cols[column.0 as usize].name_lost = true;
+        for (column, answer) in heading.iter().zip(answers) {
+            let record = &mut inner.cols[column.0 as usize];
+            if answer.is_none()
+                && record.published.is_some()
+                && record.addressing != Addressing::Hygienic
+            {
+                record.name_lost = true;
             }
         }
     }
 
     /// Carry the loss to a republication of a marked occurrence.
-    pub(super) fn inherit_name_loss(&self, column: ColId) {
+    fn inherit_name_loss(&self, column: ColId) {
         self.inner.borrow_mut().cols[column.0 as usize].name_lost = true;
     }
 
     /// Whether this occurrence's authored name lost an ambiguity.
-    pub(super) fn name_lost(&self, column: ColId) -> bool {
+    fn name_lost(&self, column: ColId) -> bool {
         self.inner.borrow().cols[column.0 as usize].name_lost
     }
+
+    /// THE NAME EACH POSITION OF ONE HEADING ANSWERS TO, in heading order.
+    ///
+    /// A position answers to its published name only while nothing has
+    /// taken it: not an ambiguity upstream (the loss record, honored even
+    /// where one survivor of the repetition is all that remains), and not
+    /// another position of THIS heading that still answers to the same
+    /// canonical name (COLLIDING OUTPUTS POISON BOTH: neither is the real
+    /// one). A lost position's name is a mint, unique by construction, so
+    /// it contends with nothing: a name an author writes beside it keeps
+    /// that name. A hygienic carrier answers to no name and contends for
+    /// none; a position with no published spelling — a latent dimension, a
+    /// computed value — answers to none.
+    ///
+    /// The answer depends on the heading asked about: one position can
+    /// answer in a heading where it stands alone and not in one that holds
+    /// a same-named position too. Every name a result carries is unique,
+    /// so a consumer matching two headings through it matches each name at
+    /// most once. The seal records it, baptism draws a heading's mints from
+    /// it, and every consumer that aligns, pairs or compares positions by
+    /// name asks it; nothing may re-derive it from the characters of a
+    /// drawn name.
+    pub fn heading_names(&self, heading: &[ColId]) -> Vec<Option<Sym>> {
+        let inner = self.inner.borrow();
+        let live: Vec<Option<Sym>> = heading
+            .iter()
+            .map(|column| {
+                let record = &inner.cols[column.0 as usize];
+                if record.addressing == Addressing::Hygienic || record.name_lost {
+                    return None;
+                }
+                record
+                    .published
+                    .map(|spelling| inner.spellings[spelling.0 as usize].canon)
+            })
+            .collect();
+        live.iter()
+            .map(|name| {
+                let name = (*name)?;
+                let contested = live.iter().filter(|other| **other == Some(name)).count() > 1;
+                (!contested).then_some(name)
+            })
+            .collect()
+    }
+
 
     /// The same, for the projection authority: a position holding a name
     /// the repetition already took away is not the author naming it again.
@@ -563,46 +625,23 @@ impl Registry {
 
     /// Allocate a physical SQL alias after semantic construction has sealed.
     ///
-    /// The source contributes spelling and value metadata only. No semantic
-    /// ancestry or ownership edge is recorded; those facts live in the
-    /// relation store and SQL binding map.
+    /// The source contributes spelling, value metadata and — where the
+    /// spelling is carried — its name loss, so re-staging a survivor of an
+    /// ambiguity cannot give the emitted heading back the name it lost. No
+    /// semantic ancestry or ownership edge is recorded; those facts live in
+    /// the relation store and SQL binding map.
     pub(crate) fn rebind_sql_column(
         &self,
         source: ColId,
         into: ScopeId,
         published: Option<Spelling>,
     ) -> ColId {
-        self.mint_column(into, published, self.addressing(source), self.facts(source))
-    }
-
-    pub(crate) fn mint_semantic_port(
-        &self,
-        _authority: &crate::relation::builder::SemanticConstruction,
-        source: ColId,
-        into: ScopeId,
-        published: Option<Spelling>,
-        addressing: Addressing,
-        update: impl FnOnce(&mut ValueFacts),
-    ) -> ColId {
-        let mut facts = self.facts(source);
-        update(&mut facts);
         let carried = published == self.published(source);
-        let output = self.mint_column(into, published, addressing, facts);
+        let output = self.mint_column(into, published, self.addressing(source), self.facts(source));
         if carried && self.name_lost(source) {
             self.inherit_name_loss(output);
         }
         output
-    }
-
-    pub(crate) fn mint_new_semantic_port(
-        &self,
-        _authority: &crate::relation::builder::SemanticConstruction,
-        into: ScopeId,
-        published: Option<Spelling>,
-        addressing: Addressing,
-        facts: ValueFacts,
-    ) -> ColId {
-        self.mint_column(into, published, addressing, facts)
     }
 
     pub(crate) fn sql_column(
@@ -625,27 +664,6 @@ impl Registry {
     pub(crate) fn scaffolding_slot(&self) -> ColId {
         let at = self.anonymous_scope(None);
         self.sql_column(at, None, Addressing::Hygienic)
-    }
-
-    /// The column carries a nested relation payload with no static
-    /// interior heading to record — a metadata group's data-keyed record,
-    /// a tuple's positional rows. The physical fact alone: an embedding
-    /// nests it instead of quoting it.
-    pub(crate) fn mark_nested_payload(&self, of: ColId) {
-        self.inner.borrow_mut().cols[of.0 as usize]
-            .facts
-            .tree_valued = true;
-    }
-
-    /// Mint the lexical scope used to emit an interior relation.
-    /// Semantic ownership is recorded by the relation authority, not as a
-    /// copied scope identity in a value-facts sidecar.
-    pub(super) fn mint_interior_scope(&self, of: ColId, hint: Hint) -> ScopeId {
-        let parent = self.scope_of(of);
-        self.inner.borrow_mut().cols[of.0 as usize]
-            .facts
-            .tree_valued = true;
-        self.mint_scope(ScopeKind::Interior, hint, Some(parent))
     }
 
     // ---- ask: never returns characters ---------------------------------
@@ -672,46 +690,8 @@ impl Registry {
         self.inner.borrow().scopes[s.0 as usize].kind
     }
 
-    pub(crate) fn catalog_storage_key(&self, entity: EntityId) -> CatalogStorageKey {
-        let inner = self.inner.borrow();
-        let entity = &inner.entities[entity.0 as usize];
-        CatalogStorageKey {
-            canonical: inner.spellings[entity.canonical.0 as usize].canon,
-            backend_schema: entity
-                .backend_schema
-                .map(|schema| inner.spellings[schema.0 as usize].canon),
-        }
-    }
-
     pub fn parent_of(&self, s: ScopeId) -> Option<ScopeId> {
         self.inner.borrow().scopes[s.0 as usize].parent
-    }
-
-    /// THE AUTHORED OWNER OF A STAGE. `|> … as s` names the relation the
-    /// stage produced: an identity fact of that occurrence, reported by the
-    /// metadata view and recorded here once. It is not a route — which
-    /// authored spelling reaches the relation at a position is the lexical
-    /// frontier's judgment — and it is written by the crossing that
-    /// consumed the stage's input, over the relation that crossing
-    /// produced, never over a relation a caller chose. A scope that already
-    /// answers to a name cannot be renamed by it.
-    pub(crate) fn adopt_stage_owner(
-        &self,
-        scope: ScopeId,
-        answer: Spelling,
-    ) -> Result<(), crate::error::DelightQLError> {
-        {
-            let mut inner = self.inner.borrow_mut();
-            let record = &mut inner.scopes[scope.0 as usize];
-            if record.answers_to.is_some() {
-                return Err(Internal::invariant(
-                    "stage owner",
-                    "a stage that already answers to a name cannot be named again",
-                ));
-            }
-            record.answers_to = Some(answer);
-        }
-        Ok(())
     }
 
     pub fn answers_to(&self, s: ScopeId) -> Option<Sym> {
@@ -733,10 +713,6 @@ impl Registry {
 
     pub fn facts(&self, c: ColId) -> ValueFacts {
         self.inner.borrow().cols[c.0 as usize].facts.clone()
-    }
-
-    pub(crate) fn is_tree_valued(&self, c: ColId) -> bool {
-        self.inner.borrow().cols[c.0 as usize].facts.tree_valued
     }
 
     /// Whether what stands in this slot is a value being written.
@@ -783,38 +759,6 @@ impl Registry {
         }
     }
 
-    /// Refuse where ONE scope binds one name twice argumentatively.
-    ///
-    /// Owed by every correspondence road, the set law's included: there the
-    /// author wrote an ambiguity no ranking resolves, so no alignment may
-    /// pick one of the two.
-    pub(crate) fn refuse_duplicate_bound_names(
-        &self,
-        columns: &[ColId],
-    ) -> Result<(), CorrespondenceError> {
-        for (index, column) in columns.iter().copied().enumerate() {
-            if !matches!(
-                self.addressing(column),
-                Addressing::Bare | Addressing::BareUnder
-            ) {
-                continue;
-            }
-            let Some(name) = self.published_sym(column) else {
-                continue;
-            };
-            if columns[index + 1..].iter().copied().any(|candidate| {
-                matches!(
-                    self.addressing(candidate),
-                    Addressing::Bare | Addressing::BareUnder
-                ) && self.scope_of(candidate) == self.scope_of(column)
-                    && self.published_sym(candidate) == Some(name)
-            }) {
-                return Err(CorrespondenceError::Ambiguous);
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn reserved(&self) -> Vec<Sym> {
         self.inner.borrow().reserved.clone()
     }
@@ -857,43 +801,6 @@ impl Registry {
 
     pub(super) fn canon_bytes(&self, s: Sym) -> Vec<u8> {
         self.inner.borrow().canon_text[s.0 as usize].clone()
-    }
-
-    /// TWO LIVE SCOPES NEVER SHARE A NAME, judged over one co-visible set
-    /// of scopes the lexical frontier made addressable together. The
-    /// answer each scope was born under — or adopted as a stage owner — is
-    /// the registry's record; no capability is minted to ask it.
-    pub(crate) fn refuse_shared_names(
-        &self,
-        co_visible: &[ScopeId],
-        policy: super::scope::DuplicateScopePolicy,
-    ) -> Result<(), crate::error::DelightQLError> {
-        let mut seen: Vec<(Sym, ScopeId)> = Vec::with_capacity(co_visible.len());
-        for scope in co_visible.iter().copied() {
-            let Some(answer) = self.answers_to(scope) else {
-                continue;
-            };
-            if seen
-                .iter()
-                .any(|(name, owner)| *name == answer && *owner != scope)
-            {
-                match policy {
-                    super::scope::DuplicateScopePolicy::Acknowledged => {}
-                    super::scope::DuplicateScopePolicy::Refuse => {
-                        let spelling = self
-                            .answer_spelling(scope)
-                            .map(|spelling| self.spelling_text(spelling).0)
-                            .unwrap_or_default();
-                        return Err(super::scope::ScopeActivationRefusal::DuplicateAnswer {
-                            spelling,
-                        }
-                        .into());
-                    }
-                }
-            }
-            seen.push((answer, scope));
-        }
-        Ok(())
     }
 
     pub(super) fn answer_spelling(&self, s: ScopeId) -> Option<Spelling> {
@@ -940,36 +847,12 @@ impl Registry {
         w.push_ident(&text, stropped);
     }
 
-    /// Spell a scope reported as a VALUE — meta-ize puts one in every row it
-    /// builds — never one written into the SQL text.
-    ///
-    /// Two cases, and only the first is settled here. A scope answering to an
-    /// authored name reports THAT name: a [`Sym`] cannot be rendered, so the
-    /// spelling is what is written, and the reader gets the characters they
-    /// would have to type to qualify those columns. Baptism's alias is the
-    /// wrong answer for it, being uniquified against whatever else one
-    /// emission happens to name — two occurrences answering to `j` must both
-    /// report `j` even when the SQL has to call one of them something else.
-    ///
-    /// A scope answering to nothing gets [`UNMINTED_MARKER`], which is a
-    /// placeholder and not the answer. It is owed a name minted for that
-    /// relation instead, and the marker's own documentation says why.
-    /// Spell a never-named column reported as a VALUE, or decline.
-    ///
-    /// A column the user never named has no name to report: the emission's
-    /// invented alias (`anon`, `op`) would name something no reference can
-    /// address, which reads as an answer and is a lie. What DOES reach the
-    /// column is its ordinal, so the report is that reference as the user
-    /// would write it — `|2|`, or `t|2|` where the scope answers to a name.
-    ///
-    /// Declines (returns false) where no ordinal reaches the column either —
-    /// a heading nobody enumerated has no position to point at.
-    ///
-    /// WHICH columns take this road is baptism's call, not this one's: an
-    /// authored spelling that lost an ambiguity is emitted as an invented
-    /// name too, and the registry still holds the characters its author
-    /// wrote.
-    pub fn write_ordinal_report<W: IdentSink>(&self, c: ColId, w: &mut W) -> bool {
+    /// Spell the ordinal reference that reaches a column with no name, for
+    /// a teaching that has to point at it: `|2|`, or `t|2|` where the scope
+    /// answers to a name. Only a diagnostic writes this. An ordinal is an
+    /// address, never a column's name, so no report of a heading's names
+    /// may take this road.
+    pub fn write_ordinal_reference<W: IdentSink>(&self, c: ColId, w: &mut W) {
         let inner = self.inner.borrow();
         let column = &inner.cols[c.0 as usize];
         let scope = column.scope;
@@ -978,12 +861,11 @@ impl Registry {
         // The qualifier travels as an IDENTIFIER, carrying its stropped bit,
         // and the ordinal syntax follows as its own plain segment. Flattening
         // the two into one string drops the bit, and `a b|1|` is not a
-        // reference anyone can type — the very thing this report promises.
+        // reference anyone can type — the very thing this teaching promises.
         if let Some(spelling) = self.answer_spelling(scope) {
             self.write(spelling, w);
         }
         w.push_ident(&format!("|{}|", position + 1), false);
-        true
     }
 
     /// Spell a catalog entity's physical relation name into a sink.

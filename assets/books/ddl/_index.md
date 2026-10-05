@@ -33,27 +33,27 @@ Assertion mode has two general syntactic forms: *rules* and *facts*.
 
 The general form of a rule is
 
-```
+```text
   <HEAD>  <NECK>  <BODY>
 ```
 
 
-```dql
-  young_users(*)
-    :- adults(*), age < 20
+```{.delightql .am}
+  short_tracks(*)
+    :- track(*), milliseconds < 60000
 ```
 
 In the above example:
 
-  - `young_users(*)`{.delightql} is the `HEAD`
+  - `short_tracks(*)`{.delightql} is the `HEAD`
   - `:-`{.delightql} is the `NECK`
-  - `adults(*), age <20`{.delightql} is the `BODY`. The body may use any DQL feature--the entire previous book applies here.
+  - `track(*), milliseconds < 60000`{.delightql} is the `BODY`. The body may use any DQL feature--the entire previous book applies here.
 
 ### Facts {.dqlh}
 
 Facts are functor forms with grounded data.
 
-```delightql
+```{.delightql .am}
 parent("Abraham", "Isaac")
 ```
 

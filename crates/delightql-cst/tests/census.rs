@@ -65,7 +65,8 @@ fn workspace_root() -> PathBuf {
 ///
 /// A suite test's own `query.dql` is the sequence its runner executes; the
 /// `ddl/` beside it holds the definition sources that same test consults. The
-/// embedded `autoload/` modules are consulted at session start and the embedded
+/// embedded `autoload/` modules — core's, and the client's `repl::*` programs —
+/// are consulted at session start and the embedded
 /// `seed/` programs are run as a sequence — the same two categories, named by
 /// the loader rather than by a test directory.
 fn classify(relative: &Path) -> Option<Class> {
@@ -89,7 +90,9 @@ fn classify(relative: &Path) -> Option<Class> {
         };
     }
 
-    if path.starts_with("crates/delightql-core/autoload/") {
+    if path.starts_with("crates/delightql-core/autoload/")
+        || path.starts_with("crates/delightql-cli/autoload/")
+    {
         return Some(Class::Definitions);
     }
     if path.starts_with("crates/delightql-core/seed/") {

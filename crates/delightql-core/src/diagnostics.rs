@@ -171,7 +171,6 @@ pub(crate) fn run_selftest(system: &DelightQLSystem) -> Vec<DiagnosticFinding> {
     findings.extend(run_catalog(system));
     // Every non-Ok finding is a row of sys::diagnostics.finding: the
     // remediation is the identity when the provider minted one.
-    #[cfg(not(target_arch = "wasm32"))]
     for f in &findings {
         if f.severity == Severity::Ok {
             continue;

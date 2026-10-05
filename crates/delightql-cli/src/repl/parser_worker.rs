@@ -106,8 +106,29 @@ impl WorkerHandle {
     }
 }
 
+/// What the text at the prompt is, for the per-keystroke helpers: one goal
+/// behind the host's wrap, or definitions read as written. The REPL's input
+/// mode sets it; every helper probe and the Tab handler read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperRoad {
+    Prompt,
+    Definitions,
+}
+
+impl HelperRoad {
+    /// The entrance name a request and its evidence carry.
+    pub fn entrance(self) -> &'static str {
+        match self {
+            HelperRoad::Prompt => "prompt",
+            HelperRoad::Definitions => "definitions",
+        }
+    }
+}
+
 pub struct ParserWorkerController {
     inner: Mutex<Option<WorkerHandle>>,
+    /// What the prompt's text is, for the helpers' parses.
+    road: Mutex<HelperRoad>,
     budgets: ReplParserBudgets,
     /// The SHARED optional-helper breaker — the same instance `ReplConfig`
     /// mutates, never a copy of its value. Optional probes read it before
@@ -126,6 +147,10 @@ pub struct ParserWorkerController {
     /// Test seam: spawn workers that panic on every request, to prove the
     /// forwarded-panic road deterministically.
     panic_workers: std::sync::atomic::AtomicBool,
+    /// Test seam: the NEXT request asks the live worker to stall, once, so
+    /// a containment test can model one nonresponsive request while every
+    /// replacement worker stays healthy.
+    stall_next_request: std::sync::atomic::AtomicBool,
     /// Monotonic spawn counter; increments on EVERY spawn, the initial
     /// worker included, and rides in every request and incident.
     generation: AtomicU64,
@@ -145,6 +170,7 @@ impl ParserWorkerController {
     ) -> ParserWorkerController {
         ParserWorkerController {
             inner: Mutex::new(None),
+            road: Mutex::new(HelperRoad::Prompt),
             budgets,
             policy,
             repl_db,
@@ -152,6 +178,7 @@ impl ParserWorkerController {
             executable: None,
             hang_workers: std::sync::atomic::AtomicBool::new(false),
             panic_workers: std::sync::atomic::AtomicBool::new(false),
+            stall_next_request: std::sync::atomic::AtomicBool::new(false),
             generation: AtomicU64::new(0),
             next_request_id: AtomicU64::new(1),
             warn_gate: Mutex::new(HashMap::new()),
@@ -176,6 +203,22 @@ impl ParserWorkerController {
         &self.budgets
     }
 
+    /// What the prompt's text is now.
+    pub fn road(&self) -> HelperRoad {
+        *self
+            .road
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Set what the prompt's text is: the REPL's input mode changed.
+    pub fn set_road(&self, road: HelperRoad) {
+        *self
+            .road
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = road;
+    }
+
     /// A read of the shared policy — never a cached copy. The prompt's
     /// neutral fallback asks this without minting a probe.
     pub fn helpers_enabled(&self) -> bool {
@@ -195,6 +238,10 @@ impl ParserWorkerController {
 
     pub fn hang_workers_for_tests(&self) {
         self.hang_workers.store(true, Ordering::SeqCst);
+    }
+
+    pub fn stall_next_request_for_tests(&self) {
+        self.stall_next_request.store(true, Ordering::SeqCst);
     }
 
     /// The live worker's OS pid, when one is running.
@@ -315,7 +362,7 @@ impl ParserWorkerController {
         // submission's own bytes name; every per-keystroke probe is the
         // prompt road. Hard-kill evidence records THIS copy, because a
         // killed worker answered nothing.
-        let entrance = selected_entrance(operation, input);
+        let entrance = selected_entrance(operation, input, self.road());
         let request = WorkerRequest {
             request_id,
             worker_generation: worker.generation,
@@ -324,6 +371,7 @@ impl ParserWorkerController {
             input: input.to_string(),
             cursor_byte,
             cooperative_budget_ms: budget.as_millis() as u64,
+            stall_for_tests: self.stall_next_request.swap(false, Ordering::SeqCst),
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -383,6 +431,7 @@ impl ParserWorkerController {
                     let entrance: &'static str = match entrance.as_str() {
                         "query_sequence" => "query_sequence",
                         "companion_cell" => "companion_cell",
+                        "definitions" => "definitions",
                         _ => "prompt",
                     };
                     drop(slot);
@@ -784,15 +833,22 @@ fn variant_matches(operation: ReplParserOperation, result: &WorkerResult) -> boo
 /// The parser entrance the PARENT selects for a request, by the same
 /// framing law the parse applies: preflight follows the submission's own
 /// bytes (marked text — misplaced header included — is the utility
-/// entrance); every per-keystroke probe is the prompt road.
-fn selected_entrance(operation: ReplParserOperation, input: &str) -> &'static str {
+/// entrance); every per-keystroke probe reads the prompt's text as `road`
+/// says it is.
+fn selected_entrance(
+    operation: ReplParserOperation,
+    input: &str,
+    road: HelperRoad,
+) -> &'static str {
     match operation {
         ReplParserOperation::SubmissionPreflight => match delightql_cst::submission_road(input) {
             delightql_cst::Root::QuerySequence => "query_sequence",
-            delightql_cst::Root::DefinitionFile | delightql_cst::Root::CompanionCell => "prompt",
+            delightql_cst::Root::DefinitionFile | delightql_cst::Root::CompanionCell => {
+                road.entrance()
+            }
         },
         ReplParserOperation::PromptWellFormed
         | ReplParserOperation::SyntaxHighlight
-        | ReplParserOperation::ContinuationNavigation => "prompt",
+        | ReplParserOperation::ContinuationNavigation => road.entrance(),
     }
 }

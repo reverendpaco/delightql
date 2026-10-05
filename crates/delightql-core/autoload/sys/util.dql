@@ -1,16 +1,12 @@
 
-  style_mapper2:(variant) :-
-     _:( variant
-         @
-        "DBPermanentTable" -> :"style.fill: \Q#f4a261\Q";
-        "DBPermanentView" -> "style.fill: black"
-         )
 
 tables_as_d2(*) :-
   (~~docs
     The live entity catalog rendered as a d2 diagram source document
     (https://d2lang.com). One namespace becomes one d2 container, one
-    entity one sql_table shape, one output column one row. The diagram's
+    entity one sql_table shape, one output column one row. A shape lists
+    its rows in column position order and a container its shapes by name;
+    each concatenation is a window that states its own ordering. The diagram's
     CONTENT is a projection of the catalog, so it cannot drift from the
     schema it documents; layout is left to the d2 renderer (or a
     hand-tuning pass on the emitted SVG).
@@ -42,16 +38,16 @@ tables_as_d2(*) :-
   : base
 
   base(*),  variant in ("DBPermanentTable"; "DBPermanentView")
-   |> #(ns, tname, pos, variant)
-   |> %(ns, tname , variant~> group_concat:(colline, char:(10)) as cols)
+   |> +(group_concat:(colline, char:(10) <~ %(ns, tname, variant), #(pos), rows(_,_)) as cols)
+   |> %(ns, tname, variant, cols)
    |> (ns, tname,
        :"{tname}: {char:(123)}{char:(10)}  shape: sql_table{char:(10)}{cols}{char:(10)}{ style_mapper:(variant)}{char:(125)}"
          as block)
   : tbls
 
   tbls(*)
-   |> #(ns, tname)
-   |> %(ns ~> group_concat:(block, char:(10)) as blocks)
+   |> +(group_concat:(block, char:(10) <~ %(ns), #(tname), rows(_,_)) as blocks)
+   |> %(ns, blocks)
    |> (:"{char:(34)}{ns}{char:(34)}: {char:(123)}{char:(10)}{blocks}{char:(10)}{char:(125)}"
          as container)
   : nss

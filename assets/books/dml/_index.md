@@ -16,9 +16,9 @@ mutation target -- the rows being sourced are the rows being mutated.
 Mark the source with `!!` to make this explicit:
 
 ```delightql
-hr.employee!!(*)                   // !! = "these rows will be mutated"
-  , Department = "Executive"
-  |> delete!(hr.employee(*))(*)
+employee!!(*)                      // !! = "these rows will be mutated"
+  , title = "IT Staff"
+  |> delete!(employee(*))(*)
 ```
 
 The `!!` marker is required when the source is the mutation target.  The
@@ -29,10 +29,10 @@ source table happens to be the same as the target.  Do not use `!!` on
 insert sources:
 
 ```delightql
-employees(*)                       // no !! -- these rows are read-only
-  , department = "Engineering"
-  |> (id + 10 as id, name, department, age, salary)
-  |> insert!(employees(*))(*)
+employee(*)                        // no !! -- these rows are read-only
+  , title = "IT Staff"
+  |> (employee_id + 100 as employee_id, last_name, first_name, title, reports_to)
+  |> insert!(employee(*))(*)
 ```
 
 | Terminal | Source has `!!`? | Reason |

@@ -28,5 +28,10 @@ Throughout this reference, examples of SQL illustrate how a delightql
 expression *could* be transpiled.  Such SQL examples should be viewed as both
 descriptive of the translation semantics and accurate as to the final results.
 
+Every example runs against one sample database: Chinook, a small digital
+music store, extended with a few tables of our own. The
+example database appendix lists its tables and
+credits its source.
+
 
 

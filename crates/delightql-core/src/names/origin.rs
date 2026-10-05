@@ -16,9 +16,49 @@ use super::id::{EntityId, Spelling, Sym};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Intrinsic {
     JsonExtractRaw,
+    /// ONE EXPANDED ELEMENT AS ONE JSON DOCUMENT, before it crosses the
+    /// expansion's subquery boundary: `(value, kind)`, both columns of the
+    /// sequence TVF. A container element is already its document; an atom
+    /// is quoted into one. The kind is read from the TVF's `type` column
+    /// because it is a VALUE: SQLite marks a container element's JSON-ness
+    /// only by subtype, and a sorter or materialized subquery drops the
+    /// subtype, after which `json_quote` turns the document into a string.
+    /// Typed-JSON targets hand back every element as a document and spend
+    /// the kind unread. No callable canonical spelling: the canonical form
+    /// is a CASE the generator writes.
+    JsonEachDocument,
     JsonEachArray,
     JsonEachObject,
     JsonObject,
+    /// THE SPLICE: a structured value the language made, CARRIED into a
+    /// constructor (a column, a subquery), re-marked as JSON so the
+    /// constructor nests it instead of quoting its bytes as text. The one
+    /// spelling of "this member is a contained structure"; a target whose
+    /// carriers keep the JSON type may render it as the value itself.
+    JsonSplice,
+    /// THE ADMISSION: an ordinary value a structure the language makes takes
+    /// as the value it is. A target whose document writer prints a REAL in
+    /// fewer digits than the REAL holds (SQLite writes fifteen) spells the
+    /// admission so the member reads back as the same REAL, or refuses; a
+    /// target that writes the value itself renders it as the value. No
+    /// callable canonical spelling: the canonical form is a CASE the
+    /// generator writes.
+    JsonScalar,
+    /// THE LABEL: a value that becomes a key of a document the language
+    /// makes — a metadata group's partition key. A key is text. A target
+    /// whose key conversion prints a REAL in fewer digits than the REAL holds
+    /// (SQLite) would give two partitions one key, so it spells a REAL label
+    /// in digits it reads back as the same REAL, or refuses. No callable
+    /// canonical spelling: the canonical form is a CASE the generator writes.
+    JsonLabel,
+    /// THE EXACT OPERAND: a value compared as the value it is, never under a
+    /// collation its column declares — an operand of DelightQL equality, a
+    /// grouping or partition key, a distinct aggregate's argument. A target
+    /// whose comparison honours a declared collation (SQLite) spells it
+    /// under its exact collation; a target not claimed by that measurement
+    /// renders it as the value. No callable canonical spelling: the
+    /// canonical form is a postfix collation the generator writes.
+    Exact,
     ScalarMax,
     ScalarMin,
     Round2,
@@ -46,6 +86,27 @@ impl Intrinsic {
         }
     }
 
+    /// What the form does with the rows it stands over: the arbitrary-value
+    /// form reduces them, every other form computes per row.
+    pub fn grade(self) -> crate::resolution::registry::CallGrade {
+        use crate::resolution::registry::CallGrade;
+        match self {
+            Intrinsic::Arbitrary => CallGrade::Aggregate,
+            Intrinsic::JsonExtractRaw
+            | Intrinsic::JsonEachDocument
+            | Intrinsic::JsonEachArray
+            | Intrinsic::JsonEachObject
+            | Intrinsic::JsonObject
+            | Intrinsic::JsonSplice
+            | Intrinsic::JsonScalar
+            | Intrinsic::JsonLabel
+            | Intrinsic::Exact
+            | Intrinsic::ScalarMax
+            | Intrinsic::ScalarMin
+            | Intrinsic::Round2 => CallGrade::Scalar,
+        }
+    }
+
     /// The canonical SQLite call spelling of this form.
     ///
     /// Some structural forms do not lower to a function call. Their
@@ -53,8 +114,11 @@ impl Intrinsic {
     pub fn canonical(self) -> Option<&'static str> {
         match self {
             Intrinsic::JsonExtractRaw => Some("json_extract"),
+            Intrinsic::JsonEachDocument => None,
             Intrinsic::JsonEachArray | Intrinsic::JsonEachObject => Some("json_each"),
             Intrinsic::JsonObject => Some("json_object"),
+            Intrinsic::JsonSplice => Some("json"),
+            Intrinsic::JsonScalar | Intrinsic::JsonLabel | Intrinsic::Exact => None,
             Intrinsic::ScalarMax => Some("max"),
             Intrinsic::ScalarMin => Some("min"),
             Intrinsic::Round2 => Some("round"),
@@ -133,7 +197,6 @@ pub enum HoRole {
     Argument,
     PipeSource,
     ScalarInput,
-    Proffer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,10 +217,6 @@ pub enum Hint {
     User(Spelling),
     /// A rendering prefix; the scope answers to nothing a user may write.
     Prefix(&'static str),
-    /// A compiler-chosen emitted base. Unlike `Prefix`, the base is used
-    /// verbatim and is uniquified only when the finished bundle requires it.
-    /// It never answers a user-written qualifier.
-    Exact(Spelling),
     /// No hint; baptism derives the name from the kind.
     None,
 }
@@ -195,9 +254,7 @@ pub enum Addressing {
     /// A live bare lvar a PIPE STAGE published. Every pipe form is
     /// scope-dequalifying, so a spelling it publishes is bare and a later
     /// bare occurrence reuses it — but the position is a stage's
-    /// publication, not an argumentative binding: two stage-published
-    /// cells carrying one name align ranked at a set correspondence,
-    /// where two argumentative binds of one name refuse.
+    /// publication, not an argumentative binding.
     BareStage,
     /// Never addressable by the user.
     Hygienic,
@@ -216,14 +273,16 @@ pub struct ValueFacts {
     /// Catalog type spelling. This is SQL type syntax, not an identifier,
     /// and is copied out as value data rather than interned as a name.
     pub declared_type: Option<String>,
-    /// A construction shape proved where the value was produced. This fact
-    /// republishes with the value, so a narrowing guard sees the same answer
-    /// for a literal column, a computed projection, and an alias of either.
-    pub shape: ValueShape,
-    /// The value is emitted as a nested relation payload. This is physical
-    /// value metadata only; the exact interior relation and its interface
-    /// live in the semantic relation store.
-    pub tree_valued: bool,
+    /// THE CONTAINED SHAPE: what the value IS while the language carries it,
+    /// proved where the value was produced — as the closed summary an
+    /// output supplied by alternatives folds, so that "no non-null value
+    /// supplied" is a fact a column can carry until a later alternative
+    /// composition consumes it. This fact republishes with the value, so a
+    /// narrowing guard, a constructor embedding it, an alternative folding
+    /// it, and a created object's interior census see the same answer for a
+    /// literal column, a computed projection, a subquery's column, and an
+    /// alias of any of them.
+    pub shape: AlternativeShape,
     /// A cover (`$$`) named this slot and gave it a different value.
     ///
     /// A cover keeps the slot's identity — downstream references were
@@ -241,12 +300,129 @@ pub struct ValueFacts {
     /// a projection, a name, a boundary export all keep it, and a fresh
     /// read of the same catalog column does not have it.
     pub written_by_a_cover: bool,
+    /// WHERE THE VALUE CAME FROM, stated by the act that produced it and
+    /// carried with it. Where names are chosen, a column republished through
+    /// a join or a projection no longer says how it began, and a name
+    /// nobody gave it says so from this.
+    pub provenance: Provenance,
 }
 
+/// Where a value came from, as far as a name invented for it can say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Provenance {
+    /// No act of production described it; an invented name is the bare mark.
+    #[default]
+    Unstated,
+    /// Computed: an expression, a call, a reduction, a collected group.
+    Computed,
+    /// A cell of an anonymous table whose header gave it no name.
+    AnonymousCell,
+    /// A dimension displayed without being activated, which keeps the name
+    /// it has where it lives.
+    Dimension(super::Spelling),
+}
+
+/// What a value IS while the language carries it. `Unknown` is an ordinary
+/// scalar — text included, however much it may look like JSON: resemblance
+/// is never a shape. The structured shapes are DelightQL's own
+/// constructions, and a consumer that must nest one rather than quote it
+/// reads this fact, never the bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ValueShape {
     #[default]
     Unknown,
+    /// One record, `{…}` in value position.
     Record,
+    /// One tuple, `[…]` in value position.
     Tuple,
+    /// A nested relation payload: the rows a collector gathered, a metadata
+    /// group's data-keyed record, a tuple collection. The exact interior
+    /// relation and its interface, where static, live in the semantic
+    /// relation store; this is the physical fact alone.
+    Nested,
+    /// A DelightQL-produced structure whose exact kind is not one fact: the
+    /// join of two different structured shapes, as a branch whose arms make
+    /// a record and a tuple publishes. Enough to nest it rather than quote
+    /// it; not a claim of any one kind.
+    Structured,
+    /// A path extraction whose kind is decided per value at execution: one
+    /// row may be a record, another a tuple, and another genuine text that
+    /// happens to look like either.  This is deliberately not a structured
+    /// shape.  It is the positive fact that a later structural consumer needs
+    /// per-value evidence which the current carriers do not hold.
+    UnprovedDynamic,
+}
+
+impl ValueShape {
+    /// Whether the value is a structure the language made, of any kind.
+    pub fn is_structured(self) -> bool {
+        match self {
+            Self::Record | Self::Tuple | Self::Nested | Self::Structured => true,
+            Self::Unknown | Self::UnprovedDynamic => false,
+        }
+    }
+
+    /// THE JOIN of the shape lattice: the strongest fact two shapes share.
+    /// Equal shapes keep their exact kind; two different structures share
+    /// being structured; anything beside an ordinary value shares nothing.
+    pub fn join(self, other: Self) -> Self {
+        if matches!(self, Self::UnprovedDynamic) || matches!(other, Self::UnprovedDynamic) {
+            Self::UnprovedDynamic
+        } else if self == other {
+            self
+        } else if self.is_structured() && other.is_structured() {
+            Self::Structured
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// THE SHAPE OF ONE OUTPUT SUPPLIED BY ALTERNATIVES — a branch's arms, a
+/// clause selection's clauses, a fact function's arms, an anonymous
+/// column's rows, a set output's arm contributions. One fold for all of
+/// them: it is associative and commutative, so no arm's order or nesting
+/// decides; `Absent` — no non-null value supplied — is its identity and
+/// survives nesting until a value meets it; a value joins by the shape
+/// lattice, where an ordinary value is absorbing. What stands after the
+/// fold is the strongest fact every possible non-null value shares, or
+/// nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlternativeShape {
+    /// No non-null value is supplied here.
+    Absent,
+    /// A value of this shape may be supplied here.
+    Present(ValueShape),
+}
+
+/// A column nothing has proved anything about may supply an ordinary
+/// value: `Absent` is a positive proof, never a default.
+impl Default for AlternativeShape {
+    fn default() -> Self {
+        Self::Present(ValueShape::Unknown)
+    }
+}
+
+impl AlternativeShape {
+    pub fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Absent, shape) | (shape, Self::Absent) => shape,
+            (Self::Present(left), Self::Present(right)) => Self::Present(left.join(right)),
+        }
+    }
+
+    /// The fold over every alternative, from the identity.
+    pub fn fold(alternatives: impl IntoIterator<Item = Self>) -> Self {
+        alternatives.into_iter().fold(Self::Absent, Self::join)
+    }
+
+    /// The shape PROJECTION a consumer that embeds or narrows the value
+    /// reads: what the values share, or — where none was supplied — no
+    /// shape. The summary itself is what a column carries.
+    pub fn shape(self) -> ValueShape {
+        match self {
+            Self::Absent => ValueShape::Unknown,
+            Self::Present(shape) => shape,
+        }
+    }
 }

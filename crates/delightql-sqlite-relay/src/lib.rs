@@ -323,6 +323,7 @@ impl SqlParty {
                 position: (i + 1) as u64,
                 name: name.as_bytes().to_vec(),
                 descriptor: dtype.as_bytes().to_vec(),
+                naming: delightql_protocol::Naming::Authored,
             })
             .collect();
 
@@ -371,8 +372,16 @@ impl SqlParty {
                     return error_term(teach(diagnostic));
                 }
                 Err(_) => {
-                    // Channel closed unexpectedly
+                    // The stream ends only on the worker's `Done`: a channel
+                    // closed before it is the worker's death, and the rows
+                    // already received are not the result.
                     state.exhausted = true;
+                    return error_term(
+                        Sqlite::Worker {
+                            message: "worker thread died before ending its rows".to_string(),
+                        }
+                        .into(),
+                    );
                 }
             }
         }
@@ -435,6 +444,9 @@ impl Handler for SqlParty {
                 lease_ms,
                 orientations,
             } => {
+                if let Some(refusal) = delightql_protocol::version_refusal(&protocol_version) {
+                    return ServerTerm::Error(delightql_protocol::WireError::of(&refusal));
+                }
                 let supported = vec![Orientation::Rows];
                 let agreed: Vec<Orientation> = orientations
                     .iter()

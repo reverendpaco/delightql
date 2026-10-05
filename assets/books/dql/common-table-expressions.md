@@ -8,19 +8,19 @@ Once, a common table expression is defined, it is sufficient to query
 from that as if it were a table.
 
 ```delightql
-adults(*) : users(*), age > 30
-adults(*)
+big_invoices(*) : invoice(*), total > 15
+big_invoices(*)
 ```
 
 
 ```sql
-WITH "adults" AS (
+WITH "big_invoices" AS (
   SELECT *
-  FROM "users"
-  WHERE "age" > 30
+  FROM "invoice"
+  WHERE "total" > 15
 )
 SELECT *
-FROM "adults";
+FROM "big_invoices";
 ```
 
 An alternate syntax, called *post-labeling*, allows the CTE to be named
@@ -28,8 +28,8 @@ after the query by postfixing a valid query with the **SHADOW-NECK** `:`{.deligh
 and a simple identifier:
 
 ```delightql
-users(*), age > 30 : adults
-adults(*)
+invoice(*), total > 15 : big_invoices
+big_invoices(*)
 ```
 
 > Note: post-labeling can only be used on lower-order relational predicates.
@@ -38,23 +38,23 @@ adults(*)
 These syntaxes may be intermixed:
 
 ```delightql
-us_users(*): users(*), country = 'USA'
-orders(*), status = 'completed' : completed_orders
-us_users(*), completed_orders(*)
+us_customers(*): customer(*), country = "USA"
+invoice(*), total > 15 : big_invoices
+us_customers(*), big_invoices(*.(customer_id))
 ```
 
 ```sql
-WITH "us_users" AS (
+WITH "us_customers" AS (
   SELECT *
-  FROM "users"
+  FROM "customer"
   WHERE "country" IS NOT DISTINCT FROM 'USA'
 ),
-"completed_orders" AS (
+"big_invoices" AS (
   SELECT *
-  FROM "orders"
-  WHERE "status" IS NOT DISTINCT FROM 'completed'
+  FROM "invoice"
+  WHERE "total" > 15
 )
 SELECT *
-FROM "us_users"
-CROSS JOIN "completed_orders";
+FROM "us_customers"
+JOIN "big_invoices" USING ("customer_id");
 ```

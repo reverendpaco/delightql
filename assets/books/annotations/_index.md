@@ -11,8 +11,8 @@ Annotations are distinguished by matching **PARENOTATES** `(~~ ~~)`{.delightql .
 followed immediately (no space) by an `<identifier>`.
 
 ```delightql
-(~~<identifier> body ~~)             -- annotation with body
-(~~<identifier>:instance body ~~)    -- annotation with instance name
+(~~<identifier> body ~~)             // annotation with body
+(~~<identifier>:instance body ~~)    // annotation with instance name
 ```
 
 The identifier after the `(~~` is the **ANNOTATION-TYPE**.
@@ -30,8 +30,8 @@ A colon form `identifier:instance` names a specific annotation instance
 and is also a function of the particular annotation type in question.
 
 ```delightql
-users(*), age > 0
-  (~~danger://semantics/example ~~)
+invoice(*), total > 0
+  (~~danger://cardinality/cartesian ~~)
 ```
 
 Only the annotation types listed above are recognized by the grammar.
@@ -43,16 +43,16 @@ Annotations may appear at any continuation point -- before a pipe, before
 a comma, or at the end of an expression:
 
 ```delightql
-users(*), age > 30
-  (~~danger://foo/bar ~~)
-  |> (first_name, email)
+invoice(*), total > 20
+  (~~danger://cardinality/cartesian ~~)
+  |> (invoice_date, billing_city)
 ```
 
 Annotations are usually transparent to SQL generation and so the pipeline above
 produces identical SQL to:
 
 ```delightql
-users(*), age > 30 |> (first_name, email)
+invoice(*), total > 20 |> (invoice_date, billing_city)
 ```
 
 Multiple annotations at the same point are permitted. They appear as siblings

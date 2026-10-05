@@ -4,24 +4,25 @@
 //!
 //! THE COLUMN SELECTS THE ROOT. A companion cell is DATA, and which column it
 //! came from is what says whether it is a constraint or a default — no reader
-//! here classifies a cell by what is inside it. Building the cell is
+//! here classifies a cell by what is inside it. The parse under that column
+//! answers with a tree TYPED by the category it admitted, and only the
+//! normalizer of that category takes it. Building the cell is
 //! `normalize::companion`'s; this is the door the DDL pipeline knocks on.
 
 use crate::ddl_pipeline::asts::{DdlConstraint, DdlDefault};
-use crate::pipeline::syntax::CompanionColumn;
 use crate::Result;
 use std::rc::Rc;
 
 /// One constraint cell: `%%`, `%%(a, b)`, `%`, `%(a)`, or a truth expression
 /// (`@ > 0`, `+parents(parent_code)`).
 pub fn build_constraint(source: &str) -> Result<DdlConstraint> {
-    let tree = crate::pipeline::parse::companion_cell(CompanionColumn::Constraint, source)?;
+    let tree = crate::pipeline::parse::constraint_cell(source)?;
     crate::pipeline::normalize::companion::constraint_cell(&tree, registry())
 }
 
 /// One default cell: any domain expression.
 pub fn build_default(source: &str) -> Result<DdlDefault> {
-    let tree = crate::pipeline::parse::companion_cell(CompanionColumn::Default, source)?;
+    let tree = crate::pipeline::parse::default_cell(source)?;
     crate::pipeline::normalize::companion::default_cell(&tree, registry())
 }
 
@@ -120,7 +121,6 @@ mod tests {
             DdlDefault::Value { expr } => {
                 assert!(matches!(expr, DomainExpression::Application(_)));
             }
-            other => panic!("Expected Value with function, got: {:?}", other),
         }
     }
 
@@ -129,9 +129,13 @@ mod tests {
         let result = build_default("42").unwrap();
         match result {
             DdlDefault::Value { expr } => {
-                assert!(matches!(expr, DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(_))));
+                assert!(matches!(
+                    expr,
+                    DomainExpression::Application(
+                        crate::pipeline::asts::core::FunctionApplication::Ground(_)
+                    )
+                ));
             }
-            other => panic!("Expected Value, got: {:?}", other),
         }
     }
 
@@ -141,9 +145,13 @@ mod tests {
         let result = build_default("'hello'").unwrap();
         match result {
             DdlDefault::Value { expr } => {
-                assert!(matches!(expr, DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(_))));
+                assert!(matches!(
+                    expr,
+                    DomainExpression::Application(
+                        crate::pipeline::asts::core::FunctionApplication::Ground(_)
+                    )
+                ));
             }
-            other => panic!("Expected Value, got: {:?}", other),
         }
     }
 
@@ -152,9 +160,13 @@ mod tests {
         let result = build_default("null").unwrap();
         match result {
             DdlDefault::Value { expr } => {
-                assert!(matches!(expr, DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(_))));
+                assert!(matches!(
+                    expr,
+                    DomainExpression::Application(
+                        crate::pipeline::asts::core::FunctionApplication::Ground(_)
+                    )
+                ));
             }
-            other => panic!("Expected Value with null literal, got: {:?}", other),
         }
     }
 
@@ -165,10 +177,13 @@ mod tests {
         let result = build_default("active").unwrap();
         match result {
             DdlDefault::Value { expr } => match expr {
-                DomainExpression::Application(crate::pipeline::asts::core::FunctionApplication::Ground(crate::pipeline::asts::core::LiteralValue::String(s))) => assert_eq!(s, "active"),
+                DomainExpression::Application(
+                    crate::pipeline::asts::core::FunctionApplication::Ground(
+                        crate::pipeline::asts::core::LiteralValue::String(s),
+                    ),
+                ) => assert_eq!(s, "active"),
                 other => panic!("Expected String literal, got: {:?}", other),
             },
-            other => panic!("Expected Value, got: {:?}", other),
         }
     }
 

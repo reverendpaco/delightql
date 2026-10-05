@@ -9,8 +9,9 @@
 //! - **Rendering parity with the in-process path**: values render
 //!   through the SAME `delightql-backends` DuckDB executor that native
 //!   `--db file.duckdb` uses, so fatboy hashes equal in-proc hashes by
-//!   construction (no NULL-fidelity distinction either — exactly like
-//!   in-proc; the fingerprint conflates NULL and '' anyway).
+//!   construction. That executor renders NULL as the text `NULL`, so every
+//!   cell this party sends is present: a digest of its result cannot tell
+//!   SQL NULL from the text NULL.
 //! - **No server**: DuckDB is a file database. `connect` is fail-closed
 //!   (a DuckParty whose database doesn't exist never exists) but LAZY:
 //!   the file is not opened until the first Query. dql spawns two
@@ -165,6 +166,7 @@ impl DuckParty {
                 position: (i + 1) as u64,
                 name: name.as_bytes().to_vec(),
                 descriptor: Vec::new(), // v1: no foreign descriptors
+                naming: delightql_protocol::Naming::Authored,
             })
             .collect();
 
@@ -279,6 +281,9 @@ impl Handler for DuckParty {
                 lease_ms,
                 orientations,
             } => {
+                if let Some(refusal) = delightql_protocol::version_refusal(&protocol_version) {
+                    return ServerTerm::Error(delightql_protocol::WireError::of(&refusal));
+                }
                 let supported = [Orientation::Rows];
                 let agreed: Vec<Orientation> = orientations
                     .iter()
@@ -354,7 +359,7 @@ mod tests {
         let party = DuckParty::connect(path.to_str().unwrap()).unwrap();
         let client = RelayClient::new(DirectTransport::new(party));
         let VersionResult::Accepted(mut session) = client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .version(1_000_000, delightql_protocol::PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
             .unwrap()
         else {
             panic!("handshake should succeed")
@@ -451,7 +456,7 @@ mod tests {
     fn run_sql(party: DuckParty, sql: &str) -> Result<Vec<String>, String> {
         let client = RelayClient::new(DirectTransport::new(party));
         let VersionResult::Accepted(mut session) = client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .version(1_000_000, delightql_protocol::PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
             .unwrap()
         else {
             panic!("handshake should succeed")
@@ -500,7 +505,7 @@ mod tests {
             let party = DuckParty::connect(path.to_str().unwrap()).unwrap();
             let client = RelayClient::new(DirectTransport::new(party));
             let VersionResult::Accepted(mut session) = client
-                .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+                .version(1_000_000, delightql_protocol::PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
                 .unwrap()
             else {
                 panic!("handshake should succeed")
@@ -568,7 +573,7 @@ mod tests {
         let party = DuckParty::connect(path.to_str().unwrap()).unwrap();
         let client = RelayClient::new(DirectTransport::new(party));
         let VersionResult::Accepted(mut session) = client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .version(1_000_000, delightql_protocol::PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
             .unwrap()
         else {
             panic!("handshake should succeed")

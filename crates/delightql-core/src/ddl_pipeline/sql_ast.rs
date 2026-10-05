@@ -2,8 +2,6 @@
 // Copyright 2026 Daniel Eklund
 use crate::pipeline::sql_ast::DomainExpression as SqlExpression;
 
-use super::asts::GeneratedKind;
-
 /// SQL-layer CREATE TABLE definition.
 #[derive(Debug, Clone)]
 pub struct SqlCreateTable {
@@ -29,10 +27,6 @@ pub struct SqlColumnDef {
 #[derive(Debug, Clone)]
 pub enum SqlDefaultClause {
     Expression(SqlExpression),
-    Generated {
-        expr: SqlExpression,
-        kind: GeneratedKind,
-    },
 }
 
 /// SQL-layer table constraint.

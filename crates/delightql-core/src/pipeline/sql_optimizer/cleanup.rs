@@ -18,122 +18,39 @@ use crate::pipeline::sql_ast::{
 
 use super::visitor::{apply_transformer, QueryTransformer};
 
-pub(super) fn pass_cleanup(stmt: SqlStatement) -> Result<SqlStatement> {
+pub(super) fn pass_cleanup(
+    stmt: SqlStatement,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
+) -> Result<SqlStatement> {
     let mut stmt = stmt;
     deduplicate_visible_ctes(&mut stmt);
-    apply_transformer(stmt, &mut CollapseTransformer)
+    apply_transformer(stmt, &mut CollapseTransformer { target })
 }
 
+/// A WITH list binds each scope once: a later binding of a scope the list
+/// already binds is dropped.
 fn deduplicate_visible_ctes(stmt: &mut SqlStatement) {
-    use crate::pipeline::sql_ast::walk::{visit_expression_mut, visit_query, SqlVisitorMut};
-    use crate::pipeline::sql_ast::Cte;
-
-    struct RemoveVisible<'a> {
-        visible: &'a HashSet<crate::names::ScopeId>,
-    }
-
-    impl SqlVisitorMut for RemoveVisible<'_> {
-        fn query(&mut self, query: &mut QueryExpression) {
-            let QueryExpression::WithCte { ctes, query: body } = query else {
-                return;
-            };
-            let mut visible = self.visible.clone();
-            deduplicate_list(ctes, &mut visible);
-            remove_from_query(body, &visible);
-            if ctes.is_empty() {
-                *query =
-                    std::mem::replace(body, Box::new(QueryExpression::Values { rows: Vec::new() }))
-                        .as_ref()
-                        .clone();
-            }
-        }
-    }
-
-    fn remove_from_query(query: &mut QueryExpression, visible: &HashSet<crate::names::ScopeId>) {
-        visit_query(query, &mut RemoveVisible { visible });
-    }
-
-    fn remove_from_expression(
-        expression: &mut DomainExpression,
-        visible: &HashSet<crate::names::ScopeId>,
-    ) {
-        visit_expression_mut(expression, &mut RemoveVisible { visible });
-    }
-
-    fn deduplicate_list(ctes: &mut Vec<Cte>, visible: &mut HashSet<crate::names::ScopeId>) {
-        let mut kept = Vec::with_capacity(ctes.len());
-        for mut cte in std::mem::take(ctes) {
-            if visible.contains(&cte.scope()) {
-                continue;
-            }
-            for part in cte.parts_mut() {
-                remove_from_query(part, visible);
-            }
-            visible.insert(cte.scope());
-            kept.push(cte);
-        }
-        *ctes = kept;
-    }
-
-    let mut visible = HashSet::new();
-    match stmt {
-        SqlStatement::DropTempTable { .. } => {}
-        SqlStatement::Query { with_clause, query }
-        | SqlStatement::CreateTempTable {
-            with_clause, query, ..
-        }
-        | SqlStatement::CreateTempView {
-            with_clause, query, ..
-        } => {
-            if let Some(ctes) = with_clause {
-                deduplicate_list(ctes, &mut visible);
-            }
-            remove_from_query(query, &visible);
-        }
-        SqlStatement::Insert {
-            with_clause,
-            source,
-            ..
-        } => {
-            if let Some(ctes) = with_clause {
-                deduplicate_list(ctes, &mut visible);
-            }
-            remove_from_query(source, &visible);
-        }
-        SqlStatement::Delete {
-            with_clause,
-            where_clause,
-            ..
-        } => {
-            if let Some(ctes) = with_clause {
-                deduplicate_list(ctes, &mut visible);
-            }
-            if let Some(expression) = where_clause {
-                remove_from_expression(expression, &visible);
-            }
-        }
-        SqlStatement::Update {
-            with_clause,
-            set_clause,
-            where_clause,
-            ..
-        } => {
-            if let Some(ctes) = with_clause {
-                deduplicate_list(ctes, &mut visible);
-            }
-            for (_, expression) in set_clause {
-                remove_from_expression(expression, &visible);
-            }
-            if let Some(expression) = where_clause {
-                remove_from_expression(expression, &visible);
-            }
-        }
+    let with_clause = match stmt {
+        SqlStatement::DropTempTable { .. } => return,
+        SqlStatement::Query { with_clause, .. }
+        | SqlStatement::CreateTempTable { with_clause, .. }
+        | SqlStatement::Insert { with_clause, .. }
+        | SqlStatement::Delete { with_clause, .. }
+        | SqlStatement::Update { with_clause, .. } => with_clause,
+    };
+    if let Some(ctes) = with_clause {
+        let mut visible = HashSet::new();
+        ctes.retain(|cte| visible.insert(cte.scope()));
     }
 }
 
-struct CollapseTransformer;
+/// A wrapper stays standing when either side reduces or windows; which
+/// calls reduce is what the target's aggregate catalog knows.
+struct CollapseTransformer<'t> {
+    target: &'t crate::pipeline::aggregate_catalog::TargetAggregates,
+}
 
-impl QueryTransformer for CollapseTransformer {
+impl QueryTransformer for CollapseTransformer<'_> {
     fn transform_query(&mut self, query: QueryExpression) -> Result<Option<QueryExpression>> {
         let QueryExpression::Select(outer) = &query else {
             return Ok(None);
@@ -164,7 +81,7 @@ impl QueryTransformer for CollapseTransformer {
         let QueryExpression::Select(inner) = inner else {
             return Ok(None);
         };
-        if has_barrier(outer) || has_barrier(&inner) {
+        if has_barrier(outer, self.target) || has_barrier(&inner, self.target) {
             return Ok(None);
         }
 
@@ -216,16 +133,19 @@ fn trivial_star_wrapper(select: &SelectStatement) -> bool {
         && select.limit().is_none()
 }
 
-fn has_barrier(select: &SelectStatement) -> bool {
+fn has_barrier(
+    select: &SelectStatement,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
+) -> bool {
     select.is_distinct()
         || select.group_by().is_some()
         || select.having().is_some()
         || select.order_by().is_some()
         || select.limit().is_some()
-        || select
-            .select_list()
-            .iter()
-            .any(select_item_contains_window_or_aggregate)
+        || select.select_list().iter().any(|item| {
+            item.expr()
+                .is_some_and(|expr| contains_window_or_aggregate(expr, target))
+        })
 }
 
 /// Would collapsing write some body expression into more than one place?
@@ -418,45 +338,35 @@ fn rewrite_exprs(
         .collect()
 }
 
-fn select_item_contains_window_or_aggregate(item: &SelectItem) -> bool {
-    item.expr().is_some_and(contains_window_or_aggregate)
-}
-
-fn contains_window_or_aggregate(expr: &DomainExpression) -> bool {
+fn contains_window_or_aggregate(
+    expr: &DomainExpression,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
+) -> bool {
+    let contains = |expr: &DomainExpression| contains_window_or_aggregate(expr, target);
     match expr {
         DomainExpression::WindowFunction { .. } => true,
         DomainExpression::Function { name, args, .. } => {
-            name.user().is_some_and(|name| {
-                matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    "count" | "sum" | "avg" | "min" | "max" | "group_concat"
-                )
-            }) || args.iter().any(contains_window_or_aggregate)
+            name.user()
+                .is_some_and(|name| target.reduces(name, args.len()))
+                || args.iter().any(contains)
         }
         DomainExpression::Cast { expr, .. }
         | DomainExpression::Unary { expr, .. }
         | DomainExpression::Observation { expr, .. }
-        | DomainExpression::Parens(expr) => contains_window_or_aggregate(expr),
-        DomainExpression::Binary { left, right, .. } => {
-            contains_window_or_aggregate(left) || contains_window_or_aggregate(right)
-        }
+        | DomainExpression::Parens(expr) => contains(expr),
+        DomainExpression::Binary { left, right, .. } => contains(left) || contains(right),
         DomainExpression::Case {
             expr,
             when_clauses,
             else_clause,
         } => {
-            expr.as_deref().is_some_and(contains_window_or_aggregate)
-                || when_clauses.iter().any(|clause| {
-                    contains_window_or_aggregate(clause.when())
-                        || contains_window_or_aggregate(clause.then())
-                })
-                || else_clause
-                    .as_deref()
-                    .is_some_and(contains_window_or_aggregate)
+            expr.as_deref().is_some_and(contains)
+                || when_clauses
+                    .iter()
+                    .any(|clause| contains(clause.when()) || contains(clause.then()))
+                || else_clause.as_deref().is_some_and(contains)
         }
-        DomainExpression::PredicateRewrite { args: elements, .. } => {
-            elements.iter().any(contains_window_or_aggregate)
-        }
+        DomainExpression::PredicateRewrite { args: elements, .. } => elements.iter().any(contains),
         DomainExpression::Exists { .. }
         | DomainExpression::Subquery(_)
         | DomainExpression::Column(_)

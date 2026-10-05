@@ -10,26 +10,23 @@ default and opened explicitly per-query.
 A danger gate is a `danger://` URI inside annotation delimiters:
 
 ```delightql
-employee(*) as e (~~danger://cardinality/nulljoin ON~~),
-  department(*) as d,
-  e.DepartmentId = d.DepartmentId
+genre_2024(*) as x (~~danger://semantics/min_multiplicity~~)
+  |;| genre_2025(*) as y,
+  x.* = y.*
 ```
 
 The annotation attaches at a continuation point (after a relation). The URI
-identifies the specific danger. The toggle controls it:
+identifies the specific danger. The annotation takes the URI alone: writing
+it opens that gate for this query. State words such as `ON` belong only to
+the CLI's `--danger hierarchy=STATE` flag (see Session Baseline).
 
-| Toggle | Meaning |
-|--------|---------|
-| `ON` | Enable the dangerous behavior for this query |
-| `OFF` | Restore the safe default (useful to override a CLI baseline) |
-| `1`--`9` | Graduated severity levels for host-defined behavior |
-
-
-A bare form without a toggle is an error:
+A state word inside the annotation is an error:
 
 ```{.delightql .bad}
-// INVALID: no toggle
-(~~danger://cardinality/nulljoin~~)
+// INVALID: the annotation takes no state word
+genre_2024(*) as x (~~danger://semantics/min_multiplicity ON~~)
+  |;| genre_2025(*) as y,
+  x.* = y.*
 ```
 
 ## Scoping {.dqlh}
@@ -38,24 +35,34 @@ A danger gate opens for one query and auto-closes at query end. It
 does not leak into subsequent queries:
 
 ```delightql
--- gate is open for this query
-employee(*) as e (~~danger://cardinality/nulljoin ON~~),
-  department(*) as d,
-  e.DepartmentId = d.DepartmentId
+// gate is open for this query: 23 rows, Jazz once
+genre_2024(*) as x (~~danger://semantics/min_multiplicity~~)
+  |;| genre_2025(*) as y,
+  x.* = y.*
 
--- gate is closed again -- safe defaults restored
-employee(*) as e, department(*) as d,
-  e.DepartmentId = d.DepartmentId
+// gate is closed again: 47 rows, every matching row of both arms
+genre_2024(*) as x |;| genre_2025(*) as y,
+  x.* = y.*
 ```
 
 Multiple gates may be opened for the same query:
 
 ```delightql
-employee(*) as e
-  (~~danger://cardinality/nulljoin ON~~)
-  (~~danger://cardinality/cartesian ON~~),
-  department(*) as d
+genre_2024(*) as x
+  (~~danger://semantics/min_multiplicity~~)
+  (~~danger://cardinality/cartesian~~)
+  |;| genre_2025(*) as y,
+  x.* = y.*
 ```
+
+A `min_multiplicity` gate must be spent: written on a statement where no
+correlated union uses it, it refuses (`semantic/setop/min_multiplicity/unspent`),
+and over a correlation that compares only some of the columns the arms share
+it refuses too (`semantic/setop/min_multiplicity/partial`) — correlate the
+whole row (`x.* = y.*`).
+
+An unaliased self-join is not a danger to acknowledge: two live scopes
+sharing a name always refuse (`semantic/scope/duplicate`). Alias one side.
 
 ## Session Baseline {.dqlh}
 
@@ -79,11 +86,11 @@ At query end, the danger reverts to the enclosing scope:
 ## Danger URI Reference {.dqlh}
 
 The full hierarchy of danger URIs, their defaults, and their semantics
-is documented in the **Danger URI Taxonomy** appendix. The initial
+is documented in the **Danger URI Taxonomy** appendix. The known
 dangers are:
 
 | URI | What it gates |
 |-----|---------------|
-| `delightql-danger://cardinality/nulljoin` | NULL-matching joins (`=` compiles to `IS NOT DISTINCT FROM` in join position) |
-| `delightql-danger://cardinality/cartesian` | Cross joins without explicit conditions |
-| `delightql-danger://termination/unbounded` | Recursive CTEs without termination conditions |
+| `delightql-danger://cardinality/cartesian` | Cross joins without explicit conditions (declared, not yet enforced: such a join runs with the gate closed) |
+| `delightql-danger://termination/unbounded` | Recursive CTEs without termination conditions (declared, not yet enforced) |
+| `delightql-danger://semantics/min_multiplicity` | A correlated union pairs duplicate copies by minimum multiplicity (SQL's `INTERSECT ALL`) instead of keeping every matching row of both arms; inline only |

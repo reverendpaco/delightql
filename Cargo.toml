@@ -18,16 +18,12 @@ default-members = [
     "crates/delightql-protocol",
     "crates/delightql-sqlite-relay",
     "crates/dql-test-ball-runner",
-    "crates/tree-sitter-highlight",
     "crates/delightql-cabi",
 ]
 # delightql-cst is a member but NOT a default member: its build script runs the
 # pinned tree-sitter CLI, so building it requires that CLI on PATH. Build it
 # explicitly: `cargo build -p delightql-cst`.
-# delightql-architecture-tests is also explicit-only: it launches child Cargo
-# checks and belongs to major-series closure, not the default developer loop.
 members = [
-    "crates/delightql-architecture-tests",
     "crates/delightql-buildinfo",
     "crates/delightql-core",
     "crates/delightql-cst",
@@ -40,7 +36,6 @@ members = [
     "crates/delightql-protocol",
     "crates/delightql-sqlite-relay",
     "crates/dql-test-ball-runner",
-    "crates/tree-sitter-highlight",
     "crates/delightql-cabi",
 ]
 
@@ -58,13 +53,16 @@ serde_json = "1.0"
 rmp-serde = "1.3"
 
 # Databases
-rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "serialize", "hooks"] }
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "serialize", "hooks", "fallible_uint"] }
 
-# Tree-sitter parsing
-# Using tree-sitter-c2rust - pure Rust port of tree-sitter that works seamlessly with WASM
-# No special build setup, LLVM clang, or WASM stubs needed
-# Works identically on native and WASM targets
-tree-sitter = { package = "tree-sitter-c2rust", version = "0.25" }
+# Tree-sitter: ONE exact upstream family. The generator CLI (Makefile pin),
+# the runtime, the highlighter and the language crate are one tuple; a
+# semver range here could let any of them drift from the others. On
+# wasm32-unknown-unknown the runtime supplies C allocation from Rust's
+# global allocator and its own libc subset, so no sysroot and no second
+# allocator are linked.
+tree-sitter = "=0.27.0"
+tree-sitter-highlight = "=0.27.0"
 
 # Error handling
 thiserror = "1.0"
@@ -89,6 +87,17 @@ tempfile = "3.8"
 # variable and type inspection is what is given up.
 [profile.dev]
 debug = "line-tables-only"
+
+# Dependencies rarely recompile, so optimizing them costs nothing per edit,
+# while the test suite, which runs this dev binary, spends much of its time in
+# them (bundled SQLite among them). "*" covers only non-workspace packages, so
+# delightql-cst, the workspace crate that compiles the grammar's C parser, is
+# named separately; it recompiles only when it or the grammar changes.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.delightql-cst]
+opt-level = 3
 
 # Custom profile: optimize for maximum speed
 [profile.release-fast]

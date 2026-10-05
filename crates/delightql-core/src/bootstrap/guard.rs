@@ -72,6 +72,7 @@ const DEFINITION_TABLES: &[&str] = &[
     "interior_entity",
     "interior_entity_attribute",
     "activated_entity",
+    "session_overlay",
 ];
 
 /// SQLite compares object names ASCII-case-insensitively; the guard must
@@ -122,7 +123,8 @@ impl BootstrapGuard {
                 Some(Structural::Sealed) => Authorization::Deny,
                 _ => Authorization::Allow,
             }
-        }));
+        }))
+        .map_err(|e| Runtime::catalog("bootstrap guard authorizer", e.to_string()))?;
         // Defense in depth beneath the authorizer: defensive mode makes the
         // engine itself refuse direct writes to sqlite_master and the other
         // schema-corrupting roads, so a bypass of the callback still meets

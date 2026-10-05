@@ -45,12 +45,12 @@ fn restrict(chain: Chain<Unresolved>) -> Chain<Unresolved> {
             operator: crate::pipeline::asts::vocabulary::CmpOp::Equal,
             left: Box::new(DomainExpression::Application(
                 crate::pipeline::asts::core::FunctionApplication::Ground(
-                    crate::pipeline::asts::core::LiteralValue::Number("1".into()),
+                    crate::pipeline::asts::core::LiteralValue::integer(1),
                 ),
             )),
             right: Box::new(DomainExpression::Application(
                 crate::pipeline::asts::core::FunctionApplication::Ground(
-                    crate::pipeline::asts::core::LiteralValue::Number("1".into()),
+                    crate::pipeline::asts::core::LiteralValue::integer(1),
                 ),
             )),
         }),
@@ -69,7 +69,7 @@ fn member(left: Chain<Unresolved>, right: Chain<Unresolved>) -> Chain<Unresolved
     left.then(Step::authored(Continuation::Member {
         rhs: right,
         correlation: None,
-        join_type: None,
+        join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
     }))
 }
 
@@ -168,10 +168,10 @@ fn source_spine_stops_at_a_bag_operation_and_at_an_edge() {
                         namespace_path: NamespacePath::empty(),
                         name: "b".into(),
                     }),
-                    outer: false,
                 },
                 Access::All,
             ),
+            role: crate::pipeline::asts::core::operators::MemberRole::Required,
         },
     ))));
     assert_eq!(over_edge.source_spine().count(), 1);
@@ -261,44 +261,6 @@ fn fold_tail_hands_the_leaf_the_whole_chain() {
     assert!(saw_operator);
 }
 
-/// A pipe's authored name lives in the authored phase and nowhere else.
-///
-/// The type is the real pin and it is in `phases.rs`: past resolution the
-/// slot IS `()`, so `Continuation::<Refined>::Pipe { named: Some(…) }` is
-/// not a value anyone can write and no lowering has a spelling to read. What
-/// cannot be said in the type is what happens to a fold that arrives at a
-/// spent phase still holding one — dropping it would leave a named stage
-/// unreachable by its own name, and looking the other way is how a second
-/// carrier drifts from the scope that owns the answer. It refuses.
-#[test]
-fn a_spent_phase_refuses_an_authored_stage_name_rather_than_dropping_it() {
-    use crate::pipeline::asts::core::{Phase, Refined, Resolved};
-
-    let written = delightql_types::SqlIdentifier::new("f");
-
-    assert_eq!(
-        Unresolved::admit_stage_name(Some(written.clone())).unwrap(),
-        Some(written.clone())
-    );
-
-    for refusal in [
-        Resolved::admit_stage_name(Some(written.clone())).err(),
-        Refined::admit_stage_name(Some(written.clone())).err(),
-        Refined::admit_stage_name(Some(written.clone())).err(),
-    ] {
-        let refusal = refusal.expect("a spent phase has nowhere to put a name");
-        assert!(
-            refusal.to_string().contains("already spent it"),
-            "should name what went wrong: {refusal}"
-        );
-    }
-
-    // An UNNAMED pipe crosses every phase, because that is the ordinary
-    // case and not a name at all.
-    assert!(Resolved::admit_stage_name(None).is_ok());
-    assert!(Refined::admit_stage_name(None).is_ok());
-}
-
 /// THE PARTITION IS THE ONE MEMBERSHIP ANSWER, and it is one OPERATION:
 /// `pop_run_step` takes a run step off as the exact family, and restores a
 /// nonmember unchanged — so no consumer holds a boolean membership list
@@ -327,7 +289,7 @@ fn the_run_partition_is_one_operation() {
     let mut bounded = sentinel("base").then(Step::authored(Continuation::Bound {
         bound: crate::pipeline::asts::core::specs::TupleOrdinalClause {
             operator: crate::pipeline::asts::core::specs::TupleOrdinalOperator::LessThan,
-            value: 2,
+            value: crate::pipeline::asts::core::CompileTimeInteger::Number(2),
             offset: None,
         },
     }));

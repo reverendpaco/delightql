@@ -7,20 +7,24 @@
 // its 0 into an absence.
 `exists`(T(*))(*) :- T(+), met = 1
 notexists(T(*))(*) :- T(\+), met = 1
-count_is(n, T(*))(*) :- T(*) ~> count:(*) as c, c = n |> exists(*)
-at_least(n, T(*))(*) :- T(*) ~> count:(*) as c, c >= n |> exists(*)
+count_is(n, T(*))(*) :- T(*) ~> count:(*) as c, c = $.n |> exists(*)
+at_least(n, T(*))(*) :- T(*) ~> count:(*) as c, c >= $.n |> exists(*)
 
-// Positional bag equality first makes each row a tuple, orders those tuples,
-// and collects the ordered bag as one interior value. Tuple construction
-// preserves duplicate headings, NULL positions, and multiplicity; comparing
-// the two one-row values is therefore the positional bag judgment.
-bag_tuple(T(*))(*) :-
-  T(*) |> ([*] as tuple_value) |> #(tuple_value)
-       ~> [tuple_value] as bag
+// Positional bag equality makes each row one tuple and counts the copies of
+// each tuple. Tuple construction preserves duplicate headings and NULL
+// positions; two bags are equal when neither holds a tuple, or a count of
+// its copies, that the other lacks. It answers as the existence views do.
+// No row order is read: a collected bag has no element order to compare.
 same_bag(E(*), T(*))(*) :-
-  bag_tuple(T(*))(*) as actual,
-  bag_tuple(E(*))(*) as expected,
-  actual.bag = expected.bag
+  actual(*) : T(*) |> ([*] as tuple_value) |> %(tuple_value ~> count:(*) as copies)
+  expected(*) : E(*) |> ([*] as tuple_value) |> %(tuple_value ~> count:(*) as copies)
+  surplus(*) : actual(*) - expected(*)
+  shortfall(*) : expected(*) - actual(*)
+  surplus(\+) as over, over.met = 1, shortfall(\+) as under, under.met = 1
+  |> (over.met as met)
 
-iota(end)(value) :- _(value@1)
-iota(end)(value) :- iota(end)(*),value<end |> (value + 1 as value)
+// THE INTERVAL IS 1 THROUGH `end`, INCLUSIVE. The anchor is a member only
+// when the interval admits it: a bound below 1 has no positive members, so
+// no anchor and no recursion — an empty relation with iota's heading.
+iota(end)(value) :- _(value@1), value <= $.end
+iota(end)(value) :- iota($.end)(*),value<$.end |> (value + 1 as value)

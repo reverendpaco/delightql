@@ -7,12 +7,12 @@ create directories. When you close the lid, the state persists. When
 you reopen it, everything is where you left it.
 
 ```
-~::                             -- your home directory
-├── data::wh                    -- a mounted database
-├── analytics                   -- a consulted DDL library
-│   └── helpers                 -- the library's internal dependency
-├── analytics::grounded         -- library bound to data
-└── scratch                     -- a namespace you made
+~::                             // your home directory
+├── data::wh                    // a mounted database
+├── analytics                   // a consulted DDL library
+│   └── helpers                 // the library's internal dependency
+├── analytics::grounded         // library bound to data
+└── scratch                     // a namespace you made
 ```
 
 `~::` is home. `::` is root (where `sys` and `std` live). Directives
@@ -30,8 +30,8 @@ echo 'users(*)' | dql query --db warehouse.db
 
 # Persistent -- your laptop
 dql --session workspace.db --db warehouse.db -i
-> mount!("ref.db", "data::ref")
-> consult!("analytics.dql", "analytics")
+> mount!("ref.db", "data::ref")(*)
+> consult!("analytics.dql", "analytics")(*)
 > weekly_report(*)
 > .quit                        # state saved to workspace.db
 
@@ -62,11 +62,11 @@ Every directive produces, consumes, borrows, or transforms a namespace.
 ### Produce {.dqlh}
 
 ```dql
-mount!("warehouse.db", "data::wh")        -- connect database → DataNs
-consult!("analytics.dql", "analytics")     -- load DDL file → LibNs
-copy!("subset")                            -- pipe terminal: create from entity metadata → LibNs
-consult_tree!("models/", "lib")            -- directory tree → nested LibNs
-mount_tree!("postgres://host/db", "data")  -- database catalog → nested DataNs
+mount!("warehouse.db", "data::wh")        // connect database → DataNs
+consult!("analytics.dql", "analytics")     // load DDL file → LibNs
+copy!("subset")                            // pipe terminal: create from entity metadata → LibNs
+consult_tree!("models/", "lib")            // directory tree → nested LibNs
+mount_tree!("postgres://host/db", "data")  // database catalog → nested DataNs
 ```
 
 The `_tree` variants mirror an external hierarchy (filesystem or database
@@ -78,7 +78,7 @@ names the branches. `models/util/greet.dql` becomes `lib::util::greet`.
 ```dql
 unmount!("data::wh")
 unconsult!("analytics")
-imprint!("analytics", "data::wh")         -- materializes views as tables, consumes LibNs
+imprint!("analytics", "data::wh")         // materializes views as tables, consumes LibNs
 ```
 
 `imprint!` is linear -- the library namespace is consumed. This prevents
@@ -88,23 +88,23 @@ inevitably drift).
 ### Borrow {.dqlh}
 
 ```dql
-ground!("data::wh", "analytics", "analytics::g")   -- bind lib to data → GroundedNs
-serialize!("analytics", "backup.dql")               -- write to file
+ground!("data::wh", "analytics", "analytics::g")   // bind lib to data → GroundedNs
+serialize!("analytics", "backup.dql")               // write to file
 ```
 
 ### Transform {.dqlh}
 
 ```dql
-refresh!("data::wh")           -- re-introspect schema
-reconsult!("analytics")        -- reload from file
+refresh!("data::wh")           // re-introspect schema
+reconsult!("analytics")        // reload from file
 ```
 
 ### Scope-local (visibility) {.dqlh}
 
 ```dql
-enlist!("analytics")           -- bare names visible in my scope
-alias!("data::wh", "wh")      -- wh.users(*) shorthand
-delist!("analytics")           -- remove enlistment + alias
+enlist!("analytics")           // bare names visible in my scope
+alias!("data::wh", "wh")      // wh.users(*) shorthand
+delist!("analytics")           // remove the enlistment only
 ```
 
 Scope-local operations are saved/restored at DDL boundaries. A DDL
@@ -124,7 +124,7 @@ captures that binding at creation time.
   young(*) :- users(*), age < 20
 ~~)
 enlist!("helpers")
-young(*)        -- users resolves against the current database
+young(*)        // users resolves against the current database
 ```
 
 See `book/design/inline-ddl.md` for details on ambient binding,
@@ -134,10 +134,10 @@ namespaces.
 ### Execution {.dqlh}
 
 ```dql
-play!("setup.dql")                  -- execute in my scope (source)
-exec!("report.dql") |> (total)      -- execute, return last expression
-run!("job.dql", "sandbox")          -- isolated sub-session
-save!()                             -- persist ~:: to session file
+play!("setup.dql")                  // execute in my scope (source)
+exec!("report.dql") |> (total)      // execute, return last expression
+run!("job.dql", "sandbox")          // isolated sub-session
+save!()                             // persist ~:: to session file
 ```
 
 ## Pipe schemas {.dqlh}
@@ -159,8 +159,8 @@ Pipe terminals read the single column positionally.
 DDL files don't know their own name. The caller chooses:
 
 ```dql
-consult!("analytics.dql", "analytics")   -- caller's choice
-consult!("analytics.dql", "reports")     -- different caller, different name
+consult!("analytics.dql", "analytics")   // caller's choice
+consult!("analytics.dql", "reports")     // different caller, different name
 ```
 
 A DDL that needs helpers cannot self-nest -- it doesn't have
@@ -168,9 +168,9 @@ A DDL that needs helpers cannot self-nest -- it doesn't have
 a DDL are prefixed under the DDL's namespace automatically.
 
 ```dql
--- Inside analytics.dql:
-consult!("helpers.dql", "helpers")     -- becomes analytics::helpers
-consult!("shared.dql", "::shared")    -- :: escapes to global root
+// Inside analytics.dql:
+consult!("helpers.dql", "helpers")     // becomes analytics::helpers
+consult!("shared.dql", "::shared")    // :: escapes to global root
 ```
 
 | Prefix | Target | Unix analogy |
@@ -193,7 +193,7 @@ Key rules:
 - Can't `unmount!` a DataNs that's borrowed by a `ground!`
 - Can't `unconsult!` a LibNs that's borrowed by a `ground!`
 - `imprint!` consumes the LibNs -- use-after-imprint is an error
-- `delist!` drops both enlistments and aliases
+- `delist!` removes one enlistment; an alias is reach, not brevity, and stays
 - Destroying a parent namespace cascades to children
 
 These enforce real invariants (no dangling views, no stale groundings)

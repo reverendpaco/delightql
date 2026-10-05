@@ -21,7 +21,7 @@
 
 use rusqlite::config::DbConfig;
 use rusqlite::hooks::{AuthAction, Authorization};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -32,7 +32,7 @@ use super::incident::Incident;
 
 /// Physical schema revision, stamped as `PRAGMA user_version` and into the
 /// `session` row a dump carries.
-pub const REPL_SCHEMA_VERSION: i64 = 1;
+pub const REPL_SCHEMA_VERSION: i64 = 3;
 
 /// Input-ledger ring bound: the ledger replaces the in-memory history
 /// vectors, whose largest bound was the TUI's 50-entry ring; a session ledger
@@ -90,6 +90,8 @@ const VALUELESS_WRITE_PRAGMAS: &[&str] = &["wal_checkpoint", "optimize", "increm
 pub enum InputKind {
     DotCommand,
     Dql,
+    /// DQL definitions, admitted into `home`.
+    Ddl,
     Sql,
 }
 
@@ -98,6 +100,7 @@ impl InputKind {
         match self {
             InputKind::DotCommand => "dot_command",
             InputKind::Dql => "dql",
+            InputKind::Ddl => "ddl",
             InputKind::Sql => "sql",
         }
     }
@@ -166,7 +169,6 @@ enum PendingWrite {
         completed_at: String,
         outcome: InputOutcome,
         error: Option<String>,
-        generated_sql: Option<String>,
         elapsed_ms: Option<f64>,
     },
     Incident {
@@ -186,8 +188,8 @@ struct SealState {
     open_windows: u32,
 }
 
-/// A history row read back for presentation DTOs (the TUI ring, the bug
-/// manifest). The ledger is the authority; this is a projection of it.
+/// A history row read back for presentation DTOs. The ledger is the
+/// authority; this is a projection of it.
 #[derive(Clone, Debug)]
 pub struct HistoryRow {
     pub occurred_at: String,
@@ -196,7 +198,6 @@ pub struct HistoryRow {
     pub input: String,
     pub outcome: String,
     pub error: Option<String>,
-    pub generated_sql: Option<String>,
     pub elapsed_ms: Option<f64>,
 }
 
@@ -215,17 +216,60 @@ pub struct ClientDatabase {
     dql_build: String,
 }
 
-/// One row of `repl::surface.dot_command`: the dot-command registry's
-/// projection, supplied by the REPL that owns the registry.
-#[derive(Clone, Copy, Debug)]
+/// One row of `repl::surface.dot_command`: one accepted spelling, an alias
+/// pointing at its canonical spelling. `ordinal` is the command's place in
+/// the registry, shared by its aliases.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SurfaceRow {
-    pub spelling: &'static str,
-    pub canonical_name: &'static str,
+    pub ordinal: i64,
+    pub spelling: String,
+    pub canonical_name: String,
     pub is_alias: bool,
-    pub args: &'static str,
-    pub section: &'static str,
-    pub summary: &'static str,
-    pub example: &'static str,
+    pub args: String,
+    pub section: String,
+    pub summary: String,
+    pub example: String,
+}
+
+/// One row of `repl::surface.key_binding`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyBindingRow {
+    pub ordinal: i64,
+    pub section: String,
+    pub keys: String,
+    pub action: String,
+}
+
+/// One row of `repl::surface.example`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExampleRow {
+    pub ordinal: i64,
+    pub section: String,
+    pub query: String,
+    pub note: String,
+}
+
+/// One row of `repl::surface.message`: something the REPL says, by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageRow {
+    pub ordinal: i64,
+    pub name: String,
+    /// The wording, its `{placeholder}`s filled in where it is said.
+    pub text: String,
+}
+
+/// THE REPL'S SURFACE: every relation of `repl::surface`, as the REPL's
+/// registries state it when the database opens and as its tables read back.
+/// What the REPL says in its own words is rendered from what reads back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Surface {
+    pub dot_commands: Vec<SurfaceRow>,
+    /// The welcome message, one line per row. `{version}` and
+    /// `{connection}` are filled in where the message is shown.
+    pub welcome: Vec<String>,
+    pub key_bindings: Vec<KeyBindingRow>,
+    pub examples: Vec<ExampleRow>,
+    pub messages: Vec<MessageRow>,
 }
 
 /// RFC 3339 UTC to the millisecond, the ONE timestamp shape of every
@@ -253,7 +297,7 @@ impl ClientDatabase {
     /// afterwards; ordinary activity only changes rows.
     pub fn open(
         context: super::context::ProcessContext,
-        surface: &[SurfaceRow],
+        surface: &Surface,
     ) -> anyhow::Result<ClientDatabase> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(&format!(
@@ -265,7 +309,29 @@ impl ClientDatabase {
                  args            TEXT NOT NULL,
                  section         TEXT NOT NULL,
                  summary         TEXT NOT NULL,
-                 example         TEXT NOT NULL
+                 example         TEXT NOT NULL,
+                 ordinal         INTEGER NOT NULL
+             );
+             CREATE TABLE welcome (
+                 line_no  INTEGER PRIMARY KEY,
+                 text     TEXT NOT NULL
+             );
+             CREATE TABLE key_binding (
+                 ordinal  INTEGER PRIMARY KEY,
+                 section  TEXT NOT NULL,
+                 keys     TEXT NOT NULL,
+                 action   TEXT NOT NULL
+             );
+             CREATE TABLE example (
+                 ordinal  INTEGER PRIMARY KEY,
+                 section  TEXT NOT NULL,
+                 query    TEXT NOT NULL,
+                 note     TEXT NOT NULL
+             );
+             CREATE TABLE message (
+                 ordinal  INTEGER PRIMARY KEY,
+                 name     TEXT NOT NULL UNIQUE,
+                 text     TEXT NOT NULL
              );
              CREATE TABLE option (
                  name           TEXT PRIMARY KEY,
@@ -280,7 +346,7 @@ impl ClientDatabase {
                  occurred_at     TEXT NOT NULL,
                  completed_at    TEXT,
                  kind            TEXT NOT NULL
-                                 CHECK (kind IN ('dot_command', 'dql', 'sql')),
+                                 CHECK (kind IN ('dot_command', 'dql', 'ddl', 'sql')),
                  input           TEXT NOT NULL,
                  outcome         TEXT NOT NULL
                                  CHECK (outcome IN (
@@ -288,7 +354,6 @@ impl ClientDatabase {
                                      'failed', 'interrupted'
                                  )),
                  error           TEXT,
-                 generated_sql   TEXT,
                  elapsed_ms      REAL
              );
              CREATE TABLE incident (
@@ -395,11 +460,13 @@ impl ClientDatabase {
         }
 
         {
-            // Exhaustive projection of the registry: one row per accepted
-            // spelling; aliases point at the canonical spelling.
-            let mut insert =
-                conn.prepare("INSERT INTO dot_command VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
-            for row in surface {
+            // Exhaustive projection of the registries: one dot_command row
+            // per accepted spelling, aliases pointing at the canonical one.
+            let mut insert = conn.prepare(
+                "INSERT INTO dot_command (spelling, canonical_name, is_alias, args, section, \
+                 summary, example, ordinal) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for row in &surface.dot_commands {
                 insert.execute(params![
                     row.spelling,
                     row.canonical_name,
@@ -407,8 +474,25 @@ impl ClientDatabase {
                     row.args,
                     row.section,
                     row.summary,
-                    row.example
+                    row.example,
+                    row.ordinal
                 ])?;
+            }
+            let mut insert = conn.prepare("INSERT INTO welcome VALUES (?1, ?2)")?;
+            for (line_no, text) in surface.welcome.iter().enumerate() {
+                insert.execute(params![line_no as i64 + 1, text])?;
+            }
+            let mut insert = conn.prepare("INSERT INTO key_binding VALUES (?1, ?2, ?3, ?4)")?;
+            for row in &surface.key_bindings {
+                insert.execute(params![row.ordinal, row.section, row.keys, row.action])?;
+            }
+            let mut insert = conn.prepare("INSERT INTO example VALUES (?1, ?2, ?3, ?4)")?;
+            for row in &surface.examples {
+                insert.execute(params![row.ordinal, row.section, row.query, row.note])?;
+            }
+            let mut insert = conn.prepare("INSERT INTO message VALUES (?1, ?2, ?3)")?;
+            for row in &surface.messages {
+                insert.execute(params![row.ordinal, row.name, row.text])?;
             }
         }
 
@@ -439,7 +523,7 @@ impl ClientDatabase {
     /// command registry (empty without the REPL feature: no surface).
     pub fn open_on(mode: super::context::Mode) -> anyhow::Result<ClientDatabase> {
         let context = super::context::ProcessContext::capture(mode);
-        Self::open(context, &dot_command_surface())
+        Self::open(context, &registry_surface())
     }
 
     /// The road this process is on.
@@ -621,7 +705,6 @@ impl ClientDatabase {
         id: i64,
         outcome: InputOutcome,
         error: Option<String>,
-        generated_sql: Option<String>,
         elapsed_ms: Option<f64>,
     ) -> WriteOutcome {
         let completed_at = now_rfc3339();
@@ -634,7 +717,6 @@ impl ClientDatabase {
                     &completed_at,
                     outcome,
                     error.as_deref(),
-                    generated_sql.as_deref(),
                     elapsed_ms,
                 ) {
                     Ok(()) => WriteOutcome::Applied,
@@ -646,7 +728,6 @@ impl ClientDatabase {
                 completed_at,
                 outcome,
                 error,
-                generated_sql,
                 elapsed_ms,
             }),
         }
@@ -781,7 +862,6 @@ impl ClientDatabase {
                     completed_at,
                     outcome,
                     error,
-                    generated_sql,
                     elapsed_ms,
                 } => close_input_row(
                     &window.conn,
@@ -789,7 +869,6 @@ impl ClientDatabase {
                     &completed_at,
                     outcome,
                     error.as_deref(),
-                    generated_sql.as_deref(),
                     elapsed_ms,
                 )
                 .map_err(|e| e.to_string()),
@@ -834,8 +913,7 @@ impl ClientDatabase {
             .lock_within(READER_LOCK_BUDGET)
             .ok_or_else(|| anyhow::anyhow!("the live REPL database is busy"))?;
         let mut stmt = conn.prepare(
-            "SELECT occurred_at, completed_at, kind, input, outcome, error,
-                    generated_sql, elapsed_ms
+            "SELECT occurred_at, completed_at, kind, input, outcome, error, elapsed_ms
              FROM input ORDER BY id",
         )?;
         let rows = stmt
@@ -847,12 +925,93 @@ impl ClientDatabase {
                     input: row.get(3)?,
                     outcome: row.get(4)?,
                     error: row.get(5)?,
-                    generated_sql: row.get(6)?,
-                    elapsed_ms: row.get(7)?,
+                    elapsed_ms: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// `repl::surface` read back, each relation in its own order.
+    pub fn surface(&self) -> anyhow::Result<Surface> {
+        let conn = self
+            .lock_within(READER_LOCK_BUDGET)
+            .ok_or_else(|| anyhow::anyhow!("the live REPL database is busy"))?;
+        let dot_commands = conn
+            .prepare(
+                "SELECT ordinal, spelling, canonical_name, is_alias, args, section, summary,
+                        example
+                 FROM dot_command ORDER BY ordinal, is_alias, spelling",
+            )?
+            .query_map([], |row| {
+                Ok(SurfaceRow {
+                    ordinal: row.get(0)?,
+                    spelling: row.get(1)?,
+                    canonical_name: row.get(2)?,
+                    is_alias: row.get::<_, i64>(3)? != 0,
+                    args: row.get(4)?,
+                    section: row.get(5)?,
+                    summary: row.get(6)?,
+                    example: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let welcome = conn
+            .prepare("SELECT text FROM welcome ORDER BY line_no")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let key_bindings = conn
+            .prepare("SELECT ordinal, section, keys, action FROM key_binding ORDER BY ordinal")?
+            .query_map([], |row| {
+                Ok(KeyBindingRow {
+                    ordinal: row.get(0)?,
+                    section: row.get(1)?,
+                    keys: row.get(2)?,
+                    action: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let examples = conn
+            .prepare("SELECT ordinal, section, query, note FROM example ORDER BY ordinal")?
+            .query_map([], |row| {
+                Ok(ExampleRow {
+                    ordinal: row.get(0)?,
+                    section: row.get(1)?,
+                    query: row.get(2)?,
+                    note: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let messages = conn
+            .prepare("SELECT ordinal, name, text FROM message ORDER BY ordinal")?
+            .query_map([], |row| {
+                Ok(MessageRow {
+                    ordinal: row.get(0)?,
+                    name: row.get(1)?,
+                    text: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Surface {
+            dot_commands,
+            welcome,
+            key_bindings,
+            examples,
+            messages,
+        })
+    }
+
+    /// The wording of one `repl::surface.message` row; `None` when no row
+    /// has that name.
+    pub fn message(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let conn = self
+            .lock_within(READER_LOCK_BUDGET)
+            .ok_or_else(|| anyhow::anyhow!("the live REPL database is busy"))?;
+        Ok(conn
+            .query_row("SELECT text FROM message WHERE name = ?1", [name], |row| {
+                row.get(0)
+            })
+            .optional()?)
     }
 }
 
@@ -878,15 +1037,15 @@ impl Drop for WindowCloser {
     }
 }
 
-/// The dot-command registry projected into surface rows.
-fn dot_command_surface() -> Vec<SurfaceRow> {
+/// The REPL's registries, as the surface they seed.
+fn registry_surface() -> Surface {
     #[cfg(feature = "repl")]
     {
-        crate::repl::commands::dot_command_surface()
+        crate::repl::surface::registry()
     }
     #[cfg(not(feature = "repl"))]
     {
-        Vec::new()
+        Surface::default()
     }
 }
 
@@ -939,21 +1098,12 @@ fn close_input_row(
     completed_at: &str,
     outcome: InputOutcome,
     error: Option<&str>,
-    generated_sql: Option<&str>,
     elapsed_ms: Option<f64>,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE input SET completed_at = ?2, outcome = ?3, error = ?4,
-                          generated_sql = ?5, elapsed_ms = ?6
+        "UPDATE input SET completed_at = ?2, outcome = ?3, error = ?4, elapsed_ms = ?5
          WHERE id = ?1",
-        params![
-            id,
-            completed_at,
-            outcome.as_str(),
-            error,
-            generated_sql,
-            elapsed_ms
-        ],
+        params![id, completed_at, outcome.as_str(), error, elapsed_ms],
     )?;
     Ok(())
 }
@@ -1131,7 +1281,7 @@ fn install_authorizer(conn: &Connection, seal: Arc<Mutex<SealState>>) -> anyhow:
             // Future authorizer actions fail CLOSED while sealed.
             _ => Authorization::Deny,
         }
-    }));
+    }))?;
     Ok(())
 }
 
@@ -1162,11 +1312,15 @@ mod tests {
                 "argument",
                 "dot_command",
                 "environment",
+                "example",
                 "incident",
                 "input",
+                "key_binding",
+                "message",
                 "option",
                 "session",
-                "sqlite_sequence"
+                "sqlite_sequence",
+                "welcome"
             ]
         );
         let version: i64 = conn
@@ -1242,6 +1396,14 @@ mod tests {
                 assert_eq!(*is_alias, 1);
             }
         }
+    }
+
+    /// `repl::surface` reads back exactly what the registries seeded, in
+    /// their order: the rows the welcome message and `.help` render from.
+    #[test]
+    fn the_surface_reads_back_as_the_registries_state_it() {
+        let db = open();
+        assert_eq!(db.surface().unwrap(), crate::repl::surface::registry());
     }
 
     /// Read-only boundary: row DML, schema DDL, attach, and write-capable
@@ -1337,24 +1499,18 @@ mod tests {
         let (id, outcome) = db.record_input(InputKind::Dql, "users(*)");
         assert!(matches!(outcome, WriteOutcome::Applied));
         assert!(matches!(
-            db.close_input(
-                id,
-                InputOutcome::Succeeded,
-                None,
-                Some("SELECT 1".into()),
-                Some(1.5)
-            ),
+            db.close_input(id, InputOutcome::Succeeded, None, Some(1.5)),
             WriteOutcome::Applied
         ));
         let rows = db.history_rows().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, "dql");
         assert_eq!(rows[0].outcome, "succeeded");
-        assert_eq!(rows[0].generated_sql.as_deref(), Some("SELECT 1"));
+        assert_eq!(rows[0].elapsed_ms, Some(1.5));
 
         for i in 0..(INPUT_RING_CAPACITY + 10) {
-            let (id, _) = db.record_input(InputKind::DotCommand, &format!(".zebra {i}"));
-            db.close_input(id, InputOutcome::Succeeded, None, None, None);
+            let (id, _) = db.record_input(InputKind::DotCommand, &format!(".help {i}"));
+            db.close_input(id, InputOutcome::Succeeded, None, None);
         }
         let rows = db.history_rows().unwrap();
         assert_eq!(rows.len() as i64, INPUT_RING_CAPACITY);
@@ -1437,7 +1593,7 @@ mod tests {
         let (id, outcome) = db.record_input(InputKind::Sql, "SELECT 1");
         assert!(matches!(outcome, WriteOutcome::Queued));
         assert!(matches!(
-            db.close_input(id, InputOutcome::Succeeded, None, None, Some(0.5)),
+            db.close_input(id, InputOutcome::Succeeded, None, Some(0.5)),
             WriteOutcome::Queued
         ));
         match db.record_incident(specimen("x", 25, "worker_kill")) {
@@ -1474,7 +1630,7 @@ mod tests {
     fn serialize_snapshots_without_mutating() {
         let db = open();
         let (id, _) = db.record_input(InputKind::Dql, "users(*)");
-        db.close_input(id, InputOutcome::Succeeded, None, None, None);
+        db.close_input(id, InputOutcome::Succeeded, None, None);
         let image = db.serialize().unwrap();
 
         let mut loaded = Connection::open_in_memory().unwrap();
@@ -1496,7 +1652,7 @@ mod tests {
         // Still alive and still sealed afterwards.
         let (id2, outcome) = db.record_input(InputKind::Dql, "users(*) |> (id)");
         assert!(matches!(outcome, WriteOutcome::Applied));
-        db.close_input(id2, InputOutcome::Failed, Some("boom".into()), None, None);
+        db.close_input(id2, InputOutcome::Failed, Some("boom".into()), None);
         assert_eq!(db.history_rows().unwrap().len(), 2);
     }
 }

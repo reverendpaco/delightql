@@ -3,23 +3,23 @@
 
 Shared identifiers across functors induce join conditions -- Prolog-style unification:
 ```delightql
-employee(Name, Department), department(Department, location)
+album(album_id, title, artist_id), artist(artist_id, name)
 ```
 ```sql
-SELECT employee.Name, employee.Department, department.location
-FROM employee
-  JOIN department ON employee.Department = department.Department;
+SELECT album.album_id, album.title, album.artist_id, artist.name
+FROM album
+  JOIN artist ON album.artist_id = artist.artist_id;
 ```
 
-The variable `Department` appears in both functors, unifying the columns.
+The variable `artist_id` appears in both functors, unifying the columns.
 
 Multi-table example:
 ```delightql
-people(people_id, _, last_name),
-  stock_ownership(people_id, stock_id, quantity),
-  stocks(stock_id, stock_name),
-  quantity < 200
-  |> (last_name, stock_name)
+artist(artist_id, name),
+  similar_artist(artist_id, similar_id, score),
+  artist(similar_id, similar_name),
+  score > 0.85
+  |> (name, similar_name)
 ```
 
 Argumentative joins are idiomatic in Prolog. Delightql supports them but

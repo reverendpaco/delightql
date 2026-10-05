@@ -25,7 +25,7 @@
 //!   └── base trait for all bin entities
 //!       ├── name, type, signature
 //!       └── EffectExecutable (for pseudo-predicates)
-//!           └── execute() method for the effect executor
+//!           └── execute() method the runtime calls
 //! ```
 //!
 //! ## Example: Pseudo-Predicate
@@ -40,6 +40,7 @@
 //! }
 //!
 //! impl EffectExecutable for MountPredicate {
+//!     fn class(&self) -> ExecutionClass { ExecutionClass::Effect }
 //!     fn execute(&self, args: &[...], alias: Option<String>, system: &mut DelightQLSystem) -> Result<EntityResult> {
 //!         // Open database, register namespace, etc.
 //!     }
@@ -183,19 +184,10 @@ pub trait BinEntity: Send + Sync {
     /// Entity signature (parameters + return type)
     fn signature(&self) -> EntitySignature;
 
-    /// Whether this entity has side effects
-    ///
-    /// Side-effecting entities (pseudo-predicates) must be executed during
-    /// the effect executor rather than deferred to a later stage.
-    #[allow(dead_code)]
-    fn has_side_effects(&self) -> bool {
-        false // Most entities don't have side effects
-    }
-
     /// Get this entity as an EffectExecutable trait object (if applicable)
     ///
-    /// Returns Some if this entity implements EffectExecutable (i.e., can be executed
-    /// in the effect executor). Returns None otherwise.
+    /// Returns Some if this entity implements EffectExecutable (i.e., the
+    /// runtime can execute it). Returns None otherwise.
     ///
     /// Default implementation returns None. Override this for executable entities.
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
@@ -225,12 +217,30 @@ pub enum EntityResult {
     Relation(GroundForm),
 }
 
-/// Effect Executable - Entities that execute in the effect executor
+/// What executing an entity does to the world it runs against.
 ///
-/// Pseudo-predicates implement this trait to provide their execution logic.
-/// The effect executor calls `execute()` when it encounters the pseudo-predicate
-/// in the unresolved AST.
+/// Declared by every executable, with no default: an executable exists
+/// only together with its class, so an observing compilation
+/// (`compiler_limits::Admission::Observe`) judges the executable it is
+/// about to run and nothing an author could forget to say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionClass {
+    /// Mutates the namespace, database, filesystem, output, or session.
+    Effect,
+    /// Reads and answers; runs unchanged under observation
+    /// (`sys::execution.compile`).
+    Pure,
+}
+
+/// Effect Executable - Entities the runtime executes
+///
+/// Pseudo-predicates implement this trait to provide their execution logic;
+/// the runtime calls `execute()` when a plan runs the pseudo-predicate.
 pub trait EffectExecutable: BinEntity {
+    /// What this execution does to the world. Required: the class crosses
+    /// into the executor as one fact with the operation it classifies.
+    fn class(&self) -> ExecutionClass;
+
     /// Execute the entity with the given arguments
     ///
     /// # Arguments
@@ -312,7 +322,7 @@ pub struct GeneratorContext<'a> {
 /// Sigma predicates and functions implement this trait to generate
 /// dialect-specific SQL strings in the SQL generator.
 ///
-/// The entity has complete control over SQL generation - the transformer
+/// The entity has complete control over SQL generation - the generator
 /// does NOT interpret or map anything. It just asks the entity to generate SQL.
 pub trait SqlGeneratable: BinEntity {
     /// Generate SQL for this entity with the given arguments

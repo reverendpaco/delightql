@@ -128,25 +128,6 @@ impl<P: Phase<Output = ()>> MetadataOut<P> {
     }
 }
 
-impl<P: Phase<Output = crate::relation::PortId>> MetadataOut<P> {
-    /// THE ONE BOUND-PHASE CONSTRUCTOR, and it is the authority's. The
-    /// port is the one the derivation made for THIS position.
-    pub(crate) fn published(
-        _authority: &crate::relation::builder::SemanticConstruction,
-        group: super::expressions::MetadataGroup<P>,
-        naming: Option<SqlIdentifier>,
-        output: crate::relation::PortId,
-    ) -> Self {
-        MetadataOut {
-            group,
-            naming,
-            output,
-        }
-    }
-
-}
-
-
 impl<P: Phase> ReductionItem<P> {
     /// The column this item publishes, once the resolver has decided.
     pub fn output(&self) -> &P::Output {
@@ -294,33 +275,6 @@ impl<P: Phase<Output = ()>> OneOut<P> {
     }
 }
 
-impl<P: Phase<Output = crate::relation::PortId>> OneOut<P> {
-    /// THE ONE BOUND-PHASE CONSTRUCTOR, and it is the authority's. The
-    /// port is the one the derivation made for THIS position.
-    pub(crate) fn published(
-        _authority: &crate::relation::builder::SemanticConstruction,
-        expr: DomainExpression<P>,
-        naming: Option<SqlIdentifier>,
-        output: crate::relation::PortId,
-    ) -> Self {
-        OneOut {
-            expr,
-            naming,
-            output,
-        }
-    }
-
-
-    /// The same act over a port the authority followed one carry edge to.
-    pub(crate) fn reland(
-        &mut self,
-        _authority: &crate::relation::builder::SemanticConstruction,
-        output: crate::relation::PortId,
-    ) {
-        self.output = output;
-    }
-}
-
 /// A publication item: one value, or a spread standing for the several it
 /// covers.
 ///
@@ -365,19 +319,6 @@ impl<P: Phase> OutItem<P> {
     pub fn value_mut(&mut self) -> Option<&mut DomainExpression<P>> {
         match self {
             Self::One(one) => Some(&mut one.expr),
-            Self::Many(_) | Self::Whole => None,
-        }
-    }
-}
-
-/// After resolution the stamp is there to read. A spread has none of its own:
-/// it published through its expansion, and the expansion is what carries the
-/// occurrences — which is a PERMANENT no-single-output, not an interval, and
-/// says so.
-impl<P: Phase<Output = crate::relation::PortId>> OutItem<P> {
-    pub fn output(&self) -> Option<crate::relation::PortId> {
-        match self {
-            Self::One(one) => Some(*one.output()),
             Self::Many(_) | Self::Whole => None,
         }
     }
@@ -437,25 +378,6 @@ impl<P: Phase<Output = ()>> NamedOutItem<P> {
             output: (),
         }
     }
-}
-
-impl<P: Phase<Output = crate::relation::PortId>> NamedOutItem<P> {
-    /// THE ONE BOUND-PHASE CONSTRUCTOR, and it is the authority's.
-    pub(crate) fn published(
-        _authority: &crate::relation::builder::SemanticConstruction,
-        expr: DomainExpression<P>,
-        naming: SqlIdentifier,
-        qualifier: Option<SqlIdentifier>,
-        output: crate::relation::PortId,
-    ) -> Self {
-        NamedOutItem {
-            expr,
-            naming,
-            qualifier,
-            output,
-        }
-    }
-
 }
 
 /// Ordering direction for ORDER BY
@@ -529,6 +451,13 @@ pub enum TupleOrdinalOperator {
 #[lispy("sigma_clause:tuple_ordinal")]
 pub struct TupleOrdinalClause {
     pub operator: TupleOrdinalOperator,
-    pub value: i64,
-    pub offset: Option<i64>,
+    pub value: super::CompileTimeInteger,
+    pub offset: Option<super::CompileTimeInteger>,
+}
+
+impl TupleOrdinalClause {
+    /// The scalar formals the bound names, count first.
+    pub fn formals(&self) -> Vec<super::definitions::FormalSelector> {
+        self.value.formal().into_iter().chain(self.offset.and_then(|o| o.formal())).collect()
+    }
 }

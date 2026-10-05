@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-// Abstract Syntax Tree representations for the DelightQL pipeline.
-//
-// Three phases with shared core structures:
-// - unresolved: Direct output from parser
-// - resolved: With symbol resolution and result
-// - refined: Restructured for SQL generation
 
 pub mod core; // Public - needed for SQL AST provenance
 pub mod ddl;
 pub mod effects;
-pub mod refined;
-pub mod resolved;
+pub(crate) mod package;
 pub mod unresolved;
 pub mod vocabulary;

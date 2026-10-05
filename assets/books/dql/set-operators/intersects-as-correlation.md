@@ -13,9 +13,9 @@ After any union-flavored multiset operator, conjoin a condition that correlates
 the previous relations together.  From such a union an intersection results:
 
 ```delightql
-employee_2019(*) as e1 |;|
-  employee_2018(*) as e2,
-  e1.EmployeeId = e2.EmployeeId
+genre_2024(*) as g1 |;|
+  genre_2025(*) as g2,
+  g1.genre_id = g2.genre_id
 ```
 
 
@@ -49,33 +49,38 @@ The positional shorthand `x|*| = y|*|` means "match on all column positions."
 | DQL                           | Equivalent SQL concept              |
 +===============================+=====================================+
 |                               |                                     |
-| ```                           |                                     |
-| x(*) ; y(*) ,x.* = y.*        |   INTERSECT ALL CORRESPONDING       |
+| ```delightql                  |                                     |
+| employee_2024(*) as x ;       |   INTERSECT ALL CORRESPONDING       |
+|   employee_2025(*) as y,      |                                     |
+|   x.* = y.*                   |                                     |
 | ```                           |                                     |
 +-------------------------------+-------------------------------------+
 |                               |                                     |
+| ```delightql                  |                                     |
+| genre_2024(*) as x |;|        |   INTERSECT ALL                     |
+|   genre_2025(*) as y,         |                                     |
+|   x.* = y.*                   |  (name safe)                        |
 | ```                           |                                     |
-| x(*) |;| y(*) ,x.* = y.*      |   INTERSECT ALL                     |
-| ```                           |                                     |
-|                               |  (Name safe)                        |
 +-------------------------------+-------------------------------------+
 |                               |                                     |
-| ```                           |                                     |
-| x(*) || y(*) ,x|*| = y|*|     |   INTERSECT ALL                     |
-| ```                           |                                     |
-|                               |  (positional,                       |
-|                               |    = SQL's `INTERSECT ALL`)         |
-+-------------------------------+-------------------------------------+
-|                               |                                     |
-| ```                           |                                     |
-| x(*) || y(*) ,x|*| = y|*|     |   INTERSECT ALL                     |
-| ```                           |                                     |
-|                               |  (positional,                       |
-|                               |    = SQL's `INTERSECT ALL`)         |
+| ```delightql                  |                                     |
+| employee_2024(*) as x ||      |   INTERSECT ALL                     |
+|   employee_2025(*) as y,      |                                     |
+|   x|*| = y|*|                 |  (positional,                       |
+| ```                           |    = SQL's `INTERSECT ALL`)         |
 +-------------------------------+-------------------------------------+
 |                               |                                     |
 | ```delightql                  | Per-column intersection             |
-| x(*) |;| y(*) ,x.id = y.id    |   (no SQL equivalent)               |
+| employee_2024(*) as x ||      |   (positional,                      |
+|   employee_2025(*) as y,      |    no SQL equivalent)               |
+|   x|1| = y|1|                 |                                     |
+| ```                           |                                     |
++-------------------------------+-------------------------------------+
+|                               |                                     |
+| ```delightql                  | Per-column intersection             |
+| genre_2024(*) as x |;|        |   (no SQL equivalent)               |
+|   genre_2025(*) as y,         |                                     |
+|   x.genre_id = y.genre_id     |                                     |
 | ```                           |                                     |
 +-------------------------------+-------------------------------------+
 
@@ -92,11 +97,11 @@ the two tables prior are combined:
 | Correlation as JOIN ON        | Correlation as INTERSECT ON    |
 +===============================+================================+
 |                               |                                |
-| ```                           |   ```                          |
+| ```delightql                  |   ```delightql                 |
 |                               |                                |
-| employee_2019(*) as e1,       |   employee_2019(*) as e1 |;|   |
-|   employee_2018(*) as e2,     |     employee_2018(*) as e2,    |
-|   e1.id=e2.id                 |     e1.id=e2.id                |
+| genre_2024(*) as g1,          |   genre_2024(*) as g1 |;|      |
+|   genre_2025(*) as g2,        |     genre_2025(*) as g2,       |
+|   g1.genre_id = g2.genre_id   |     g1.genre_id = g2.genre_id  |
 |                               |                                |
 | ```                           |   ```                          |
 +-------------------------------+--------------------------------+
@@ -124,40 +129,42 @@ the two tables prior are combined:
 >
 > Example:
 >
-> ```dql
-> users_2023(*) as u23 ; users_2024(*) as u24,
->   u23.email = u24.email
+> ```delightql
+> customer(*) as c ; employee(*) as e,
+>   c.city = e.city
 > ```
 >
 > ```sql
 > SELECT
->   id, first_name, last_name, email, age,
->   status, country, balance, NULL, NULL, NULL
-> FROM users_2023 AS u23
+>   customer_id, first_name, last_name, company, address, city,
+>   state, country, postal_code, phone, fax, email, support_rep_id,
+>   NULL, NULL, NULL, NULL, NULL
+> FROM customer AS c
 >   WHERE EXISTS (SELECT 1
 >     FROM (
 >       SELECT
->         id, first_name, last_name, email, NULL,
->         status, NULL, NULL, department,
->         salary, created_at
->       FROM users_2024 AS u24
+>         employee_id, last_name, first_name, title, reports_to,
+>         birth_date, hire_date, address, city, state, country,
+>         postal_code, phone, fax, email
+>       FROM employee AS e
 >     ) AS t1
->     WHERE outer_0.email IS NOT DISTINCT FROM t1.email)
+>     WHERE c.city IS NOT DISTINCT FROM t1.city)
 >
 > UNION ALL
 >
 > SELECT
->   id, first_name, last_name, email, NULL,
->   status, NULL, NULL, department, salary,
->   created_at
-> FROM users_2024 AS u24
+>   NULL, first_name, last_name, NULL, address, city,
+>   state, country, postal_code, phone, fax, email, NULL,
+>   employee_id, title, reports_to, birth_date, hire_date
+> FROM employee AS e
 >   WHERE EXISTS (SELECT 1
 >     FROM (
 >       SELECT
->         id, first_name, last_name, email, age,
->         status, country, balance, NULL, NULL, NULL
->       FROM users_2023 AS u23
+>         customer_id, first_name, last_name, company, address,
+>         city, state, country, postal_code, phone, fax, email,
+>         support_rep_id
+>       FROM customer AS c
 >     ) AS t0
->     WHERE t0.email IS NOT DISTINCT FROM outer_1.email)
+>     WHERE t0.city IS NOT DISTINCT FROM e.city)
 > ```
 

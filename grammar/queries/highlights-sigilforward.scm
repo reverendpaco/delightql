@@ -1,14 +1,15 @@
 
 (star_sigil) @variable.parameter
 (comma_sigil)@punctuation.delimiter
-(ho_rule "("@keyword")"@keyword )
-;(ho_cte "("@keyword")"@keyword )
+(ho_rule head: (ho_heading "("@keyword")"@keyword ))
+;(ho_cte head: (ho_heading "("@keyword")"@keyword ))
 (definition_neck) @punctuation.delimiter
 (metadata_sigil)@punctuation.special
 (effect_marker)@punctuation.special
 (symbol) @string.special.symbol
 (pipe_operator) @punctuation.special
 (separator) @punctuation.delimiter
+(singleton_sigil) @punctuation.delimiter
 (comma_continuation (comma_sigil)@punctuation.special)
 (arrow) @punctuation.special
 (function_pipe_operator) @punctuation.special
@@ -35,6 +36,7 @@
 (metadata_group
   (tuple ("[") @module.builtin ("]") @module.builtin))
 (map_cover ("$(") @keyword ")"@keyword "("@keyword)
+(parameter_reference (parameter_sigil) @keyword name: (_) @variable.parameter)
 (embed_map_cover ("+$(") @keyword ")"@keyword "("@keyword)
 (embed ("+(") @keyword ")"@keyword)
 (project_out ("-(") @keyword ")"@keyword)

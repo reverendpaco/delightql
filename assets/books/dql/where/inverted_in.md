@@ -5,28 +5,28 @@ The anonymous semi-join syntax permits an inversion -- ground the header, vary t
 
 
 ```delightql
-people(*),
-    +_("MA" @
-      birth_state;
-      death_state;
-      work_state;
-      marriage_state)
+customer(*),
+    +_("Dublin" @
+      city;
+      state;
+      country)
 ```
 
 
 ```sql
 select
   *
-from people
-  where birth_state IS NOT DISTINCT FROM 'MA'
-    or death_state IS NOT DISTINCT FROM 'MA'
-    or work_state IS NOT DISTINCT FROM 'MA'
-    or marriage_state IS NOT DISTINCT FROM 'MA';
+from customer
+  where city = 'Dublin'
+    or state = 'Dublin'
+    or country = 'Dublin';
 ```
 
 
-This asks: "does 'MA' appear in any of these columns?" The columns become the
+This asks: "does 'Dublin' appear in any of these columns?" The columns become the
 rows of the anonymous table; the constant becomes the match target.
+Because `'Dublin'` is non-NULL, SQL `=` is a result-equivalent filter here.
+Grounding a candidate's header to NULL is instead a local null-safe test.
 
 >   **SQL supports Inverted In**
 >
@@ -36,9 +36,9 @@ rows of the anonymous table; the constant becomes the match target.
 >   ```sql
 >   select
 >     *
->   from people
->     where 'MA' in
->       (birth_state,death_state,work_state,marriage_state);
+>   from customer
+>     where 'Dublin' in
+>       (city,state,country);
 >   ```
 
 
@@ -46,15 +46,18 @@ Similarly, to test if one column equals any of several others:
 
 
 ```delightql
-people(*), +_(birth_state @ death_state; work_state; marriage_state)
+customer(*), +_(city @ state; country)
 ```
 
 ```sql
 select
   *
-from people
-  where birth_state IS NOT DISTINCT FROM death_state
-    or birth_state IS NOT DISTINCT FROM work_state
-    or birth_state IS NOT DISTINCT FROM marriage_state;
+from customer
+  where city = state
+    or city = country;
 ```
 
+Here `city` is supplied by the customer row and each candidate is
+an anonymous-table row. `+` keeps or drops the customer depending on whether
+such a row corresponds; it does not turn NULL-to-NULL into a match. A
+wholly ground anonymous test still follows the local ground-value law.

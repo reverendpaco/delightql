@@ -7,7 +7,7 @@ use anyhow::Result;
 use delightql_backends::SqliteConnectionManager;
 use delightql_types::diagnostic::{Client, DelightQLError, Mount};
 use delightql_types::DatabaseConnection;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// True when the string is URI-shaped (`scheme://...`) rather than a file
 /// path. One shared test so no caller can fall through to file handling.
@@ -489,8 +489,8 @@ impl SessionProfile {
                 Box::new(crate::connection_factory::CliConnectionFactory)
             }
         };
-        let mut handle = delightql_core::api::open(factory, Some(mount_factory))
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut handle = delightql_core::api::open(factory, Some(mount_factory), boot_settings())
+            .map_err(anyhow::Error::new)?;
         // The CLI's embedded database images are BOUND on every profile. A
         // binding is a name→bytes map entry, not a mount: no attachment, no
         // I/O, no cost until a session actually runs
@@ -545,6 +545,37 @@ impl SessionProfile {
 /// `mount!` first-query, not by any pre-opened `ConnectionManager`. Keeping
 /// it self-less makes that separation explicit: a `&self` method that
 /// ignores `self` reads as if a manager fed the handle.
+/// What `dql` tells core at boot. Only this process knows its working
+/// directory, so it states it; a process whose directory cannot be read
+/// states none, and core then refuses a relative path rather than guessing.
+/// The dialect this invocation states at boot, fixed by `main` before any
+/// handle opens. Unset in library use: every handle then states none, and
+/// each query takes its connection's dialect.
+static DIALECT: OnceLock<String> = OnceLock::new();
+
+/// Fix the dialect every handle this process opens will state.
+pub fn state_dialect(dialect: Option<String>) {
+    if let Some(dialect) = dialect {
+        let stated = DIALECT.get_or_init(|| dialect.clone());
+        debug_assert_eq!(
+            *stated, dialect,
+            "the invocation's dialect was already stated"
+        );
+    }
+}
+
+fn boot_settings() -> delightql_core::api::BootSettings {
+    let base = std::env::current_dir()
+        .ok()
+        .and_then(|dir| dir.to_str().map(str::to_string));
+    let boot = delightql_core::api::BootSettings::new()
+        .state(delightql_core::api::BASE_DIRECTORY, base.as_deref());
+    match DIALECT.get() {
+        Some(dialect) => boot.state(delightql_core::api::DIALECT, Some(dialect)),
+        None => boot,
+    }
+}
+
 pub fn open_handle(profile: SessionProfile) -> Result<Box<dyn delightql_core::api::DqlHandle>> {
     profile.open().map(|(handle, _)| handle)
 }
@@ -552,6 +583,47 @@ pub fn open_handle(profile: SessionProfile) -> Result<Box<dyn delightql_core::ap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The contract binds every host: one that states nothing is refused
+    /// before any connection or catalog exists, and the refusal names what
+    /// it owes.
+    #[test]
+    fn a_host_that_states_nothing_is_refused_at_open() {
+        let refused = match delightql_core::api::open(
+            Box::new(crate::connection_factory::CliConnectionFactory),
+            None,
+            delightql_core::api::BootSettings::new(),
+        ) {
+            Ok(_) => panic!("a host that stated nothing was admitted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            refused.contains("'base_directory' is required"),
+            "{refused}"
+        );
+        assert!(refused.contains("state it as none"), "{refused}");
+    }
+
+    /// `dql` states its working directory, and core publishes it.
+    #[test]
+    fn dql_states_its_working_directory_at_boot() {
+        let mut handle = open_handle(SessionProfile::client()).expect("handle");
+        let mut session = handle.session().expect("session");
+        let rows = crate::exec_ng::run_dql_query(
+            "sys::config.setting(*) |> (key, layer, value)",
+            &mut *session,
+        )
+        .expect("the settings answer");
+        let here = std::env::current_dir().expect("cwd");
+        assert_eq!(
+            rows.rows,
+            [[
+                "base_directory".to_string(),
+                "boot".to_string(),
+                here.to_str().expect("utf-8 cwd").to_string()
+            ]]
+        );
+    }
 
     /// A private client database on the `Other` road, never the process's.
     fn private_db() -> std::sync::Arc<crate::client::database::ClientDatabase> {
@@ -699,66 +771,6 @@ mod tests {
         .is_err());
     }
 
-    /// PROFILE CENSUS over the crate's shipped source: the one handle
-    /// construction, the one server-profile site (the listener), and no
-    /// surviving ambient server-policy road.
-    #[test]
-    fn the_profile_owns_the_only_handle_construction() {
-        fn shipped(path: &std::path::Path, found: &mut Vec<(String, String)>) {
-            for entry in std::fs::read_dir(path).unwrap() {
-                let entry = entry.unwrap();
-                let p = entry.path();
-                if p.is_dir() {
-                    shipped(&p, found);
-                } else if p.extension().is_some_and(|e| e == "rs") {
-                    let text = std::fs::read_to_string(&p).unwrap();
-                    let text = text.split("#[cfg(test)]").next().unwrap_or("").to_string();
-                    found.push((p.display().to_string(), text));
-                }
-            }
-        }
-        let mut sources = Vec::new();
-        shipped(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut sources,
-        );
-        let occurrences = |needle: &str| -> Vec<String> {
-            sources
-                .iter()
-                .filter(|(_, text)| text.contains(needle))
-                .map(|(path, _)| path.clone())
-                .collect()
-        };
-        for retired in [
-            "is_server_process",
-            "attach_unless_server",
-            "reinstall_client_namespace",
-            "open_client_handle",
-            "open_handle_over",
-            "open_bare_handle",
-        ] {
-            assert!(
-                occurrences(retired).is_empty(),
-                "retired road `{retired}` survives in {:?}",
-                occurrences(retired)
-            );
-        }
-        let opens = occurrences("delightql_core::api::open(");
-        assert_eq!(
-            opens.len(),
-            1,
-            "handles are constructed outside the profile: {opens:?}"
-        );
-        assert!(opens[0].ends_with("connection.rs"));
-        let server = occurrences("SessionProfile::Server");
-        assert_eq!(
-            server.len(),
-            2,
-            "the server profile is chosen somewhere other than the listener: {server:?}"
-        );
-        assert!(server.iter().any(|p| p.ends_with("server/listener.rs")));
-    }
-
     /// Bindings are immutable for the life of a handle — rebinding
     /// refuses, even to the same bytes, so a locator's referent can never
     /// change underneath a mounted namespace.
@@ -818,13 +830,17 @@ mod tests {
         // Refusal-class mount failures (unbound name) leave the namespace
         // cleanly mountable afterwards.
         let mut session = handle.session().unwrap();
-        session
-            .query("mount!(\"delightql-bytes://junk\", \"spot\")(*)")
-            .err()
-            .expect("unbound name must refuse");
-        session
-            .query("mount!(\"delightql-bytes://man\", \"spot\")(*)")
-            .expect("a refused mount must not leave metadata that blocks the namespace");
+        crate::exec_ng::query(
+            &mut *session,
+            "mount!(\"delightql-bytes://junk\", \"spot\")(*)",
+        )
+        .err()
+        .expect("unbound name must refuse");
+        crate::exec_ng::query(
+            &mut *session,
+            "mount!(\"delightql-bytes://man\", \"spot\")(*)",
+        )
+        .expect("a refused mount must not leave metadata that blocks the namespace");
     }
 
     /// Owned bindings (bind_owned_bytes) share the whole contract: bind-time
@@ -843,11 +859,12 @@ mod tests {
         let mut handle = open_handle(SessionProfile::client()).unwrap();
         handle.bind_owned_bytes("emptyimg", image).unwrap();
         let mut session = handle.session().unwrap();
-        session
-            .query("mount!(\"delightql-bytes://emptyimg\", \"emptyns\")(*)")
-            .expect("empty owned image must mount");
-        let err = session
-            .query("refresh!(\"emptyns\")(*)")
+        crate::exec_ng::query(
+            &mut *session,
+            "mount!(\"delightql-bytes://emptyimg\", \"emptyns\")(*)",
+        )
+        .expect("empty owned image must mount");
+        let err = crate::exec_ng::query(&mut *session, "refresh!(\"emptyns\")(*)")
             .err()
             .expect("refresh of a bytes image must refuse");
         assert!(
@@ -872,11 +889,9 @@ mod tests {
 
         let mut handle = open_handle(SessionProfile::client()).unwrap();
         let mut session = handle.session().unwrap();
-        session
-            .query(&format!("mount!(\"{db_s}\", \"a\")(*)"))
+        crate::exec_ng::query(&mut *session, &format!("mount!(\"{db_s}\", \"a\")(*)"))
             .expect("non-empty mount a");
-        session
-            .query(&format!("mount!(\"{db_s}\", \"b\")(*)"))
+        crate::exec_ng::query(&mut *session, &format!("mount!(\"{db_s}\", \"b\")(*)"))
             .expect("non-empty same-source mount b is allowed");
 
         // The source loses its table out from under both mounts.
@@ -885,18 +900,14 @@ mod tests {
             .execute_batch("DROP TABLE t;")
             .unwrap();
 
-        session
-            .query("refresh!(\"a\")(*)")
-            .expect("first refresh-to-empty");
-        session
-            .query("refresh!(\"b\")(*)")
+        crate::exec_ng::query(&mut *session, "refresh!(\"a\")(*)").expect("first refresh-to-empty");
+        crate::exec_ng::query(&mut *session, "refresh!(\"b\")(*)")
             .expect("second refresh-to-empty is legal under the stored link");
 
         // Lifecycle stays sound afterwards.
-        session.query("unmount!(\"a\")(*)").expect("unmount a");
-        session.query("unmount!(\"b\")(*)").expect("unmount b");
-        session
-            .query(&format!("mount!(\"{db_s}\", \"c\")(*)"))
+        crate::exec_ng::query(&mut *session, "unmount!(\"a\")(*)").expect("unmount a");
+        crate::exec_ng::query(&mut *session, "unmount!(\"b\")(*)").expect("unmount b");
+        crate::exec_ng::query(&mut *session, &format!("mount!(\"{db_s}\", \"c\")(*)"))
             .expect("no leaked alias: the source mounts again");
     }
 
@@ -932,33 +943,35 @@ mod tests {
         let mut handle = open_handle(SessionProfile::client()).unwrap();
         handle.bind_owned_bytes("imprintimg", image).unwrap();
         let mut session = handle.session().unwrap();
-        session
-            .query("mount!(\"delightql-bytes://imprintimg\", \"ia\")(*)")
-            .expect("mount ia");
-        session
-            .query("mount!(\"delightql-bytes://imprintimg\", \"ib\")(*)")
-            .expect("second same-source mount ib is legal under the link");
-        session
-            .query(&format!("consult!(\"{lib_path}\", \"lib::imp\")(*)"))
-            .expect("consult");
-        session
-            .query("imprint!(\"lib::imp\", \"ia\")(*)")
+        crate::exec_ng::query(
+            &mut *session,
+            "mount!(\"delightql-bytes://imprintimg\", \"ia\")(*)",
+        )
+        .expect("mount ia");
+        crate::exec_ng::query(
+            &mut *session,
+            "mount!(\"delightql-bytes://imprintimg\", \"ib\")(*)",
+        )
+        .expect("second same-source mount ib is legal under the link");
+        crate::exec_ng::query(
+            &mut *session,
+            &format!("consult!(\"{lib_path}\", \"lib::imp\")(*)"),
+        )
+        .expect("consult");
+        crate::exec_ng::query(&mut *session, "imprint!(\"lib::imp\", \"ia\")(*)")
             .expect("imprint into ia");
 
-        session
-            .query("ia.t(*)")
+        crate::exec_ng::query(&mut *session, "ia.t(*)")
             .expect("the imprinted table must live in ia's image");
-        session
-            .query("ib.t(*)")
+        crate::exec_ng::query(&mut *session, "ib.t(*)")
             .err()
             .expect("ib's image must be untouched");
     }
 
     /// Rows of an in-process query, decoded as text.
     fn rows_of(session: &mut dyn delightql_core::api::DqlSession, text: &str) -> Vec<Vec<String>> {
-        let result = session
-            .query(text)
-            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        let result =
+            crate::exec_ng::query(&mut *session, text).unwrap_or_else(|e| panic!("{text}: {e}"));
         let fetched = session.fetch(&result.handle, 1_000).expect("fetch");
         session.close(result.handle).expect("close");
         fetched
@@ -1007,18 +1020,23 @@ mod tests {
 
         let mut handle = open_handle(SessionProfile::client()).unwrap();
         let mut session = handle.session().unwrap();
-        session
-            .query(&format!("mount_new!(\"{main_db}\", \"main\")(*)"))
-            .expect("main");
-        session
-            .query(&format!("consult!(\"{lib_path}\", \"blue\")(*)"))
-            .expect("consult");
-        session
-            .query("imprint!(\"blue\", \"main\")(*)")
+        crate::exec_ng::query(
+            &mut *session,
+            &format!("mount_new!(\"{main_db}\", \"main\")(*)"),
+        )
+        .expect("main");
+        crate::exec_ng::query(
+            &mut *session,
+            &format!("consult!(\"{lib_path}\", \"blue\")(*)"),
+        )
+        .expect("consult");
+        crate::exec_ng::query(&mut *session, "imprint!(\"blue\", \"main\")(*)")
             .expect("lawful imprint");
-        session
-            .query(&format!("mount_new!(\"{second_db}\", \"second\")(*)"))
-            .expect("fresh target");
+        crate::exec_ng::query(
+            &mut *session,
+            &format!("mount_new!(\"{second_db}\", \"second\")(*)"),
+        )
+        .expect("fresh target");
 
         let census = |session: &mut dyn delightql_core::api::DqlSession| -> Vec<Vec<String>> {
             let mut rows: Vec<Vec<String>> =
@@ -1042,10 +1060,12 @@ mod tests {
             "the lawful imprint archives the source under main"
         );
 
-        let err = session
-            .query("imprint!(\"main::_0_blueprint\", \"second\")(*)")
-            .err()
-            .expect("re-imprinting the archive must refuse");
+        let err = crate::exec_ng::query(
+            &mut *session,
+            "imprint!(\"main::_0_blueprint\", \"second\")(*)",
+        )
+        .err()
+        .expect("re-imprinting the archive must refuse");
         assert_eq!(
             err.identity.as_deref(),
             Some("delightql-error://imprint/blueprint/inert"),
@@ -1062,8 +1082,7 @@ mod tests {
             vec![vec!["main::_0_blueprint".to_string()]],
             "the archive is still visible at its path through the catalog functor"
         );
-        session
-            .query("second.items(*)")
+        crate::exec_ng::query(&mut *session, "second.items(*)")
             .err()
             .expect("nothing resolves in the fresh target");
         assert_eq!(
@@ -1074,6 +1093,135 @@ mod tests {
                 vec!["3".to_string()]
             ],
             "the lawful materialization still answers"
+        );
+    }
+
+    /// An imprint archive's lifecycle, in one session. `reconsult!` of the
+    /// archive, or of a namespace inside it, refuses as inert and changes
+    /// nothing. `unconsult!` removes the archive by its exact name once the
+    /// manifest namespace beneath it has gone, and refuses and names that
+    /// child before then. None of it takes the catalog down: the same session
+    /// reads the catalog and the imprinted table afterward.
+    ///
+    /// RED-BEFORE: both verbs panicked on the archive's kind while holding
+    /// the catalog lock, and `reconsult!` of the manifest namespace inside
+    /// the archive reloaded it from the replacement file.
+    #[test]
+    fn archive_removal_and_refused_reconsult_leave_the_session_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("items.dql");
+        std::fs::write(
+            &lib,
+            "items(*) :- _(x @ 1;2;3)\n\
+             (~~ddl:\"_internal\"\n\
+             imprinting(*) :- _(entity,materialization,extent @ \"items\",\"table\",\"permanent\")\n\
+             ~~)\n",
+        )
+        .unwrap();
+        let replacement = dir.path().join("replacement.dql");
+        std::fs::write(&replacement, "fresh(*) :- _(y @ 42)\n").unwrap();
+        let lib_path = lib.to_string_lossy().to_string();
+        let replacement_path = replacement.to_string_lossy().to_string();
+        let main_db = dir.path().join("main.sqlite").to_string_lossy().to_string();
+
+        let mut handle = open_handle(SessionProfile::client()).unwrap();
+        let mut session = handle.session().unwrap();
+        crate::exec_ng::query(
+            &mut *session,
+            &format!("mount_new!(\"{main_db}\", \"main\")(*)"),
+        )
+        .expect("main");
+        crate::exec_ng::query(
+            &mut *session,
+            &format!("consult!(\"{lib_path}\", \"blue\")(*)"),
+        )
+        .expect("consult");
+        crate::exec_ng::query(&mut *session, "imprint!(\"blue\", \"main\")(*)")
+            .expect("lawful imprint");
+
+        // The archive's namespaces with the definitions active in each.
+        let archive = |session: &mut dyn delightql_core::api::DqlSession| -> Vec<Vec<String>> {
+            let mut rows = rows_of(
+                session,
+                "sys::ns.namespace(nid, _, _, fq_name, _, kind, _, source_path, _), \
+                 sys::ns.activated_entity(eid, _, nid, _), \
+                 sys::entities.entity(eid, name, _, _, _, _) \
+                 |> (fq_name, kind, source_path, name)",
+            );
+            rows.retain(|row| row[0].starts_with("main::_0_blueprint"));
+            rows.sort();
+            rows
+        };
+        let before = archive(&mut *session);
+        assert_eq!(
+            before
+                .iter()
+                .map(|row| (row[0].as_str(), row[3].as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("main::_0_blueprint", "items"),
+                ("main::_0_blueprint::_internal", "imprinting"),
+            ],
+            "the lawful imprint archives the source and its manifest namespace"
+        );
+
+        for target in ["main::_0_blueprint", "main::_0_blueprint::_internal"] {
+            let err = crate::exec_ng::query(
+                &mut *session,
+                &format!("reconsult!(\"{target}\", \"{replacement_path}\")(*)"),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("reconsult! of '{target}' must refuse"));
+            assert_eq!(
+                err.identity.as_deref(),
+                Some("delightql-error://imprint/blueprint/inert"),
+                "'{target}': {err}"
+            );
+        }
+        assert_eq!(
+            archive(&mut *session),
+            before,
+            "a refused reconsult! changes nothing"
+        );
+
+        let err = crate::exec_ng::query(&mut *session, "unconsult!(\"main::_0_blueprint\")(*)")
+            .err()
+            .expect("the archive's manifest namespace stands beneath it");
+        assert!(
+            err.to_string()
+                .contains("'main::_0_blueprint::_internal' stands beneath it"),
+            "{err}"
+        );
+        assert_eq!(
+            archive(&mut *session),
+            before,
+            "the refusal removed nothing"
+        );
+
+        crate::exec_ng::query(
+            &mut *session,
+            "unconsult!(\"main::_0_blueprint::_internal\")(*)",
+        )
+        .expect("the manifest namespace is removed by its exact name");
+        crate::exec_ng::query(&mut *session, "unconsult!(\"main::_0_blueprint\")(*)")
+            .expect("the archive is removed by its exact name");
+        assert!(archive(&mut *session).is_empty(), "the archive is gone");
+        assert_eq!(
+            rows_of(
+                &mut *session,
+                "sys::ns.namespace(*), fq_name = \"main::_0_blueprint\" |> (fq_name)"
+            ),
+            Vec::<Vec<String>>::new(),
+            "no namespace row survives at the archive's path"
+        );
+        assert_eq!(
+            rows_of(&mut *session, "main.items(*)"),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ],
+            "the imprinted table still answers"
         );
     }
 

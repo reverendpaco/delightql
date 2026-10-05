@@ -6,7 +6,7 @@
 
 use super::{SqlDialect, SqlGenerator};
 use crate::names::{baptise, Addressing, Baptised, Bundle, ColId, Registry, ScopeId, Statement};
-use crate::pipeline::ast_refined::LiteralValue;
+use crate::pipeline::asts::core::LiteralValue;
 use crate::pipeline::dialect_pack::DialectPack;
 use crate::pipeline::sql_ast::{BinaryOperator, DomainExpression};
 use std::collections::HashMap;
@@ -443,7 +443,7 @@ fn sql_comparison(generator: &TestGenerator, name: &str, namespace: &[&str]) -> 
         namespace: namespace.iter().map(|part| part.to_string()).collect(),
         args: vec![
             generator.column("age"),
-            DomainExpression::literal(LiteralValue::Number("1".into())),
+            DomainExpression::literal(LiteralValue::integer(1)),
         ],
         negated: false,
     }
@@ -550,8 +550,8 @@ fn sigma_form_rule_fires_per_dialect() {
             namespace: Vec::new(),
             args: vec![
                 generator.column("age"),
-                DomainExpression::literal(LiteralValue::Number("18".into())),
-                DomainExpression::literal(LiteralValue::Number("65".into())),
+                DomainExpression::literal(LiteralValue::integer(18)),
+                DomainExpression::literal(LiteralValue::integer(65)),
             ],
             negated: false,
         };
@@ -577,8 +577,8 @@ fn canonical_sigma_propagates_a_nested_rendering_error() {
         namespace: Vec::new(),
         args: vec![
             nested,
-            DomainExpression::literal(LiteralValue::Number("1".into())),
-            DomainExpression::literal(LiteralValue::Number("2".into())),
+            DomainExpression::literal(LiteralValue::integer(1)),
+            DomainExpression::literal(LiteralValue::integer(2)),
         ],
         negated: false,
     };
@@ -665,9 +665,7 @@ fn tvf_join_case(
     let result_scope = registry.join_scope();
 
     let source = (SelectStatement::builder().select(SelectItem::expression_with_alias(
-        DomainExpression::literal(crate::pipeline::asts::core::literals::LiteralValue::Number(
-            "1".into(),
-        )),
+        DomainExpression::literal(crate::pipeline::asts::core::literals::LiteralValue::integer(1)),
         source_column,
     )))
     .standing_at(source_scope)
@@ -730,19 +728,26 @@ fn tvf_join_case(
 }
 
 #[test]
-fn internal_json_each_array_spells_canonically_off_postgres() {
-    // The internal array-each name never leaks: sqlite/duckdb (no tvf rows)
-    // fall back to the canonical json_each spelling.
-    for dialect in [SqlDialect::SQLite, SqlDialect::DuckDB] {
+fn internal_json_each_array_uses_the_selected_generic_operation_guard() {
+    // The internal array-each name never leaks. Targets without a complete
+    // intrinsic template use the generic json_each operation, whose result
+    // discriminator is target data; PostgreSQL selects its own template
+    // below and therefore does not use this guard.
+    for (dialect, type_name) in [
+        (SqlDialect::SQLite, "array"),
+        (SqlDialect::DuckDB, "ARRAY"),
+        (SqlDialect::MySQL, "ARRAY"),
+        (SqlDialect::SqlServer, "array"),
+    ] {
         let (generator, statement) = tvf_join_case(crate::names::Intrinsic::JsonEachArray, dialect);
         let sql = generator.generate_statement(&statement).unwrap();
         // The sequence guard: a non-array or malformed value becomes a
         // NULL interior — zero rows.
         assert!(
-            sql.contains(
-                "json_each(CASE WHEN json_valid(t_1.j) AND json_type(t_1.j) = 'array' \
+            sql.contains(&format!(
+                "json_each(CASE WHEN json_valid(t_1.j) AND json_type(t_1.j) = '{type_name}' \
                  THEN t_1.j END) AS _narrow_2"
-            ),
+            )),
             "expected guarded canonical json_each spelling on {dialect:?}, got: {sql}"
         );
         assert!(
@@ -843,7 +848,7 @@ fn scalar_form_overloads_max_min_round() {
         "max",
         vec![
             sqlite.column("a"),
-            DomainExpression::literal(LiteralValue::Number("18".to_string())),
+            DomainExpression::literal(LiteralValue::integer(18)),
         ],
     );
     assert!(
@@ -859,7 +864,7 @@ fn scalar_form_overloads_max_min_round() {
             "max",
             vec![
                 generator.column("a"),
-                DomainExpression::literal(LiteralValue::Number("18".to_string())),
+                DomainExpression::literal(LiteralValue::integer(18)),
             ],
         );
         generator.render_expression(&expression).unwrap()
@@ -902,7 +907,7 @@ fn scalar_form_overloads_max_min_round() {
             "round",
             vec![
                 generator.column("x"),
-                DomainExpression::literal(LiteralValue::Number("1".to_string())),
+                DomainExpression::literal(LiteralValue::integer(1)),
             ],
         );
         generator.render_expression(&expression).unwrap()
@@ -1059,7 +1064,9 @@ fn contract_p6_clause_carrying_template() {
     let expr = fn_call(
         "probe_pctl",
         vec![
-            DomainExpression::literal(LiteralValue::Number("0.5".into())),
+            DomainExpression::literal(LiteralValue::Number(
+                crate::pipeline::asts::core::NumericLiteral::from_decimal_spelling("0.5".into()),
+            )),
             g.column("salary"),
         ],
     );
@@ -1133,139 +1140,346 @@ fn contract_n5_unknown_rust_handler_is_loud() {
     );
 }
 
-/// Build a statement whose single CTE must be evaluated once, and the same
-/// statement without that requirement, for `dialect`.
-///
-/// The requirement is what a closed configured rule value produces: one
-/// carrier holding an evaluation every spend of the value must share.
-fn once_only_cte_case(
-    dialect: SqlDialect,
-) -> (
-    TestGenerator,
-    crate::pipeline::sql_ast::SqlStatement,
-    crate::pipeline::sql_ast::SqlStatement,
-) {
-    use crate::pipeline::sql_ast::*;
-    let registry = Box::leak(Box::new(Registry::new(&[])));
-    let cte_name = registry.intern("capture_1", false);
-    let cte_scope = registry.anonymous_scope(Some(cte_name));
-    let value_name = registry.intern("v", false);
-    let cte_column = registry.sql_column(cte_scope, Some(value_name), Addressing::Published);
-    let result_scope = registry.join_scope();
-
-    let body = (SelectStatement::builder().select(SelectItem::expression_with_alias(
-        DomainExpression::literal(LiteralValue::Number("1".into())),
-        cte_column,
-    )))
-    .standing_at(cte_scope)
-    .map_err(|e| {
-        crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
-            message: e.to_string(),
-        })
-    })
-    .unwrap();
-    let outer = || {
-        (SelectStatement::builder()
-            .select(SelectItem::star_over_nothing())
-            .from_tables(vec![TableExpression::Scope(cte_scope)]))
-        .standing_at(result_scope)
-        .map_err(|e| {
-            crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
-                message: e.to_string(),
-            })
-        })
-        .unwrap()
-    };
-    let ordinary = Cte::ordinary(cte_scope, QueryExpression::Select(Box::new(body.clone())));
-    let once_only = Cte::ordinary(cte_scope, QueryExpression::Select(Box::new(body)))
-        .requiring_materialization();
-    let names = Box::leak(Box::new(
-        baptise(
-            registry,
-            &Bundle::gather(vec![Statement {
-                scopes: vec![cte_scope, result_scope],
-                headings: vec![vec![cte_column]],
-                refs: vec![cte_column],
-                ..Default::default()
-            }])
-            .reserve_authored(registry),
-        )
-        .unwrap(),
-    ));
-    let generator = TestGenerator {
-        _registry: registry,
-        names,
-        at: result_scope,
-        columns: HashMap::from([("v", cte_column)]),
-        dialect,
-        pack: seeded_pack(),
-        bin_registry: None,
-    };
-    (
-        generator,
-        SqlStatement::with_ctes(
-            Some(vec![once_only]),
-            QueryExpression::Select(Box::new(outer())),
-        ),
-        SqlStatement::with_ctes(
-            Some(vec![ordinary]),
-            QueryExpression::Select(Box::new(outer())),
-        ),
-    )
-}
-
-/// CONTRACT N6 — THREE TARGETS CAN PROMISE ONCE-ONLY EVALUATION.
-///
-/// SQLite, PostgreSQL and DuckDB all spell the promise in the binding
-/// itself, and it is the binding — not a hint outside it — that a spend
-/// reads.
+/// A TYPED REACH IS RENDERED IN THE TARGET'S OWN PATH REPRESENTATION, NEVER
+/// RE-PARSED: on the `$`-path families every key is written quoted and
+/// escaped and every index as a subscript; on PostgreSQL the same steps are
+/// the array literal its operators take, quoted and escaped by the array
+/// literal's own rules. A key carrying a dot, a comma, a quote or a bracket
+/// is one element everywhere.
 #[test]
-fn contract_n6_once_only_cte_is_spelled_where_the_target_can_promise_it() {
+fn a_typed_json_path_renders_in_each_targets_own_representation() {
+    use crate::pipeline::asts::core::{Path, PathStep};
+    let path = Path::key("a.b")
+        .then(PathStep::Key("q\"k[0],{}".to_string()))
+        .then(PathStep::Index(2))
+        .then(PathStep::Key("c".to_string()));
+    let reach = |generator: &TestGenerator| {
+        fn_call(
+            "json_extract",
+            vec![
+                generator.column("j"),
+                DomainExpression::JsonPathLiteral(path.clone()),
+            ],
+        )
+    };
     for dialect in [
         SqlDialect::SQLite,
-        SqlDialect::PostgreSQL,
         SqlDialect::DuckDB,
+        SqlDialect::MySQL,
+        SqlDialect::SqlServer,
     ] {
-        let (generator, once_only, ordinary) = once_only_cte_case(dialect);
-        let sql = generator.generate_statement(&once_only).unwrap();
+        let generator = seeded_generator(dialect);
+        let sql = generator.render_expression(&reach(&generator)).unwrap();
         assert!(
-            sql.contains(" AS MATERIALIZED ("),
-            "{dialect:?} must spell the once-only requirement in the binding, got: {sql}"
+            sql.ends_with(r#"(j, '$."a.b"."q\"k[0],{}"[2]."c"')"#),
+            "expected the `$`-path rendering on {dialect:?}, got: {sql}"
         );
-        let plain = generator.generate_statement(&ordinary).unwrap();
+    }
+    let generator = seeded_generator(SqlDialect::PostgreSQL);
+    assert_eq!(
+        generator.render_expression(&reach(&generator)).unwrap(),
+        r#"(CAST(j AS jsonb) #>> '{"a.b","q\"k[0],{}",2,"c"}')"#
+    );
+}
+
+/// A NEGATIVE INDEX COUNTS FROM THE END, spelled as each target spells it;
+/// a target with no such spelling refuses, naming itself, rather than
+/// emitting a path it would reject or misread.
+#[test]
+fn a_signed_index_is_spelled_from_the_end_by_each_target_or_refused() {
+    use crate::pipeline::asts::core::{Path, PathStep};
+    let reach = |generator: &TestGenerator, index: i64| {
+        fn_call(
+            "json_extract",
+            vec![
+                generator.column("j"),
+                DomainExpression::JsonPathLiteral(Path::key("items").then(PathStep::Index(index))),
+            ],
+        )
+    };
+    for (dialect, last, second_last) in [
+        (
+            SqlDialect::SQLite,
+            "'$.\"items\"[#-1]'",
+            "'$.\"items\"[#-2]'",
+        ),
+        (
+            SqlDialect::DuckDB,
+            "'$.\"items\"[#-1]'",
+            "'$.\"items\"[#-2]'",
+        ),
+        (
+            SqlDialect::MySQL,
+            "'$.\"items\"[last]'",
+            "'$.\"items\"[last-1]'",
+        ),
+        (
+            SqlDialect::PostgreSQL,
+            "'{\"items\",-1}'",
+            "'{\"items\",-2}'",
+        ),
+    ] {
+        let generator = seeded_generator(dialect);
+        let sql = generator.render_expression(&reach(&generator, -1)).unwrap();
+        assert!(sql.contains(last), "last element on {dialect:?}: {sql}");
+        let sql = generator.render_expression(&reach(&generator, -2)).unwrap();
         assert!(
-            !plain.contains("MATERIALIZED"),
-            "{dialect:?} must not materialize a binding that made no such \
-             requirement, got: {plain}"
+            sql.contains(second_last),
+            "second-to-last element on {dialect:?}: {sql}"
+        );
+    }
+    let generator = seeded_generator(SqlDialect::SqlServer);
+    let refused = generator.render_expression(&reach(&generator, -1));
+    assert!(
+        matches!(&refused, Err(super::GeneratorError::Error(message)) if message.contains("from-the-end")),
+        "SQL Server refuses a from-the-end index by name, got: {refused:?}"
+    );
+}
+
+/// THE SPLICE has one identity and each target's own operation: SQLite must
+/// re-mark the carried bytes as JSON (`json`), three families carry a
+/// JSON-typed value through the boundary and nest it as it is, and SQL
+/// Server marks its text as a document (`JSON_QUERY`). The internal name
+/// never leaks.
+#[test]
+fn the_splice_intrinsic_lowers_to_each_targets_structured_value_operation() {
+    for (dialect, expected) in [
+        (SqlDialect::SQLite, "json(j)"),
+        (SqlDialect::PostgreSQL, "j"),
+        (SqlDialect::DuckDB, "j"),
+        (SqlDialect::MySQL, "j"),
+        (SqlDialect::SqlServer, "JSON_QUERY(j)"),
+    ] {
+        let generator = seeded_generator(dialect);
+        let expr = intrinsic_call(
+            crate::names::Intrinsic::JsonSplice,
+            vec![generator.column("j")],
+        );
+        let sql = generator.render_expression(&expr).unwrap();
+        assert_eq!(sql, expected, "on {dialect:?}");
+        assert!(
+            !sql.contains("__dql"),
+            "internal name leaked ({dialect:?}): {sql}"
         );
     }
 }
 
-/// CONTRACT N6 — MYSQL AND SQL SERVER REFUSE, LOUDLY AND ON PURPOSE.
-///
-/// Neither target has a spelling that forbids re-evaluating a CTE, so a
-/// plain binding there would silently re-run a volatile configuration once
-/// per spend. The refusal names the target and the guarantee it cannot
-/// make. An ordinary binding on the same targets is unaffected.
+/// THE ADMISSION of an ordinary member and THE LABEL of a partition: SQLite
+/// writes a REAL in the fewest of fifteen, sixteen or seventeen digits it
+/// reads back as the same REAL — a JSON number for a member, the text for a
+/// key — and refuses where none does; every other storage class is the
+/// value. The other targets' writers are not claimed by that measurement and
+/// take the value as it is. The internal names never leak.
 #[test]
-fn contract_n6_once_only_cte_refuses_where_the_target_cannot_promise_it() {
-    for dialect in [SqlDialect::MySQL, SqlDialect::SqlServer] {
-        let (generator, once_only, ordinary) = once_only_cte_case(dialect);
-        let error = generator
-            .generate_statement(&once_only)
-            .expect_err("a guarantee this target cannot make must refuse");
-        let rendered = format!("{error:?}");
-        assert!(
-            rendered.contains("once-only materialization")
-                && rendered.contains(&format!("{dialect:?}")),
-            "{dialect:?} must refuse by naming itself and the guarantee, got: {rendered}"
+fn the_admission_and_the_label_write_an_exact_real_only_on_sqlite() {
+    let exact = |written: fn(&str) -> String| {
+        let mut sql = "CASE WHEN typeof(v) <> 'real' THEN v".to_string();
+        for digits in [15, 16, 17] {
+            let text = format!("printf('%!0.{digits}g', v)");
+            sql.push_str(&format!(
+                " WHEN CAST({text} AS REAL) = v THEN {}",
+                written(&text)
+            ));
+        }
+        sql.push_str(
+            " ELSE json_extract('null', 'a REAL cannot enter a document on SQLite exactly: \
+             no spelling of ' || quote(v) || ' reads back as the same REAL') END",
         );
-        let plain = generator
-            .generate_statement(&ordinary)
-            .expect("an ordinary binding is lawful on every target");
-        assert!(
-            !plain.contains("MATERIALIZED"),
-            "{dialect:?} emits an ordinary binding unchanged, got: {plain}"
+        sql
+    };
+    for (intrinsic, sqlite) in [
+        (
+            crate::names::Intrinsic::JsonScalar,
+            exact(|text| format!("json({text})")),
+        ),
+        (
+            crate::names::Intrinsic::JsonLabel,
+            exact(|text| text.to_string()),
+        ),
+    ] {
+        for (dialect, expected) in [
+            (SqlDialect::SQLite, sqlite.as_str()),
+            (SqlDialect::PostgreSQL, "v"),
+            (SqlDialect::DuckDB, "v"),
+            (SqlDialect::MySQL, "v"),
+            (SqlDialect::SqlServer, "v"),
+        ] {
+            let generator = seeded_generator(dialect);
+            let expr = intrinsic_call(intrinsic, vec![generator.column("v")]);
+            let sql = generator.render_expression(&expr).unwrap();
+            assert_eq!(sql, expected, "{intrinsic:?} on {dialect:?}");
+            assert!(!sql.contains("__dql"), "internal name leaked: {sql}");
+        }
+    }
+}
+
+/// THE ADMISSION PRESERVES OR REFUSES, on the SQLite the compiler ships:
+/// every sampled REAL written into a document reads back out of it as the
+/// same REAL, still a REAL, and its key casts back to the same REAL — or
+/// both refuse naming the failure, never a neighbouring number. At moderate
+/// magnitudes neither refuses. On the shipped SQLite no sample refuses at
+/// all — a finite-sample regression contract, not a proof that every REAL
+/// round-trips: a refusal here means the bundled engine misreads a sampled
+/// REAL again (SQLite 3.50.2 misread extreme magnitudes), and the refusal
+/// branch is what keeps that safe on any engine that does.
+#[test]
+fn sqlite_admission_reads_every_real_back_or_refuses() {
+    let mut member = String::new();
+    super::write_exact_real(&mut member, "?1", super::ExactReal::Member);
+    let mut label = String::new();
+    super::write_exact_real(&mut label, "?1", super::ExactReal::Label);
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut read_member = conn
+        .prepare(&format!(
+            "SELECT json_extract(json_array({member}), '$[0]') = ?1, \
+             typeof(json_extract(json_array({member}), '$[0]'))"
+        ))
+        .unwrap();
+    let mut read_label = conn
+        .prepare(&format!(
+            "SELECT CAST(key AS REAL) = ?1, typeof(key) \
+             FROM json_each(json_object({label}, 1))"
+        ))
+        .unwrap();
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let mut anywhere = vec![
+        0.1,
+        0.3,
+        0.1 + 0.2,
+        1.0 / 3.0,
+        1.2345678901234567,
+        1.0,
+        1e20,
+        1e300,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        f64::from_bits(1),
+    ];
+    while anywhere.len() < 20_000 {
+        let value = f64::from_bits(next());
+        if !value.is_nan() {
+            anywhere.push(value);
+        }
+    }
+    // Moderate magnitudes: a random mantissa under a decimal exponent drawn
+    // from -70..=100.
+    let moderate: Vec<f64> = (0..20_000)
+        .map(|_| {
+            let mantissa = 1.0 + (next() >> 11) as f64 / (1u64 << 53) as f64;
+            let exponent = (next() % 171) as i32 - 70;
+            mantissa * 10f64.powi(exponent)
+        })
+        .collect();
+    let mut refused = 0;
+    for (value, moderate) in anywhere
+        .iter()
+        .map(|value| (*value, false))
+        .chain(moderate.iter().map(|value| (*value, true)))
+    {
+        let answers =
+            [(&mut read_member, "real"), (&mut read_label, "text")].map(|(statement, kind)| {
+                (
+                    statement.query_row([value], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    }),
+                    kind,
+                )
+            });
+        let refusals = answers.iter().filter(|(answer, _)| answer.is_err()).count();
+        assert!(refusals == 0 || refusals == 2, "{value:e}: {answers:?}");
+        for (answer, kind) in answers {
+            match answer {
+                Ok((same, written)) => {
+                    assert_eq!((same, written.as_str()), (1, kind), "{value:e} read back");
+                }
+                Err(error) => {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(delightql_types::INEXACT_DOCUMENT_REAL),
+                        "{value:e}: {error}"
+                    );
+                    assert!(!moderate, "{value:e} refused at a moderate magnitude");
+                }
+            }
+        }
+        if refusals > 0 {
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 0, "the bundled SQLite misread sampled REALs");
+}
+
+/// An expanded element crosses the expansion's subquery as one JSON
+/// document when a structural pattern will inspect it. The form is
+/// `(value, kind)`: SQLite decides container-or-atom from the TVF's `type`
+/// column — a value that survives a sorter — and quotes only atoms;
+/// typed-JSON targets hand back every element as a document and spend the
+/// kind unread.
+#[test]
+fn json_each_document_is_decided_from_the_element_kind_not_a_subtype() {
+    for (dialect, expected) in [
+        (
+            SqlDialect::SQLite,
+            "CASE WHEN k IN ('object', 'array') THEN j ELSE json_quote(j) END",
+        ),
+        (SqlDialect::PostgreSQL, "j"),
+        (SqlDialect::DuckDB, "j"),
+        (SqlDialect::MySQL, "j"),
+        (SqlDialect::SqlServer, "j"),
+    ] {
+        let generator = seeded_generator(dialect);
+        let expr = intrinsic_call(
+            crate::names::Intrinsic::JsonEachDocument,
+            vec![generator.column("j"), generator.column("k")],
         );
+        let sql = generator.render_expression(&expr).unwrap();
+        assert_eq!(sql, expected, "on {dialect:?}");
+        assert!(!sql.contains("__dql"), "internal name leaked: {sql}");
+    }
+}
+
+/// An exponent-bearing NUMBER is the approximate category on every target.
+/// Four targets read the spelling as their binary floating-point type;
+/// PostgreSQL would read it as exact `numeric`, so the category is stated
+/// with a cast. Integer and decimal spellings are written as they are.
+#[test]
+fn an_approximate_literal_is_stated_to_every_target_in_its_category() {
+    use crate::pipeline::asts::core::NumericLiteral;
+    for (dialect, expected) in [
+        (SqlDialect::SQLite, "1.25e-2"),
+        (SqlDialect::PostgreSQL, "CAST(1.25e-2 AS double precision)"),
+        (SqlDialect::DuckDB, "1.25e-2"),
+        (SqlDialect::MySQL, "1.25e-2"),
+        (SqlDialect::SqlServer, "1.25e-2"),
+    ] {
+        let generator = seeded_generator(dialect);
+        let approximate = DomainExpression::literal(LiteralValue::Number(
+            NumericLiteral::from_decimal_spelling("1.25e-2".into()),
+        ));
+        assert_eq!(
+            generator.render_expression(&approximate).unwrap(),
+            expected,
+            "on {dialect:?}"
+        );
+        for plain in ["42", "42.5", "-7"] {
+            let literal = DomainExpression::literal(LiteralValue::Number(
+                NumericLiteral::from_decimal_spelling(plain.into()),
+            ));
+            assert_eq!(
+                generator.render_expression(&literal).unwrap(),
+                plain,
+                "{plain} on {dialect:?}"
+            );
+        }
     }
 }

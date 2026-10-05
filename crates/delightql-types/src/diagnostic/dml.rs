@@ -57,6 +57,13 @@ pub enum Dml {
     #[leaf("plan/unrunnable_obligation", class = Syntax, summary = "A DML obligation cannot be evaluated where its statement runs.")]
     #[error("Validation error: {message}")]
     PlanUnrunnableObligation { message: String },
+
+    /// update! and delete! reach the exact rows the `!!` occurrence
+    /// selected through the target's own row identity; this target exposes
+    /// none to a statement, so the mutation cannot be lowered for it.
+    #[leaf("target/row_identity", class = Syntax, summary = "The target exposes no row identity for update!/delete! to reach the selected rows by.")]
+    #[error("Validation error: {message}")]
+    TargetRowIdentity { message: String },
 }
 
 /// `dml/marker/…`
@@ -103,12 +110,6 @@ pub enum DmlShape {
     #[error("Validation error: {message}")]
     DeleteWithCover { message: String },
 
-    /// delete! must be able to identify each row it removes; a source whose
-    /// columns do not determine the target row cannot.
-    #[leaf("delete_column_identity", class = Syntax, summary = "delete!'s source does not identify target rows.")]
-    #[error("Validation error: {message}")]
-    DeleteColumnIdentity { message: String },
-
     /// One statement ends in one DML terminal.
     #[leaf("multi_terminal", class = Syntax, summary = "More than one DML terminal in one statement.")]
     #[error("Validation error: {message}")]
@@ -129,19 +130,6 @@ pub enum DmlShape {
     #[error("Validation error: {message}")]
     UpdateAmbiguousSource { message: String },
 
-    /// update!'s source must carry the target's identity columns so each
-    /// source row names the target row it changes; the columns written do
-    /// not determine one.
-    #[leaf("update_column_identity", class = Syntax, summary = "update!'s source does not identify target rows.")]
-    #[error("Validation error: {message}")]
-    UpdateColumnIdentity { message: String },
-
-    /// A joined update must say which rows of the target correspond to
-    /// which source rows; the join stated no such identity.
-    #[leaf("update_join_identity", class = Syntax, summary = "A joined update! states no row identity.")]
-    #[error("Validation error: {message}")]
-    UpdateJoinIdentity { message: String },
-
     /// update! changes columns; without a cover naming what changes there
     /// is nothing to write.
     #[leaf("update_no_cover", class = Syntax, summary = "update! has no cover to write.")]
@@ -159,6 +147,12 @@ pub enum DmlShape {
     #[leaf("update_unnamed_column", class = Syntax, summary = "update! received an unnamed cover column.")]
     #[error("Validation error: {message}")]
     UpdateUnnamedColumn { message: String },
+
+    /// The incoming heading of update! is not the target's heading: every
+    /// column of the target, by name, once, and nothing else.
+    #[leaf("update_heading", class = Syntax, summary = "update!'s incoming heading is not the target's heading.")]
+    #[error("Validation error: {message}")]
+    UpdateHeading { message: String },
 }
 
 /// `dml/source/…`
@@ -170,6 +164,15 @@ pub enum DmlSource {
     #[leaf("aggregate", class = Syntax, summary = "A mutation's source aggregates.")]
     #[error("Validation error: {message}")]
     Aggregate { message: String },
+
+    /// The rows a mutation touches are the `!!` occurrence's own rows,
+    /// reached by their identity. A form standing between the occurrence
+    /// and the terminal that does not preserve which rows are the
+    /// occurrence's — a set operation, a witness, a reflection — leaves the
+    /// terminal nothing to reach them by.
+    #[leaf("occurrence", class = Syntax, summary = "The `!!` occurrence's rows do not reach the mutation terminal.")]
+    #[error("Validation error: {message}")]
+    Occurrence { message: String },
 }
 
 /// `dml/roles/…`

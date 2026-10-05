@@ -9,7 +9,7 @@
 // equivalent always exists — CROSS JOIN for inner joins, ON TRUE for outer
 // joins — so this legalization is total and never diagnoses.
 
-use crate::pipeline::ast_refined::LiteralValue;
+use crate::pipeline::asts::core::LiteralValue;
 use crate::pipeline::generator::SqlDialect;
 use crate::pipeline::sql_ast::{
     walk, DomainExpression, JoinCondition, JoinType, SqlStatement, TableExpression,

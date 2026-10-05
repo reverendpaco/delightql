@@ -1,79 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Manifest reader — reads `_internal` companion relations from bootstrap DB.
+//! Manifest reader — a library's `_internal` companion rules, queried as
+//! relations.
 //!
-//! `_internal` companions (schema, constraints, defaults, imprinting) are
-//! ordinary consulted relations stored in the bootstrap DB. Their clause
-//! bodies are anonymous-table facts with a ground entity key in the first
-//! head position. This module extracts those facts by:
+//! The companion rules — `imprinting`, `schema`, `constraints` and
+//! `defaults` in `<library>::_internal` — are ordinary rules. Each one the
+//! library declares is queried as `<library>::_internal.<companion>(*)`
+//! through the whole system, and read BY COLUMN NAME from its published
+//! heading. That heading must be exactly the companion's columns: a missing,
+//! misspelled or extra column refuses rather than being ignored or read by
+//! position. Nothing reads a companion's body.
 //!
-//! 1. Enumerating every active clause of the companion relation and reading
-//!    its first ground head position
-//! 2. Extracting body text from `entity_clause.definition` (text after `:-`)
-//! 3. Compiling body via `compile_source_to_sql(body, &EmptySchema)` → SQL
-//! 4. Executing SQL on bootstrap connection → get rows
+//! Every row is judged here, before any consumer touches a target: entity
+//! names, materializations and extents, and the two keys — within one
+//! entity, a column is declared once in `schema` and defaulted at most once
+//! in `defaults`, names compared case-insensitively.
 
-use crate::ddl::lifecycle::{Catalog, LiveNamespace};
+use std::collections::{BTreeSet, HashMap};
+
+use delightql_types::DbValue;
+
 use crate::diagnostic::{Manifest as ManifestDiagnostic, Runtime};
-use rusqlite::{Connection, OptionalExtension};
-
 use crate::error::{DelightQLError, Result};
 
-/// How an imprinted entity is stored. Parsed at manifest-read from the
-/// `imprinting()` `materialization` column; unknown spellings are rejected
-/// loudly (`imprint/manifest/materialization`) instead of the old silent
-/// fallback where `"veiw"` materialized a table. Pinned by
-/// companion_linear--75 and `manifest::tests::materialization_rejects_typo`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Materialization {
-    Table,
-    View,
-}
-
-impl Materialization {
-    /// Parse the manifest `materialization` string, rejecting unknown values.
-    pub fn parse(raw: &str) -> Result<Self> {
-        match raw {
-            "table" => Ok(Materialization::Table),
-            "view" => Ok(Materialization::View),
-            other => Err(DelightQLError::from(ManifestDiagnostic::Materialization {
-                message: format!(
-                    "imprinting() materialization '{}' is not recognized — \
-                     valid values are \"table\" or \"view\"",
-                    other
-                ),
-            })),
-        }
-    }
-}
-
-/// Whether an imprinted entity persists (`permanent`) or is a session-scoped
-/// `temporary` object. Parsed at manifest-read; unknown spellings are rejected
-/// loudly (`imprint/manifest/extent`) instead of the old silent fallback where
-/// `"temp"` meant permanent. Pinned by companion_linear--76 and
-/// `manifest::tests::extent_rejects_typo`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Extent {
-    Permanent,
-    Temporary,
-}
-
-impl Extent {
-    /// Parse the manifest `extent` string, rejecting unknown values.
-    pub fn parse(raw: &str) -> Result<Self> {
-        match raw {
-            "permanent" => Ok(Extent::Permanent),
-            "temporary" => Ok(Extent::Temporary),
-            other => Err(DelightQLError::from(ManifestDiagnostic::Extent {
-                message: format!(
-                    "imprinting() extent '{}' is not recognized — \
-                     valid values are \"permanent\" or \"temporary\"",
-                    other
-                ),
-            })),
-        }
-    }
-}
+pub use super::manifest_contract::{
+    ConstraintRow, DefaultRow, Extent, ImprintingRow, Materialization, OrdinalCell,
+    SchemaRow,
+};
 
 /// Reject a manifest entity name that carries a `"`. The imprint DDL path
 /// interpolates entity names into quoted identifiers; the declared-table
@@ -97,427 +50,306 @@ fn validate_entity_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Row from `imprinting()`: (entity_name, materialization, extent)
-pub struct ImprintingRow {
-    pub entity: String,
-    pub materialization: Materialization,
-    pub extent: Extent,
+/// The companion rules the manifest reads, each with exactly its columns.
+pub(crate) const COMPANIONS: [(&str, &[&str]); 4] = [
+    ("imprinting", &["entity", "materialization", "extent"]),
+    ("schema", &["entity", "name", "type", "ordinal"]),
+    ("constraints", &["entity", "column", "constraint", "constraint_name"]),
+    ("defaults", &["entity", "column", "default_val"]),
+];
+
+/// One companion rule, queried: its published heading and its rows.
+pub(crate) struct CompanionAnswer {
+    pub(crate) heading: Vec<Option<String>>,
+    pub(crate) rows: Vec<Vec<DbValue>>,
 }
 
-/// Row from `schema()`: (column_name, column_type)
-#[derive(Clone)]
-pub struct SchemaRow {
-    pub name: String,
-    pub col_type: String,
+/// A library's manifest, read and judged.
+pub struct ManifestRows {
+    /// The namespace the companion rules are declared in: where their
+    /// constraint and default cells stand.
+    namespace: String,
+    imprinting: Option<Vec<ImprintingRow>>,
+    schema: Vec<(String, SchemaRow)>,
+    constraints: Vec<(String, ConstraintRow)>,
+    defaults: Vec<(String, DefaultRow)>,
 }
 
-/// Row from `constraints()`: (column_name, constraint_sigil, constraint_name)
-pub struct ConstraintRow {
-    pub column: String,
-    pub constraint: String,
-    pub constraint_name: String,
-}
-
-/// Row from `defaults()`: (column_name, default_value, generated_kind)
-pub struct DefaultRow {
-    pub column: String,
-    pub default_val: String,
-    pub generated: Option<String>,
-}
-
-/// Empty schema for compiling manifest bodies and imprint CTAS compilation.
-/// These bodies are anonymous tables with no table references.
-pub struct EmptySchema;
-
-impl delightql_types::schema::DatabaseSchema for EmptySchema {
-    fn get_table_columns(
-        &self,
-        _: Option<&str>,
-        _: &str,
-    ) -> delightql_types::Result<Option<Vec<delightql_types::schema::ColumnInfo>>> {
-        Ok(None)
-    }
-    fn table_exists(&self, _: Option<&str>, _: &str) -> delightql_types::Result<bool> {
-        Ok(false)
-    }
-}
-
-/// A live library's `_internal` companion namespace, opened for reading
-/// from the catalog its source was judged in.
-///
-/// Companion rows are the DDL a materialization act executes, so they are
-/// reachable only through a judged [`LiveNamespace`] and read only from
-/// that proof's [`Catalog`]: no reader takes a connection, a namespace id,
-/// or a spelling. Copying the handle copies the borrow, so a retained copy
-/// keeps the system borrowed and cannot outlive the lock or survive a
-/// consume.
-#[derive(Clone, Copy, Debug)]
-pub struct Manifest<'c> {
-    catalog: &'c Catalog<'c>,
-    internal_ns_id: i32,
-}
-
-impl<'c> Manifest<'c> {
-    /// Open the companions of a live source. `Ok(None)`: the source declares
-    /// no `_internal` block — the caller says what that means for its act.
-    pub fn open(source: &LiveNamespace<'c>) -> Result<Option<Manifest<'c>>> {
-        let catalog = source.catalog();
-        Ok(
-            internal_namespace_id(catalog, source.fq())?.map(|internal_ns_id| Manifest {
-                catalog,
-                internal_ns_id,
-            }),
-        )
+impl ManifestRows {
+    /// Read a library's manifest through the whole system. `Ok(None)`: the
+    /// library declares no `_internal` namespace. The caller holds no
+    /// catalog lock — the queries take it.
+    pub(crate) fn read(
+        system: &crate::system::DelightQLSystem,
+        library_fq: &str,
+    ) -> Result<Option<ManifestRows>> {
+        let Some(declared) = system.companion_rules_of(library_fq)? else {
+            return Ok(None);
+        };
+        let mut answers = HashMap::new();
+        for (companion, _) in COMPANIONS {
+            if declared.iter().any(|name| name == companion) {
+                let source = format!("{library_fq}::_internal.{companion}(*)");
+                answers.insert(companion, system.query_in_system(&source)?);
+            }
+        }
+        Self::judge(library_fq, answers).map(Some)
     }
 
-    /// The `imprinting()` rows: (entity, materialization, extent). Empty
-    /// when the companion is absent.
-    pub fn imprinting(&self) -> Result<Vec<ImprintingRow>> {
-        read_imprinting(self.catalog, self.internal_ns_id)
+    /// The namespace the companion rules are declared in.
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
     }
 
-    /// Every entity name that has `schema` rows — the discovery road when
-    /// `imprinting()` is absent.
+    /// Judge the companions a library declared, as queried.
+    pub(crate) fn judge(
+        library_fq: &str,
+        mut answers: HashMap<&'static str, CompanionAnswer>,
+    ) -> Result<ManifestRows> {
+        let imprinting_present = answers.contains_key("imprinting");
+        let mut read = |companion: &'static str| -> Result<Vec<Vec<DbValue>>> {
+            let Some(answer) = answers.remove(companion) else {
+                return Ok(Vec::new());
+            };
+            let expected = COMPANIONS
+                .iter()
+                .find(|(name, _)| *name == companion)
+                .map(|(_, columns)| *columns)
+                .unwrap_or(&[]);
+            let order = columns_by_name(library_fq, companion, expected, &answer.heading)?;
+            Ok(answer
+                .rows
+                .into_iter()
+                .map(|row| order.iter().map(|&at| row[at].clone()).collect())
+                .collect())
+        };
+        let imprinting_rows = read("imprinting")?;
+        let schema_rows = read("schema")?;
+        let constraint_rows = read("constraints")?;
+        let default_rows = read("defaults")?;
+
+        let imprinting = if imprinting_present {
+            let mut rows = Vec::with_capacity(imprinting_rows.len());
+            for row in imprinting_rows {
+                let entity = entity_of("imprinting", &row[0])?;
+                validate_entity_name(&entity)?;
+                rows.push(ImprintingRow {
+                    entity,
+                    materialization: Materialization::parse(&text("imprinting", "materialization", &row[1])?)?,
+                    extent: Extent::parse(&text("imprinting", "extent", &row[2])?)?,
+                });
+            }
+            Some(rows)
+        } else {
+            None
+        };
+
+        let mut schema = Vec::with_capacity(schema_rows.len());
+        for row in schema_rows {
+            schema.push((
+                entity_of("schema", &row[0])?,
+                SchemaRow {
+                    name: text("schema", "name", &row[1])?,
+                    col_type: text("schema", "type", &row[2])?,
+                    ordinal: ordinal_cell(&row[3]),
+                },
+            ));
+        }
+        let mut constraints = Vec::with_capacity(constraint_rows.len());
+        for row in constraint_rows {
+            constraints.push((
+                entity_of("constraints", &row[0])?,
+                ConstraintRow {
+                    column: text("constraints", "column", &row[1])?,
+                    constraint: text("constraints", "constraint", &row[2])?,
+                    constraint_name: text("constraints", "constraint_name", &row[3])?,
+                },
+            ));
+        }
+        let mut defaults = Vec::with_capacity(default_rows.len());
+        for row in default_rows {
+            defaults.push((
+                entity_of("defaults", &row[0])?,
+                DefaultRow {
+                    column: text("defaults", "column", &row[1])?,
+                    default_val: default_value(&row[2]),
+                },
+            ));
+        }
+
+        refuse_repeats(&schema, "schema", |row| &row.name, "declares")?;
+        refuse_repeats(&defaults, "defaults", |row| &row.column, "gives a default to")?;
+
+        Ok(ManifestRows {
+            namespace: format!("{library_fq}::_internal"),
+            imprinting,
+            schema,
+            constraints,
+            defaults,
+        })
+    }
+
+    /// The `imprinting` rows; empty when the companion is absent.
+    pub fn imprinting(&self) -> &[ImprintingRow] {
+        self.imprinting.as_deref().unwrap_or(&[])
+    }
+
+    /// Every entity with `schema` rows — the discovery road when the
+    /// library declares no `imprinting` rule.
     pub fn schema_entities(&self) -> Result<Vec<String>> {
-        discover_schema_entities(self.catalog, self.internal_ns_id)
-    }
-
-    /// `schema("entity", column, type)` rows for one entity.
-    pub fn schema(&self, entity: &str) -> Result<Vec<SchemaRow>> {
-        read_schema(self.catalog, self.internal_ns_id, entity)
-    }
-
-    /// `constraints("entity", column, constraint, name)` rows for one entity.
-    pub fn constraints(&self, entity: &str) -> Result<Vec<ConstraintRow>> {
-        read_constraints(self.catalog, self.internal_ns_id, entity)
-    }
-
-    /// `defaults("entity", column, value[, generated])` rows for one entity.
-    pub fn defaults(&self, entity: &str) -> Result<Vec<DefaultRow>> {
-        read_defaults(self.catalog, self.internal_ns_id, entity)
-    }
-}
-
-/// Find the `_internal` child namespace ID for a given source namespace.
-///
-/// The `_internal` namespace is created by `(~~ddl:"_internal" ... ~~)` blocks
-/// and has `fq_name = "{source_ns}::_internal"`.
-fn internal_namespace_id(conn: &Connection, source_ns: &str) -> Result<Option<i32>> {
-    let internal_fq = format!("{}::_internal", source_ns);
-    conn.query_row(
-        "SELECT id FROM namespace WHERE fq_name = ?1",
-        [&internal_fq],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(|e| {
-        Runtime::catalog(
-            format!("Failed to look up _internal namespace for '{}'", source_ns),
-            e.to_string(),
-        )
-    })
-}
-
-/// Read `imprinting()` entity from `_internal` namespace.
-///
-/// Returns the list of (entity, materialization, extent) tuples.
-/// Returns empty vec if `imprinting` entity doesn't exist.
-fn read_imprinting(conn: &Connection, internal_ns_id: i32) -> Result<Vec<ImprintingRow>> {
-    // imprinting is a regular (non-HO) entity — no ground value matching needed
-    let clauses = read_entity_clauses(conn, internal_ns_id, "imprinting")?;
-    if clauses.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut rows = Vec::new();
-    for clause_def in &clauses {
-        let body = crate::ddl::reconstruct::body_text(clause_def);
-        let sql = compile_body(&body)?;
-        let mut stmt = conn.prepare(&sql).map_err(|e| {
-            Runtime::catalog(
-                format!("Failed to prepare imprinting SQL: {}", sql),
-                e.to_string(),
-            )
-        })?;
-        let result_rows = stmt
-            .query_map([], |row| {
-                let entity: String = row.get(0)?;
-                let materialization: String = row.get(1)?;
-                let extent: String = row.get(2)?;
-                Ok((
-                    strip_dql_quotes(&entity).to_string(),
-                    strip_dql_quotes(&materialization).to_string(),
-                    strip_dql_quotes(&extent).to_string(),
-                ))
-            })
-            .map_err(|e| Runtime::catalog("Failed to execute imprinting query", e.to_string()))?;
-        // Parse enums / validate names OUTSIDE the rusqlite closure so the loud
-        // manifest-validation errors (imprint/manifest/*) propagate as
-        // DelightQLError, not swallowed into a rusqlite row error.
-        for r in result_rows {
-            let (entity, materialization, extent) =
-                r.map_err(|e| Runtime::catalog("Failed to read imprinting row", e.to_string()))?;
-            validate_entity_name(&entity)?;
-            rows.push(ImprintingRow {
-                entity,
-                materialization: Materialization::parse(&materialization)?,
-                extent: Extent::parse(&extent)?,
-            });
+        let names: BTreeSet<&String> = self.schema.iter().map(|(entity, _)| entity).collect();
+        for name in &names {
+            validate_entity_name(name)?;
         }
+        Ok(names.into_iter().cloned().collect())
     }
 
-    Ok(rows)
+    pub fn schema(&self, entity: &str) -> Vec<SchemaRow> {
+        of_entity(&self.schema, entity)
+    }
+
+    pub fn constraints(&self, entity: &str) -> Vec<ConstraintRow> {
+        of_entity(&self.constraints, entity)
+    }
+
+    pub fn defaults(&self, entity: &str) -> Vec<DefaultRow> {
+        of_entity(&self.defaults, entity)
+    }
 }
 
-/// Read `schema("entity_name", column, type)` from `_internal` namespace.
-fn read_schema(conn: &Connection, internal_ns_id: i32, entity: &str) -> Result<Vec<SchemaRow>> {
-    let clauses = read_relation_clauses_by_ground_value(conn, internal_ns_id, "schema", entity)?;
-    if clauses.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut rows = Vec::new();
-    for clause_def in &clauses {
-        let body = crate::ddl::reconstruct::body_text(clause_def);
-        let sql = compile_body(&body)?;
-        let mut stmt = conn.prepare(&sql).map_err(|e| {
-            Runtime::catalog(
-                format!("Failed to prepare schema SQL: {}", sql),
-                e.to_string(),
-            )
-        })?;
-        let result_rows = stmt
-            .query_map([], |row| {
-                Ok(SchemaRow {
-                    name: row.get(0)?,
-                    col_type: row.get(1)?,
-                })
-            })
-            .map_err(|e| Runtime::catalog("Failed to execute schema query", e.to_string()))?;
-        for r in result_rows {
-            rows.push(r.map_err(|e| Runtime::catalog("Failed to read schema row", e.to_string()))?);
-        }
-    }
-
-    Ok(rows)
+fn of_entity<T: Clone>(rows: &[(String, T)], entity: &str) -> Vec<T> {
+    rows.iter()
+        .filter(|(owner, _)| owner == entity)
+        .map(|(_, row)| row.clone())
+        .collect()
 }
 
-/// Read `constraints("entity_name", column, constraint, name)`.
-fn read_constraints(
-    conn: &Connection,
-    internal_ns_id: i32,
-    entity: &str,
-) -> Result<Vec<ConstraintRow>> {
-    let clauses =
-        read_relation_clauses_by_ground_value(conn, internal_ns_id, "constraints", entity)?;
-    if clauses.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut rows = Vec::new();
-    for clause_def in &clauses {
-        let body = crate::ddl::reconstruct::body_text(clause_def);
-        let sql = compile_body(&body)?;
-        let mut stmt = conn.prepare(&sql).map_err(|e| {
-            Runtime::catalog(
-                format!("Failed to prepare constraints SQL: {}", sql),
-                e.to_string(),
-            )
-        })?;
-        let result_rows = stmt
-            .query_map([], |row| {
-                Ok(ConstraintRow {
-                    column: row.get(0)?,
-                    constraint: row.get(1)?,
-                    constraint_name: row.get(2)?,
-                })
-            })
-            .map_err(|e| Runtime::catalog("Failed to execute constraints query", e.to_string()))?;
-        for r in result_rows {
-            rows.push(
-                r.map_err(|e| Runtime::catalog("Failed to read constraint row", e.to_string()))?,
-            );
-        }
-    }
-
-    Ok(rows)
-}
-
-/// Read `defaults("entity_name", column, value[, generated])`.
-///
-/// Defaults may have 2 columns (column, default_val) or 3 columns
-/// (column, default_val, generated). We detect the column count from the SQL.
-fn read_defaults(conn: &Connection, internal_ns_id: i32, entity: &str) -> Result<Vec<DefaultRow>> {
-    let clauses = read_relation_clauses_by_ground_value(conn, internal_ns_id, "defaults", entity)?;
-    if clauses.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut rows = Vec::new();
-    for clause_def in &clauses {
-        let body = crate::ddl::reconstruct::body_text(clause_def);
-        let sql = compile_body(&body)?;
-        let mut stmt = conn.prepare(&sql).map_err(|e| {
-            Runtime::catalog(
-                format!("Failed to prepare defaults SQL: {}", sql),
-                e.to_string(),
-            )
-        })?;
-
-        // Detect column count from the statement
-        let col_count = stmt.column_count();
-
-        let result_rows = stmt
-            .query_map([], |row| {
-                // default_val can be string or integer in the anonymous table
-                let default_val: String = match row.get::<_, rusqlite::types::Value>(1)? {
-                    rusqlite::types::Value::Text(s) => s,
-                    rusqlite::types::Value::Integer(i) => i.to_string(),
-                    rusqlite::types::Value::Real(f) => f.to_string(),
-                    other => format!("{:?}", other),
-                };
-                Ok(DefaultRow {
-                    column: row.get(0)?,
-                    default_val,
-                    generated: if col_count >= 3 { row.get(2)? } else { None },
-                })
-            })
-            .map_err(|e| Runtime::catalog("Failed to execute defaults query", e.to_string()))?;
-        for r in result_rows {
-            rows.push(
-                r.map_err(|e| Runtime::catalog("Failed to read default row", e.to_string()))?,
-            );
-        }
-    }
-
-    Ok(rows)
-}
-
-/// Discover all entity names that have `schema` rows in `_internal`.
-///
-/// Used as fallback when `imprinting()` is absent — we discover entities
-/// from the first ground head position of every active `schema` clause.
-fn discover_schema_entities(conn: &Connection, internal_ns_id: i32) -> Result<Vec<String>> {
-    let clauses = read_entity_clauses(conn, internal_ns_id, "schema")?;
-    let mut names = std::collections::BTreeSet::new();
-    for clause in clauses {
-        let name = companion_clause_entity("schema", &clause)?;
-        validate_entity_name(&name)?;
-        names.insert(name);
-    }
-    Ok(names.into_iter().collect())
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Read all entity_clause definitions for a non-HO entity in a namespace.
-fn read_entity_clauses(
-    conn: &Connection,
-    namespace_id: i32,
-    entity_name: &str,
-) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT ec.definition FROM entity_clause ec
-             JOIN entity e ON ec.entity_id = e.id
-             JOIN activated_entity ae ON ae.entity_id = e.id
-             WHERE ae.namespace_id = ?1
-               AND e.name = ?2
-             ORDER BY ec.ordinal",
-        )
-        .map_err(|e| {
-            Runtime::catalog(
-                format!("Failed to query entity clauses for '{}'", entity_name),
-                e.to_string(),
-            )
-        })?;
-
-    let rows = stmt
-        .query_map(rusqlite::params![namespace_id, entity_name], |row| {
-            row.get::<_, String>(0)
+/// Each expected column's position in the published heading. The heading
+/// must be exactly the companion's columns, in any order.
+fn columns_by_name(
+    library_fq: &str,
+    companion: &str,
+    expected: &[&str],
+    heading: &[Option<String>],
+) -> Result<Vec<usize>> {
+    let refuse = |detail: String| {
+        DelightQLError::from(ManifestDiagnostic::CompanionHeading {
+            message: format!(
+                "companion rule '{library_fq}::_internal.{companion}' {detail}; its head must \
+                 name exactly ({})",
+                expected.join(", ")
+            ),
         })
-        .map_err(|e| {
-            Runtime::catalog(
-                format!("Failed to execute clause query for '{}'", entity_name),
-                e.to_string(),
-            )
-        })?;
-
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            Runtime::catalog(
-                format!("Failed to read clauses for '{}'", entity_name),
-                e.to_string(),
-            )
-        })
-}
-
-/// Strip surrounding double quotes from a DQL string literal value.
-/// `"products"` → `products`, `products` → `products` (no-op).
-fn strip_dql_quotes(s: &str) -> &str {
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    }
-}
-
-/// Read every active clause of an ordinary companion and retain the clauses
-/// whose first ground head position is the requested entity.
-fn read_relation_clauses_by_ground_value(
-    conn: &Connection,
-    namespace_id: i32,
-    relation_name: &str,
-    ground_value: &str,
-) -> Result<Vec<String>> {
-    let clauses = read_entity_clauses(conn, namespace_id, relation_name)?;
-    let mut matching = Vec::new();
-    for clause in clauses {
-        if companion_clause_entity(relation_name, &clause)? == ground_value {
-            matching.push(clause);
+    };
+    let mut at: Vec<Option<usize>> = vec![None; expected.len()];
+    for (position, name) in heading.iter().enumerate() {
+        let Some(name) = name else {
+            return Err(refuse(format!(
+                "publishes position {} with no name",
+                position + 1
+            )));
+        };
+        match expected
+            .iter()
+            .position(|column| column.eq_ignore_ascii_case(name))
+        {
+            Some(index) if at[index].is_none() => at[index] = Some(position),
+            Some(_) => return Err(refuse(format!("publishes '{name}' twice"))),
+            None => {
+                return Err(refuse(format!(
+                    "publishes '{name}', which is not one of its columns"
+                )))
+            }
         }
     }
-    Ok(matching)
+    let missing: Vec<&str> = expected
+        .iter()
+        .zip(&at)
+        .filter(|(_, found)| found.is_none())
+        .map(|(column, _)| *column)
+        .collect();
+    if !missing.is_empty() {
+        return Err(refuse(format!(
+            "publishes no '{}' column",
+            missing.join("', '")
+        )));
+    }
+    Ok(at.into_iter().flatten().collect())
 }
 
-fn companion_clause_entity(relation_name: &str, source: &str) -> Result<String> {
-    use crate::pipeline::asts::core::definitions::Supply;
-    use crate::pipeline::asts::core::LiteralValue;
-
-    let group = crate::ddl::reconstruct::group(source)?;
-    let first = group
-        .first()
-        .head
-        .items
-        .listed()
-        .and_then(|items| items.first())
-        .ok_or_else(|| {
-DelightQLError::from(ManifestDiagnostic::CompanionKey {
+/// Within one entity, a column appears once.
+fn refuse_repeats<T>(
+    rows: &[(String, T)],
+    companion: &str,
+    column: impl Fn(&T) -> &String,
+    verb: &str,
+) -> Result<()> {
+    let mut seen: HashMap<(String, String), &String> = HashMap::new();
+    for (entity, row) in rows {
+        let name = column(row);
+        if let Some(first) = seen.insert((entity.clone(), name.to_ascii_lowercase()), name) {
+            let spelled = if first == name {
+                format!("'{name}'")
+            } else {
+                format!("'{first}' and '{name}'")
+            };
+            return Err(DelightQLError::from(ManifestDiagnostic::DuplicateColumn {
                 message: format!(
-                    "ordinary companion '{relation_name}' has no first head position naming its entity"
+                    "imprint!() entity '{entity}': '{companion}' {verb} the column {spelled} \
+                     twice (column names compare case-insensitively)"
                 ),
-            })
-        })?;
-    match &first.supply {
-        Supply::Ground(LiteralValue::String(entity)) => Ok(entity.clone()),
-        Supply::Ground(other) => Err(DelightQLError::from(ManifestDiagnostic::CompanionKey {
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn entity_of(companion: &str, value: &DbValue) -> Result<String> {
+    match value {
+        DbValue::Text(entity) => Ok(entity.clone()),
+        other => Err(DelightQLError::from(ManifestDiagnostic::CompanionKey {
             message: format!(
-                "ordinary companion '{relation_name}' uses non-string entity key {other}"
-            ),
-        })),
-        Supply::Ref(_) => Err(DelightQLError::from(ManifestDiagnostic::CompanionKey {
-            message: format!(
-                "ordinary companion '{relation_name}' leaves its manifest entity key data-dependent"
+                "companion rule '{companion}' has a row whose entity is {}, not a name",
+                other.storage_class()
             ),
         })),
     }
 }
 
-/// Compile an anonymous table body to SQL via the DQL pipeline.
-fn compile_body(body: &str) -> Result<String> {
-    crate::pipeline::compile_source_to_sql(body, &EmptySchema)
+fn text(companion: &str, column: &str, value: &DbValue) -> Result<String> {
+    match value {
+        DbValue::Text(text) => Ok(text.clone()),
+        other => Err(DelightQLError::from(Runtime::General {
+            message: format!(
+                "companion rule '{companion}' has a row whose '{column}' is {}, not text",
+                other.storage_class()
+            ),
+            details: "Companion cell is not text".to_string(),
+        })),
+    }
+}
+
+/// The ordinal as written; the correspondence refuses anything that is not
+/// an integer, naming the column.
+fn ordinal_cell(value: &DbValue) -> OrdinalCell {
+    match value {
+        DbValue::Integer(value) => OrdinalCell::Integer(*value),
+        DbValue::Null => OrdinalCell::Other("NULL".to_string()),
+        DbValue::Real(value) => OrdinalCell::Other(value.to_string()),
+        DbValue::Text(value) => OrdinalCell::Other(value.clone()),
+        DbValue::Blob(_) => OrdinalCell::Other("a BLOB".to_string()),
+    }
+}
+
+/// A default cell holds a plain value or a sigil expression; a number is
+/// its own spelling.
+fn default_value(value: &DbValue) -> String {
+    match value {
+        DbValue::Text(text) => text.clone(),
+        DbValue::Integer(value) => value.to_string(),
+        DbValue::Real(value) => value.to_string(),
+        other => format!("{:?}", other),
+    }
 }
 
 #[cfg(test)]

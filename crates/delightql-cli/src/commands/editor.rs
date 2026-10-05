@@ -60,7 +60,7 @@ pub fn handle_export_artifacts(dir: &Path) -> Result<()> {
 
     let sources = crate::exec_ng::fetch_all(
         &mut *session,
-        &format!("{NAMESPACE}.grammar_source(*) |> #(path) |> (path, content)"),
+        &format!("{NAMESPACE}.grammar_source(*) |> (path, content) |> #(path)"),
     )?;
     for row in &sources.rows {
         write_file(&grammar_dir, &row[0], row[1].as_bytes())?;
@@ -68,7 +68,7 @@ pub fn handle_export_artifacts(dir: &Path) -> Result<()> {
 
     let queries = crate::exec_ng::fetch_all(
         &mut *session,
-        &format!("{NAMESPACE}.editor_query(*) |> #(name) |> (name, content)"),
+        &format!("{NAMESPACE}.editor_query(*) |> (name, content) |> #(name)"),
     )?;
     for row in &queries.rows {
         write_file(&queries_dir, &format!("{}.scm", row[0]), row[1].as_bytes())?;

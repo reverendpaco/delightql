@@ -45,6 +45,13 @@ pub struct WorkerRequest {
     pub input: String,
     pub cursor_byte: Option<u64>,
     pub cooperative_budget_ms: u64,
+    /// Test seam: the worker reads THIS request and never answers it. The
+    /// parent's containment roads need one nonresponsive request without
+    /// arming every replacement worker, which an environment hook would do.
+    /// Only the parent writes this pipe, and a stalled worker is exactly
+    /// what the parent's timeout and kill roads contain.
+    #[serde(default)]
+    pub stall_for_tests: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,8 +103,7 @@ pub enum WorkerResult {
 
 /// What the panic hook saw, for `serve` to read back after the unwind is
 /// caught: the hook has the location, the caught payload does not.
-static LAST_PANIC: std::sync::Mutex<Option<(String, Option<String>)>> =
-    std::sync::Mutex::new(None);
+static LAST_PANIC: std::sync::Mutex<Option<(String, Option<String>)>> = std::sync::Mutex::new(None);
 
 /// Called by the process panic hook when this process is the worker: keep
 /// the facts for the answer and stay silent — the parent records and says
@@ -190,8 +196,13 @@ pub fn run_worker(generation: u64, highlights: Option<std::path::PathBuf>) -> an
             "protocol violation: request generation {} against worker generation {generation}",
             request.worker_generation
         );
-        // The panic road: the parser is a c2rust runtime and the typed CST
-        // reads it; a panic in either is an ANSWER, never a dead worker.
+        if request.stall_for_tests {
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+        // The panic road: the parser runtime and the typed CST reading it
+        // may panic; a panic in either is an ANSWER, never a dead worker.
         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if panic_on_serve {
                 panic!("deliberate worker panic (DQL_TEST_WORKER_PANIC)");
@@ -242,25 +253,41 @@ fn serve(parser: &mut Parser, request: &WorkerRequest) -> WorkerResult {
         .find(|op| op.as_str() == request.operation);
     match operation {
         Some(ReplParserOperation::PromptWellFormed) => {
-            match parser.parse_prompt_cancellable(&request.input, &mut should_cancel) {
+            match parse_helper_text(
+                parser,
+                &request.entrance,
+                &request.input,
+                &mut should_cancel,
+            ) {
                 CancellableParse::Completed(tree) => WorkerResult::WellFormed {
                     well_formed: !tree.has_defects() && tree.root_branch_if_shaped().is_some(),
                 },
                 CancellableParse::Cancelled {
+                    last_progress_byte, ..
+                } => cancelled(
+                    started,
                     last_progress_byte,
-                    entrance,
-                } => cancelled(started, last_progress_byte, root_entrance_name(entrance)),
+                    helper_road_name(&request.entrance),
+                ),
             }
         }
         Some(ReplParserOperation::ContinuationNavigation) => {
-            match parser.parse_prompt_cancellable(&request.input, &mut should_cancel) {
+            match parse_helper_text(
+                parser,
+                &request.entrance,
+                &request.input,
+                &mut should_cancel,
+            ) {
                 CancellableParse::Completed(tree) => WorkerResult::Continuations {
                     byte_offsets: continuation_offsets(&tree),
                 },
                 CancellableParse::Cancelled {
+                    last_progress_byte, ..
+                } => cancelled(
+                    started,
                     last_progress_byte,
-                    entrance,
-                } => cancelled(started, last_progress_byte, root_entrance_name(entrance)),
+                    helper_road_name(&request.entrance),
+                ),
             }
         }
         Some(ReplParserOperation::SyntaxHighlight) => {
@@ -274,7 +301,13 @@ fn serve(parser: &mut Parser, request: &WorkerRequest) -> WorkerResult {
                 CancellableParse::Completed(tree) => WorkerResult::Preflight {
                     defects: tree.has_defects(),
                     has_root_branch: tree.root_branch_if_shaped().is_some(),
-                    entrance: entrance_name(&tree).to_string(),
+                    entrance: match tree.entrance() {
+                        Root::QuerySequence => entrance_name(&tree),
+                        Root::DefinitionFile | Root::CompanionCell => {
+                            helper_road_name(&request.entrance)
+                        }
+                    }
+                    .to_string(),
                 },
                 CancellableParse::Cancelled {
                     last_progress_byte,
@@ -302,6 +335,28 @@ fn serve(parser: &mut Parser, request: &WorkerRequest) -> WorkerResult {
                 entrance: "unknown_operation".to_string(),
             }
         }
+    }
+}
+
+/// The helpers' parse of the prompt's text, at the road the parent
+/// selected: one goal behind the prompt wrap, or definitions as written.
+pub(super) fn parse_helper_text(
+    parser: &mut Parser,
+    entrance: &str,
+    text: &str,
+    should_cancel: &mut dyn FnMut(usize) -> bool,
+) -> CancellableParse {
+    match entrance {
+        "definitions" => parser.parse_submission_cancellable(text, should_cancel),
+        _ => parser.parse_prompt_cancellable(text, should_cancel),
+    }
+}
+
+/// The road a parse of the prompt's text took, as its evidence names it.
+fn helper_road_name(entrance: &str) -> &'static str {
+    match entrance {
+        "definitions" => "definitions",
+        _ => "prompt",
     }
 }
 
@@ -337,9 +392,14 @@ fn highlight_result(
     started: Instant,
     should_cancel: &mut dyn FnMut(usize) -> bool,
 ) -> WorkerResult {
-    match super::syntax_highlighter::highlight_spans(parser, &request.input, should_cancel) {
+    match super::syntax_highlighter::highlight_spans(
+        parser,
+        &request.entrance,
+        &request.input,
+        should_cancel,
+    ) {
         Some(spans) => WorkerResult::Highlights { spans },
-        None => cancelled(started, None, "prompt"),
+        None => cancelled(started, None, helper_road_name(&request.entrance)),
     }
 }
 
@@ -369,6 +429,7 @@ mod tests {
             input: "users(*)\n  |> (naïve, δ)\n\"line\nbreak\"".to_string(),
             cursor_byte: Some(5),
             cooperative_budget_ms: 25,
+            stall_for_tests: false,
         };
         let mut wire = Vec::new();
         write_frame(&mut wire, &serde_json::to_vec(&request).unwrap()).unwrap();
@@ -392,6 +453,48 @@ mod tests {
         assert!(read_frame(&mut &wire[..]).is_err());
     }
 
+    /// The helpers read the prompt's text at the road the parent selected:
+    /// a definition stands whole as definitions and not as a goal, and a
+    /// query the other way round. Definitions preflight as written.
+    #[test]
+    fn helpers_read_the_prompt_text_at_the_selected_road() {
+        let mut parser = Parser::new();
+        let request = |operation: &str, entrance: &str, input: &str| WorkerRequest {
+            request_id: 1,
+            worker_generation: 1,
+            operation: operation.to_string(),
+            entrance: entrance.to_string(),
+            input: input.to_string(),
+            cursor_byte: None,
+            cooperative_budget_ms: 1_000,
+            stall_for_tests: false,
+        };
+        let well_formed = |parser: &mut Parser, entrance: &str, input: &str| match serve(
+            parser,
+            &request("prompt_well_formed", entrance, input),
+        ) {
+            WorkerResult::WellFormed { well_formed } => well_formed,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        let definition = "adults(*) :- users(*), id > 1";
+        assert!(well_formed(&mut parser, "definitions", definition));
+        assert!(!well_formed(&mut parser, "prompt", definition));
+        assert!(well_formed(&mut parser, "prompt", "users(*)"));
+        assert!(!well_formed(&mut parser, "definitions", "users(*)"));
+        match serve(
+            &mut parser,
+            &request("submission_preflight", "definitions", definition),
+        ) {
+            WorkerResult::Preflight {
+                defects, entrance, ..
+            } => {
+                assert!(!defects);
+                assert_eq!(entrance, "definitions");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     /// The served operations answer their closed variants.
     #[test]
     fn operations_answer_their_variants() {
@@ -404,6 +507,7 @@ mod tests {
             input: input.to_string(),
             cursor_byte: None,
             cooperative_budget_ms: 1_000,
+            stall_for_tests: false,
         };
         match serve(&mut parser, &request("prompt_well_formed", "users(*)")) {
             WorkerResult::WellFormed { well_formed } => assert!(well_formed),
@@ -422,7 +526,7 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
-        match serve(&mut parser, &request("submission_preflight", "users(*)")) {
+        match serve(&mut parser, &request("submission_preflight", "?- users(*)")) {
             WorkerResult::Preflight {
                 defects,
                 has_root_branch,
@@ -457,6 +561,7 @@ mod tests {
             input: marked,
             cursor_byte: None,
             cooperative_budget_ms: 0,
+            stall_for_tests: false,
         };
         match serve(&mut parser, &request) {
             WorkerResult::Cancelled { entrance, .. } => assert_eq!(entrance, "query_sequence"),
@@ -477,6 +582,7 @@ mod tests {
             input: large,
             cursor_byte: None,
             cooperative_budget_ms: 0,
+            stall_for_tests: false,
         };
         match serve(&mut parser, &request) {
             WorkerResult::Cancelled { entrance, .. } => assert_eq!(entrance, "prompt"),

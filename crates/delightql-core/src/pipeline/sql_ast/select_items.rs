@@ -85,19 +85,12 @@ impl Publishes<'_> {
 
 // Smart constructors for SelectItem
 impl SelectItem {
-    /// `*` over the ordered occurrences the FROM underneath offers.
-    pub fn star(expansion: Vec<crate::names::ColId>) -> Self {
-        SelectItem::Star {
-            reads: expansion.clone(),
-            expansion,
-        }
-    }
-
     /// `*` where nothing underneath is addressable.
     ///
     /// SQL requires a select list; a layer that publishes no heading still
     /// has to write something, and this is that. It is not a star whose
     /// expansion is unknown — it is a star that stands for no output.
+    #[cfg(test)]
     pub fn star_over_nothing() -> Self {
         SelectItem::Star {
             reads: Vec::new(),
@@ -123,19 +116,6 @@ impl SelectItem {
             expr,
             slot: alias,
             printed: true,
-        }
-    }
-
-    /// A BARE COLUMN REFERENCE. It realizes the occurrence it names, so the
-    /// slot is that occurrence; SQL writes no `AS` because the expression
-    /// already carries the name. The identity is stated here rather than
-    /// recovered downstream from the fact that the expression happens to
-    /// be a column.
-    pub fn bare_column(column: crate::names::ColId) -> Self {
-        SelectItem::Publishing {
-            expr: DomainExpression::Column(column),
-            slot: column,
-            printed: false,
         }
     }
 
@@ -186,20 +166,6 @@ impl SelectItem {
                 expansion: expansion.clone(),
             },
         }
-    }
-
-    /// STATE WHICH OCCURRENCE THIS POSITION REALIZES.
-    ///
-    /// The lowering that laid a semantic interface out says here which port
-    /// each emitted position is. `None` for a star: it stands for a run,
-    /// so there is no single occurrence it could be.
-    pub fn realizing(&self, slot: crate::names::ColId) -> Option<Self> {
-        let expr = self.expr()?.clone();
-        Some(SelectItem::Publishing {
-            expr,
-            slot,
-            printed: true,
-        })
     }
 
     /// What this item contributes to its statement's published heading.

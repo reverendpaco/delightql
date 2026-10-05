@@ -59,17 +59,35 @@ pub fn prompt_showing_defects(source: &str) -> Result<SyntaxTree> {
 /// that reads it. The three framing states — an authored header, a misplaced
 /// one, no header at all — are the syntax crate's answer, and a host that
 /// reduced them to "is it marked?" before parsing would lose the middle one:
-/// misframed text would be read as an interactive prompt and refuse for a
-/// reason the author did not write. Nothing on this side scans for the header.
+/// misframed text would be read as canonical text and refuse for a reason the
+/// author did not write. Nothing on this side scans for the header.
 ///
-/// Unmarked text is one interactive submission and takes the prompt wrap.
+/// Unmarked text is canonical, read as written. The prompt wrap is the
+/// host's: a host that sends what a user typed at a prompt has already
+/// written the goal marker, and nothing here writes it again.
 pub fn submission(source: &str, budget: NestingBudget) -> Result<SyntaxTree> {
     submission_attributed(source, budget).map_err(|refusal| refusal.error)
 }
 
+/// What a user typed at a prompt, read as the submission the host's wrap
+/// makes of it, with the wrap outside every authored coordinate. For a
+/// relation whose argument is prompt text by its contract, which makes the
+/// relation that text's host.
+pub fn prompt_submission(source: &str, budget: NestingBudget) -> Result<SyntaxTree> {
+    let tree = Parser::new().parse_prompt_submission(source);
+    let owner = match tree.entrance() {
+        Root::QuerySequence => failing_form(&tree),
+        Root::DefinitionFile | Root::CompanionCell => submission_extent(&tree),
+    };
+    attributed(tree, Category::Query, owner, budget).map_err(|refusal| refusal.error)
+}
+
 /// The same, tolerating defects, for `--to cst`.
-pub fn submission_showing_defects(source: &str, budget: NestingBudget) -> Result<SyntaxTree> {
-    let tree = Parser::new().parse_submission(source);
+pub fn prompt_submission_showing_defects(
+    source: &str,
+    budget: NestingBudget,
+) -> Result<SyntaxTree> {
+    let tree = Parser::new().parse_prompt_submission(source);
     within_budget(&tree, budget)?;
     Ok(tree)
 }
@@ -85,7 +103,7 @@ pub(crate) fn submission_attributed(
     let tree = Parser::new().parse_submission(source);
     let owner = match tree.entrance() {
         Root::QuerySequence => failing_form(&tree),
-        // A prompt carries ONE goal, so that goal's extent is the owner.
+        // A submission carries ONE goal, so that goal's extent is the owner.
         Root::DefinitionFile | Root::CompanionCell => submission_extent(&tree),
     };
     attributed(tree, Category::Query, owner, budget)
@@ -166,13 +184,47 @@ pub fn normalize_sequence(tree: &SyntaxTree) -> Result<crate::pipeline::normaliz
     )
 }
 
-/// One companion cell, at the root its COLUMN selects.
-pub fn companion_cell(column: CompanionColumn, cell: &str) -> Result<SyntaxTree> {
+/// A CONSTRAINT CELL'S TREE: parsed under the constraint marker, so the
+/// grammar admitted a constraint cell and nothing else. The field is
+/// private and the only constructor is [`constraint_cell`]: a tree of the
+/// other category cannot reach the constraint normalizer, because no safe
+/// signature takes a category beside a generic tree.
+pub struct ConstraintCellTree(SyntaxTree);
+
+impl ConstraintCellTree {
+    pub(crate) fn tree(&self) -> &SyntaxTree {
+        &self.0
+    }
+}
+
+/// A DEFAULT CELL'S TREE: parsed under the default marker; see
+/// [`ConstraintCellTree`].
+pub struct DefaultCellTree(SyntaxTree);
+
+impl DefaultCellTree {
+    pub(crate) fn tree(&self) -> &SyntaxTree {
+        &self.0
+    }
+}
+
+/// One constraint cell, at the root its column selects.
+pub fn constraint_cell(cell: &str) -> Result<ConstraintCellTree> {
     checked(
-        Parser::new().parse_companion_cell(column, cell),
+        Parser::new().parse_companion_cell(CompanionColumn::Constraint, cell),
         Category::Companion,
         NestingBudget::current(),
     )
+    .map(ConstraintCellTree)
+}
+
+/// One default cell, at the root its column selects.
+pub fn default_cell(cell: &str) -> Result<DefaultCellTree> {
+    checked(
+        Parser::new().parse_companion_cell(CompanionColumn::Default, cell),
+        Category::Companion,
+        NestingBudget::current(),
+    )
+    .map(DefaultCellTree)
 }
 
 /// The AUTHORED extent of each query in a sequence, in order.
@@ -375,13 +427,7 @@ fn separators(tree: &SyntaxTree) -> Vec<std::ops::Range<usize>> {
         .filter(|node| {
             matches!(
                 node.typed_kind(),
-                Some(
-                    cst::Kind::Comment
-                        | cst::Kind::SmartComment
-                        | cst::Kind::StopPoint
-                        | cst::Kind::DebugPoint
-                        | cst::Kind::QuerySequenceHeader
-                )
+                Some(cst::Kind::Comment | cst::Kind::SmartComment | cst::Kind::QuerySequenceHeader)
             )
         })
         .filter_map(|node| tree.byte_range(node))
@@ -813,7 +859,7 @@ mod tests {
     #[test]
     fn a_misplaced_header_keeps_its_framing_when_defects_are_shown() {
         for (why, source) in MISFRAMED {
-            let tree = submission_showing_defects(source, NestingBudget::current())
+            let tree = prompt_submission_showing_defects(source, NestingBudget::current())
                 .unwrap_or_else(|error| panic!("{why}: showing defects does not refuse: {error}"));
             assert_eq!(
                 tree.entrance(),
@@ -852,7 +898,8 @@ mod tests {
     }
 
     /// The two lawful shapes, each on its own road: a placed mark is a
-    /// sequence, and unmarked text is one interactive submission.
+    /// sequence, and unmarked text is canonical — a goal carries its marker,
+    /// and a naked query is not canonical text.
     #[test]
     fn a_placed_header_and_unmarked_text_take_their_own_roads() {
         let marked = submission("#!dql query-sequence\nusers(*)\n", NestingBudget::current())
@@ -860,10 +907,15 @@ mod tests {
         assert_eq!(marked.entrance(), Root::QuerySequence);
         assert!(!marked.has_defects(), "{:?}", marked.defects());
 
-        let unmarked = submission("users(*)\n", NestingBudget::current())
-            .expect("unmarked text is one submission");
+        let unmarked = submission("?- users(*)\n", NestingBudget::current())
+            .expect("unmarked text is canonical");
         assert_eq!(unmarked.entrance(), Root::DefinitionFile);
         assert!(!unmarked.has_defects(), "{:?}", unmarked.defects());
+
+        assert!(submission("users(*)\n", NestingBudget::current()).is_err());
+        let typed = prompt_submission("users(*)\n", NestingBudget::current())
+            .expect("prompt text is one goal");
+        assert_eq!(typed.entrance(), Root::DefinitionFile);
     }
 
     /// DIAGNOSIS AND OWNERSHIP ARE ONE ACT at the canonical entrance too. Two

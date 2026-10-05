@@ -6,15 +6,15 @@ URIs* -- named safety boundaries that are closed by default and opened
 explicitly per-query.
 
 ```delightql
--- open a specific danger for one query
+// open a specific danger for one query
 employee(*) as e (~~danger://cardinality/nulljoin ON~~),
   department(*) as d,
   e.DepartmentId = d.DepartmentId
 
--- the danger auto-closes at query end
+// the danger auto-closes at query end
 employee(*) as e, department(*) as d,
   e.DepartmentId = d.DepartmentId
--- this query uses safe defaults again
+// this query uses safe defaults again
 ```
 
 The URI is a stable identifier. It doubles as the canonical reference
@@ -236,12 +236,12 @@ dangers: inline-only, never CLI-overridable.
 
 | URI | Default | Condition | What happens when ON |
 |-----|---------|-----------|---------------------|
-| `delightql-danger://semantics/min_multiplicity` | OFF | Intersection-via-correlation uses bidirectional semijoin (UNION ALL of EXISTS-filtered operands), producing m+n copies of matching tuples | Intersection-via-correlation uses ROW_NUMBER + equi-join, producing min(m,n) copies -- true INTERSECT ALL multiplicity. |
+| `delightql-danger://semantics/min_multiplicity` | OFF | Intersection-via-correlation uses bidirectional semi-join (UNION ALL of EXISTS-filtered operands), producing m+n copies of matching tuples | Intersection-via-correlation uses ROW_NUMBER + equi-join, producing min(m,n) copies -- true INTERSECT ALL multiplicity. |
 
 **Why `min_multiplicity` is a semantic danger.** The bidirectional
-semijoin and the ROW_NUMBER path compute different multisets for
+semi-join and the ROW_NUMBER path compute different multisets for
 duplicate tuples. Three copies in the left operand and two in the
-right yield five rows under bidirectional semijoin but two under
+right yield five rows under bidirectional semi-join but two under
 min-multiplicity. The difference only surfaces with genuinely
 duplicate tuples, but it changes what the operator *means* --
 the same query produces different results. This is a semantic

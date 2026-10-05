@@ -47,6 +47,25 @@ impl SqlComparison {
     }
 }
 
+/// The selected prelude comparisons lower to SQL's strict `=` / `<>`.
+/// Their generated TRUE result requires both operands to be non-NULL.
+/// Other sigma predicates make no such promise here.
+pub(crate) fn strict_comparison_operands<'a>(
+    namespace: &[String],
+    name: &str,
+    args: &'a [DomainExpression],
+) -> Option<(&'a DomainExpression, &'a DomainExpression)> {
+    if namespace.len() != 2
+        || namespace[0] != "std"
+        || namespace[1] != "prelude"
+        || !matches!(name, "sql_eq" | "sql_ne")
+    {
+        return None;
+    }
+    let [left, right] = args else { return None };
+    Some((left, right))
+}
+
 /// `sql_eq(l, r)`: target SQL `=`.
 pub struct SqlEqPredicate;
 

@@ -25,8 +25,8 @@ use crate::pipeline::asts::core::definitions::Head;
 use crate::pipeline::asts::core::operators::HoArgument;
 use crate::pipeline::asts::core::Step;
 use crate::pipeline::asts::core::{
-    Access, Chain, Continuation, FunctorCall, GroundMention, PipeOp, Query, Relation, SealedCall,
-    SetOperator, Unresolved,
+    Access, Chain, Continuation, FunctorCall, GroundMention, GroupSpec, OutItem, PipeOp, Query,
+    ReductionItem, Relation, SealedCall, SetOperator, Unresolved,
 };
 use crate::pipeline::syntax::cst;
 use delightql_types::SqlIdentifier;
@@ -229,12 +229,35 @@ impl<'t> Normalizer<'t> {
         for step in steps {
             match step {
                 EffectToken::Continuation(continuation) => {
-                    chain = self.continuation(continuation, chain)?
+                    chain = self.effect_continuation(continuation, chain)?
                 }
                 EffectToken::Annotation(annotation) => self.annotation(annotation, &chain)?,
             }
         }
         Ok(chain)
+    }
+
+    /// Effect chains use the same singleton-reduction surface as pure chains.
+    /// Tree-sitter can otherwise split `~> count:(*) as n` into an unnamed
+    /// reduction followed by a stage label because an effect chain also admits
+    /// stage names as continuations. In the singleton grammar the `as` belongs
+    /// to the one reduction value, so consume that authored name at this
+    /// construction boundary before the generic stage-name road sees it.
+    fn effect_continuation(
+        &mut self,
+        node: cst::Continuation<'t>,
+        chain: Chain<Unresolved>,
+    ) -> Result<Chain<Unresolved>> {
+        match node {
+            cst::Continuation::OperatorContinuation(cst::OperatorContinuation::StageName(
+                stage,
+            )) if chain_is_unnamed_singleton_reduction(&chain) => {
+                let name = self.require(stage.name(), "a stage name carries a name")?;
+                let name = self.admit_stage(self.identifier(name))?;
+                name_singleton_reduction(chain, name)
+            }
+            other => self.continuation(other, chain),
+        }
     }
 
     fn join(
@@ -249,7 +272,7 @@ impl<'t> Normalizer<'t> {
                 chain.then(Step::authored(Continuation::Member {
                     rhs: arm,
                     correlation: None,
-                    join_type: None,
+                    join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
                 }))
             }
             cst::BinaryConnectiveChild::CorrespondingUnionSigil(_) => {
@@ -463,7 +486,6 @@ impl<'t> Normalizer<'t> {
                     mutation_target: true,
                     passthrough: false,
                 },
-                outer: false,
             },
             Access::All,
         ))
@@ -533,9 +555,6 @@ impl<'t> Normalizer<'t> {
             expression,
             name,
             head,
-            // An effect binding's head has no badge position: recursion is
-            // relation-form only.
-            crate::pipeline::asts::vocabulary::Fixpoint::Bag,
             crate::pipeline::asts::core::CteEffectDeclaration::DemandsDirective,
         )
         .map(super::relex::LetBinding::Relation)
@@ -563,10 +582,14 @@ impl<'t> Normalizer<'t> {
             })
             .map(|param| self.ho_param(param))
             .collect::<Result<_>>()?;
-        let expression = match body {
-            cst::EffectHoCteBody::LetFreeRelex(relex) => self.let_free_relex(relex)?,
-            cst::EffectHoCteBody::EffectChain(chain) => self.effect_chain(chain)?,
-        };
+        // The body is read now, within its own clause's marked scope, with no
+        // actual in hand: an invocation spends its selections by position.
+        let scope = Self::declared_scope(&params);
+        let own = scope.id();
+        let expression = self.within_scope(scope, |n| match body {
+            cst::EffectHoCteBody::LetFreeRelex(relex) => n.let_free_relex(relex),
+            cst::EffectHoCteBody::EffectChain(chain) => n.effect_chain(chain),
+        })?;
         if !crate::pipeline::asts::effects::expression_demands_directive(&expression) {
             return Err(DelightQLError::from(EffectCte::PureMark {
                 message: format!(
@@ -578,15 +601,17 @@ impl<'t> Normalizer<'t> {
         }
         // THE SUBJECT CARRIES THE MARK, as a consulted effect rule's does:
         // the demand that opens it names `p!`.
+        let mut query = Query::relational(expression);
+        query.locals.clause_formals =
+            crate::pipeline::asts::core::definitions::ClauseFormals::Marked(own);
         let decl = self.clause(
             DefKind::Effect,
             DefSubject::Named(SqlIdentifier::new(format!("{}!", name.as_str()))),
             Head::signature(params),
-            crate::pipeline::asts::vocabulary::Fixpoint::Bag,
-            DdlBody::Relational(Query::relational(expression)),
+            DdlBody::Relational(query),
             self.text(node),
             None,
-        );
+        )?;
         Ok(super::relex::LetBinding::HigherOrder {
             name,
             effect: crate::pipeline::asts::core::CteEffectDeclaration::DemandsDirective,
@@ -609,4 +634,94 @@ impl<'t> Normalizer<'t> {
             "an effect identifier has a predicate identifier",
         ))
     }
+}
+
+/// Whether the last effect-chain continuation is exactly the zero-key,
+/// one-position reduction whose trailing name is its output baptism. A keyed
+/// group or a multi-position group still has a stage-level name and follows
+/// the ordinary stage naming authority.
+fn chain_is_unnamed_singleton_reduction(chain: &Chain<Unresolved>) -> bool {
+    let Some(Continuation::Pipe {
+        operator: PipeOp::Group(GroupSpec::Reduce {
+            keys, reductions, ..
+        }),
+        named: None,
+    }) = chain.continuations().last().map(|step| step.form())
+    else {
+        return false;
+    };
+    if !keys.is_empty() || reductions.len() != 1 {
+        return false;
+    }
+    match reductions.first() {
+        ReductionItem::Out(OutItem::One(item)) => item.naming.is_none(),
+        ReductionItem::Metadata(item) => item.naming.is_none(),
+        ReductionItem::Out(OutItem::Many(_))
+        | ReductionItem::Out(OutItem::Whole)
+        | ReductionItem::Delegate(_)
+        | ReductionItem::Pivot(_) => false,
+    }
+}
+
+/// Spend an effect-chain singleton's trailing name on its one reduction
+/// position. The shape predicate above proves the mutable path is exhaustive;
+/// a second arm would mean the caller changed the construction without
+/// updating the law.
+fn name_singleton_reduction(
+    mut chain: Chain<Unresolved>,
+    name: SqlIdentifier,
+) -> Result<Chain<Unresolved>> {
+    let Some(Continuation::Pipe {
+        operator: PipeOp::Group(GroupSpec::Reduce {
+            keys, reductions, ..
+        }),
+        named,
+    }) = chain
+        .continuations_mut()
+        .last_mut()
+        .map(|step| step.form_mut())
+    else {
+        return Err(Internal::invariant(
+            "normalize::effects",
+            "singleton reduction name lost its construction carrier",
+        ));
+    };
+    if !keys.is_empty() || reductions.len() != 1 || named.is_some() {
+        return Err(Internal::invariant(
+            "normalize::effects",
+            "singleton reduction name reached a different stage shape",
+        ));
+    }
+    let result = match reductions.iter_mut().next() {
+        Some(ReductionItem::Out(OutItem::One(item))) => {
+            if item.naming.is_some() {
+                return Err(Internal::invariant(
+                    "normalize::effects",
+                    "singleton reduction name would replace an authored name",
+                ));
+            }
+            item.naming = Some(name);
+            Ok(())
+        }
+        Some(ReductionItem::Metadata(item)) => {
+            if item.naming.is_some() {
+                return Err(Internal::invariant(
+                    "normalize::effects",
+                    "singleton reduction name would replace an authored name",
+                ));
+            }
+            item.naming = Some(name);
+            Ok(())
+        }
+        Some(ReductionItem::Out(OutItem::Many(_)))
+        | Some(ReductionItem::Out(OutItem::Whole))
+        | Some(ReductionItem::Delegate(_))
+        | Some(ReductionItem::Pivot(_))
+        | None => Err(Internal::invariant(
+            "normalize::effects",
+            "singleton reduction name reached a non-singleton reduction",
+        )),
+    };
+    result?;
+    Ok(chain)
 }

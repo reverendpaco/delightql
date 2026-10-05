@@ -19,16 +19,16 @@ Calls of the form `foo(*)` may either be delightql
 rules or target tables.
 
 ```delightql
-foo(*)
+artist(*)
 ```
 
-In either case, delightql's resolution both ensures that the name (`foo`)
+In either case, delightql's resolution both ensures that the name (`artist`)
 exists and that its columns (dimensions) are named and in a certain order.  For
 a data-backed table, the default transpilation rule places the entity after a
-`FROM` (e.g. `FROM foo`).
+`FROM` (e.g. `FROM artist`).
 
 ```sql
-select * from foo;
+select * from artist;
 ```
 
 Resolution for non-namespaced entities checks common-table expressions first followed by any in-scope
@@ -68,29 +68,29 @@ Upon finding no delightql-authored function, delightql will emit a SQL fragment 
 function form into the SQL function form:
 
 ```delightql
-foo(*) |> +( bar:(x) as b)
+album(*) |> +( hex:(title) as title_hex)
 ```
 
 ```sql
-select *, bar(x) as b from foo;
+select *, hex(title) as title_hex from album;
 ```
 
 This default tranpsilation rules runs assuming imperfect knowledge as to
-whether the SQL target defines such an entity. That is to say, the `bar`
+whether the SQL target defines such an entity. That is to say, the `hex`
 in the above SQL may or may not exist as a function in the target SQL
 engine.
 
 
 ## Sigma Predicate Resolution and Transpilation {.dqlh}
 
-All sigma-predicates have **no** default transpilation rule.
+All sigma predicates have **no** default transpilation rule.
 This is because SQL has no uniform syntax for row predication with
 such diverse syntax as `LIKE`, `BETWEEN`, in-fix operators, `IN`, and `EXSISTS`.
 
 All delightql calls of the form
 
 ```delightql
-foo(*), +bar(x)
+track(*), +like(name, "%Love%")
 ```
 
 will resolve to a delightql-authored entity (either built-in or programmer authored).

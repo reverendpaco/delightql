@@ -47,13 +47,13 @@ module.exports = {
   // ---- pipes ---------------------------------------------------------------
   pipe_operator: $ => '|>',
   unwrap_pipe_operator: $ => '!>',
-  function_pipe_operator: $ => '/->',
+  function_pipe_operator: $ => '>>',
 
   // ---- reduction, iteration, arrows --------------------------------------
   reduction_sigil: $ => '~>',
   // ':~>' is ONE token; interior whitespace is allowed.
   metadata_sigil: $ => token(seq(':', /[ \t\r\n]*/, '~>')),
-  destructure_sigil: $ => choice('~=','has','@'),
+  destructure_sigil: $ => choice('~=','has'),
   arrow: $ => '->',
   window_sigil: $ => '<~',
 
@@ -70,6 +70,10 @@ module.exports = {
   sparse_mark: $ => '?',
   meta_sigil: $ => '^',
   signed_witness_sigil: $ => '+-',
+  // A definition-owned scalar reference opens with `$.`; the covers' `$(`,
+  // `+$(` and `$$(` share only the dollar, and the character after it
+  // decides.
+  parameter_sigil: $ => '$.',
 
   // ---- chain connectives --------------------------------------------------
   comma_sigil: $ => ',',
@@ -102,6 +106,10 @@ module.exports = {
   // ONE shape for every tabular interior: anon bodies, fact bodies, and
   // fact-function arms all take '@' or three-or-more dashes.
   separator: $ => token(choice('@', /---+/)),
+  // A bare singleton's `@`: the separator of its one-column heading and its
+  // one value, and nothing else — the dashed separator belongs to a written
+  // tabular interior.
+  singleton_sigil: $ => '@',
 
   // ---- anaphors -----------------------------------------------------------
   // `@` always names what flows in; `_` always names the disregarded. Each
@@ -120,10 +128,13 @@ module.exports = {
   // ---- terminal sorts -----------------------------------------------------
   // Spelling belongs to the lexical layer, deferred deliberately by the
   // semantic grammars. These follow the language as it is spelled today.
+  // The exponent form (`1e3`, `1.25e-2`, `2E+3`) is the APPROXIMATE
+  // numeric category; the normalizer reads the category off the spelling
+  // once and nothing downstream re-reads it.
   number: $ => token(choice(
     /0[xX][0-9a-fA-F]+/,
     /0[oO][0-7]+/,
-    /-?[0-9][0-9_]*(\.[0-9][0-9_]*)?/,
+    /-?[0-9][0-9_]*(\.[0-9][0-9_]*)?([eE][+-]?[0-9]+)?/,
   )),
   boolean: $ => choice('true', 'false'),
   null: $ => 'null',
@@ -144,6 +155,9 @@ module.exports = {
   // Stropping is spelling: a strop is a reference, never a value, and the
   // engine-facing bytes are never stripped.
   stropped_form: $ => token(seq('`', /[^`]+/, '`')),
-  regex: $ => token(seq('/', /[^\/\r\n]+/, '/')),
+  // A column regex and its flag letters glued after the closing slash; the
+  // letters are read whole so that normalization can teach about `i` and
+  // unknown flags rather than leave them to a syntax error.
+  regex: $ => token(seq('/', /[^\/\r\n]+/, '/', optional(/[A-Za-z]+/))),
   comment: $ => token(prec(10, /\/\/[^\r\n]*/)),
 };

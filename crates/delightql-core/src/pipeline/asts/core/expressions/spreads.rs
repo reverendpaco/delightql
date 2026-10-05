@@ -57,13 +57,25 @@ impl Glob<Unresolved> {
 #[lispy("regex_selector")]
 pub struct RegexSelector<P: Phase = Unresolved> {
     pub pattern: String,
+    pub case: RegexCase,
     pub authored: P::Enumeration,
 }
 
+/// How a column regex compares letters: without regard to case, as a column
+/// reference does, unless the `c` flag asks for the case as written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToLispy)]
+pub enum RegexCase {
+    #[lispy("case:ignored")]
+    Ignored,
+    #[lispy("case:exact")]
+    Exact,
+}
+
 impl RegexSelector<Unresolved> {
-    pub fn new(pattern: String) -> Self {
+    pub fn new(pattern: String, case: RegexCase) -> Self {
         Self {
             pattern,
+            case,
             authored: (),
         }
     }

@@ -4,35 +4,35 @@ The GROUP-MODULO operator `%(  )`{.delightql .sigil}
 returns distinct combinations of the specified columns:
 
 ```delightql
-employee(*)
-  |> %(Department)
+customer(*)
+  |> %(country)
 ```
 
 
 ```sql
 select
-  distinct Department
-from employee;
+  distinct country
+from customer;
 ```
 
 Multiple columns return distinct combinations:
 
 ```delightql
-employee(*)
-  |> %(Department, State)
-  |> #(Department,State descending)
+customer(*)
+  |> %(country, state)
+  |> #(country,state descending)
 ```
 
 ```sql
 select
-  distinct Department, State
-from employee
-    order by Department asc, State desc;
+  distinct country, state
+from customer
+    order by country asc, state desc;
 ```
 
 To deduplicate all columns -- converting a multiset (bag) into a set:
 
 ```delightql
-employee(*)
+genre_2025(*)
   |> %(*)  //returns unique rows and removes duplicates
 ```

@@ -206,7 +206,7 @@ pub enum EntityType {
 
     /// Built-in pseudo-predicate (mount!, consult!, enlist!, etc.)
     /// Pseudo-predicates are state-mutating relations with `!` suffix
-    /// that execute in the effect executor and are compiled into the engine
+    /// that the runtime executes and that are compiled into the engine
     BinPseudoPredicate = 14,
 
     /// Built-in sigma predicate (like(), =(), <(), etc.)
@@ -229,8 +229,8 @@ pub enum EntityType {
     BinRelation = 19,
 
     /// DelightQL effect rule — a user directive definition (EFFECT-ALGEBRA §1):
-    /// `name!(*) :- body`. Registered at consult time and demanded through
-    /// the effect transformer. The stored entity name carries the `!` suffix,
+    /// `name!(*) :- body`. Registered at consult time and demanded by the
+    /// plan that runs it. The stored entity name carries the `!` suffix,
     /// matching the BinPseudoPredicate naming convention.
     DqlEffectRule = 20,
 
@@ -352,6 +352,20 @@ impl EntityType {
                 | Self::DqlHoFunctionExpression
                 | Self::DqlContextAwareFunctionExpression
                 | Self::DqlDefaultFactFunctionExpression
+        )
+    }
+
+    /// A PHYSICAL database object the engine holds rows for — a table or
+    /// view the catalog introspected or the session materialized. Its
+    /// heading is its registered columns and its read is a physical read
+    /// placed by its namespace; nothing opens a body for it.
+    pub fn is_database_object(self) -> bool {
+        matches!(
+            self,
+            Self::DbPermanentTable
+                | Self::DbPermanentView
+                | Self::DbTemporaryTable
+                | Self::DbTemporaryView
         )
     }
 

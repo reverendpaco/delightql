@@ -43,7 +43,7 @@ fn load_pages() -> Result<Vec<Page>> {
         crate::embedded_db::verify_bundle_schema_version(&mut *session, "cli::man")?;
         let results = crate::exec_ng::fetch_all(
             &mut *session,
-            "cli::man.man_page(*) |> #(name, section) |> (name, section, troff)",
+            "cli::man.man_page(*) |> (name, section, troff) |> #(name, section)",
         )?;
         results
             .rows

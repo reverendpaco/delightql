@@ -124,20 +124,10 @@ pub(crate) struct CreatedObjectReadback {
     pub(crate) attributes: Vec<(String, String)>,
 }
 
-/// Catalog input prepared entirely from target read-backs. The complete batch
-/// is handed to one reconciliation boundary so a later object cannot leave an
-/// earlier sibling committed in the bootstrap catalog.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CreatedObjectRegistration {
-    pub(crate) name: String,
-    pub(crate) is_view: bool,
-    pub(crate) connection_id: i64,
-    pub(crate) namespace_id: i64,
-    pub(crate) attributes: Vec<(String, String)>,
-    /// Positions among `attributes` that carry nested relation payloads,
-    /// as the creating plan knew them.
-    pub(crate) interior_positions: Vec<usize>,
-}
+/// The registration carrier is the system's: the registration act alone
+/// constructs it, from the placement it judged and the shape the plan
+/// carried, and the complete batch reaches one reconciliation boundary.
+pub(crate) use crate::system::{CreatedObjectRegistration, Placement};
 
 pub(crate) trait CreatedObjectCatalog: Send + Sync {
     fn reconcile(

@@ -30,32 +30,32 @@ Argumentative access introduces **unqualified** names -- bare identifiers. Wildc
 
 When the same name appears in multiple places, unification creates a join condition:
 ```delightql
-users(user_id, name, _), orders(order_id, user_id, total, _)
+artist(artist_id, name), album(album_id, title, artist_id)
 ```
 
-Both introduce `user_id`. Unification produces:
+Both introduce `artist_id`. Unification produces:
 ```sql
-SELECT users.name, orders.order_id, orders.total
-FROM users, orders
-WHERE users.user_id = orders.user_id;
+SELECT artist.artist_id, artist.name, album.album_id, album.title
+FROM artist, album
+WHERE artist.artist_id = album.artist_id;
 ```
 
 
 ## Wildcard Access and Qualification {.dqlh}
 ```delightql
-users(*), orders(*)
+artist(*), album(*)
 ```
 
-This introduces `users.user_id` and `orders.user_id` -- different names. No unification occurs; the result is a cross join.
+This introduces `artist.artist_id` and `album.artist_id` -- different names. No unification occurs; the result is a cross join.
 
 To join with wildcard access, use explicit conditions:
 ```delightql
-users(*), orders(*), users.user_id = orders.user_id
+artist(*), album(*), artist.artist_id = album.artist_id
 ```
 
 Or use the USING operator `.(cols)`:
 ```delightql
-users(*), orders(*.(user_id))
+artist(*), album(*.(artist_id))
 ```
 
 
@@ -63,68 +63,68 @@ users(*), orders(*.(user_id))
 
 Argumentative patterns can reference lvars from other tables:
 ```delightql
-users(*) as u, orders(order_id, u.user_id, total, _)
+artist(*) as a, album(album_id, title, a.artist_id)
 ```
 
-The `u.user_id` in positional access matches the `u.user_id` from `users(*) as u`, creating unification. This mixes styles: wildcard for one table, positional for another, with explicit cross-reference.
+The `a.artist_id` in positional access matches the `a.artist_id` from `artist(*) as a`, creating unification. This mixes styles: wildcard for one table, positional for another, with explicit cross-reference.
 
 A more elaborate example:
 ```delightql
-users(*) as u,
-reviews(*) as r,
-products(product_id, u.user_id, r.rating, _)
+playlist(*) as p,
+track(*) as t,
+playlist_track(p.playlist_id, t.track_id)
 ```
 
-Here `products` unifies with `users` on `u.user_id` and with `reviews` on `r.rating` -- a three-way join through positional cross-references.
+Here `playlist_track` unifies with `playlist` on `p.playlist_id` and with `track` on `t.track_id` -- a three-way join through positional cross-references.
 
 ## Literals and Constraints {.dqlh}
 
 Ground terms in positional access create `WHERE` conditions:
 
 ```delightql
-users(user_id, name, "active", _)
+invoice(invoice_id, customer_id, invoice_date, _, _, _, "Canada", _, total)
 ```
 
-The positional grounding filters rows where the third column equals `"active"`.  The column `status` has been unified with the ground value `"active"`.
+The positional grounding filters rows where the seventh column equals `"Canada"`.  The column `billing_country` has been unified with the ground value `"Canada"`.
 
 ```sql
-SELECT user_id, name FROM users WHERE status = 'active';
+SELECT invoice_id, customer_id, invoice_date, total FROM invoice WHERE billing_country IS NOT DISTINCT FROM 'Canada';
 ```
 
 ## Self-Unification {.dqlh}
 
 The same name repeated in positional access forces equality:
 ```delightql
-users(user_id, name, user_id, _)
+invoice(invoice_id, customer_id, invoice_date, _, billing_city, billing_city, _, _, total)
 ```
 
-Columns 1 and 3 both bind to `user_id`. This filters to rows where those columns are equal:
+Columns 5 and 6 both bind to `billing_city`. This filters to rows where those columns are equal:
 ```sql
-SELECT user_id, name FROM users WHERE column1 = column3;
+SELECT invoice_id, customer_id, invoice_date, billing_city, total FROM invoice WHERE billing_city IS NOT DISTINCT FROM billing_state;
 ```
 
 ## Anonymous Tables and Unification {.dqlh}
 
 Anonymous tables participate in unification through their header names:
 ```delightql
-users(user_id, name, status, _),
-_(status @ "active"; "pending"; "suspended")
+invoice(invoice_id, customer_id, _, _, _, _, billing_country, _, total),
+_(billing_country @ "Canada"; "France"; "Germany")
 ```
 
-The anonymous table introduces `status`. This matches `status` from users, creating:
+The anonymous table introduces `billing_country`. This matches `billing_country` from `invoice`, creating:
 ```sql
-SELECT user_id, name, status
-FROM users
-WHERE status IN ('active', 'pending', 'suspended');
+SELECT invoice_id, customer_id, billing_country, total
+FROM invoice
+WHERE billing_country IN ('Canada', 'France', 'Germany');
 ```
 
 With wildcard access, qualification is required:
 ```delightql
-users(*) as u,
-_(u.status @ "active"; "pending"; "suspended")
+invoice(*) as i,
+_(i.billing_country @ "Canada"; "France"; "Germany")
 ```
 
-Without the `u.` prefix, no unification occurs -- the anonymous table's `status` wouldn't match `u.status`.
+Without the `i.` prefix, no unification occurs -- the anonymous table's `billing_country` wouldn't match `i.billing_country`.
 
 ## Lvars as Data in Anonymous Tables {.dqlh}
 
@@ -134,56 +134,55 @@ Anonymous tables can use lvars as data values, not just in headers.
 
 ### Inverted IN Pattern {.dqlh}
 ```delightql
-users(*) as u,
-_("happy" @ u.status; u.feelings; u.worldview)
+employee(*) as e,
+_(2 @ e.employee_id; e.reports_to)
 ```
 
-Find users where `"happy"` appears in any of these columns:
+Find employees where `2` appears in any of these columns:
 ```sql
-SELECT * FROM users u
-WHERE 'happy' IN (u.status, u.feelings, u.worldview);
+SELECT * FROM employee e
+WHERE 2 IN (e.employee_id, e.reports_to);
 ```
 
 Or equivalently:
 ```sql
-SELECT * FROM users u
-WHERE u.status = 'happy'
-   OR u.feelings = 'happy'
-   OR u.worldview = 'happy';
+SELECT * FROM employee e
+WHERE e.employee_id = 2
+   OR e.reports_to = 2;
 ```
 
-The anonymous table's header is a literal (`"happy"`); the data rows are lvars from `users`. This inverts the typical IN pattern.
+The anonymous table's header is a literal (`2`); the data rows are lvars from `employee`. This inverts the typical IN pattern.
 
 ### EAV Transformation {.dqlh}
 
 ```delightql
-users(*) as u,
+employee(*) as e,
 _(attribute, value @
-  "name", u.name;
-  "email", u.email;
-  "status", u.status;
-  "created", u.created_at)
+  "name", e.last_name;
+  "email", e.email;
+  "title", e.title;
+  "hired", e.hire_date)
 ```
 
 This is the melt pattern.
 
 ### Row-Wise Correspondence {.dqlh}
 ```delightql
-users(*) as u,
-orders(*) as o,
-_(u.status, o.priority @
-  u.feelings, o.urgency;
-  u.mood, "high";
-  "active", "rush")
+customer(*) as c,
+employee(*) as e,
+_(c.country, e.employee_id @
+  e.country, c.support_rep_id;
+  e.country, 1;
+  "USA", 2)
 ```
 
-Each row in the anonymous table represents a valid combination. The result includes only rows where `(u.status, o.priority)` matches one of the specified pairs:
+Each row in the anonymous table represents a valid combination. The result includes only rows where `(c.country, e.employee_id)` matches one of the specified pairs:
 ```sql
 SELECT *
-FROM users u, orders o
-WHERE (u.status = u.feelings AND o.priority = o.urgency)
-   OR (u.status = u.mood AND o.priority = 'high')
-   OR (u.status = 'active' AND o.priority = 'rush');
+FROM customer c, employee e
+WHERE (c.country = e.country AND e.employee_id = c.support_rep_id)
+   OR (c.country = e.country AND e.employee_id = 1)
+   OR (c.country = 'USA' AND e.employee_id = 2);
 ```
 
 

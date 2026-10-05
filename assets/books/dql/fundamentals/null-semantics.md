@@ -1,40 +1,40 @@
 
 # Null Semantics {.dqlh}
 
-Delightql defaults to null-safety by choosing `=` to mean `IS NOT DISTINCT FROM`
-in *most* situations.
+## Equality expressions {.dqlh}
 
-| Sigil | Name                    | SQL Equivalent         |
-|-------|-------------------------|------------------------|
-| `=`   | **NULL-SAFE-GROUND-EQ** | `IS NOT DISTINCT FROM` |
-| `!=`  | **NULL-SAFE-NOT-EQ**    | `IS DISTINCT FROM`     |
-: Infix domain predicates
+When both sides of a delightql `=` expression come from two different relations, then the traditional SQL `=` is used during transpilation. This rule applies
+for regular joins and inner relations (EXISTS and scalar subqueries).
 
-In joins importantly the `=` transpiles to the traditional SQL equality,
-preventing NULL from matching with NULL and safeguarding
-against cartesian explosion.
+When the above condition is not met, then delightql transpiles `=` to SQL's
+`IS NOT DISTINCT FROM`.
 
+## Unification equality {.dqlh}
+
+The rules of equality expressions are created to use null-safe equality ()
+in all places where join semantics are at play.  This applies to
+Prolog-style unification as well:
 
 ```delightql
-users(user_id, name, _), orders(order_id, user_id, total, _)
+playlist(playlist_id, name), playlist_track(playlist_id, track_id)
 ```
 
 ```sql
-SELECT users.name, orders.order_id, orders.total
-FROM users, orders
-WHERE users.user_id = orders.user_id;
+SELECT playlist.playlist_id, playlist.name, playlist_track.track_id
+FROM playlist, playlist_track
+WHERE playlist.playlist_id = playlist_track.playlist_id;
 ```
 
 
 ```delightql
-users(*), orders(*), users.user_id = orders.user_id
+employee(*) as e, employee(*) as m, e.reports_to = m.employee_id
 ```
 
 
 ```sql
 SELECT *
-FROM users, orders
-WHERE users.user_id = orders.user_id;
+FROM employee e, employee m
+WHERE e.reports_to = m.employee_id;
 ```
 
 ## Traditional SQL Equals {.dqlh}

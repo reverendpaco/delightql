@@ -143,14 +143,15 @@ pub fn activate_entities_from_cartridge(
 ///                  entity_clause, er_rule
 /// - sys::entities::ho: ho_param, ho_param_column
 /// - sys::entities::interior: interior_entity, interior_entity_attribute
-/// - sys::ns: activated_entity, enlisted_entity, enlisted_namespace,
-///            namespace_alias, namespace_local_alias, namespace_local_enlist,
+/// - sys::ns: activated_entity, session_overlay, enlisted_entity, enlisted_namespace,
+///            namespace_alias, namespace_local_alias, lexical_import,
 ///            exposed_namespace, grounding, liminal_receipt (the curated
 ///            `namespace` entity is registered separately in system.rs,
 ///            public columns only — it carries an internal mount link)
 /// - sys::execution: compilation, stack, compiler_limit, effect_plan,
 ///                    effect_guard, effect_requirement, effect_run
-/// - sys::targeting: dialect_render, dialect_form_rule, dialect_capability
+/// - sys::targeting: dialect_render, dialect_form_rule, dialect_capability,
+///                   aggregates, type_classes
 /// - sys::connections: connection_type_enum (the curated `connection` entity is
 ///                     registered separately in system.rs, safe columns only)
 ///
@@ -181,6 +182,7 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         // (register_sys_ns_namespace_table) — the sys::connections
         // precedent: a column added to the physical table is default-deny.
         ("activated_entity", 5),
+        ("session_overlay", 5),
         ("enlisted_entity", 5),
         ("enlisted_namespace", 5),
         // sys::execution (namespace_id = 10)
@@ -203,6 +205,8 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         ("dialect_render", 12),
         ("dialect_form_rule", 12),
         ("dialect_capability", 12),
+        ("aggregates", 12),
+        ("type_classes", 12),
         // sys::entities (namespace_id = 4) — entity-detail that isn't ho/interior
         ("entity_clause", 4),
         ("join_edge", 4),
@@ -216,12 +220,12 @@ pub fn activate_bootstrap_entities(conn: &Connection, cartridge_id: i32) -> Resu
         // sys::ns (namespace_id = 5) — namespace wiring
         ("namespace_alias", 5),
         ("namespace_local_alias", 5),
-        ("namespace_local_enlist", 5),
+        ("lexical_import", 5),
         ("exposed_namespace", 5),
         ("grounding", 5),
         // sys::ns — the liminal ledger storage (THE LIMINAL RELATION); read by
-        // the catalog functor's synthesized `liminal` drill expansion
-        // (resolver_fold::r_resolve_pipe). Pinned by effects/liminal--43/45.
+        // the catalog functor's synthesized `liminal` drill expansion. Pinned
+        // by effects/liminal--43/45.
         ("liminal_receipt", 5),
         // sys::connections (namespace_id = 13) — reference enum (safe raw).
         // The `connection` table itself carries secret columns; its curated

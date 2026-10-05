@@ -2,12 +2,12 @@
 # Stacked Notation (Named Case) {.dqlh}
 
 The stacked form defines functions as lookup tables with explicit input-output mappings:
-```delightql
-department_kind(
-  department     -> kind
+```{.delightql .am}
+title_kind(
+  title          -> kind
   ------------------
-  "engineering"  -> "tech";
-  "data science" -> "tech";
+  "IT Manager"   -> "tech";
+  "IT Staff"     -> "tech";
   _              -> "other"
 )
 ```
@@ -18,30 +18,30 @@ Despite the visual similarity to anonymous table stacked notation, this is an as
 
 **Invocation:**
 ```delightql
-employee(*) |> +(department_kind:(Department) as kind)
+employee(*) |> +(title_kind:(title) as kind)
 ```
 ```sql
 SELECT *,
-  CASE Department
-    WHEN 'engineering' THEN 'tech'
-    WHEN 'data science' THEN 'tech'
+  CASE title
+    WHEN 'IT Manager' THEN 'tech'
+    WHEN 'IT Staff' THEN 'tech'
     ELSE 'other'
   END AS kind
 FROM employee;
 ```
 
 **Multi-column inputs:**
-```delightql
+```{.delightql .am}
 tax_rate(
-  state, category -> rate
+  country, state -> rate
   --------------------------
-  "CA", "food"    -> 0.0;
-  "CA", "electronics" -> 0.0825;
-  "TX", "food"    -> 0.0;
-  "TX", "electronics" -> 0.0625;
-  _, _            -> 0.05
+  "USA", "CA"    -> 0.0725;
+  "USA", "TX"    -> 0.0625;
+  "Canada", "ON" -> 0.13;
+  "Canada", "AB" -> 0.05;
+  _              -> 0.0
 )
 ```
 ```delightql
-products(*) |> +(tax_rate:(state, category) as tax)
+invoice(*) |> +(tax_rate:(billing_country, billing_state) as tax)
 ```

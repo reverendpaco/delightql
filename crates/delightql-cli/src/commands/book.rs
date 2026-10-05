@@ -10,7 +10,7 @@ const NAMESPACE: &str = "cli::book";
 fn list_books(session: &mut dyn DqlSession) -> Result<Vec<String>> {
     let results = crate::exec_ng::fetch_all(
         session,
-        "cli::book.book_meta(*) |> #(book_name) |> (book_name)",
+        "cli::book.book_meta(*) |> (book_name) |> #(book_name)",
     )?;
     Ok(results.rows.into_iter().map(|row| row[0].clone()).collect())
 }
@@ -68,11 +68,13 @@ pub fn handle_book(
             "invalid book name '{name}': expected [a-z0-9][a-z0-9._-]*"
         );
 
+        // `ordinal` is projected last only so the closing ordering can name
+        // it; the emitter reads the first two columns and never emits it.
         let results = crate::exec_ng::fetch_all(
             &mut *session,
             &format!(
                 "cli::book.book(*), cli::book.base_content(*.(slug)), book_name = \"{name}\" \
-                 |> #(ordinal) |> (heading_shift, content)"
+                 |> (heading_shift, content, ordinal) |> #(ordinal)"
             ),
         )?;
         if results.rows.is_empty() {
@@ -126,7 +128,7 @@ pub fn handle_book(
 fn export_pool_images(session: &mut dyn DqlSession, dir: &std::path::Path) -> Result<()> {
     let rows = crate::exec_ng::fetch_all(
         session,
-        &format!("{NAMESPACE}.image(*) |> #(name) |> (name, hex:(content))"),
+        &format!("{NAMESPACE}.image(*) |> (name, hex:(content)) |> #(name)"),
     )?;
     std::fs::create_dir_all(dir)
         .map_err(|e| anyhow::anyhow!("create image directory {}: {e}", dir.display()))?;

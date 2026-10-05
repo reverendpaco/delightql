@@ -3,22 +3,23 @@
 
 A higher-order rule has two sets of parentheses: the first for input parameters the second for output (and occasionally input -- via unification) columns.
 
-```delightql
-department_employee_count(E(*), D(*))(department, employee_count) :-
-  E(*), D(*.(DepartmentId))
-    |> %(D.department ~> count:(*) as employee_count)
+```{.delightql .am}
+genre_track_count(T(*), G(*))(genre, track_count) :-
+  T(*), G(*.(genre_id))
+    |> %(G.name as genre ~> count:(*) as track_count)
 ```
 
-In the above example, the parameters `E(*)` and `D(*)` are *glob parameter
+In the above example, the parameters `T(*)` and `G(*)` are *glob parameter
 functors* and denote that two tables (or lower-order relations) are expected as
 inputs.  The `(*)` in the parameter functor name signals to the compiler that
 the body will reference these tables' columns by name.
 
 The term **higher-order rules** is the standard usage throughout this reference, but an equally valid term is **input-moded rules**.
 
-```delightql
-foo(input1,input2(*),input3(t,v))(output_column1,output_column2)
-  :-  <body>
+```{.delightql .am}
+long_tracks(n, T(*), G(genre_id, genre))(genre, track_name) :-
+  T(*), G(*.(genre_id)), milliseconds > $.n
+    |> (genre, name as track_name)
 ```
 
 The first set of parentheses, the ones closer to the name of the rule, should

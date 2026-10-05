@@ -7,8 +7,9 @@ use delightql_cli::exec_ng::run_dql_query;
 
 #[test]
 fn a_refusal_is_a_finding_row_with_its_input() {
-    let mut handle = delightql_cli::connection::open_handle(delightql_cli::connection::SessionProfile::client())
-        .expect("handle");
+    let mut handle =
+        delightql_cli::connection::open_handle(delightql_cli::connection::SessionProfile::client())
+            .expect("handle");
     let mut session = handle.session().expect("session");
 
     let before = run_dql_query("sys::diagnostics.finding(*)", &mut *session).unwrap();
@@ -26,16 +27,28 @@ fn a_refusal_is_a_finding_row_with_its_input() {
     let col = |name: &str| rows.columns.iter().position(|c| c == name).unwrap();
     let row = &rows.rows[0];
     assert_eq!(row[col("kind")], "error");
-    assert_eq!(row[col("uri")], "delightql-error://semantic/resolution/table");
-    assert_eq!(row[col("provider")], "session", "recorded where the error crossed to the client");
-    assert_eq!(row[col("input")], "nosuch_relation(*)", "the exact submission");
+    assert_eq!(
+        row[col("uri")],
+        "delightql-error://semantic/resolution/table"
+    );
+    assert_eq!(
+        row[col("provider")],
+        "session",
+        "recorded where the error crossed to the client"
+    );
+    assert_eq!(
+        row[col("input")],
+        "?- nosuch_relation(*)",
+        "the exact submission: the host's wrap of what was typed"
+    );
     assert!(row[col("message")].contains("nosuch_relation"));
 }
 
 #[test]
 fn the_namespace_is_published_and_read_only() {
-    let mut handle = delightql_cli::connection::open_handle(delightql_cli::connection::SessionProfile::client())
-        .expect("handle");
+    let mut handle =
+        delightql_cli::connection::open_handle(delightql_cli::connection::SessionProfile::client())
+            .expect("handle");
     let mut session = handle.session().expect("session");
     let ns = run_dql_query(
         "sys::ns.namespace(*), fq_name = \"sys::diagnostics\" |> (kind, writable)",
@@ -52,8 +65,9 @@ fn the_namespace_is_published_and_read_only() {
 /// record of problems.
 #[test]
 fn ok_selftest_findings_are_not_rows() {
-    let mut handle = delightql_cli::connection::open_handle(delightql_cli::connection::SessionProfile::client())
-        .expect("handle");
+    let mut handle =
+        delightql_cli::connection::open_handle(delightql_cli::connection::SessionProfile::client())
+            .expect("handle");
     let findings = handle.selftest();
     let mut session = handle.session().expect("session");
     let rows = run_dql_query(

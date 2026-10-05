@@ -5,9 +5,9 @@ All calls of the form `+foo(x,y)` or `\+ foo(x,y)` are EXISTS/NOT-EXISTS sigma-p
 
 
 ```delightql
-orders(*),
-  +empty(comments),
-  +like(description,"%widget")
+track(*),
+  +between(milliseconds,60000,180000),
+  +like(name,"%Love%")
 ```
 
 Delightql requires that all columns be instantiated as input.
@@ -38,8 +38,8 @@ The invocation of this rule will **always** be discernible, by virtue
 of requiring a `+` or `\+` EXISTS marker before the predicate name:
 
 ```delightql
-orders(*),
-  +empty(comments)
+track(*),
+  +empty(composer)
 ```
 
 

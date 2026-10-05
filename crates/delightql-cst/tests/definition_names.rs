@@ -121,9 +121,9 @@ fn a_query_scoped_binding_spells_its_subject_the_same_way() {
 }
 
 /// The query-scoped PARAMETERIZED binding — a CHOE — spells its subject the
-/// same way, and its two groups stay the rule's own: the parameters are
-/// `ho_param`s and the head is the heading's terms, so a typed consumer reads
-/// one shape whether the neck is `:` or `:-`.
+/// same way, and its heading IS the rule's: one `ho_heading` production
+/// holds the badge, the `ho_param` row and the output head, so a typed
+/// consumer reads one shape whether the neck is `:` or `:-`.
 #[test]
 fn a_query_scoped_parameterized_binding_spells_its_subject_the_same_way() {
     let tree = admits("twice(T(*), n)(*): T(*) twice(users(*), 2)(*)");
@@ -132,17 +132,47 @@ fn a_query_scoped_parameterized_binding_spells_its_subject_the_same_way() {
         .expect("a query-scoped parameterized binding");
     let name = cte.name().expect("a binding names its subject");
     assert_eq!(tree.text(name.name().expect("a subject has a name")), "twice");
+    let head = cte.head().expect("a binding has a heading");
     assert_eq!(
-        cte.children()
-            .filter(|child| matches!(child, HoCteChild::HoParam(_)))
+        head.children()
+            .filter(|child| matches!(child, HoHeadingChild::HoParam(_)))
             .count(),
         2,
         "the parameter group is the rule's own ho_params"
     );
     assert!(
-        cte.head().any(|item| matches!(item, HoCteHead::Glob(_))),
-        "the head group is the heading's own terms"
+        head.output()
+            .any(|item| matches!(item, HoHeadingOutput::Glob(_))),
+        "the output group is the heading's own terms"
     );
+}
+
+/// The badge of a parameterized head has ONE position on both necks: the
+/// heading both forms share, before the parameter row.
+#[test]
+fn a_parameterized_badge_stands_in_the_shared_heading() {
+    let badged = |head: HoHeading<'_>| {
+        head.children()
+            .any(|child| matches!(child, HoHeadingChild::FixpointBadge(_)))
+    };
+
+    let rule = admits_file("reach%(s)(node) :- _(node @ s)");
+    let rule = delightql_cst::walk(&rule)
+        .find_map(|n| HoRule::cast(n.node()))
+        .expect("a parameterized rule");
+    assert!(badged(rule.head().expect("a rule has a heading")));
+
+    let query = admits("reach%(s)(node): _(node @ s) reach(1)(*)");
+    let cte = delightql_cst::walk(&query)
+        .find_map(|n| HoCte::cast(n.node()))
+        .expect("a query-scoped parameterized binding");
+    assert!(badged(cte.head().expect("a binding has a heading")));
+
+    let unbadged = admits_file("reach(s)(node) :- _(node @ $.s)");
+    let unbadged = delightql_cst::walk(&unbadged)
+        .find_map(|n| HoRule::cast(n.node()))
+        .expect("a parameterized rule");
+    assert!(!badged(unbadged.head().expect("a rule has a heading")));
 }
 
 /// ONE AUTHORED SPELLING PER `rule_form` MEMBER — the inventory every
@@ -184,8 +214,8 @@ fn the_rule_form_inventory_is_the_grammar_s_own() {
 /// EVERY member's subject is captured, and ONLY the subject.
 ///
 /// Each sample carries body calls, so a pattern that reached past the
-/// definition — which is exactly how the supertype spelling degrades for the
-/// two forms with their own name kind — fails here rather than shipping as
+/// definition — one that matched a name kind anywhere under a form instead
+/// of the form's own `name` field — fails here rather than shipping as
 /// colour on an ordinary reference.
 #[test]
 fn the_highlight_file_captures_every_definition_subject() {
@@ -199,7 +229,7 @@ fn the_highlight_file_captures_every_definition_subject() {
         let mut captured = Vec::new();
         let mut matches = cursor.matches(&query, tree.raw().root_node(), source.as_bytes());
         while let Some(m) = tree_sitter::StreamingIterator::next(&mut matches) {
-            for capture in m.captures {
+            for capture in m.captures() {
                 if query.capture_names()[capture.index as usize] != "function.definition" {
                     continue;
                 }
@@ -243,25 +273,47 @@ fn highlight_queries() -> String {
         .unwrap_or_else(|e| panic!("the declared highlight query '{declared}': {e}"))
 }
 
-/// THE SUPERTYPE IS THE ROAD WHERE IT RESOLVES. Every form declaring the
-/// shared name kind is reached through `rule_form` and never form by form; a
-/// per-form pattern for one of those would compile just as well and go stale
-/// the moment a fifth predicate-named form is added.
-///
-/// The two forms with their own name kind are named, because the supertype
-/// spelling does not resolve for them — the coverage test above is what
-/// measures that, and what keeps the exception from spreading.
+/// EVERY MEMBER IS ADDRESSED BY ITS OWN NAME FIELD, and the pattern is
+/// derived here, not spelled here. A supertype in a query stands for its
+/// member set — its children must be members, and a field cannot be reached
+/// through it — so the subject of each `rule_form` member is captured by a
+/// pattern naming that member and the kind its `name` field carries. The
+/// member list is the grammar's (held to `RULE_FORMS` above) and the name
+/// kind is read off the parsed sample, so a new member, or a member whose
+/// name kind changes, arrives as a failure naming the pattern the query
+/// lacks rather than as an unhighlighted subject.
 #[test]
-fn the_highlight_file_addresses_the_subject_uniformly() {
+fn the_highlight_file_addresses_every_member_by_its_own_name_field() {
     let scm = highlight_queries();
+    // The patterns, not the comments that explain them.
+    let patterns: String = scm
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(';'))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        scm.contains("(rule_form name: (predicate_identifier"),
-        "the shared name kind is addressed through the supertype"
+        !patterns.contains("(rule_form name:"),
+        "a supertype cannot address a field; the pattern belongs on the member"
     );
-    for form in ["fo_rule", "ho_rule", "function_rule", "sigma_rule"] {
+    for (kind, source, _) in RULE_FORMS {
+        let tree = admits_file(source);
+        let root = tree.root_branch().expect("a file declares something");
+        let SourceFileChild::DefinitionFile(file) = root else {
+            panic!("the canonical entrance");
+        };
+        let form = file.children().next().expect("one form").node();
+        assert_eq!(form.kind(), *kind, "the sample is the member it stands for");
+        let name = form
+            .child_by_field_name("name")
+            .expect("a rule form spells its subject on itself");
+        let expected = if name.kind() == PredicateIdentifier::KIND {
+            format!("({kind} name: (predicate_identifier name: (identifier) @function.definition))")
+        } else {
+            format!("({kind} name: ({}) @function.definition)", name.kind())
+        };
         assert!(
-            !scm.contains(&format!("({form} name:")),
-            "{form} declares the shared name kind and must take the supertype road"
+            patterns.contains(&expected),
+            "{kind}: the canonical query lacks its subject pattern `{expected}`"
         );
     }
 }

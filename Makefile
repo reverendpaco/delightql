@@ -10,9 +10,15 @@
 
 # The grammar is generated at build time from ignored paths, so
 # compiling delightql-core requires the pinned CLI — `build` and `ship` ensure
-# it. Tree-sitter CLI must match tree-sitter-c2rust version in Cargo.toml
-TREE_SITTER_EXPECTED_VERSION := 0.25.2
-LLVM_PATH := /opt/homebrew/opt/llvm/bin/clang
+# it. The CLI version equals the `tree-sitter` runtime version in Cargo.toml,
+# and it is installed with `--locked`: an unlocked install links whatever
+# runtime and generator the registry resolves that day, and the version the
+# binary prints is then not the version that generated the parser.
+TREE_SITTER_EXPECTED_VERSION := 0.27.0
+# A clang with the wasm32 backend, for compiling the generated parser.c to
+# wasm32-unknown-unknown. Any clang built with the WebAssembly target serves;
+# Apple's system clang lacks it, so macOS points this at Homebrew's LLVM.
+WASM_CLANG ?= $(shell command -v clang 2>/dev/null)
 DUCKDB_LIB := /opt/homebrew/lib/libduckdb.dylib
 
 .DEFAULT_GOAL := build
@@ -84,11 +90,12 @@ ensure-rust:
 
 .PHONY: ensure-llvm
 ensure-llvm:
-	@if [ ! -f $(LLVM_PATH) ]; then \
-		echo "Installing LLVM (needed for WASM C compilation)..."; \
-		brew install llvm; \
+	@if [ -z "$(WASM_CLANG)" ] || ! $(WASM_CLANG) --print-targets 2>/dev/null | grep -q wasm32; then \
+		echo "❌ no clang with the wasm32 backend (WASM_CLANG=$(WASM_CLANG))"; \
+		echo "   Linux: the distribution clang; macOS: brew install llvm and WASM_CLANG=/opt/homebrew/opt/llvm/bin/clang"; \
+		exit 1; \
 	else \
-		echo "✓ LLVM clang at $(LLVM_PATH)"; \
+		echo "✓ wasm32-capable clang at $(WASM_CLANG)"; \
 	fi
 
 .PHONY: ensure-duckdb
@@ -126,11 +133,15 @@ ensure-node:
 ensure-tree-sitter:
 	@if ! command -v tree-sitter >/dev/null 2>&1; then \
 		echo "Installing tree-sitter CLI v$(TREE_SITTER_EXPECTED_VERSION)..."; \
-		cargo install tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION); \
+		cargo install --locked tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION); \
 	else \
-		INSTALLED_VERSION=$$(tree-sitter --version 2>&1 | grep -o 'tree-sitter [0-9.]*' || echo "unknown"); \
-		echo "✓ tree-sitter CLI installed ($$INSTALLED_VERSION)"; \
-		echo "  Note: Must be v$(TREE_SITTER_EXPECTED_VERSION) to match tree-sitter-c2rust in Cargo.toml"; \
+		INSTALLED_VERSION=$$(tree-sitter --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1); \
+		if [ "$$INSTALLED_VERSION" != "$(TREE_SITTER_EXPECTED_VERSION)" ]; then \
+			echo "❌ tree-sitter CLI $$INSTALLED_VERSION is on PATH; the pin is $(TREE_SITTER_EXPECTED_VERSION)"; \
+			echo "   cargo install --locked tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION) --force"; \
+			exit 1; \
+		fi; \
+		echo "✓ tree-sitter CLI $$INSTALLED_VERSION (the pin; install it --locked so the generator it links is the release's own)"; \
 	fi
 
 .PHONY: generate-grammar
@@ -141,7 +152,7 @@ generate-grammar: ensure-tree-sitter
 	@INSTALLED_VERSION=$$(tree-sitter --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1); \
 	if [ "$$INSTALLED_VERSION" != "$(TREE_SITTER_EXPECTED_VERSION)" ]; then \
 		echo "❌ tree-sitter CLI $$INSTALLED_VERSION; the pin is $(TREE_SITTER_EXPECTED_VERSION)"; \
-		echo "   cargo install tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION) --force"; \
+		echo "   cargo install --locked tree-sitter-cli --version $(TREE_SITTER_EXPECTED_VERSION) --force"; \
 		exit 1; \
 	fi
 	@cd grammar && tree-sitter generate
@@ -157,6 +168,91 @@ lint: grammar-fields error-expectations
 	@./lint_ratchet.py
 
 
+# --- cross-compiled release tarballs -----------------------------------------
+# `make dist` builds every target this host can build and packages each as
+# dist/dql-<version>-<platform>.tar.gz, with dist/SHA256SUMS. The Linux
+# targets are cross-compiled with cargo-zigbuild, which uses zig as the C
+# compiler and linker for the bundled SQLite and tree-sitter C sources, so
+# they build from Linux or macOS alike. macOS builds only on macOS: linking
+# needs Apple's SDK, which is licensed for Apple hardware.
+#
+# The musl builds are fully static and run on any Linux distribution. The
+# glibc build targets glibc 2.17 (zig selects the version from the suffix),
+# so it runs on anything newer.
+DIST_DIR        := dist
+DIST_TARGET_DIR := target/dist
+DIST_PROFILE    := release-ship
+DIST_LINUX      := x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-unknown-linux-gnu
+DIST_MACOS      := aarch64-apple-darwin x86_64-apple-darwin
+DIST_VERSION     = $(shell cargo pkgid -p delightql-cli | sed 's/.*[#@]//')
+HOST_OS         := $(shell uname -s)
+
+.PHONY: dist dist-setup dist-linux dist-macos dist-clean ensure-zig ensure-zigbuild
+
+dist: dist-linux dist-macos
+	@cd $(DIST_DIR) && (command -v sha256sum >/dev/null 2>&1 && sha256sum dql-*.tar.gz || shasum -a 256 dql-*.tar.gz) > SHA256SUMS
+	@echo ""
+	@echo "✓ $(DIST_DIR)/:"
+	@cat $(DIST_DIR)/SHA256SUMS
+
+# One-time: the Rust targets and cargo-zigbuild. zig itself comes from the
+# system package manager, `mise install`, or `pip install ziglang`.
+dist-setup: ensure-cargo ensure-zig
+	rustup target add $(DIST_LINUX) $(if $(filter Darwin,$(HOST_OS)),$(DIST_MACOS))
+	@command -v cargo-zigbuild >/dev/null 2>&1 || cargo install --locked cargo-zigbuild
+
+dist-linux: ensure-cargo ensure-uv ensure-tree-sitter ensure-zig ensure-zigbuild
+	@mkdir -p $(DIST_DIR)
+	@set -e; for t in $(DIST_LINUX); do \
+		zt=$$t; [ $$t = aarch64-unknown-linux-gnu ] && zt=$$t.2.17; \
+		echo "--- $$t"; \
+		CARGO_TARGET_DIR=$(DIST_TARGET_DIR) cargo zigbuild --profile $(DIST_PROFILE) --bin dql --target $$zt; \
+		$(MAKE) --no-print-directory dist-pack BIN=$(DIST_TARGET_DIR)/$$t/$(DIST_PROFILE)/dql \
+			PLATFORM=$$(echo $$t | sed 's/-unknown//'); \
+	done
+
+ifeq ($(HOST_OS),Darwin)
+dist-macos: ensure-cargo ensure-uv ensure-tree-sitter
+	@mkdir -p $(DIST_DIR) $(DIST_TARGET_DIR)/universal
+	@set -e; for t in $(DIST_MACOS); do \
+		echo "--- $$t"; \
+		CARGO_TARGET_DIR=$(DIST_TARGET_DIR) cargo build --profile $(DIST_PROFILE) --bin dql --target $$t; \
+	done
+	lipo -create -output $(DIST_TARGET_DIR)/universal/dql \
+		$(foreach t,$(DIST_MACOS),$(DIST_TARGET_DIR)/$(t)/$(DIST_PROFILE)/dql)
+	codesign --force --sign - $(DIST_TARGET_DIR)/universal/dql
+	@$(MAKE) --no-print-directory dist-pack BIN=$(DIST_TARGET_DIR)/universal/dql PLATFORM=macos-universal
+else
+dist-macos:
+	@echo "--- macOS: skipped (needs a Mac: linking requires Apple's SDK)"
+endif
+
+# Package one binary: dql, LICENSE and README.md under dql-<version>-<platform>/.
+.PHONY: dist-pack
+dist-pack:
+	@name=dql-$(DIST_VERSION)-$(PLATFORM); stage=$(DIST_TARGET_DIR)/stage/$$name; \
+	rm -rf $$stage && mkdir -p $$stage && \
+	cp $(BIN) LICENSE README.md $$stage/ && \
+	tar -C $(DIST_TARGET_DIR)/stage -czf $(DIST_DIR)/$$name.tar.gz $$name && \
+	echo "✓ $(DIST_DIR)/$$name.tar.gz"
+
+dist-clean:
+	rm -rf $(DIST_DIR) $(DIST_TARGET_DIR)
+
+ensure-zig:
+	@if ! command -v zig >/dev/null 2>&1 && ! python3 -c 'import ziglang' 2>/dev/null; then \
+		echo "❌ zig not found (cargo-zigbuild uses it to cross-compile the Linux targets)."; \
+		echo "   Install: mise install   or   your package manager   or   pip install ziglang"; \
+		exit 1; \
+	fi
+
+ensure-zigbuild:
+	@if ! command -v cargo-zigbuild >/dev/null 2>&1; then \
+		echo "❌ cargo-zigbuild not found. Run: make dist-setup"; \
+		exit 1; \
+	fi
+
+
 help:
 	@echo "DelightQL Dependency Management"
 	@echo ""
@@ -165,6 +261,10 @@ help:
 	@echo "  make grammar-fields    - Refuse grammar fields without Rust readers"
 	@echo "  make error-expectations - Ratchet empty and bare refusal expectations"
 	@echo "  make ship              - Optimized build (fat LTO, stripped) -> target/release-ship/dql"
+	@echo "  make dist              - Release tarballs for every platform this host can build -> dist/"
+	@echo "  make dist-setup        - One-time: Rust targets + cargo-zigbuild (zig itself: mise/pkg/pip)"
+	@echo "  make dist-linux        - Only the three Linux tarballs (x86_64/aarch64 musl, aarch64 glibc)"
+	@echo "  make dist-macos        - Only the macOS universal tarball (skipped off macOS)"
 	@echo "  make setup             - Ensure all build dependencies are installed"
 	@echo "  make ensure-tree-sitter - Ensure tree-sitter CLI is installed (pinned to $(TREE_SITTER_EXPECTED_VERSION))"
 	@echo "  make generate-grammar  - Generate the parser from grammar.js (derived, ignored)"
@@ -172,7 +272,7 @@ help:
 	@echo ""
 	@echo "Individual dependency checks:"
 	@echo "  make ensure-rust       - Check Rust + wasm32 target"
-	@echo "  make ensure-llvm       - Check LLVM clang"
+	@echo "  make ensure-llvm       - Check for a clang with the wasm32 backend"
 	@echo "  make ensure-duckdb     - Check DuckDB"
 	@echo "  make ensure-wasm-pack  - Check wasm-pack"
 	@echo "  make ensure-node       - Check Node.js"

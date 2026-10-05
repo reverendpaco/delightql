@@ -27,8 +27,8 @@ fn the_same_bytes_are_a_fact_or_a_query_by_entrance() {
             .definitions()
             .nth(0)
             .expect("a definition")
-            .front
-            .kind,
+            .front()
+            .kind(),
         DefKind::Fact
     );
 }
@@ -488,36 +488,42 @@ fn the_unwrap_pipe_is_the_long_spelling() {
 /// declared kind is never re-derived from the body's Rust type.
 #[test]
 fn the_head_form_declares_the_kind() {
-    assert_eq!(definition("v(*) :- users(*)").front.kind, DefKind::View);
-    assert_eq!(definition("f:(x) :- (x * 2)").front.kind, DefKind::Function);
-    assert_eq!(definition("pi :- 3.14").front.kind, DefKind::Function);
-    assert_eq!(definition("p(x) :- x > 1").front.kind, DefKind::Sigma);
-    assert_eq!(definition("h(T(*))(*) :- T(*)").front.kind, DefKind::HoView);
+    assert_eq!(definition("v(*) :- users(*)").front().kind(), DefKind::View);
     assert_eq!(
-        definition("d!(*) :- stdout!(*)").front.kind,
+        definition("f:(x) :- (x * 2)").front().kind(),
+        DefKind::Function
+    );
+    assert_eq!(definition("pi :- 3.14").front().kind(), DefKind::Function);
+    assert_eq!(definition("p(x) :- x > 1").front().kind(), DefKind::Sigma);
+    assert_eq!(
+        definition("h(T(*))(*) :- T(*)").front().kind(),
+        DefKind::HoView
+    );
+    assert_eq!(
+        definition("d!(*) :- stdout!(*)").front().kind(),
         DefKind::Effect
     );
-    assert_eq!(definition("f(1, 2)").front.kind, DefKind::Fact);
+    assert_eq!(definition("f(1, 2)").front().kind(), DefKind::Fact);
 }
 
 /// A CLAUSE BODY IS A COMPLETE EXPRESSION OF ITS CATEGORY (FN.43). The
 /// relational rule's body is a `relex` — a let block and the chain it feeds —
 /// and the effect rule's is `effrelex`, its effectual twin. A labelled CTE was
 /// spellable in every other effect position and not here, which is a shape
-/// accident rather than a distinction the effect algebra draws.
+/// accident rather than a distinction the receipt algebra draws.
 #[test]
 fn an_effect_rule_body_carries_its_let_block() {
     // A PURE binding feeding an effectual body — the block itself is one
     // production and carries both kinds.
     let pure_binding = definition("main!(*) :-\n  x(*) : q\n  q(*) |> log!(*)");
-    assert_eq!(pure_binding.front.kind, DefKind::Effect);
+    assert_eq!(pure_binding.front().kind(), DefKind::Effect);
     assert!(lispy_body(&pure_binding).contains("cte_binding"));
 
     // A standard effect CTE head reaches the same block.
     assert_eq!(
         definition("main!(*) :-\n  q!(*) : x(*) |> log!(*)\n  q!(*)")
-            .front
-            .kind,
+            .front()
+            .kind(),
         DefKind::Effect
     );
 
@@ -535,22 +541,22 @@ fn an_effect_rule_body_carries_its_let_block() {
 #[test]
 fn a_definition_doc_becomes_the_clauses_documentation() {
     assert_eq!(
-        definition("v(*) :- (~~docs Users aged 65 or older. ~~) users(*), age >= 65").doc,
-        Some("Users aged 65 or older.".to_string())
+        definition("v(*) :- (~~docs Users aged 65 or older. ~~) users(*), age >= 65").doc(),
+        Some("Users aged 65 or older.")
     );
     assert_eq!(
-        definition("f:(x) :- (~~docs Multiplies the input by two. ~~) (x * 2)").doc,
-        Some("Multiplies the input by two.".to_string())
+        definition("f:(x) :- (~~docs Multiplies the input by two. ~~) (x * 2)").doc(),
+        Some("Multiplies the input by two.")
     );
     // Prose is prose: `*`, `/` and `!` inside the body are text, not syntax.
     assert_eq!(
-        definition("v(*) :- (~~docs Uses users(*) and f!/g at 100% ~~) users(*)").doc,
-        Some("Uses users(*) and f!/g at 100%".to_string())
+        definition("v(*) :- (~~docs Uses users(*) and f!/g at 100% ~~) users(*)").doc(),
+        Some("Uses users(*) and f!/g at 100%")
     );
-    assert_eq!(definition("v(*) :- users(*)").doc, None);
+    assert_eq!(definition("v(*) :- users(*)").doc(), None);
     // The smart comment is the OTHER documentation form and stays distinct:
     // it attaches by position and is not the clause's own doc payload.
-    assert_eq!(definition("v(*) :- (/* a note */) users(*)").doc, None);
+    assert_eq!(definition("v(*) :- (/* a note */) users(*)").doc(), None);
 }
 
 /// `doc_slot = (definition_doc | annotation)+`, and BOTH inhabitants are
@@ -566,7 +572,7 @@ fn an_annotation_in_a_doc_slot_reaches_its_own_collector() {
     );
     // …and the annotation is not mistaken for the clause's documentation.
     assert_eq!(
-        dangered.definitions().nth(0).expect("a definition").doc,
+        dangered.definitions().nth(0).expect("a definition").doc(),
         None
     );
 
@@ -578,8 +584,8 @@ fn an_annotation_in_a_doc_slot_reaches_its_own_collector() {
         file("v(*) :- (~~docs What it is. ~~) (~~danger://cardinality/cartesian ~~) users(*)");
     assert_eq!(both.declared.dangers.len(), 1);
     assert_eq!(
-        both.definitions().nth(0).expect("a definition").doc,
-        Some("What it is.".to_string())
+        both.definitions().nth(0).expect("a definition").doc(),
+        Some("What it is.")
     );
 }
 
@@ -614,15 +620,21 @@ fn a_definition_carries_at_most_one_document() {
 #[test]
 fn a_fact_elaborates_into_a_relational_body() {
     let clause = definition("f(a, b ---- 1, 2)");
-    let DdlBody::Relational(query) = &clause.body else {
+    let DdlBody::Relational(query) = clause.body() else {
         panic!("a fact body is relational");
     };
     let GroundForm::Literal(table) = query.body.head().form() else {
         panic!("a fact body is an anonymous table");
     };
-    assert_eq!(table.table.body.rows.len(), 1);
+    assert_eq!(table.table().unwrap().body.rows.len(), 1);
     assert_eq!(
-        table.table.body.header.as_ref().map(TabularRow::len),
+        table
+            .table()
+            .unwrap()
+            .body
+            .header
+            .as_ref()
+            .map(TabularRow::len),
         Some(2),
         "the header row is a slot row"
     );
@@ -637,25 +649,40 @@ fn a_fact_elaborates_into_a_relational_body() {
 fn a_fact_row_fills_a_sparse_column() {
     let source = "config(kind, value, note? ---- \"a\", 1 ; \"b\", 2, _(note @ \"why\"))";
     let clause = definition(source);
-    let DdlBody::Relational(fact_query) = &clause.body else {
+    let DdlBody::Relational(fact_query) = clause.body() else {
         panic!("a fact body is relational");
     };
     let GroundForm::Literal(table) = fact_query.body.head().form() else {
         panic!("a fact body is an anonymous table");
     };
     assert_eq!(
-        table.table.body.header.as_ref().map(TabularRow::len),
+        table
+            .table()
+            .unwrap()
+            .body
+            .header
+            .as_ref()
+            .map(TabularRow::len),
         Some(3)
     );
-    assert_eq!(table.table.body.rows.len(), 2);
+    assert_eq!(table.table().unwrap().body.rows.len(), 2);
     // The row that omitted the sparse column is still the heading's width.
-    assert_eq!(table.table.body.rows.first().len(), 3);
+    assert_eq!(table.table().unwrap().body.rows.first().len(), 3);
     assert!(matches!(
-        table.table.body.rows.first().0.get(2).unwrap().value(),
+        table
+            .table()
+            .unwrap()
+            .body
+            .rows
+            .first()
+            .0
+            .get(2)
+            .unwrap()
+            .value(),
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::Null))
     ));
     assert!(matches!(
-        table.table.body.rows.get(1).unwrap().0.get(2).unwrap().value(),
+        table.table().unwrap().body.rows.get(1).unwrap().0.get(2).unwrap().value(),
         DomainExpression::Application(FunctionApplication::Ground(LiteralValue::String(text))) if text == "why"
     ));
 
@@ -688,7 +715,7 @@ fn a_fact_row_fills_a_sparse_column() {
 #[test]
 fn a_fact_function_matches_and_the_searched_form_is_a_function_rule() {
     let matched = definition("grade(score -> letter ---- 90 -> \"A\"; _ -> \"F\")");
-    assert_eq!(matched.front.kind, DefKind::FactFunction);
+    assert_eq!(matched.front().kind(), DefKind::FactFunction);
 
     // A condition does not derive in an arm — a parse refusal, not a builder
     // check a consumer could forget to run.
@@ -700,12 +727,12 @@ fn a_fact_function_matches_and_the_searched_form_is_a_function_rule() {
     // The canonical searched spelling, and it is an ordinary function.
     let searched =
         definition("grade:(score) :- _:(score > 90 -> \"A\"; score > 80 -> \"B\"; _ -> \"F\")");
-    assert_eq!(searched.front.kind, DefKind::Function);
+    assert_eq!(searched.front().kind(), DefKind::Function);
     // SEARCHED, not anchored: the HEADER classifies, and the anchored shape
     // is a different variant no arm content can reach.
     let DdlBody::Scalar(DomainExpression::Application(FunctionApplication::Case(
         crate::pipeline::asts::core::CaseExpression::Searched { arms, default },
-    ))) = &searched.body
+    ))) = searched.body()
     else {
         panic!("the searched form's body is a searched case");
     };
@@ -713,7 +740,7 @@ fn a_fact_function_matches_and_the_searched_form_is_a_function_rule() {
     assert!(default.is_some());
 }
 
-/// THE EFFECT ALGEBRA ADMITS PURE AND EFFECT CTEs ALIKE, and the `!` on a
+/// THE receipt algebra ADMITS PURE AND EFFECT CTEs ALIKE, and the `!` on a
 /// binding is an ASSERTION that the body is effectful, never a coercion.
 #[test]
 fn an_effect_marked_binding_over_a_pure_body_refuses() {
@@ -726,7 +753,7 @@ fn an_effect_marked_binding_over_a_pure_body_refuses() {
 #[test]
 fn an_effect_marked_binding_over_an_effectful_body_stands() {
     let clause = definition("main!(*) :-\n    x!(*) : q!\n    q!(*)");
-    assert_eq!(clause.front.kind, DefKind::Effect);
+    assert_eq!(clause.front().kind(), DefKind::Effect);
     assert!(lispy_body(&clause).contains("cte_binding"));
 }
 
@@ -739,7 +766,7 @@ fn an_edge_declares_a_pair() {
         left,
         right,
         context,
-    } = &clause.front.subject
+    } = &clause.front().subject()
     else {
         panic!("an edge's subject is a pair");
     };
@@ -755,7 +782,7 @@ fn a_head_term_supplies_and_offers() {
     use crate::pipeline::asts::core::definitions::Supply;
 
     let clause = definition("v(x, \"tag\" as kind) :- users(*)");
-    let items = clause.front.head.items.listed().expect("a listed head");
+    let items = clause.front().head().items.listed().expect("a listed head");
     assert!(matches!(items[0].supply, Supply::Ref(_)));
     assert_eq!(
         items[0].offered_name().map(ToString::to_string),
@@ -779,34 +806,39 @@ fn a_head_term_supplies_and_offers() {
 fn a_companion_cell_takes_its_category_from_its_column() {
     use crate::ddl_pipeline::asts::{DdlConstraint, DdlDefault};
     use crate::pipeline::normalize::companion;
-    use crate::pipeline::syntax::{CompanionColumn, Parser};
+    use crate::pipeline::parse;
 
     let registry = std::rc::Rc::new(crate::names::Registry::new(&[]));
-    let mut parser = Parser::new();
 
-    let primary = parser.parse_companion_cell(CompanionColumn::Constraint, "%%(a, b)");
+    let primary = parse::constraint_cell("%%(a, b)").expect("a constraint tree");
     assert!(matches!(
         companion::constraint_cell(&primary, registry.clone()).expect("a primary key"),
         DdlConstraint::PrimaryKey { columns: Some(_) }
     ));
 
-    let unique = parser.parse_companion_cell(CompanionColumn::Constraint, "%");
+    let unique = parse::constraint_cell("%").expect("a constraint tree");
     assert!(matches!(
         companion::constraint_cell(&unique, registry.clone()).expect("a unique key"),
         DdlConstraint::Unique { columns: None }
     ));
 
-    let check = parser.parse_companion_cell(CompanionColumn::Constraint, "@ > 0");
+    let check = parse::constraint_cell("@ > 0").expect("a constraint tree");
     assert!(matches!(
         companion::constraint_cell(&check, registry.clone()).expect("a check"),
         DdlConstraint::Check { .. }
     ));
 
-    let default = parser.parse_companion_cell(CompanionColumn::Default, "42");
+    let default = parse::default_cell("42").expect("a default tree");
     assert!(matches!(
         companion::default_cell(&default, registry).expect("a default"),
         DdlDefault::Value { .. }
     ));
+
+    // A value where a constraint belongs, and a key sigil where a value
+    // belongs, refuse at the parse: neither tree exists to hand to the other
+    // category's reader.
+    assert!(parse::constraint_cell("42").is_err());
+    assert!(parse::default_cell("%%").is_err());
 }
 
 // ---------------------------------------------------------------------
@@ -856,7 +888,7 @@ fn a_shaping_call_group_starts_realised() {
 fn an_expansion_interior_is_positional() {
     let query = query("a(*) .t(x, \"c\", _)");
     assert!(shows(&query, "(columns [\"x\" \"_\" \"_\"])"));
-    assert!(shows(&query, "(groundings [(\"1\" . \"c\")])"));
+    assert!(shows(&query, "(groundings [(1 . (literal_value:string \"c\"))])"));
 }
 
 /// THE CATALOG ANSWERS AS DATA: a namespace read is an ordinary relation, so
@@ -902,12 +934,7 @@ fn an_annotation_decorates_and_collects() {
 
     let ddl = queries("(~~ddl v(*) :- users(*) ~~) users(*)");
     assert_eq!(
-        ddl.queries()
-            .nth(0)
-            .expect("a goal")
-            .declared
-            .ddl_blocks
-            .len(),
+        ddl.queries().nth(0).expect("a goal").blocks.leading.len(),
         1
     );
 }
@@ -922,33 +949,31 @@ fn a_file_scope_ddl_block_declares_the_files_own_block() {
     let alone = file("(~~ddl:\"_internal\"\nschema(\"p\" as entity, name, type) :- _(name, type ---- \"id\", \"INTEGER\")\n~~)");
     assert!(alone.queries().next().is_none());
     assert!(alone.definitions().next().is_none());
-    assert_eq!(alone.declared.ddl_blocks.len(), 1);
+    assert_eq!(alone.blocks.leading.len(), 1);
     // The NAME is the child namespace the block is processed in; the reserved
     // `_internal` suffix reaches it exactly as authored.
     assert_eq!(
-        alone.declared.ddl_blocks[0].namespace.as_deref(),
+        alone.blocks.leading[0].namespace.as_deref(),
         Some("_internal")
     );
     // The body is TYPED definition content: one clause, already normalized,
     // never a text slice waiting for a consult-time reparse.
-    assert_eq!(alone.declared.ddl_blocks[0].body.definitions.len(), 1);
+    assert_eq!(alone.blocks.leading[0].body.definitions.len(), 1);
     assert_eq!(
-        alone.declared.ddl_blocks[0].body.definitions[0]
-            .front
-            .name(),
+        alone.blocks.leading[0].body.definitions[0].front().name(),
         "schema"
     );
-    assert!(alone.declared.ddl_blocks[0].body.ddl_blocks.is_empty());
+    assert!(alone.blocks.leading[0].body.ddl_blocks.is_empty());
 
     // Beside ordinary definitions, on either side of them.
     let beside =
         file("(~~ddl w(*) :- v(*) ~~)\nv(*) :- users(*)\n(~~ddl:\"_internal\" x(*) :- v(*) ~~)");
     assert_eq!(beside.definitions().count(), 1);
-    assert_eq!(beside.declared.ddl_blocks.len(), 2);
+    assert_eq!(beside.blocks.leading.len(), 2);
     // Unnamed is the FILE's own namespace: the suffix is absent, not empty.
-    assert_eq!(beside.declared.ddl_blocks[0].namespace, None);
+    assert_eq!(beside.blocks.leading[0].namespace, None);
     assert_eq!(
-        beside.declared.ddl_blocks[1].namespace.as_deref(),
+        beside.blocks.leading[1].namespace.as_deref(),
         Some("_internal")
     );
 
@@ -960,10 +985,17 @@ fn a_file_scope_ddl_block_declares_the_files_own_block() {
         .queries()
         .nth(0)
         .expect("a goal")
-        .declared
-        .ddl_blocks
+        .blocks
         .is_empty());
-    assert_eq!(with_goal.declared.ddl_blocks.len(), 1);
+    // Written before the goal, it leads the goal it stands before.
+    assert_eq!(with_goal.blocks.leading.len(), 1);
+    assert!(with_goal.blocks.trailing.is_empty());
+    // Written after it, it trails: the goal's own annotation claims it.
+    let after_goal = file("?- users(*)\n(~~ddl w(*) :- v(*) ~~)");
+    assert!(after_goal.blocks.is_empty());
+    let goal = after_goal.queries().nth(0).expect("a goal");
+    assert!(goal.blocks.leading.is_empty());
+    assert_eq!(goal.blocks.trailing.len(), 1);
 }
 
 /// A danger gate is a NAMED behavior: the annotation takes the URI ALONE, so
@@ -1042,8 +1074,8 @@ fn one_fact_function_carrier_serves_every_width() {
 
     fn mode(source: &str) -> FactFunctionMode<Unresolved> {
         let clause = definition(source);
-        assert_eq!(clause.front.kind, DefKind::FactFunction);
-        let DdlBody::FactFunction(definition) = clause.body else {
+        assert_eq!(clause.front().kind(), DefKind::FactFunction);
+        let DdlBody::FactFunction(definition) = clause.into_body() else {
             panic!("a fact function's body is its declared mode");
         };
         definition.mode().clone()
@@ -1129,7 +1161,7 @@ fn a_fact_function_output_cell_reads_only_its_declared_inputs() {
     // A declared input binds, and the carrier keeps the reference for the
     // two faces to spend their own way.
     let clause = definition("f(a -> c ---- 1 -> a + 1)");
-    let DdlBody::FactFunction(definition) = &clause.body else {
+    let DdlBody::FactFunction(definition) = clause.body() else {
         panic!("a fact function's body is its declared mode");
     };
     let mode = definition.mode();
@@ -1192,7 +1224,7 @@ fn a_fact_function_declares_each_name_once() {
     }
     // Two spellings that differ are two names, so this one stands.
     let clause = definition("f(a -> b, `B` ---- 1 -> 2, 3)");
-    let DdlBody::FactFunction(definition) = &clause.body else {
+    let DdlBody::FactFunction(definition) = clause.body() else {
         panic!("a fact function's body is its declared mode");
     };
     let mode = definition.mode();
@@ -1280,161 +1312,6 @@ fn a_definition_s_declarations_do_not_reach_the_next_goal() {
 // Higher-order bindings
 // ---------------------------------------------------------------------
 
-/// The invocation entrance: the SAME source, normalized again with the call
-/// site's bindings in hand. Every family the old invocation road supports
-/// reaches the resulting AST here.
-mod bindings {
-    use super::super::support::*;
-    use crate::pipeline::asts::core::*;
-    use crate::pipeline::asts::ddl::DdlBody;
-    use crate::pipeline::normalize;
-    use crate::pipeline::query_features::HoParamBindings;
-    use crate::pipeline::syntax::Parser;
-    use std::rc::Rc;
-
-    fn bound(source: &str, bindings: HoParamBindings) -> Query<Unresolved> {
-        let tree = Parser::new().parse_query_sequence(source);
-        assert!(!tree.has_defects(), "the grammar refused {source:?}");
-        let normalized = normalize::bound_query_sequence(
-            &tree,
-            Rc::new(crate::names::Registry::new(&[])),
-            bindings,
-        )
-        .unwrap_or_else(|error| panic!("normalizing {source:?} failed: {error}"));
-        assert_eq!(normalized.queries().count(), 1);
-        normalized.into_queries().remove(0).query
-    }
-
-    fn head(query: &Query<Unresolved>) -> &Grelex<Unresolved> {
-        &query.body.head()
-    }
-
-    fn read_access(query: &Query<Unresolved>) -> &Access<Unresolved> {
-        query
-            .body
-            .head_access()
-            .expect("the read carries its access")
-    }
-
-    /// A formal bound to a compiler-owned CARRIER is read by IDENTITY, under
-    /// the access the body wrote: a whole read stays whole, because the
-    /// carrier already publishes the receiving interface; a body-authored
-    /// pattern passes through as written. No name map participates.
-    #[test]
-    fn a_relation_formal_is_read_by_identity_under_the_access_written() {
-        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
-        let bindings = proffered("V(*)", &registry);
-        let scope = bindings.formals.landed_source().or_else(|| {
-            bindings
-                .formals
-                .get(&delightql_types::SqlIdentifier::new("V"))
-                .and_then(|bound| bound.landing())
-        });
-        let query = bound("V(*)", bindings.clone());
-        let GroundForm::Reference(Relation::Ground { mention, .. }) = head(&query).form() else {
-            panic!("expected a ground read");
-        };
-        assert!(
-            matches!(mention, GroundMention::Structural { pending, .. } if Some(*pending) == scope),
-            "the carrier is addressed by identity"
-        );
-        assert!(matches!(read_access(&query), Access::All));
-
-        let patterned = bound("V(id, total)", bindings);
-        let Access::Slots(slots) = read_access(&patterned) else {
-            panic!("the body's own pattern passes through");
-        };
-        assert_eq!(slots.len(), 2);
-    }
-
-    /// The bindings a definition head proffers at consult time, through the
-    /// one authority that binds relation formals.
-    fn proffered(head: &str, registry: &crate::relation::Planning) -> HoParamBindings {
-        let clause = definition(&format!("f({head})(*) :- V(*)"));
-        crate::pipeline::resolver::grounding::create_proffer_bindings(&clause.front.head, registry)
-            .expect("the head proffers")
-    }
-
-    /// A formal bound to an INLINE relation — a lift under declared names —
-    /// arrives whole.
-    #[test]
-    fn an_inline_relation_formal_arrives_whole() {
-        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
-        let bindings = proffered("V(a)", &registry);
-        let query = bound("V(*)", bindings);
-        assert!(matches!(head(&query).form(), GroundForm::Literal(_)));
-    }
-
-    /// A scalar formal RIDES AS A REFERENCE in value position — the body's
-    /// formal frame answers it at resolution — while the compile-time
-    /// whole-number positions (a row bound, an ordinal) read the literal
-    /// binding, because their value must exist before resolution.
-    #[test]
-    fn a_scalar_parameter_reaches_value_and_bound_positions() {
-        let mut bindings = HoParamBindings::default();
-        bindings.scalar_formals.insert("n".to_string());
-        bindings
-            .scalar_literals
-            .insert("n".to_string(), LiteralValue::Number("7".into()));
-
-        let valued = bound("users(*) |> (n)", bindings.clone());
-        assert!(shows(&valued, "(name \"n\")"), "got: {}", lispy(&valued));
-
-        let bounded = bound("users(*), # < n", bindings.clone());
-        assert!(shows(&bounded, "(value 7)"));
-
-        let ordinal = bound("users(*) |> (|n|)", bindings);
-        assert!(shows(&ordinal, "reference:ordinal"));
-        assert!(shows(&ordinal, "|7|"));
-    }
-
-    /// A qualified name addresses somebody else's column: it is never a
-    /// formal, so a binding of the same spelling leaves it alone.
-    #[test]
-    fn a_qualified_name_is_never_a_scalar_formal() {
-        let mut bindings = HoParamBindings::default();
-        bindings.scalar_formals.insert("n".to_string());
-        let query = bound("users(*) |> (t.n)", bindings);
-        assert!(shows(&query, "(name \"n\")"));
-        assert!(shows(&query, "(qualifier \"t\")"));
-    }
-
-    /// No fabricated stand-in. A parameterized body whose bound names a
-    /// formal is DEFERRED — the authored characters, held as such — and the
-    /// same body normalizes for real once the call site supplies the value.
-    #[test]
-    fn an_unsubstituted_bound_defers_the_body_instead_of_inventing_one() {
-        let clause = definition("top_n(T(*), n)(*) :- T(*), # < n");
-        let DdlBody::Deferred { source } = &clause.body else {
-            panic!("expected a deferred body, got {:?}", clause.body);
-        };
-        assert!(source.contains("# < n"));
-
-        // The same source, with the binding in hand, is not deferred at all.
-        let mut bindings = HoParamBindings::default();
-        bindings.scalar_formals.insert("n".to_string());
-        bindings
-            .scalar_literals
-            .insert("n".to_string(), LiteralValue::Number("3".into()));
-        assert!(shows(&bound("users(*), # < n", bindings), "(value 3)"));
-    }
-
-    /// A compiler-owned carrier is addressed by IDENTITY and its plan read
-    /// carries the AUTHORED formal: no table spelling exists for a
-    /// qualifier to convert to.
-    #[test]
-    fn a_carrier_qualifier_keeps_the_authored_formal() {
-        let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
-        let bindings = proffered("V(*)", &registry);
-        let query = bound("V(*) |> (V.key)", bindings);
-        assert!(
-            shows(&query, "(qualifier \"V\")"),
-            "the carrier's authored formal was converted\n  got: {}",
-            lispy(&query)
-        );
-    }
-}
-
 // ---------------------------------------------------------------------
 // The membership probe and the whole-heading correlation
 // ---------------------------------------------------------------------
@@ -1474,6 +1351,38 @@ fn an_existence_marked_anon_table_is_the_inverted_membership() {
     let GroundForm::Literal(_) = rhs.head().form() else {
         panic!("expected an anonymous table");
     };
+}
+
+/// A sigma body reaches the same anonymous-membership construction as an
+/// ordinary query. Named existence and `in` retain their own admitted
+/// spellings; a headerless anonymous witness still refuses under its shape
+/// law rather than becoming a permissive sigma special case.
+#[test]
+fn anonymous_existence_in_a_sigma_body_uses_membership_and_keeps_refusal() {
+    let clause = definition("allowed(x) :- +_(x @ 1; 3)");
+    assert!(matches!(
+        clause.body(),
+        crate::pipeline::asts::ddl::DdlBody::Truth(TruthExpression::Membership(Membership {
+            source: MembershipSource::WitnessAnon,
+            negated: false,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        definition("allowed(x) :- +choice(x)").body(),
+        crate::pipeline::asts::ddl::DdlBody::Truth(_)
+    ));
+    assert!(matches!(
+        definition("allowed(x) :- x in (1; 3)").body(),
+        crate::pipeline::asts::ddl::DdlBody::Truth(TruthExpression::Membership(Membership {
+            source: MembershipSource::In,
+            ..
+        }))
+    ));
+    assert!(
+        definition_refusal("allowed(x) :- +_(1; 3)").contains("needs headers"),
+        "a malformed witness acquired a sigma-only reading"
+    );
 }
 
 /// THE WHOLE HEADING CORRELATES, in the mode the step aligns by. The two
@@ -1526,10 +1435,12 @@ fn every_functor_position_takes_its_argument_row() {
     assert!(shows(&inner, "ho_argument:relation"));
 
     // An outer access: `?` is written on the ACCESS, and a higher-order
-    // access is an access.
+    // access is an access. The role it marks is the MEMBER's: the step
+    // completing the leading access records it, and the call carries none.
     let outer = query("f?(a(*))(*), b(*)");
     assert!(shows(&outer, "relation:functor_call"));
-    assert!(shows(&outer, "FunctorMarks { outer: true"));
+    assert!(shows(&outer, "join_roles:after_optional_lead"));
+    assert!(!shows(&outer, "outer"));
 }
 
 /// THE LIFT'S ROWS ARE ONE RELATION. `&` BOUNDS the ordinary arguments, so
@@ -1577,7 +1488,7 @@ fn an_expansion_interior_names_and_does_not_compute() {
     assert!(shows(&query("a(*) .t(*)"), "(glob true)"));
     assert!(shows(
         &query("a(*) .t(x, \"c\")"),
-        "(groundings [(\"1\" . \"c\")])"
+        "(groundings [(1 . (literal_value:string \"c\"))])"
     ));
 }
 
@@ -1663,33 +1574,33 @@ fn a_structural_form_takes_a_stage_name() {
 fn binding_badge(source: &str) -> Fixpoint {
     let normalized = queries(source);
     let goal = normalized.into_queries().remove(0);
-    goal.query.ctes()[0].authority().fixpoint
+    goal.query.ctes()[0].authority().head.fixpoint
+}
+
+/// The badge a definition file's first clause carries out of normalization.
+fn clause_badge(source: &str) -> Fixpoint {
+    file(source)
+        .definitions()
+        .nth(0)
+        .expect("a definition")
+        .front()
+        .head()
+        .fixpoint
 }
 
 /// THE BADGE CHOOSES THE UNION, and normalization CARRIES the choice under
 /// both surfaces rather than acting on it: whether the subject is a fixpoint
-/// at all is not knowable here, so the flavor rides the clause and the
-/// binding to the one recursion decision.
+/// at all is not knowable here, so the flavor rides the head to the one
+/// recursion decision. A parameterized heading wears it in the same place.
 #[test]
 fn a_fixpoint_badge_is_carried_from_both_surfaces() {
+    assert_eq!(clause_badge("cnt%(*) :- _(n @ 1)"), Fixpoint::Deduplicating);
+    assert_eq!(clause_badge("cnt(*) :- _(n @ 1)"), Fixpoint::Bag);
     assert_eq!(
-        file("cnt%(*) :- _(n @ 1)")
-            .definitions()
-            .nth(0)
-            .expect("a definition")
-            .front
-            .fixpoint,
+        clause_badge("reach%(s)(*) :- _(n @ s)"),
         Fixpoint::Deduplicating
     );
-    assert_eq!(
-        file("cnt(*) :- _(n @ 1)")
-            .definitions()
-            .nth(0)
-            .expect("a definition")
-            .front
-            .fixpoint,
-        Fixpoint::Bag
-    );
+    assert_eq!(clause_badge("reach(s)(*) :- _(n @ $.s)"), Fixpoint::Bag);
     assert_eq!(
         binding_badge("c%(*) : _(n @ 1)\nc(*)"),
         Fixpoint::Deduplicating

@@ -15,6 +15,12 @@ pub enum Operational {
     #[error("Validation error: {message}")]
     FederationProhibited { message: String },
 
+    /// A statement the compiler does not cover: outside its fragment, and
+    /// never handed to another compiler.
+    #[leaf("uncovered", class = Permission, summary = "This build's compiler does not cover the statement.")]
+    #[error("{message}")]
+    Uncovered { message: String },
+
     /// The compiler's resource budgets. Two, measuring different objects at
     /// different times: nesting (the authored tree, before any walk) and
     /// refinement-depth (active refiner frames, while it runs).

@@ -197,7 +197,7 @@ fn open_session(
     let session = match client
         .version(
             1_000_000,
-            b"relay0".to_vec(),
+            delightql_protocol::PROTOCOL_VERSION.to_vec(),
             300_000,
             vec![Orientation::Rows],
         )
@@ -251,7 +251,7 @@ fn send_mount(
 ) -> Result<(), String> {
     let mount_query = format!("mount!(\"{}\",\"main\")(*)", db_filename);
     let handle = match session
-        .query(mount_query.as_bytes().to_vec())
+        .query(delightql_cst::prompt_wrap(&mount_query).into_owned().into_bytes())
         .map_err(|e| format!("mount: {}", e.message))?
     {
         QueryResponse::Header { handle, .. } => handle,
@@ -303,7 +303,7 @@ pub(crate) fn send_shutdown(
     let mut session = match client
         .version(
             1_000_000,
-            b"relay0".to_vec(),
+            delightql_protocol::PROTOCOL_VERSION.to_vec(),
             300_000,
             vec![Orientation::Rows],
         )

@@ -24,8 +24,8 @@ symbols make panics less legible, so it is for producing a deliverable
 rather than for working on one.
 
 `make setup` is the dependency doctor for the wider toolchain
-(wasm, duckdb, tree-sitter regeneration — tree-sitter CLI 0.25.2 is only
-needed when changing the grammar).
+(wasm, duckdb, tree-sitter regeneration — the pinned tree-sitter CLI,
+installed `--locked`, is only needed when changing the grammar).
 
 
 # License

@@ -11,7 +11,7 @@ The delightql runtime guarantees
  - special namespaces for CLI, REPL and library usages
  - special rules for namespace removal and addition
  - special namespaces deemed auto-enlisted
- - the existence of certain entities: rules, functions, sigma-predicates, etc.
+ - the existence of certain entities: rules, functions, sigma predicates, etc.
  - the existence of certain directives
 
 The runtime namespacing mechanism is introspectable as tables by delightql

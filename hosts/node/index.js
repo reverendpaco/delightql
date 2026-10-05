@@ -32,6 +32,7 @@ const DqlColumnInfo = koffi.struct('DqlColumnInfo', {
     name: 'char *',
     position: 'uintptr_t',
     type_name: 'char *',
+    minted: 'uint8_t',
 });
 
 const DqlQueryResult = koffi.struct('DqlQueryResult', {
@@ -72,6 +73,12 @@ const dql_free_query_result = lib.func('void dql_free_query_result(DqlQueryResul
 const dql_free_fetch_result = lib.func('void dql_free_fetch_result(DqlFetchResult *r)');
 const dql_split_queries = lib.func('DqlSplitResult dql_split_queries(const char *src, _Out_ void **err)');
 const dql_free_split_result = lib.func('void dql_free_split_result(DqlSplitResult *r)');
+const dql_digest_version = lib.func('const char *dql_digest_version()');
+// Returns void * (not char *) so the original pointer can be freed.
+const dql_digest_rows = lib.func(
+    'void *dql_digest_rows(const uint8_t *data, uintptr_t data_len, const int64_t *lens, '
+    + 'uintptr_t num_rows, uintptr_t num_cols, _Out_ void **err)'
+);
 
 // ---------------------------------------------------------------------------
 // Error handling
@@ -119,19 +126,25 @@ class Database {
         const result = dql_query(this._handle, dql, errBuf);
         checkError(errBuf);
 
+        // minted[i] is true when the compiler minted columns[i]: its
+        // spelling moves between compilations, so do not key on it.
         const columns = [];
+        const minted = [];
         if (result.num_columns > 0 && result.columns) {
             const colArray = koffi.decode(result.columns, DqlColumnInfo, result.num_columns);
             for (const col of colArray) {
                 columns.push(col.name || '');
+                minted.push(col.minted === 1);
             }
         }
         const queryId = result.query_id;
         dql_free_query_result(result);
-        return { queryId, columns };
+        return { queryId, columns, minted };
     }
 
-    fetch(queryId, count) {
+    // A raw cell is the protocol cell itself: a Buffer of its bytes, or null
+    // for SQL NULL.
+    fetchRaw(queryId, count) {
         this._ensureOpen();
         if (count === undefined) count = 256;
         const errBuf = [null];
@@ -147,11 +160,12 @@ class Database {
                     const row = [];
                     for (let c = 0; c < numCols; c++) {
                         const cell = cellArray[r * numCols + c];
-                        if (!cell.data || cell.len === 0) {
-                            row.push(cell.data ? '' : null);
+                        if (!cell.data) {
+                            row.push(null);
+                        } else if (cell.len === 0) {
+                            row.push(Buffer.alloc(0));
                         } else {
-                            const raw = Buffer.from(koffi.decode(cell.data, 'uint8_t', cell.len));
-                            row.push(raw.toString('utf-8'));
+                            row.push(Buffer.from(koffi.decode(cell.data, 'uint8_t', cell.len)));
                         }
                     }
                     rows.push(row);
@@ -161,6 +175,13 @@ class Database {
             dql_free_fetch_result(result);
         }
         return { rows, finished: result.finished !== 0 };
+    }
+
+    // Cells decoded as UTF-8 (lossy for bytes that are not UTF-8), null being
+    // SQL NULL.
+    fetch(queryId, count) {
+        const { rows, finished } = this.fetchRaw(queryId, count);
+        return { rows: rows.map(decodeRow), finished };
     }
 
     closeQuery(queryId) {
@@ -173,11 +194,11 @@ class Database {
         }
     }
 
-    execute(dql) {
+    executeRaw(dql) {
         const qr = this.query(dql);
         const allRows = [];
         while (true) {
-            const { rows, finished } = this.fetch(qr.queryId);
+            const { rows, finished } = this.fetchRaw(qr.queryId);
             allRows.push(...rows);
             if (finished) break;
         }
@@ -185,11 +206,69 @@ class Database {
         return { columns: qr.columns, rows: allRows };
     }
 
+    execute(dql) {
+        const { columns, rows } = this.executeRaw(dql);
+        return { columns, rows: rows.map(decodeRow) };
+    }
+
     close() {
         if (this._handle) {
             dql_destroy(this._handle);
             this._handle = null;
         }
+    }
+}
+
+function decodeRow(row) {
+    return row.map(cell => (cell === null ? null : cell.toString('utf-8')));
+}
+
+// ---------------------------------------------------------------------------
+// Result digest
+// ---------------------------------------------------------------------------
+
+// The name of the digest framing digestRows computes.
+function digestVersion() {
+    return dql_digest_version();
+}
+
+// The result digest of raw rows (Buffers, null being SQL NULL) as lowercase
+// hex: the digest the CLI's `-f hash` prints. The library computes it; pass
+// the Buffers fetchRaw returned, never a decoding of them.
+function digestRows(rows, numCols) {
+    const lens = [];
+    const chunks = [];
+    for (const row of rows) {
+        if (row.length !== numCols) {
+            throw new DqlError(`a row of ${row.length} cells in a ${numCols}-column result`);
+        }
+        for (const cell of row) {
+            if (cell === null) {
+                lens.push(-1n);
+            } else {
+                lens.push(BigInt(cell.length));
+                chunks.push(cell);
+            }
+        }
+    }
+    const data = Buffer.concat(chunks);
+    const errBuf = [null];
+    const ptr = dql_digest_rows(
+        data.length > 0 ? data : null,
+        data.length,
+        lens.length > 0 ? BigInt64Array.from(lens) : null,
+        rows.length,
+        numCols,
+        errBuf,
+    );
+    checkError(errBuf);
+    if (!ptr) {
+        throw new DqlError('dql_digest_rows returned NULL without setting an error');
+    }
+    try {
+        return koffi.decode(ptr, 'char', -1);
+    } finally {
+        dql_free_string(ptr);
     }
 }
 
@@ -220,4 +299,4 @@ function splitQueries(dql) {
 // Exports
 // ---------------------------------------------------------------------------
 
-module.exports = { Database, DqlError, splitQueries };
+module.exports = { Database, DqlError, digestRows, digestVersion, splitQueries };

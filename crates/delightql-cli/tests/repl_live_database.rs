@@ -9,15 +9,16 @@
 
 use std::sync::Arc;
 
-use delightql_cli::exec_ng::run_dql_query;
 use delightql_cli::client::context::Mode;
 use delightql_cli::client::database::{ClientDatabase, InputKind, InputOutcome, WriteOutcome};
 use delightql_cli::client::mount::install_repl_namespace;
 use delightql_cli::connection::{open_handle, SessionProfile};
+use delightql_cli::exec_ng::run_dql_query;
 
 fn live() -> (Arc<ClientDatabase>, Box<dyn delightql_core::api::DqlHandle>) {
     let db = Arc::new(ClientDatabase::open_on(Mode::Other).expect("open the live database"));
-    let handle = open_handle(SessionProfile::Client(Some(db.clone()))).expect("open the repl handle");
+    let handle =
+        open_handle(SessionProfile::Client(Some(db.clone()))).expect("open the repl handle");
     (db, handle)
 }
 
@@ -29,11 +30,17 @@ fn the_public_relations_answer_and_the_surface_is_exhaustive() {
 
     // A host write lands before the reads so every relation has a row.
     assert!(matches!(
-        db.set_option("output_format", Some("table".into()), "enum", None, "startup"),
+        db.set_option(
+            "output_format",
+            Some("table".into()),
+            "enum",
+            None,
+            "startup"
+        ),
         WriteOutcome::Applied
     ));
     let (id, _) = db.record_input(InputKind::Dql, "users(*)");
-    db.close_input(id, InputOutcome::Succeeded, None, Some("SELECT 1".into()), Some(1.0));
+    db.close_input(id, InputOutcome::Succeeded, None, Some(1.0));
 
     let mut session = handle.session().expect("session");
     let surface = run_dql_query("repl::surface.dot_command(*)", &mut *session).unwrap();
@@ -61,13 +68,94 @@ fn the_public_relations_answer_and_the_surface_is_exhaustive() {
     assert!(incidents.rows.is_empty());
 }
 
+/// The welcome message, the key bindings and the examples answer through
+/// the handle as `repl::surface` relations, holding exactly the registry's
+/// rows in the registry's order — the rows the welcome message and `.help`
+/// are rendered from.
+#[test]
+fn the_surface_relations_answer_with_the_registry() {
+    let (_db, mut handle) = live();
+    let registry = delightql_cli::repl::surface::registry();
+    let mut session = handle.session().expect("session");
+    let mut column = |query: &str, name: &str| -> Vec<String> {
+        let rows = run_dql_query(query, &mut *session).expect(query);
+        let at = rows.columns.iter().position(|c| c == name).expect(name);
+        rows.rows.iter().map(|r| r[at].clone()).collect()
+    };
+    assert_eq!(
+        column("repl::surface.welcome(*) |> #(line_no)", "text"),
+        registry.welcome
+    );
+    assert_eq!(
+        column("repl::surface.key_binding(*) |> #(ordinal)", "keys"),
+        registry
+            .key_bindings
+            .iter()
+            .map(|row| row.keys.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        column("repl::surface.example(*) |> #(ordinal)", "query"),
+        registry
+            .examples
+            .iter()
+            .map(|row| row.query.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        column("repl::surface.message(*) |> #(ordinal)", "text"),
+        registry
+            .messages
+            .iter()
+            .map(|row| row.text.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `ls(*)` answers bare through a client handle: a definition made at the
+/// prompt under `home`, an enlisted namespace's entities under theirs, and
+/// itself under `repl::util`. A reset takes the enlistment back; the
+/// install that restores `repl::*` restores it too.
+#[test]
+fn ls_lists_what_answers_bare_at_the_prompt() {
+    let (_db, mut handle) = live();
+    delightql_cli::exec_ng::define(&mut *handle, "adults(*) :- _(a @ 1)").expect("define");
+    let listed = |handle: &mut Box<dyn delightql_core::api::DqlHandle>| {
+        let mut session = handle.session().expect("session");
+        let rows = run_dql_query("ls(*) |> (name, namespace)", &mut *session)
+            .expect("ls answers bare at the prompt");
+        rows.rows
+            .into_iter()
+            .map(|row| (row[0].clone(), row[1].clone()))
+            .collect::<std::collections::BTreeSet<(String, String)>>()
+    };
+    let before = listed(&mut handle);
+    for expected in [
+        ("adults", "home"),
+        ("ls", "repl::util"),
+        ("like", "std::predicates"),
+    ] {
+        let expected = (expected.0.to_string(), expected.1.to_string());
+        assert!(before.contains(&expected), "{expected:?} in {before:?}");
+    }
+
+    handle.recover_session().expect("reset");
+    delightql_cli::client::mount::install_repl_namespace(&mut *handle).expect("reinstall");
+    let after = listed(&mut handle);
+    assert!(after.contains(&("ls".to_string(), "repl::util".to_string())));
+    assert!(
+        !after.iter().any(|(name, _)| name == "adults"),
+        "a reset forgets the prompt's definitions"
+    );
+}
+
 /// One physical connection: a join among public REPL relations plans and
 /// answers — no cross-connection road involved.
 #[test]
 fn public_relations_join_on_the_one_connection() {
     let (db, mut handle) = live();
     let (id, _) = db.record_input(InputKind::DotCommand, ".help");
-    db.close_input(id, InputOutcome::Succeeded, None, None, None);
+    db.close_input(id, InputOutcome::Succeeded, None, None);
 
     let mut session = handle.session().expect("session");
     let joined = run_dql_query(
@@ -122,7 +210,7 @@ fn cli_surface_no_longer_carries_dot_commands() {
 fn a_session_reset_then_remount_retains_the_rows() {
     let (db, mut handle) = live();
     let (id, _) = db.record_input(InputKind::Dql, "users(*) |> (id)");
-    db.close_input(id, InputOutcome::Failed, Some("no such table".into()), None, None);
+    db.close_input(id, InputOutcome::Failed, Some("no such table".into()), None);
 
     handle.recover_session().expect("reset");
     {
@@ -140,22 +228,23 @@ fn a_session_reset_then_remount_retains_the_rows() {
     assert_eq!(history.rows[0][input_col], "users(*) |> (id)");
 }
 
-/// Configuration agreement: one typed operation changes the typed value,
-/// the TUI snapshot, and the option row together; an invalid value changes
-/// none of them.
+/// Configuration agreement: one typed operation changes the typed value and
+/// the option row together; an invalid value changes neither.
 #[test]
-fn configuration_operations_agree_across_all_three_faces() {
+fn configuration_operations_agree_across_both_faces() {
     use delightql_cli::output_format::OutputFormat;
     use delightql_cli::repl::commands::{handle_dot_command, ReplState};
 
-    let mut state = ReplState::new_over(None, OutputFormat::Table, None, Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap()))).expect("repl state");
+    let mut state = ReplState::new_over(
+        None,
+        OutputFormat::Table,
+        None,
+        Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap())),
+    )
+    .expect("repl state");
     state.set_output_format(OutputFormat::Json, ".format");
-    state.set_zebra_mode(3, ".zebra").expect("3 is lawful");
 
     assert_eq!(state.config().output_format(), OutputFormat::Json);
-    assert_eq!(state.config().zebra_mode(), Some(3));
-    assert_eq!(state.shared_info.config_output_format, "json");
-    assert_eq!(state.shared_info.config_zebra_mode, Some(3));
 
     let option_row = |state: &ReplState, name: &str| -> (String, String) {
         let mut handle = state.dql_handle.lock().unwrap();
@@ -174,18 +263,13 @@ fn configuration_operations_agree_across_all_three_faces() {
         option_row(&state, "output_format"),
         ("json".to_string(), ".format".to_string())
     );
-    assert_eq!(
-        option_row(&state, "zebra_columns"),
-        ("3".to_string(), ".zebra".to_string())
-    );
 
     // Invalid value: refused, and NOTHING moved.
-    assert!(state.set_zebra_mode(9, ".zebra").is_err());
-    assert_eq!(state.config().zebra_mode(), Some(3));
-    assert_eq!(state.shared_info.config_zebra_mode, Some(3));
+    handle_dot_command(".format nosuch", &mut state).expect("a known command");
+    assert_eq!(state.config().output_format(), OutputFormat::Json);
     assert_eq!(
-        option_row(&state, "zebra_columns"),
-        ("3".to_string(), ".zebra".to_string())
+        option_row(&state, "output_format"),
+        ("json".to_string(), ".format".to_string())
     );
 
     // Every effective parser budget is projected as an option row.
@@ -202,18 +286,16 @@ fn configuration_operations_agree_across_all_three_faces() {
         );
     }
 
-    // The breaker crosses the same three faces, driven by the dot command:
+    // The breaker crosses the same two faces, driven by the dot command:
     // enabled by default with the startup source; `.repl helpers off/on`
-    // moves the typed policy, the TUI snapshot, and the queryable row
-    // together, stamping the manual source.
+    // moves the typed policy and the queryable row together, stamping the
+    // manual source.
     assert_eq!(
         option_row(&state, "editor_parser_helpers"),
         ("true".to_string(), "startup".to_string())
     );
-    assert!(state.shared_info.config_editor_helpers);
     handle_dot_command(".repl helpers off", &mut state).expect("known command");
     assert!(!state.config().editor_helpers_enabled());
-    assert!(!state.shared_info.config_editor_helpers);
     assert_eq!(
         option_row(&state, "editor_parser_helpers"),
         ("false".to_string(), ".repl helpers".to_string())
@@ -222,7 +304,6 @@ fn configuration_operations_agree_across_all_three_faces() {
     assert!(!state.config().editor_helpers_enabled());
     handle_dot_command(".repl helpers on", &mut state).expect("known command");
     assert!(state.config().editor_helpers_enabled());
-    assert!(state.shared_info.config_editor_helpers);
     assert_eq!(
         option_row(&state, "editor_parser_helpers"),
         ("true".to_string(), ".repl helpers".to_string())
@@ -237,7 +318,13 @@ fn one_ordered_ledger_records_dot_commands_and_queries() {
     use delightql_cli::output_format::OutputFormat;
     use delightql_cli::repl::commands::{handle_dot_command, process_query, ReplState};
 
-    let mut state = ReplState::new_over(None, OutputFormat::Table, None, Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap()))).expect("repl state");
+    let mut state = ReplState::new_over(
+        None,
+        OutputFormat::Table,
+        None,
+        Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap())),
+    )
+    .expect("repl state");
     // The preflight gate fails closed, so the DQL submission below needs a
     // SERVING containment worker — the real dql binary, not the test
     // harness the default controller would spawn as current_exe.
@@ -290,7 +377,10 @@ fn one_ordered_ledger_records_dot_commands_and_queries() {
         (&ledger[1].1[..], &ledger[1].2[..], &ledger[1].3[..]),
         ("dot_command", ".nonsense", "refused")
     );
-    assert_eq!((&ledger[2].1[..], &ledger[2].2[..]), ("dql", "no_such_table(*)"));
+    assert_eq!(
+        (&ledger[2].1[..], &ledger[2].2[..]),
+        ("dql", "no_such_table(*)")
+    );
     assert_eq!(ledger[2].3, "failed");
     assert!(!ledger[2].4.is_empty(), "the failure carries its error");
 }
@@ -311,12 +401,22 @@ fn the_bug_tarball_carries_the_session_files_and_the_client_database() {
     let db = Arc::new(ClientDatabase::open_on(Mode::Other).unwrap());
     let mut handle = open_handle(SessionProfile::Client(Some(db.clone()))).expect("handle");
     let (id, _) = db.record_input(InputKind::Dql, "users(*)");
-    db.close_input(id, InputOutcome::Succeeded, None, Some("SELECT 1".into()), Some(1.0));
+    db.close_input(id, InputOutcome::Succeeded, None, Some(1.0));
 
-    let report = write_bug_report(&db, &mut *handle, Some("the join drops rows"), Some(user_db.path()))
-        .expect("bug report");
+    let report = write_bug_report(
+        &db,
+        &mut *handle,
+        Some("the join drops rows"),
+        Some(user_db.path()),
+    )
+    .expect("bug report");
     assert!(report.archive.starts_with(state_dir.path()));
-    assert_eq!(report.databases.len(), 1, "the primary database ships: {:?}", report.databases);
+    assert_eq!(
+        report.databases.len(),
+        1,
+        "the primary database ships: {:?}",
+        report.databases
+    );
 
     let file = std::fs::File::open(&report.archive).unwrap();
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
@@ -332,13 +432,27 @@ fn the_bug_tarball_carries_the_session_files_and_the_client_database() {
         format!("bug-{stamp}/replay-script.{stamp}"),
         format!("bug-{stamp}/repl.sqlite"),
     ] {
-        assert!(names.contains(&expected), "{expected} missing from {names:?}");
+        assert!(
+            names.contains(&expected),
+            "{expected} missing from {names:?}"
+        );
     }
-    assert!(names.iter().any(|n| n.starts_with(&format!("bug-{stamp}/db/"))), "{names:?}");
-    assert!(!names.iter().any(|n| n.ends_with("manifest.json")), "no manifest: the files are the record");
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with(&format!("bug-{stamp}/db/"))),
+        "{names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.ends_with("manifest.json")),
+        "no manifest: the files are the record"
+    );
 
     let log = std::fs::read_to_string(&report.files.error_log).unwrap();
-    assert!(log.contains("delightql-error://client/report/description"), "{log}");
+    assert!(
+        log.contains("delightql-error://client/report/description"),
+        "{log}"
+    );
     assert!(log.contains("the join drops rows"));
     assert!(log.contains("\"kind\": \"info\""));
     let script = std::fs::read_to_string(&report.files.replay_script).unwrap();
@@ -352,7 +466,13 @@ fn every_interactive_submission_road_crosses_the_one_ledger() {
     use delightql_cli::output_format::OutputFormat;
     use delightql_cli::repl::commands::{handle_dot_command, process_query, ReplState};
 
-    let mut state = ReplState::new_over(None, OutputFormat::Table, None, Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap()))).expect("repl state");
+    let mut state = ReplState::new_over(
+        None,
+        OutputFormat::Table,
+        None,
+        Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap())),
+    )
+    .expect("repl state");
     state.parser_worker = std::sync::Arc::new(
         delightql_cli::repl::parser_worker::ParserWorkerController::new_with_executable(
             std::path::PathBuf::from(env!("CARGO_BIN_EXE_dql")),
@@ -371,6 +491,13 @@ fn every_interactive_submission_road_crosses_the_one_ledger() {
     let _ = process_query("SELECT 2", &mut state, &flag);
     // A removed spelling is refused, and the refusal is a ledger row too.
     handle_dot_command(".file /tmp/anything.dql", &mut state).unwrap();
+    // Definitions: a one-off, then definition input, then back to queries,
+    // where what was defined answers.
+    handle_dot_command(".ddl two(*) :- _(v @ 2)", &mut state).unwrap();
+    handle_dot_command(".ddl", &mut state).unwrap();
+    process_query("three(*) :- _(v @ 3)", &mut state, &flag).unwrap();
+    handle_dot_command(".query", &mut state).unwrap();
+    process_query("three(*)", &mut state, &flag).unwrap();
 
     let db = state.repl_db.as_ref().unwrap();
     let ledger: Vec<(String, String, String)> = db
@@ -392,6 +519,12 @@ fn every_interactive_submission_road_crosses_the_one_ledger() {
             expect("dot_command", ".sql", "succeeded"),
             expect("sql", "SELECT 2", "succeeded"),
             expect("dot_command", ".file /tmp/anything.dql", "refused"),
+            expect("dot_command", ".ddl two(*) :- _(v @ 2)", "succeeded"),
+            expect("ddl", "two(*) :- _(v @ 2)", "succeeded"),
+            expect("dot_command", ".ddl", "succeeded"),
+            expect("ddl", "three(*) :- _(v @ 3)", "succeeded"),
+            expect("dot_command", ".query", "succeeded"),
+            expect("dql", "three(*)", "succeeded"),
         ],
         "one ordered authority over every interactive submission road"
     );
@@ -427,5 +560,8 @@ fn the_book_repl_page_names_exactly_the_registry() {
         delightql_cli::repl::commands::dot_command_spellings()
             .map(String::from)
             .collect();
-    assert_eq!(in_page, registry, "book/manual/repl.md drifted from DOT_COMMANDS");
+    assert_eq!(
+        in_page, registry,
+        "book/manual/repl.md drifted from DOT_COMMANDS"
+    );
 }

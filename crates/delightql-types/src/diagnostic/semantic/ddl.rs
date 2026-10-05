@@ -119,4 +119,12 @@ pub enum DdlHead {
     #[leaf("unresolved_reference", class = Syntax, summary = "A head names a column the body does not publish.")]
     #[error("Validation error: {message}")]
     UnresolvedReference { message: String },
+
+    /// A relational or effect higher-order family names a scalar formal at
+    /// a position no clause uses: no clause's `$.x` selects it, and no
+    /// clause grounds that position. A bare name in the body is a column,
+    /// never the formal — `$.x` is the parameter's spelling.
+    #[leaf("unused_scalar", class = Syntax, summary = "A family's named scalar formal is used by no clause.")]
+    #[error("Validation error: {message}")]
+    UnusedScalar { message: String },
 }

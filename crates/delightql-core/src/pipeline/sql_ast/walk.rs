@@ -36,9 +36,6 @@ pub fn visit_mut(stmt: &mut SqlStatement, v: &mut dyn SqlVisitorMut) {
         }
         SqlStatement::CreateTempTable {
             with_clause, query, ..
-        }
-        | SqlStatement::CreateTempView {
-            with_clause, query, ..
         } => {
             visit_ctes(with_clause, v);
             visit_query(query, v);
@@ -109,21 +106,6 @@ pub fn visit_query(query: &mut QueryExpression, v: &mut dyn SqlVisitorMut) {
             visit_query(left, v);
             visit_query(right, v);
         }
-        QueryExpression::Values { rows } => {
-            for row in rows {
-                for e in row {
-                    visit_expr(e, v);
-                }
-            }
-        }
-        QueryExpression::WithCte { ctes, query } => {
-            for cte in ctes {
-                for part in cte.parts_mut() {
-                    visit_query(part, v);
-                }
-            }
-            visit_query(query, v);
-        }
     }
     v.query(query);
 }
@@ -158,16 +140,10 @@ fn visit_select(select: &mut SelectStatement, v: &mut dyn SqlVisitorMut) {
     // LIMIT holds plain integers — nothing to descend into.
 }
 
-/// Apply a visitor to one expression and everything nested beneath it.
-pub fn visit_expression_mut(expr: &mut DomainExpression, v: &mut dyn SqlVisitorMut) {
-    visit_expr(expr, v);
-}
-
 #[stacksafe::stacksafe]
 fn visit_table(table: &mut TableExpression, v: &mut dyn SqlVisitorMut) {
     match table {
         TableExpression::Scope(_)
-        | TableExpression::QualifiedScope { .. }
         | TableExpression::Entity { .. }
         | TableExpression::TVF { .. } => {}
         TableExpression::Subquery { query, .. } => visit_query(query, v),
@@ -181,7 +157,7 @@ fn visit_table(table: &mut TableExpression, v: &mut dyn SqlVisitorMut) {
             visit_table(right, v);
             match join_condition {
                 JoinCondition::On(e) => visit_expr(e, v),
-                JoinCondition::Merge(_) | JoinCondition::Cartesian => {}
+                JoinCondition::Cartesian => {}
             }
         }
     }

@@ -37,10 +37,10 @@ Contain functions, sigma predicates, transpilation rules, and higher-order
 views with no external references. Portable -- they don't depend on any
 database -- but may depend on other pure namespaces.
 
-```delightql
+```{.delightql .am}
 // In lib::string
-clean_name:(text) :- text /-> trim:() /-> upper:()
-format_email:(name, domain) :- name ++ "@" ++ domain
+clean_name:(text) :- text >> trim:() >> upper:()
+format_email:(name, domain) :- (name ++ "@") ++ domain
 ```
 
 Pure namespaces can be used anywhere. They have no data dependencies to resolve.
@@ -51,17 +51,17 @@ Contain rules that reference external tables. These namespaces come in two forms
 
 **Groundable**  --  has free variables (unqualified table references):
 
-```delightql
+```{.delightql .am}
 // In lib::analytics (groundable)
-young_users(*) :- users(*), age < 30   // 'users' is a free variable
+long_tracks(*) :- track(*), milliseconds > 600000   // 'Track' is a free variable
 ```
 
-The reference to `users` must be resolved before use. See [Grounding].
+The reference to `track` must be resolved before use. See [Grounding].
 
 **Pre-grounded**  --  all references are qualified:
-```delightql
+```{.delightql .am}
 // In lib::analytics (pre-grounded)
-young_users(*) :- data::production.users(*), age < 30
+long_tracks(*) :- main.track(*), milliseconds > 600000
 ```
 
 No free variables. Ready to use immediately, but tied to a specific data namespace.
@@ -70,13 +70,13 @@ No free variables. Ready to use immediately, but tied to a specific data namespa
 
 Map to physical database connections. Contain tables and views introspected from the database.
 ```delightql
-mount!("sales.db", "data::sales")
-// Now: data::sales.orders(*), data::sales.customers(*)
+mount!("example.sqlite", "data::sales")(*)
+// Now: data::sales.invoice(*), data::sales.customer(*)
 ```
 
 Data namespaces are the ground truth -- they hold actual data.
 
-When a qualified mount names missing ancestors, `mount!()` creates those path
+When a qualified mount names missing ancestors, `mount!` creates those path
 segments as structural `container` namespaces. For example, mounting
 `data::sales` creates a queryable `data::(*)` parent and a `data::sales` data
 leaf. The parent has no database source of its own; mount lifecycle operations
@@ -94,7 +94,7 @@ A namespace's type is determined by its contents, not its path:
 : Namespace classification by contents
 
 
-Data namespaces are separate -- they're created by `mount!()` and contain database tables, not rules. They're the target of grounding, not the subject.
+Data namespaces are separate -- they're created by `mount!` and contain database tables, not rules. They're the target of grounding, not the subject.
 
 ## Conventional Prefixes {.dqlh}
 
@@ -102,8 +102,8 @@ By convention, namespace paths indicate their type:
 
 | Prefix | Intended for | Typically created by |
 |--------|--------------|----------------------|
-| `data::` | Database connections | `mount!()` |
-| `lib::` | Pure and derived rules | `consult!()` |
+| `data::` | Database connections | `mount!` |
+| `lib::` | Pure and derived rules | `consult!` |
 | `main` | Default working namespace | Implicit |
 
 : Conventional namespace path prefixes
@@ -117,21 +117,31 @@ Several namespaces exist automatically.
 
 ## main {.dqlh}
 
-The default working namespace for the REPL. When you use the REPL
-interactively, you're operating in `main`:
+The default working data namespace for the REPL. When you use the REPL
+interactively, you're operating with the entities of `main` auto-enlisted:
 
-```delightql
-active_users(*) :- users(*), status = "active"
-// Equivalent to: main.active_users(*)
+```{.delightql .am}
+usa_customers(*) :- customer(*), country = "USA"
+// Equivalent to: main.usa_customers(*)
 ```
 
-When you `enlist!()` a namespace in the REPL, you're making its entities
-available in `main` without qualification.
+## home {.dqlh}
+
+The `home` namespace is the user's default library namespace. Like `main`
+its entities are auto-enlisted.  In-line DDL establishes its entities
+into `home`.
+
+```delightql
+(~~ddl times_two:(x) : x*2 ~~) _(a@2;3;5;7) |> +( times_two:(a) as twice)
+```
+
+When you `enlist!` a namespace in the REPL, you're making its entities
+available in `home` without qualification.
 
 More generally, every execution context has a working namespace. In the REPL,
-it's `main`. During `consult!("file.dql", "lib::foo")`, the working context is
-`lib::foo`--definitions in that file go into `lib::foo`. During
-`run!("file.dql")`, the working context inherits from the caller.
+it is `home`. During `consult!("file.dql", "lib::foo")(*)`, the working context is
+`lib::foo` -- the definitions in that file go into `lib::foo`. During
+`run!("file.dql")(*)`, the working context inherits from the caller.
 
 ### lib::std::prelude {.dqlh}
 
@@ -139,15 +149,15 @@ Core pseudo-predicates, universally available. This is a partial list -- see [St
 
 | Pseudo-predicate | Purpose |
 |------------------|---------|
-| `mount!()` | Load database connection |
-| `consult!()` | Load DQL rules file |
-| `enlist!()` | Enable unqualified access |
-| `delist!()` | Remove enlisted namespace |
-| `run!()` | Execute query file |
+| `mount!` | Load database connection |
+| `consult!` | Load DQL rules file |
+| `enlist!` | Enable unqualified access |
+| `delist!` | Remove enlisted namespace |
+| `run!` | Execute query file |
 
 : Core pseudo-predicates in lib::std::prelude
 
-The DML directives (`insert!()`, `update!()`, `delete!()`) are covered in [DML]; multi-step effect programs are specified in `SEMANTICS/effect-algebra-law.md` (repository root).
+The DML directives (`insert!`, `update!`, `delete!`) are covered in [DML]; multi-step effect programs are specified in `SEMANTICS/effect-algebra-law.md` (repository root).
 
 No explicit enlist needed -- these are available everywhere.
 
@@ -157,7 +167,7 @@ No explicit enlist needed -- these are available everywhere.
 
 Built-in sigma predicates, universally available:
 ```delightql
-users(*), +like(name, "A%"), +between(age, 18, 65)
+track(*), +like(name, "A%"), +between(milliseconds, 180000, 240000)
 ```
 
 See [Standard Library Reference] for the complete list.
@@ -189,11 +199,11 @@ point that are used to bring rules, facts, and data
 into scope and within a namespace.
 
 
-### mount!()  --  Database Connections {.dqlh}
+### mount!  --  Database Connections {.dqlh}
 
 Opens a database and introspects its tables:
 ```delightql
-mount!("sales.db", "data::sales")
+mount!("example.sqlite", "data::sales")(*)
 ```
 
 Side effects:
@@ -204,23 +214,24 @@ Side effects:
 
 After mounting, tables are accessible:
 ```delightql
-data::sales.orders(*)
-data::sales.customers(*)
+mount!("example.sqlite", "data::sales")(*)
+data::sales.invoice(*)
+data::sales.customer(*)
 ```
 
-### consult!()  --  DQL Rules {.dqlh}
+### consult!  --  DQL Rules {.dqlh}
 
 Loads a `.dql` file containing rules:
 
 ```delightql
-consult!("analytics.dql", "lib::analytics")
+consult!("analytics.dql", "lib::analytics")(*)
 ```
 
 The file contains rule definitions:
-```delightql
+```{.delightql .am}
 // analytics.dql
-young_users(*) :- users(*), age < 30
-high_value(*) :- orders(*), total > 1000
+long_tracks(*) :- track(*), milliseconds > 600000
+big_invoices(*) :- invoice(*), total > 20
 ```
 
 Side effects:
@@ -232,31 +243,31 @@ Side effects:
 
 Rules are now accessible (qualified or via enlist):
 ```delightql
-lib::analytics.young_users(*)
+lib::analytics.long_tracks(*)
 ```
 
-### enlist!()  --  Unqualified Access {.dqlh}
+### enlist!  --  Unqualified Access {.dqlh}
 
 Makes a namespace's entities available without qualification:
 ```delightql
-enlist!("lib::analytics")
+enlist!("lib::analytics")(*)
 
 // Now can write:
-young_users(*)
+long_tracks(*)
 // Instead of:
-lib::analytics.young_users(*)
+lib::analytics.long_tracks(*)
 ```
 
 Enlisting doesn't load anything -- the namespace must already exist.
 
-### delist!()  --  Remove Enlisted Namespace {.dqlh}
+### delist!  --  Remove Enlisted Namespace {.dqlh}
 
 Removes a namespace from enlisted scope:
 ```delightql
-delist!("lib::analytics")
+delist!("lib::analytics")(*)
 
-young_users(*)                      // Error: not found
-lib::analytics.young_users(*)       // Still works (qualified)
+long_tracks(*)                      // Error: not found
+lib::analytics.long_tracks(*)       // Still works (qualified)
 ```
 
 
@@ -267,19 +278,19 @@ Groundable namespaces have free variables -- references to tables that aren't de
 
 ### The Problem Again {.dqlh}
 
-```delightql
+```{.delightql .am}
 // In lib::analytics (groundable)
-young_users(*) :- users(*), age < 30
+long_tracks(*) :- track(*), milliseconds > 600000
 ```
 
-`users` is referenced but not defined. This namespace can't be used until `users` is bound to an actual table.
+`track` is referenced but not defined. This namespace can't be used until `track` is bound to an actual table.
 
 
 ### Grounding {.dqlh}
 
-For a permanent binding, use `ground!()`:
+For a permanent binding, use `ground!`:
 ```delightql
-ground!("data::production", "lib::analytics", "lib::analytics_prod")
+ground!("data::production", "lib::analytics", "lib::analytics_prod")(*)
 ```
 
 All three arguments are required. The first two are namespace paths; the
@@ -299,7 +310,7 @@ The result is a new namespace, not a mutation of the original.
 
 ### Constraints {.dqlh}
 
-**No intersection.** The ground namespace and groundable namespace cannot share entity names. If both define `users`, grounding is ambiguous and fails.
+**No intersection.** The ground namespace and groundable namespace cannot share entity names. If both define `track`, grounding is ambiguous and fails.
 
 **Same database technology.** Cross-database grounding (e.g., SQLite namespace against PostgreSQL namespace) is not supported.
 
@@ -312,7 +323,7 @@ More so than most of what we've discussed before:  **this is where actual SQL DD
 
 ### Imprinting syntax {.dqlh}
 ```delightql
-imprint!("lib::schema", "data::production")
+imprint!("lib::schema", "data::production")(*)
 ```
 
 Imprinting:
@@ -327,4 +338,4 @@ Imprinting:
 Grounding and imprinting are highly related: where
 grounding proves compatibility, imprinting makes it permanent.
 
-If `data::production` grounded into `lib::analytics` is valid grounding, then `imprint!("lib::analytics", "data::production")` is valid imprinting. The grounding operation proves that the derived namespace can bind against the data namespace. Imprinting persists that binding.
+If `data::production` grounded into `lib::analytics` is valid grounding, then `imprint!("lib::analytics", "data::production")(*)` is valid imprinting. The grounding operation proves that the derived namespace can bind against the data namespace. Imprinting persists that binding.

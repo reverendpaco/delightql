@@ -17,30 +17,25 @@ Use with semi-join or anti-join syntax:[Delightql applies De Morgan's laws,
 distributing negation across disjunctive clauses.]{.sidenote}
 
 ```delightql
-employee(*),
-  \+empty(LastName),
-  \+empty(FirstName)
+customer(*),
+  \+empty(company),
+  \+empty(state)
 ```
 
 
 ```sql
+WITH no_data(value) AS (VALUES ('NA'), ('N/A'), ('UNKNOWN'))
 SELECT *
-FROM employee
+FROM customer
 WHERE
-  LastName IS NOT null
-  AND '' != trim(LastName)
-  AND upper(LastName) NOT IN (
-    'NA',
-    'N/ A',
-    'UNKNOWN'
-  )
-  AND (FirstName IS NOT null
-  AND '' != trim(FirstName)
-  AND upper(FirstName) NOT IN (
-    'NA',
-    'N/ A',
-    'UNKNOWN'
-  ));
+  (company IS NULL
+    OR trim(company) IS NOT DISTINCT FROM ''
+    OR EXISTS (SELECT 1 FROM no_data WHERE upper(company) = no_data.value)
+  ) IS NOT TRUE
+  AND (state IS NULL
+    OR trim(state) IS NOT DISTINCT FROM ''
+    OR EXISTS (SELECT 1 FROM no_data WHERE upper(state) = no_data.value)
+  ) IS NOT TRUE;
 ```
 
 
@@ -50,7 +45,7 @@ WHERE
 SQL's `LIKE` and `BETWEEN` have special syntax. Delightql maps functor notation to these constructs:
 
 ```delightql
-employee(*), +like(Email,"%.com"), \+between(Salary,10000,100000)
+track(*), +like(name,"%Love%"), \+between(milliseconds,120000,600000)
 ```
 
 The above delightql transpiles to the following Sql.
@@ -58,11 +53,35 @@ The above delightql transpiles to the following Sql.
 ```sql
 select
   *
-from employee
+from track
   where
-    Email like '%.com' and
-    Salary not between 10000 and 100000;
+    (name like '%Love%') is true and
+    (milliseconds between 120000 and 600000) is not true;
 ```
+
+To match a value against several patterns at once, `like_any` takes the value,
+then `&`, then the patterns as rows. Under `+` it keeps the rows whose value
+matches at least one pattern; under `\+`, the rows whose value matches none:
+
+```delightql
+customer(*), \+like_any(email & "%.com"; "%.org")(*)
+```
+
+It is equivalent to:
+
+```sql
+select *
+from customer
+where not exists (
+  select 1
+  from (values ('%.com'), ('%.org')) as p(pattern)
+  where email like p.pattern
+);
+```
+
+The patterns can be any one-column relation — `+like_any(email, domains(*))(*)`.
+Without the `+` it joins instead of filtering: each row gains the `pattern` it
+matched, once per match. A NULL value matches no pattern.
 
 
 ## Disjunction {.dqlh}
@@ -72,14 +91,14 @@ Two syntaxes express `OR`:
 **Keyword form (recommended)**. The `or` keyword binds predicates within a sigma clause:
 
 ```delightql
-employee(*)
-  , trim:(lower:(Department)) = "executive"
-        or Salary > 120000
-  , Title != "Engineer"
-  |> %( DepartmentCity
+invoice(*)
+  , trim:(lower:(billing_country)) = "usa"
+        or total > 10
+  , billing_state != "CA"
+  |> %( billing_country
           ~>
-        count:(*) as employee_count,
-        avg:(Salary) )
+        count:(*) as invoice_count,
+        avg:(total) )
 ```
 
 
@@ -87,14 +106,14 @@ employee(*)
 
 
 ```delightql
-employee(*)
-  , (trim:(lower:(Department)) = "executive"
-        ; Salary > 120000 )
-  , Title != "Engineer"
-  |> %( DepartmentCity
+invoice(*)
+  , (trim:(lower:(billing_country)) = "usa"
+        ; total > 10 )
+  , billing_state != "CA"
+  |> %( billing_country
           ~>
-        count:(*) as employee_count,
-        avg:(Salary) )
+        count:(*) as invoice_count,
+        avg:(total) )
 ```
 
 Prefer the keyword form -- it reads more clearly and avoids parenthesis errors.

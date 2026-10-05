@@ -6,29 +6,41 @@
 //! archives the source as `{target}::_N_blueprint`, an inert provenance
 //! record. Inertness is a catalog fact, never a spelling: the archive ROOT
 //! carries `kind = 'blueprint'`, and every descendant keeps its own kind
-//! with only its `fq_name` re-rooted, so "is this namespace inert?" is an
-//! ancestor-or-self test by exact `::` prefix.
+//! with only its `fq_name` re-rooted, so "is this namespace inert?" is the
+//! namespace tree's ancestor-or-self test.
 //!
 //! This module makes that judgment in one place and publishes it two ways.
 //!
 //! - As a guard, `refuse_if_blueprint`, for the read-side doors (entity
 //!   resolution, function inlining, `enlist!`) where the refusal is the
 //!   whole obligation.
-//! - As proofs for the materialization side, bound to the catalog they
-//!   were judged in. [`Catalog`] is that catalog: the bootstrap connection
-//!   locked under a shared borrow of the system, so every lifecycle
-//!   mutation (`imprint!`, `consult!`, `unconsult!`, `ground!` — all `&mut`
-//!   on the system) is excluded by the borrow checker for as long as any
-//!   proof lives. [`LiveNamespace`] witnesses a row of THAT catalog that is
-//!   not inert; [`ImprintSource`] witnesses a live library of THAT catalog
-//!   eligible to be consumed. Both borrow the catalog, have private fields
-//!   and one constructor each, and every read they make goes to the catalog
-//!   they hold. The manifest reader (`Manifest::open`) accepts only a
-//!   `LiveNamespace` and reads through it; the archival step
-//!   (`consume_source_to_blueprint`) accepts only an `ImprintSource` and
-//!   writes through it. A proof cannot outlive the lock it was judged
-//!   under, cannot survive a consume, and cannot be presented to another
-//!   catalog: the judgment is spent, not remembered.
+//! - As proofs for the reload and materialization side, bound to the
+//!   catalog they were judged in. [`Catalog`] is that catalog: the
+//!   bootstrap connection locked under a shared borrow of the system, so
+//!   every lifecycle mutation (`imprint!`, `consult!`, `unconsult!`,
+//!   `ground!` — all `&mut` on the system) is excluded by the borrow
+//!   checker for as long as any proof lives. [`LiveNamespace`] witnesses a
+//!   row of THAT catalog that is not inert; [`ImprintSource`] witnesses a
+//!   live library of THAT catalog eligible to be consumed. Both borrow the
+//!   catalog, have private fields and one constructor each, and every read
+//!   they make goes to the catalog they hold. The archival step (`consume_source_to_blueprint`) accepts
+//!   only an `ImprintSource` and writes through it. The manifest reader
+//!   (`ManifestRows::read`) queries the companions through the whole
+//!   system, so it holds no lock across its queries: it admits the library
+//!   as a `LiveNamespace` before listing them, under the same shared borrow
+//!   of the system that excludes every lifecycle mutation while it reads.
+//!   A proof cannot outlive the lock it was judged under, cannot survive a
+//!   consume, and cannot be presented to another catalog: the judgment is
+//!   spent, not remembered.
+//!
+//! It also owns KIND ADMISSION: which namespace kinds each lifecycle
+//! directive acts on. [`admit_kind`] judges the directives that take a
+//! namespace by name whatever its liveness (`unmount!`, `unconsult!`,
+//! `refresh!`); [`admit_live_kind`] judges the acts that read a namespace's
+//! truth into the session (`reconsult!` and both sides of `imprint!`), on a
+//! [`LiveNamespace`] whose [`LiveKind`] has no archive value. Both are total
+//! matches over a decoded kind: no directive compares kind text, and none
+//! has a fall-through.
 
 use std::ops::Deref;
 use std::sync::MutexGuard;
@@ -37,28 +49,29 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::diagnostic::{Blueprint, Runtime};
 use crate::error::{DelightQLError, Result};
+use crate::namespace::NamespaceKind;
 
 /// The archive root that makes `fq_name` inert, if any.
 ///
-/// `fq_name` is inert iff it equals, or is nested under, some namespace of
-/// `kind = 'blueprint'`. Membership is exact string prefix (`==` or
-/// `starts_with("{bp}::")`) — the same test that moved the descendants at
-/// consumption — never `LIKE`: `_` and `%` are ordinary namespace-name
-/// characters, and a LIKE pattern kidnaps prefix siblings (`a_b` vs `acb`).
-/// Blueprints are rare, so the scan is a handful of rows.
+/// `fq_name` is inert iff it is within some namespace of
+/// `kind = 'blueprint'`, by [`crate::namespace::is_within`] — the judgment
+/// that chose the descendants moved at consumption. Blueprints are rare, so
+/// the scan is a handful of rows.
 ///
 /// The `sys::meta` catalog functor stays VISIBLE because it resolves through
 /// `sys::meta`, never through the blueprint path — it does not consult this.
 pub(crate) fn blueprint_shadowing(conn: &Connection, fq_name: &str) -> Result<Option<String>> {
     let mut stmt = conn
-        .prepare("SELECT fq_name FROM namespace WHERE kind = 'blueprint'")
+        .prepare("SELECT fq_name FROM namespace WHERE kind = ?1")
         .map_err(|e| Runtime::catalog("prepare blueprint inertness scan", e.to_string()))?;
     let blueprints = stmt
-        .query_map([], |r| r.get::<_, String>(0))
+        .query_map([NamespaceKind::Blueprint.spelling()], |r| {
+            r.get::<_, String>(0)
+        })
         .map_err(|e| Runtime::catalog("scan blueprint namespaces", e.to_string()))?;
     for bp in blueprints {
         let bp = bp.map_err(|e| Runtime::catalog("read blueprint fq_name", e.to_string()))?;
-        if fq_name == bp || fq_name.starts_with(&format!("{}::", bp)) {
+        if crate::namespace::is_within(fq_name, &bp) {
             return Ok(Some(bp));
         }
     }
@@ -67,33 +80,35 @@ pub(crate) fn blueprint_shadowing(conn: &Connection, fq_name: &str) -> Result<Op
 
 /// The loud half of [`blueprint_shadowing`]: badged `imprint/blueprint/inert`.
 ///
-/// Read-side doors call this directly; the quiet safety net inside
-/// `ConsultRegistry::lookup_entity` uses `blueprint_shadowing` so any other
-/// lookup route degrades to a clean not-found rather than executing archived
-/// rules. Materialization does not call this: it spends the proofs below.
+/// Read-side doors call this directly. Materialization does not call this:
+/// it spends the proofs below.
 pub(crate) fn refuse_if_blueprint(conn: &Connection, fq_name: &str) -> Result<()> {
-    if let Some(bp) = blueprint_shadowing(conn, fq_name)? {
-        // The target the source was consumed into = the blueprint's
-        // parent (`{target}::_N_blueprint`); strip the last `::` segment.
-        let target = bp.rsplit_once("::").map(|(p, _)| p).unwrap_or(bp.as_str());
-        return Err(DelightQLError::from(Blueprint::Inert {
-            message: format!(
-                "'{}' is an archived blueprint (imprint! consumed it into '{}'); \
-                 blueprints are visible but inert — re-consult the source path \
-                 for a live copy",
-                bp, target
-            ),
-        }));
+    match blueprint_shadowing(conn, fq_name)? {
+        Some(archive) => Err(inert(&archive)),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The inertness refusal, naming the archive that makes a namespace inert.
+fn inert(archive: &str) -> DelightQLError {
+    // The target the source was consumed into = the archive's parent
+    // (`{target}::_N_blueprint`); strip the last `::` segment.
+    let target = archive.rsplit_once("::").map(|(p, _)| p).unwrap_or(archive);
+    DelightQLError::from(Blueprint::Inert {
+        message: format!(
+            "'{}' is an archived blueprint (imprint! consumed it into '{}'); \
+             blueprints are visible but inert — re-consult the source path \
+             for a live copy",
+            archive, target
+        ),
+    })
 }
 
 /// The catalog a lifecycle judgment is made in: the bootstrap connection,
 /// locked, under a shared borrow of the system.
 ///
-/// The one constructor takes the definition-use authority's
-/// [`CatalogRead`](crate::defuse::CatalogRead) — a shared borrow of
-/// `DelightQLSystem` — and the guard it yields carries that borrow. While a
+/// The one constructor takes a shared borrow of `DelightQLSystem`, and the
+/// guard it yields carries that borrow. While a
 /// `Catalog` or anything borrowing it exists, no `&mut` operation on the
 /// system compiles, so no lifecycle mutation can interleave with a judgment
 /// or an act that spends one. The system's own `&mut` roads open one over
@@ -107,9 +122,9 @@ pub(crate) struct Catalog<'s> {
 
 impl<'s> Catalog<'s> {
     /// Lock the bootstrap store under the read's borrow of the system.
-    pub(crate) fn open(read: crate::defuse::CatalogRead<'s>, context: &str) -> Result<Self> {
+    pub(crate) fn open(system: &'s crate::system::DelightQLSystem, context: &str) -> Result<Self> {
         Ok(Self {
-            conn: read.connection(context)?,
+            conn: system.lock_bootstrap(context)?,
         })
     }
 
@@ -136,6 +151,56 @@ impl Deref for Catalog<'_> {
     }
 }
 
+/// The kind of a LIVE namespace: every [`NamespaceKind`] but an archive
+/// root's. Only [`LiveNamespace::admit`] yields one, after it has refused an
+/// archive and everything inside one, so an act judged on a live namespace
+/// cannot be asked about an archive at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveKind {
+    System,
+    Container,
+    Data,
+    Lib,
+    Scratch,
+    Grounded,
+    Unknown,
+}
+
+impl LiveKind {
+    /// `None`: `kind` is an archive root's, which is never live.
+    fn of(kind: NamespaceKind) -> Option<Self> {
+        match kind {
+            NamespaceKind::System => Some(LiveKind::System),
+            NamespaceKind::Container => Some(LiveKind::Container),
+            NamespaceKind::Data => Some(LiveKind::Data),
+            NamespaceKind::Lib => Some(LiveKind::Lib),
+            NamespaceKind::Scratch => Some(LiveKind::Scratch),
+            NamespaceKind::Grounded => Some(LiveKind::Grounded),
+            NamespaceKind::Unknown => Some(LiveKind::Unknown),
+            NamespaceKind::Blueprint => None,
+        }
+    }
+
+    /// The catalog kind this live kind is.
+    pub(crate) fn kind(self) -> NamespaceKind {
+        match self {
+            LiveKind::System => NamespaceKind::System,
+            LiveKind::Container => NamespaceKind::Container,
+            LiveKind::Data => NamespaceKind::Data,
+            LiveKind::Lib => NamespaceKind::Lib,
+            LiveKind::Scratch => NamespaceKind::Scratch,
+            LiveKind::Grounded => NamespaceKind::Grounded,
+            LiveKind::Unknown => NamespaceKind::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for LiveKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.kind().fmt(f)
+    }
+}
+
 /// A namespace of one [`Catalog`] judged LIVE: the row exists, and neither
 /// it nor any ancestor is an imprint archive. Whatever its kind — data,
 /// lib, scratch — its definitions and data are the session's to read and
@@ -147,16 +212,17 @@ pub(crate) struct LiveNamespace<'c> {
     catalog: &'c Catalog<'c>,
     id: i32,
     fq: String,
-    kind: String,
+    kind: LiveKind,
 }
 
 impl<'c> LiveNamespace<'c> {
     /// Judge `fq` against `catalog`. `Ok(None)`: no such namespace — the
     /// caller names the absence in its own vocabulary. `Err`: the namespace
-    /// is inert (`imprint/blueprint/inert`), or the catalog could not answer.
+    /// is inert (`imprint/blueprint/inert`), its kind does not decode, or the
+    /// catalog could not answer.
     ///
-    /// A `NULL` kind reads as `unknown`, the catalog's own spelling for a
-    /// row whose creation road recorded none.
+    /// An archive root is inert by its own kind; a namespace inside an
+    /// archive is inert by the archive that encloses it.
     pub(crate) fn admit(catalog: &'c Catalog<'c>, fq: &str) -> Result<Option<Self>> {
         let row: Option<(i32, Option<String>)> = catalog
             .query_row(
@@ -169,12 +235,14 @@ impl<'c> LiveNamespace<'c> {
         let Some((id, kind)) = row else {
             return Ok(None);
         };
+        let kind =
+            LiveKind::of(NamespaceKind::decode(fq, kind.as_deref())?).ok_or_else(|| inert(fq))?;
         refuse_if_blueprint(catalog, fq)?;
         Ok(Some(Self {
             catalog,
             id,
             fq: fq.to_string(),
-            kind: kind.unwrap_or_else(|| "unknown".to_string()),
+            kind,
         }))
     }
 
@@ -192,20 +260,15 @@ impl<'c> LiveNamespace<'c> {
         &self.fq
     }
 
-    pub(crate) fn kind(&self) -> &str {
-        &self.kind
+    pub(crate) fn kind(&self) -> LiveKind {
+        self.kind
     }
 }
 
 /// A live library of one [`Catalog`] eligible to be CONSUMED by `imprint!`:
-/// a [`LiveNamespace`] whose kind is a library kind (`lib`, or `scratch` —
-/// authored in-session, lib-kind by law) and that no grounding currently
-/// borrows.
-///
-/// Kinds are admitted positively. An exclusion list ("not data, not
-/// system, not container") is the tempting regression: it silently admits
-/// every kind it never named, which is exactly how an archive root
-/// (`kind = 'blueprint'`) once materialized again.
+/// a [`LiveNamespace`] whose kind [`admit_live_kind`] admits as an imprint
+/// source (`lib`, or `scratch` — authored in-session, lib-kind by law) and
+/// that no grounding currently borrows.
 ///
 /// Fields are private; [`ImprintSource::admit`] is the only constructor.
 #[derive(Debug)]
@@ -222,18 +285,7 @@ impl<'c> ImprintSource<'c> {
         let Some(live) = LiveNamespace::admit(catalog, fq)? else {
             return Ok(None);
         };
-        match live.kind() {
-            "lib" | "scratch" => {}
-            other => {
-                return Err(Runtime::catalog(
-                    format!(
-                        "imprint!() source '{}' is a {} namespace. Source must be a lib namespace.",
-                        fq, other
-                    ),
-                    "Wrong namespace kind",
-                ));
-            }
-        }
+        admit_live_kind(LiveVerb::ImprintSource, &live)?;
         // A borrowed source cannot be consumed: destroying a borrowed
         // resource would dangle the grounding's views. A catalog failure
         // here refuses — it never admits by default.
@@ -259,11 +311,6 @@ impl<'c> ImprintSource<'c> {
         Ok(Some(Self { live }))
     }
 
-    /// The judged namespace, for opening its manifest.
-    pub(crate) fn live(&self) -> &LiveNamespace<'c> {
-        &self.live
-    }
-
     /// The catalog this source was judged in — the store the consume
     /// writes.
     pub(crate) fn catalog(&self) -> &'c Catalog<'c> {
@@ -276,6 +323,159 @@ impl<'c> ImprintSource<'c> {
 
     pub(crate) fn fq(&self) -> &str {
         self.live.fq()
+    }
+}
+
+/// A lifecycle directive that takes a namespace by its name whatever the
+/// namespace's liveness: the removers, which discard an archive or anything
+/// inside one like any other namespace, and `refresh!`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verb {
+    Unmount,
+    Unconsult,
+    Refresh,
+}
+
+/// A lifecycle act that reads a namespace's truth into the session: a
+/// `reconsult!` reload, or either side of an `imprint!` crossing. It is
+/// judged on a [`LiveNamespace`], so an archive and everything inside one
+/// have been refused as inert before its kind is consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveVerb {
+    Reconsult,
+    ImprintSource,
+    ImprintTarget,
+}
+
+/// Whether `verb` acts on the namespace `fq` of `kind`. `Err` is the
+/// refusal, naming the directive that does act on that kind where one does.
+///
+/// Kinds are admitted positively, per verb, with no fall-through: an
+/// exclusion list silently admits every kind it never named, and a
+/// fall-through that panics poisons the catalog lock it runs under.
+pub(crate) fn admit_kind(verb: Verb, fq: &str, kind: NamespaceKind) -> Result<()> {
+    use NamespaceKind as K;
+    let refuse = |message: String, details: &str| {
+        Err(DelightQLError::from(Runtime::General {
+            message,
+            details: details.to_string(),
+        }))
+    };
+    match verb {
+        Verb::Unmount => match kind {
+            K::Data => Ok(()),
+            K::System
+            | K::Container
+            | K::Lib
+            | K::Scratch
+            | K::Grounded
+            | K::Blueprint
+            | K::Unknown => refuse(
+                format!(
+                    "Cannot unmount '{fq}' — it is a {kind} namespace. Use unconsult!() for \
+                     lib/grounded namespaces."
+                ),
+                "Wrong namespace kind",
+            ),
+        },
+        Verb::Unconsult => match kind {
+            // An imprint archive is an ordinary namespace for removal.
+            K::Lib | K::Scratch | K::Grounded | K::Unknown | K::Blueprint => Ok(()),
+            K::Data => refuse(
+                format!(
+                    "Cannot unconsult '{fq}' — it is a data namespace. Use unmount!() instead."
+                ),
+                "Wrong namespace kind",
+            ),
+            K::System => refuse(
+                format!("Cannot unconsult '{fq}' — system namespaces cannot be removed."),
+                "Protected namespace",
+            ),
+            K::Container => refuse(
+                format!(
+                    "Cannot unconsult '{fq}' — structural container namespaces cannot be \
+                     removed. Unmount or unconsult their child namespaces instead."
+                ),
+                "Protected namespace",
+            ),
+        },
+        Verb::Refresh => match kind {
+            K::Data => Ok(()),
+            K::System
+            | K::Container
+            | K::Lib
+            | K::Scratch
+            | K::Grounded
+            | K::Blueprint
+            | K::Unknown => refuse(
+                format!(
+                    "Cannot refresh '{fq}' — it is a {kind} namespace. refresh!() only works on \
+                     data namespaces. Use reconsult!() for lib namespaces."
+                ),
+                "Wrong namespace kind",
+            ),
+        },
+    }
+}
+
+/// Whether `verb` acts on the live namespace `live`, by its kind. `Err` is
+/// the refusal, naming the directive that does act on that kind where one
+/// does. Total over [`LiveKind`], with no fall-through.
+pub(crate) fn admit_live_kind(verb: LiveVerb, live: &LiveNamespace<'_>) -> Result<()> {
+    use LiveKind as K;
+    let fq = live.fq();
+    let kind = live.kind();
+    let refuse = |message: String, details: &str| {
+        Err(DelightQLError::from(Runtime::General {
+            message,
+            details: details.to_string(),
+        }))
+    };
+    match verb {
+        LiveVerb::Reconsult => match kind {
+            K::Lib | K::Scratch | K::Unknown => Ok(()),
+            K::Data => refuse(
+                format!("Cannot reconsult '{fq}' — it is a data namespace. Use refresh!() instead."),
+                "Wrong namespace kind",
+            ),
+            K::System => refuse(
+                format!("Cannot reconsult '{fq}' — system namespaces cannot be modified."),
+                "Protected namespace",
+            ),
+            K::Container => refuse(
+                format!(
+                    "Cannot reconsult '{fq}' — structural container namespaces have no \
+                     authored source. Reconsult their child namespaces instead."
+                ),
+                "Protected namespace",
+            ),
+            K::Grounded => refuse(
+                format!(
+                    "Cannot reconsult '{fq}' — it is a grounded namespace. Reconsult the \
+                     source lib namespace instead."
+                ),
+                "Wrong namespace kind",
+            ),
+        },
+        LiveVerb::ImprintSource => match kind {
+            K::Lib | K::Scratch => Ok(()),
+            K::System | K::Container | K::Data | K::Grounded | K::Unknown => Err(Runtime::catalog(
+                format!("imprint!() source '{fq}' is a {kind} namespace. Source must be a lib namespace."),
+                "Wrong namespace kind",
+            )),
+        },
+        LiveVerb::ImprintTarget => match kind {
+            K::Data => Ok(()),
+            K::System | K::Container | K::Lib | K::Scratch | K::Grounded | K::Unknown => {
+                Err(Runtime::catalog(
+                    format!(
+                        "imprint!() target '{fq}' is a {kind} namespace. Target must be a data \
+                         namespace."
+                    ),
+                    "Wrong namespace kind",
+                ))
+            }
+        },
     }
 }
 
@@ -341,7 +541,7 @@ mod tests {
         }
         assert_eq!(
             LiveNamespace::admit(&c, "nokind").unwrap().unwrap().kind(),
-            "unknown"
+            LiveKind::Unknown
         );
     }
 
@@ -424,5 +624,88 @@ mod tests {
         let c = Catalog::over(&s);
         c.execute_batch("DROP TABLE grounding").unwrap();
         assert!(ImprintSource::admit(&c, "lib").is_err());
+    }
+
+    #[test]
+    fn a_kind_no_producer_writes_refuses_admission_without_a_panic() {
+        let s = store();
+        let c = Catalog::over(&s);
+        c.execute(
+            "INSERT INTO namespace (id, name, fq_name, kind) VALUES (11, 'odd', 'odd', 'archive')",
+            [],
+        )
+        .unwrap();
+        let e = LiveNamespace::admit(&c, "odd").unwrap_err();
+        assert_eq!(e.error_uri(), "delightql-error://internal/invariant");
+    }
+
+    #[test]
+    fn every_named_verb_decides_every_kind() {
+        use NamespaceKind as K;
+        for kind in NamespaceKind::ALL {
+            let admitted = |verb| admit_kind(verb, "n", kind).is_ok();
+            assert_eq!(
+                admitted(Verb::Unmount),
+                kind == K::Data,
+                "unmount! of {kind}"
+            );
+            assert_eq!(
+                admitted(Verb::Refresh),
+                kind == K::Data,
+                "refresh! of {kind}"
+            );
+            assert_eq!(
+                admitted(Verb::Unconsult),
+                matches!(
+                    kind,
+                    K::Lib | K::Scratch | K::Grounded | K::Unknown | K::Blueprint
+                ),
+                "unconsult! of {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_archive_is_removed_by_unconsult_and_no_other_named_verb() {
+        admit_kind(
+            Verb::Unconsult,
+            "main::_0_blueprint",
+            NamespaceKind::Blueprint,
+        )
+        .unwrap();
+        for verb in [Verb::Unmount, Verb::Refresh] {
+            let e = admit_kind(verb, "main::_0_blueprint", NamespaceKind::Blueprint).unwrap_err();
+            assert!(
+                e.to_string().contains("it is a blueprint namespace"),
+                "{verb:?}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_live_verbs_admit_their_kinds_positively() {
+        let s = store();
+        let c = Catalog::over(&s);
+        for (fq, reconsult, source, target) in [
+            ("main", false, false, true),
+            ("lib", true, true, false),
+            ("home::scr", true, true, false),
+            ("g", false, false, false),
+            ("nokind", true, false, false),
+            ("main::_0_blueprintx", true, true, false),
+        ] {
+            let live = LiveNamespace::admit(&c, fq).unwrap().unwrap();
+            for (verb, expected) in [
+                (LiveVerb::Reconsult, reconsult),
+                (LiveVerb::ImprintSource, source),
+                (LiveVerb::ImprintTarget, target),
+            ] {
+                assert_eq!(
+                    admit_live_kind(verb, &live).is_ok(),
+                    expected,
+                    "{verb:?} of '{fq}'"
+                );
+            }
+        }
     }
 }

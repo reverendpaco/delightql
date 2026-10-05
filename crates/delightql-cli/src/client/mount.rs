@@ -30,26 +30,37 @@ pub const REPL_SESSION_LOCATOR: &str = "delightql-repl://session";
 /// public relations need no cross-connection plan.
 pub const REPL_DATA_NAMESPACE: &str = "repl::data";
 
-/// The fixed wrapper-definition program: for each public namespace, its one
-/// projection body. Projections only — they may rename or arrange columns
+/// The fixed wrapper-definition programs: for each public namespace, its
+/// projection bodies. Projections only — they may rename or arrange columns
 /// but never keep a second copy of a row.
-// `option` is stropped in BOTH positions: the admission law refuses a
-// reserved word bare in every naming position, qualified or not.
 const WRAPPER_DEFINITIONS: &[(&str, &str)] = &[
     (
         "repl::surface",
-        "`dot_command`(*) :- repl::data.dot_command(*)\n",
+        include_str!("../../autoload/repl/surface.dql"),
     ),
-    ("repl::config", "`option`(*) :- repl::data.`option`(*)\n"),
-    ("repl::history", "`input`(*) :- repl::data.input(*)\n"),
-    ("repl::errors", "incident(*) :- repl::data.incident(*)\n"),
+    (
+        "repl::config",
+        include_str!("../../autoload/repl/config.dql"),
+    ),
+    (
+        "repl::history",
+        include_str!("../../autoload/repl/history.dql"),
+    ),
+    (
+        "repl::errors",
+        include_str!("../../autoload/repl/errors.dql"),
+    ),
     (
         "repl::context",
-        "session(*) :- repl::data.session(*)\n\
-         argument(*) :- repl::data.argument(*)\n\
-         environment(*) :- repl::data.environment(*)\n",
+        include_str!("../../autoload/repl/context.dql"),
     ),
 ];
+
+/// The client's utility namespace: rules for the person at the prompt,
+/// enlisted with the session so they answer bare there and nowhere else.
+pub const REPL_UTIL_NAMESPACE: &str = "repl::util";
+
+const REPL_UTIL_PROGRAM: &str = include_str!("../../autoload/repl/util.dql");
 
 /// The client profile's types-level mount factory. Only a handle opened
 /// under `SessionProfile::Client` over a client database receives one; a
@@ -145,13 +156,18 @@ pub fn install_repl_namespace_with(
     // namespace, and it reads a file; the program is fixed client text, so
     // it rides through a short-lived temp file that never carries session
     // data and is removed as soon as the consult returns.
-    for (namespace, program) in WRAPPER_DEFINITIONS {
+    let utility = [(REPL_UTIL_NAMESPACE, REPL_UTIL_PROGRAM)];
+    for (namespace, program) in WRAPPER_DEFINITIONS.iter().chain(&utility) {
         let mut file = tempfile::NamedTempFile::new()?;
         file.write_all(program.as_bytes())?;
         file.flush()?;
         let path = file.path().display().to_string();
         run(&format!("consult!(\"{path}\", \"{namespace}\")(*)"))?;
     }
+    // The utilities answer bare at the prompt: the session enlists them,
+    // so a reset — which returns the enlist set to its start — takes them
+    // back with this install.
+    run(&format!("enlist!(\"{REPL_UTIL_NAMESPACE}\")(*)"))?;
 
     // One known relation must answer before the namespace is called
     // restored: the session row exists in every build and mode (the

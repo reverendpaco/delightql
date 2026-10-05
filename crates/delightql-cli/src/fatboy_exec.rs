@@ -201,7 +201,7 @@ impl FatboyRelay {
         let session = match client
             .version(
                 1_000_000,
-                b"relay0".to_vec(),
+                delightql_protocol::PROTOCOL_VERSION.to_vec(),
                 300_000,
                 vec![Orientation::Rows],
             )
@@ -686,10 +686,8 @@ impl DatabaseSchema for FatboySchema {
         let escaped = table_name.replace('\'', "''");
         // Schema scoping, per profile (E-T5): on Postgres the lookup
         // prefers the SESSION'S OWN temp schema when the name is temp-held,
-        // else the mounted schema — the same COALESCE scoping E-T4 ruled
-        // for the registration read-back (`created_object_readback_sql`),
-        // and PG's own resolution order (temp shadows public for
-        // unqualified names, P1 §B). Without it a plan-created temp table
+        // else the mounted schema — PG's own resolution order (temp shadows
+        // public for unqualified names, P1 §B). Without it a plan-created temp table
         // (`|> temp_table!(staged(*))(*)`) is invisible to the NEXT statement's
         // column lookup — the read-back registers it, then live resolution
         // scoped to 'public' answers None ("Table not found"). DuckDB never

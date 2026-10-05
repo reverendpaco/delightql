@@ -34,6 +34,9 @@ pub struct DqlColumnInfo {
     pub position: usize,
     /// Null-terminated type descriptor (e.g., "INTEGER", "TEXT"). Owned by the DqlQueryResult.
     pub type_name: *mut std::os::raw::c_char,
+    /// 1 when the compiler minted `name`, 0 when someone authored it. A
+    /// minted name's spelling moves between compilations; do not key on it.
+    pub minted: u8,
 }
 
 /// Result of dql_query(). Caller must free with dql_free_query_result().

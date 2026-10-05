@@ -17,7 +17,7 @@
 //! - helpers: QualifiedName
 //! - paths: Path, PathStep, JsonAccess — the reach into a value
 //! - references: Reference, NamedReference — addressing a column
-//! - spreads: Spread, Glob, RegexSelector, SelectorItem, RenameSource
+//! - spreads: Spread, Glob, RegexSelector, RegexCase, SelectorItem, RenameSource
 
 pub mod access;
 pub mod chain;
@@ -29,7 +29,6 @@ pub mod metadata_group;
 pub mod metadata_types;
 pub mod paths;
 pub mod patterns;
-pub mod pipes;
 pub mod references;
 pub mod relational;
 pub mod spreads;
@@ -40,10 +39,10 @@ pub mod truth;
 pub use access::{Access, Slot};
 pub use chain::{
     AnonRelation, AnonTable, BagCorrelation, Chain, Continuation, CorrPred, Correspondence, Datum,
-    ErJoinStep, Grelex, GroundForm, HeaderItem, MemberCorrelation, Peel, RunForm, Standing, Step,
+    ErJoinStep, Grelex, GroundForm, HeaderItem, MemberCorrelation, Peel, Step,
     StructuralForm, StructuralStep, TabularBody, TabularRow, Transparent, WholeHeading,
 };
-pub use domain::{DomainExpression, DomainHole, FormalHole};
+pub use domain::{DomainExpression, DomainHole};
 pub use enclyph::{Enclyph, Record, RecordMember, Tuple, TupleElement};
 pub use functions::{
     Callable, CaseExpression, Crossing, FactFunctionArm, FactFunctionDefinition, FactFunctionMode,
@@ -54,20 +53,18 @@ pub use functions::{
 pub use helpers::QualifiedName;
 pub use metadata_group::{MetadataGroup, MetadataTarget};
 pub use metadata_types::{
-    CteRequirements, FilterOrigin, NestedMemberCteInfo, ReductionPlan, SetOperator,
-    TreeGroupLocation, TreeGroupPlan,
+    Collection, FilterOrigin, ReductionPlan, SetOperator, TreeGroupPlan,
 };
 pub use paths::{JsonAccess, Path, PathStep};
 pub use patterns::{
-    ArrayPattern, ArrayPatternMember, PathBinding, PatternTarget, RecordPattern,
-    RecordPatternMember, TreePattern,
+    ArrayPattern, ArrayPatternMember, DestructurePattern, IterationPattern, MetadataBinding,
+    NestedPattern, PathBinding, PatternTarget, RecordPattern, RecordPatternMember, TreePattern,
 };
-pub use pipes::{DestructureMapping, DestructureMode};
 pub use references::{NamedReference, Reference};
 pub use relational::{DeferredItem, GroundMention, InnerRelationPattern, Relation};
-pub use spreads::{Glob, RegexSelector, RenameSource, SelectorItem, Spread};
+pub use spreads::{Glob, RegexCase, RegexSelector, RenameSource, SelectorItem, Spread};
 pub use truth::{
     ArgumentValue, Comparison, Existence, Membership, MembershipSource, Polarity, Probe,
-    ProbeAddressing, RelationalMembership, SigmaApplication, TruthConsumer, TruthExpression,
+    ProbeAddressing, RelationalMembership, SigmaApplication, TruthExpression,
     ValueRow,
 };

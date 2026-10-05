@@ -55,6 +55,7 @@
 
 pub mod authored;
 pub mod client;
+pub mod configuration;
 pub mod dml;
 pub mod imprint;
 pub mod internal;
@@ -74,6 +75,7 @@ pub use crate::taxon::{
 };
 pub use authored::Authored;
 pub use client::Client;
+pub use configuration::Configuration;
 pub use delightql_macros::Taxon;
 pub use dml::{Dml, DmlMarker, DmlRoles, DmlShape, DmlSource};
 pub use imprint::{Blueprint, Imprint, Manifest};
@@ -176,6 +178,13 @@ pub enum DelightQLError {
     #[family("client", summary = "An incident of the interactive client itself.")]
     #[error(transparent)]
     Client(Client),
+
+    /// What a host stated at boot, refused. Admission happens at the public
+    /// Core construction boundary, before session or bootstrap state exists,
+    /// so every host observes the same typed refusal.
+    #[family("configuration", summary = "A host's boot settings are invalid.")]
+    #[error(transparent)]
+    Configuration(Configuration),
 
     /// What a program says about itself: the one identity an authored
     /// `abort!` reaches. The authored label is occurrence prose; authors

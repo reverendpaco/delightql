@@ -13,20 +13,20 @@ path. The pipeline attempts to compile the query; if compilation
 fails and the actual error matches the URI, the assertion passes.
 
 ```delightql
--- should fail: table does not exist
-nonexistent_table(*) (~~error://resolution/table_not_found ~~)
+// should fail: table does not exist
+nonexistent_table(*) (~~error://semantic/resolution/table ~~)
 
--- should fail: column not in scope
-users(*) |> (no_such_column) (~~error://resolution/column_not_found ~~)
+// should fail: column not in scope
+customer(*) |> (no_such_column) (~~error://semantic/resolution/column ~~)
 
--- should fail: any validation error (prefix match)
-users(*), age in (1,2,3) (~~error://validation ~~)
+// should fail: any semantic error (prefix match)
+invoice(*), total in (1,2,3) (~~error://semantic ~~)
 ```
 
 A bare error annotation with no URI matches any error:
 
 ```delightql
--- should fail with some error, don't care which
+// should fail with some error, don't care which
 bad_query(*) (~~error ~~)
 ```
 
@@ -35,9 +35,9 @@ Errors are rarely needed for end users.
 ## URI Prefix Matching {.dqlh}
 
 The URI is matched as a prefix against the actual error's canonical
-URI. `error://resolution` matches `resolution/table_not_found`,
-`resolution/column_not_found`, and any future `resolution/*` error.
-`error://validation/arity` matches only `validation/arity` and its
+URI. `error://semantic/resolution` matches `semantic/resolution/table`,
+`semantic/resolution/column`, and any future `semantic/resolution/*` error.
+`error://semantic/arity` matches only `semantic/arity` and its
 sub-paths.
 
 ## Error URI Categories {.dqlh}
@@ -46,23 +46,22 @@ Each `DelightQLError` variant maps to a canonical URI path. The URI
 is a stable identifier for the error category, reusable in
 documentation, tooling, and diagnostics.
 
-| URI | Phase | Meaning |
-|-----|-------|---------|
-| `parse` | compile | Syntax-level parse failure |
-| `resolution/table_not_found` | compile | Table not in schema |
-| `resolution/column_not_found` | compile | Column not in scope |
-| `validation/arity` | compile | Wrong number of arguments |
-| `validation/ambiguous` | compile | Ambiguous column reference |
-| `validation/duplicate` | compile | Duplicate name or definition |
-| `build/*` | compile | AST construction errors |
-| `transform/*` | compile | SQL generation errors |
-| `limitation/*` | compile | Known limitations |
-| `runtime/bug` | runtime | Generated SQL rejected by backend (compiler defect) |
-| `runtime/collision` | runtime | Namespace or resource already exists (duplicate mount!/consult!) |
-| `runtime/useafterfree` | runtime | Accessing parted or unavailable resource (use after part!) |
-| `runtime/assertion` | runtime | Data assertion verdict is fail |
+| URI | Meaning |
+|-----|---------|
+| `authored` | A termination the program itself demanded. |
+| `client` | An incident of the interactive client itself. |
+| `configuration` | A host's boot settings are invalid. |
+| `dml` | A data-modification query violated DML shape rules. |
+| `imprint` | A blueprint or manifest lifecycle refusal. |
+| `internal` | A defect in DelightQL itself. |
+| `namespace` | A namespace-creation policy refusal. |
+| `operational` | This session refuses to run a valid query. |
+| `parse` | The source text is structurally invalid. |
+| `runtime` | An execution-time failure. |
+| `semantic` | The query is well-formed but semantically invalid. |
+| `target` | The foreign engine rejected or failed the query. |
 
-: Error URI categories
+: Top-level error URI families (`dql explain delightql-error://<family>` lists each family's members)
 
 
 ## Coexistence with Data Assertions {.dqlh}
@@ -71,12 +70,12 @@ Error assertions and data assertions can appear in the same file,
 documenting both correct and incorrect forms:
 
 ```delightql
--- correct: an ordinary assertion effect checks the established relation
-users(*), age > 0
-  !> assert!(exists(*), "a positive-age row exists")(*)
+// correct: an ordinary assertion effect checks the established relation
+invoice(*), total > 0
+  !> assert!(exists(*), "a positive-total row exists")(*)
 
--- incorrect: commas produce a multi-column single-row relation
-users(*), age in (1,2,3) (~~error://validation ~~)
+// incorrect: commas produce a multi-column single-row relation
+invoice(*), total in (1,2,3) (~~error://semantic/membership ~~)
 ```
 
 ## Scope {.dqlh}

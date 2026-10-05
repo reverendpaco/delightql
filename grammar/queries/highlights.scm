@@ -50,6 +50,10 @@
 (rename (star_sigil) @punctuation.special)
 (reposition (star_sigil) @punctuation.special)
 
+; A definition-owned scalar reference: the sigil and the formal it reads.
+(parameter_sigil) @punctuation.special
+(parameter_reference name: (_) @variable.parameter)
+
 (effect_marker) @operator.dangerous
 (mutation_marker) @operator.dangerous
 (outer_marker) @operator.modifier
@@ -69,6 +73,7 @@
 (transitive_edge_sigil) @operator
 (lift_sigil) @operator
 (separator) @punctuation.special
+(singleton_sigil) @punctuation.special
 (binary_op) @operator
 (cmp_op) @operator
 
@@ -93,8 +98,6 @@
 (stropped_form) @variable
 (comment) @comment
 (smart_comment) @comment.documentation
-(stop_point) @comment.warning
-(debug_point) @comment.warning
 
 (template_text) @string
 (triple_template_text) @string
@@ -107,20 +110,22 @@
 (citation name: (identifier) @function)
 
 ; A definition's SUBJECT. The subject stands ON the form — never buried in a
-; heading — so ONE pattern through the `rule_form` supertype reaches every
-; form that declares the same KIND of name, and four do.
+; heading — so every `rule_form` member is addressed the same way, by its own
+; `name` field, one pattern per member. Four members name a predicate; an
+; effect's name carries its mark; a constant is named by a bare identifier.
 ;
-; The other two declare their own kind: an effect's name carries its mark, and
-; a constant is named by a bare identifier. Their patterns name the form
-; because the supertype spelling does not RESOLVE for them — measured:
-; `(rule_form name: (identifier) @d)` captures every identifier in the file,
-; body calls included. A pattern that highlights `users` in `adults(*) :-
-; users(*)` as a definition is worse than one that names a form.
-;
-; What keeps a seventh form from going silently unhighlighted is not the
-; supertype but `definition_names.rs`, which reads the grammar's own member
-; list and requires each member's subject to be captured and nothing else.
-(rule_form name: (predicate_identifier name: (identifier) @function.definition))
+; The supertype is not a road to the field. In a query a supertype stands
+; for its member SET: the children written under it must be members, and a
+; field cannot be reached through it, so `(rule_form name: …)` is refused
+; when the query compiles. What keeps a seventh member from going silently
+; unhighlighted is `definition_names.rs`, which reads the grammar's own
+; member list and each member's name kind, requires this file to carry that
+; member's pattern, and measures that the pattern captures the subject and
+; nothing else — a body call is never a definition.
+(fo_rule name: (predicate_identifier name: (identifier) @function.definition))
+(ho_rule name: (predicate_identifier name: (identifier) @function.definition))
+(function_rule name: (predicate_identifier name: (identifier) @function.definition))
+(sigma_rule name: (predicate_identifier name: (identifier) @function.definition))
 (effect_rule name: (effect_identifier) @function.definition)
 (constant_rule name: (identifier) @function.definition)
 

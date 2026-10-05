@@ -63,12 +63,18 @@ enum IntrinsicRenderKind {
 
 fn intrinsic_render_key(key: &str) -> Option<(IntrinsicRenderKind, Intrinsic)> {
     use crate::names::Intrinsic::{
-        Arbitrary, JsonEachArray, JsonEachObject, JsonExtractRaw, Round2, ScalarMax, ScalarMin,
+        Arbitrary, Exact, JsonEachArray, JsonEachDocument, JsonEachObject, JsonExtractRaw,
+        JsonLabel, JsonScalar, JsonSplice, Round2, ScalarMax, ScalarMin,
     };
     use IntrinsicRenderKind::{Function, Tvf};
 
     match key {
         "fn.__dql_json_extract_raw" => Some((Function, JsonExtractRaw)),
+        "fn.__dql_json_each_document" => Some((Function, JsonEachDocument)),
+        "fn.__dql_json_splice" => Some((Function, JsonSplice)),
+        "fn.__dql_json_scalar" => Some((Function, JsonScalar)),
+        "fn.__dql_json_label" => Some((Function, JsonLabel)),
+        "fn.__dql_exact" => Some((Function, Exact)),
         "fn.__dql_scalar_max" => Some((Function, ScalarMax)),
         "fn.__dql_scalar_min" => Some((Function, ScalarMin)),
         "fn.__dql_round_2" => Some((Function, Round2)),
@@ -174,6 +180,16 @@ impl DialectPack {
         self.render.get(dialect)?.get(key)
     }
 
+    /// A DQL type word's spelling on a dialect family: its `type.<word>`
+    /// render row, canonically the uppercased word. A cast and every other
+    /// place a DQL type word becomes target SQL spell it here.
+    pub fn type_spelling(&self, dialect: &str, word: &str) -> Result<String, String> {
+        match self.render(dialect, &format!("type.{}", word.to_ascii_lowercase())) {
+            Some(rule) => rule.template().map(str::to_string),
+            None => Ok(word.to_ascii_uppercase()),
+        }
+    }
+
     pub fn render_intrinsic_function(
         &self,
         dialect: &str,
@@ -211,10 +227,32 @@ impl DialectPack {
 // or argument SYNTHESIS (group_concat's implicit default separator).
 // ---------------------------------------------------------------------------
 
-/// A compiled render handler: rendered argument texts + the call's DISTINCT
-/// flag → the rendered call. Errors are loud (they surface as generator
-/// errors naming the render key).
-pub type RustRenderHandler = fn(args: &[&str], distinct: bool) -> Result<String, String>;
+/// ONE ARGUMENT AS A HANDLER RECEIVES IT: rendered SQL text, or — for a
+/// reach — the TYPED STEPS, because a handler that must spell a path in
+/// its target's representation renders the steps by that target's rules
+/// instead of re-reading a spelling meant for another target.
+#[derive(Clone, Copy, Debug)]
+pub enum RenderArg<'a> {
+    Sql(&'a str),
+    Path(&'a crate::pipeline::asts::core::Path),
+}
+
+/// The rendered texts of arguments that are all ordinary: a handler with
+/// no path position refuses a reach loudly rather than reading its steps
+/// as text.
+fn sql_args<'a>(args: &[RenderArg<'a>]) -> Result<Vec<&'a str>, String> {
+    args.iter()
+        .map(|arg| match arg {
+            RenderArg::Sql(sql) => Ok(*sql),
+            RenderArg::Path(_) => Err("a JSON path is not an argument of this call".to_string()),
+        })
+        .collect()
+}
+
+/// A compiled render handler: the call's arguments + its DISTINCT flag →
+/// the rendered call. Errors are loud (they surface as generator errors
+/// naming the render key).
+pub type RustRenderHandler = fn(args: &[RenderArg<'_>], distinct: bool) -> Result<String, String>;
 
 /// Resolve a `rust_handler` rule body to its compiled handler. A body with
 /// no entry here is a loud "unknown rust_handler" error at render time.
@@ -225,8 +263,28 @@ pub fn rust_render_handler(key: &str) -> Option<RustRenderHandler> {
         "pg_group_concat" => Some(pg_group_concat),
         "pg_scalar_max" => Some(pg_scalar_max),
         "pg_scalar_min" => Some(pg_scalar_min),
+        "json_each_document_is_value" => Some(json_each_document_is_value),
         _ => None,
     }
+}
+
+/// `__dql_json_each_document(value, kind)` → `value`. A typed-JSON target's
+/// sequence TVF hands every element back as one self-describing document,
+/// so the element's kind is spent unread. A handler rather than a `{0}`
+/// template because a template that never consumes an argument is refused:
+/// dropping the kind is this rule's whole content, stated here on purpose.
+fn json_each_document_is_value(args: &[RenderArg<'_>], distinct: bool) -> Result<String, String> {
+    if distinct {
+        return Err("DISTINCT is not valid on the element-document form".into());
+    }
+    let args = sql_args(args)?;
+    let [value, _kind] = args.as_slice() else {
+        return Err(format!(
+            "the element-document form takes (value, kind), got {} args",
+            args.len()
+        ));
+    };
+    Ok((*value).to_string())
 }
 
 /// SQLite's scalar `max(a, b, ...)` → NULL-propagating `GREATEST`.
@@ -237,13 +295,13 @@ pub fn rust_render_handler(key: &str) -> Option<RustRenderHandler> {
 /// bare GREATEST 18). The fidelity rule (the +like → ILIKE lesson) says
 /// preserve canonical semantics, and the NULL guard is variadic — a
 /// per-argument CASE a positional template cannot express.
-fn pg_scalar_max(args: &[&str], distinct: bool) -> Result<String, String> {
-    pg_scalar_extreme(args, distinct, "GREATEST")
+fn pg_scalar_max(args: &[RenderArg<'_>], distinct: bool) -> Result<String, String> {
+    pg_scalar_extreme(&sql_args(args)?, distinct, "GREATEST")
 }
 
 /// SQLite's scalar `min(a, b, ...)` → NULL-propagating `LEAST`.
-fn pg_scalar_min(args: &[&str], distinct: bool) -> Result<String, String> {
-    pg_scalar_extreme(args, distinct, "LEAST")
+fn pg_scalar_min(args: &[RenderArg<'_>], distinct: bool) -> Result<String, String> {
+    pg_scalar_extreme(&sql_args(args)?, distinct, "LEAST")
 }
 
 fn pg_scalar_extreme(args: &[&str], distinct: bool, fn_name: &str) -> Result<String, String> {
@@ -274,36 +332,46 @@ fn pg_scalar_extreme(args: &[&str], distinct: bool, fn_name: &str) -> Result<Str
 /// text-returning flavor for user-facing scalar reads (strings unquoted,
 /// matching SQLite; numbers become text → typed compares remain the known
 /// residual, same boundary as duckdb's `json_extract_string`).
-fn pg_json_path_text(args: &[&str], distinct: bool) -> Result<String, String> {
+fn pg_json_path_text(args: &[RenderArg<'_>], distinct: bool) -> Result<String, String> {
     pg_json_path(args, distinct, "#>>")
 }
 
 /// `json_extract(x, '$.a.b')` → `(CAST(x AS jsonb) #> '{a,b}')` — the
 /// json-returning flavor for `__dql_json_extract_raw` (subtrees stay json).
-fn pg_json_path_jsonb(args: &[&str], distinct: bool) -> Result<String, String> {
+fn pg_json_path_jsonb(args: &[RenderArg<'_>], distinct: bool) -> Result<String, String> {
     pg_json_path(args, distinct, "#>")
 }
 
-fn pg_json_path(args: &[&str], distinct: bool, op: &str) -> Result<String, String> {
+/// THE PATH ARRIVES TYPED: a reach the compiler made is rendered as the
+/// PostgreSQL array literal by the dialect's one renderer, keys quoted and
+/// escaped by the array literal's own rules and a negative index counting
+/// from the end. Only an AUTHORED string literal — a path the author spelled
+/// in SQLite's sub-language to a builtin — is read as text, and its
+/// unquoted keys are limited to what that reading can carry.
+fn pg_json_path(args: &[RenderArg<'_>], distinct: bool, op: &str) -> Result<String, String> {
     if distinct {
         return Err("DISTINCT is not valid on a json path read".into());
     }
-    let [source, path] = args else {
-        return Err(format!("json path read takes 2 args, got {}", args.len()));
+    let [RenderArg::Sql(source), path] = args else {
+        return Err(format!(
+            "json path read takes a source and a path, got {} args",
+            args.len()
+        ));
     };
-    let elems = parse_sqlite_json_path(path)?;
-    Ok(format!(
-        "(CAST({} AS jsonb) {} '{{{}}}')",
-        source,
-        op,
-        elems.join(",")
-    ))
+    let literal = match path {
+        RenderArg::Path(path) => {
+            crate::pipeline::generator::SqlDialect::PostgreSQL.json_path_literal(path)?
+        }
+        RenderArg::Sql(text) => format!("'{{{}}}'", parse_sqlite_json_path(text)?.join(",")),
+    };
+    Ok(format!("(CAST({source} AS jsonb) {op} {literal})"))
 }
 
-/// Parse a RENDERED SQLite json-path literal (`'$.a.b[0]'`, single-quoted
+/// Parse an AUTHORED SQLite json-path literal (`'$.a.b[0]'`, single-quoted
 /// SQL text) into PG text-array path elements. Only literal paths are
 /// supported — a dynamic path expression is a loud error, as is any key
-/// needing PG array-literal quoting (none exist in the measured corpus).
+/// needing PG array-literal quoting; a reach the compiler made never comes
+/// through here.
 fn parse_sqlite_json_path(rendered: &str) -> Result<Vec<String>, String> {
     let inner = rendered
         .strip_prefix('\'')
@@ -392,9 +460,9 @@ fn parse_sqlite_json_path(rendered: &str) -> Result<Vec<String>, String> {
 /// `group_concat(x, sep)` → `string_agg(x::text, sep)`. DISTINCT passes
 /// through — but PG rejects DISTINCT with a separate ORDER BY... none in
 /// the corpus; string_agg(DISTINCT x, sep) itself is valid.
-fn pg_group_concat(args: &[&str], distinct: bool) -> Result<String, String> {
+fn pg_group_concat(args: &[RenderArg<'_>], distinct: bool) -> Result<String, String> {
     let prefix = if distinct { "DISTINCT " } else { "" };
-    match args {
+    match sql_args(args)?.as_slice() {
         [x] => Ok(format!("string_agg({}CAST({} AS text), ',')", prefix, x)),
         [x, sep] => Ok(format!(
             "string_agg({}CAST({} AS text), {})",
@@ -462,6 +530,10 @@ pub fn apply_template(template: &str, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    fn sql<'a>(texts: &[&'a str]) -> Vec<RenderArg<'a>> {
+        texts.iter().map(|text| RenderArg::Sql(text)).collect()
+    }
+
     use super::*;
 
     /// The SQLite renderer quotes every structural json-path key; this
@@ -581,41 +653,61 @@ mod tests {
     fn pg_json_path_handlers() {
         let text = rust_render_handler("pg_json_path_text").unwrap();
         assert_eq!(
-            text(&["j", "'$.a.b'"], false).unwrap(),
+            text(&sql(&["j", "'$.a.b'"]), false).unwrap(),
             "(CAST(j AS jsonb) #>> '{a,b}')"
         );
         assert_eq!(
-            text(&["t.col", "'$[0].x'"], false).unwrap(),
+            text(&sql(&["t.col", "'$[0].x'"]), false).unwrap(),
             "(CAST(t.col AS jsonb) #>> '{0,x}')"
         );
         let jsonb = rust_render_handler("pg_json_path_jsonb").unwrap();
         assert_eq!(
-            jsonb(&["j", "'$.scripts'"], false).unwrap(),
+            jsonb(&sql(&["j", "'$.scripts'"]), false).unwrap(),
             "(CAST(j AS jsonb) #> '{scripts}')"
         );
         // loud errors: dynamic path, root-only path, DISTINCT, bad index
-        assert!(text(&["j", "some_expr"], false).is_err());
-        assert!(text(&["j", "'$'"], false).is_err());
-        assert!(text(&["j", "'$.a'"], true).is_err());
-        assert!(text(&["j", "'$[x]'"], false).is_err());
+        assert!(text(&sql(&["j", "some_expr"]), false).is_err());
+        assert!(text(&sql(&["j", "'$'"]), false).is_err());
+        assert!(text(&sql(&["j", "'$.a'"]), true).is_err());
+        assert!(text(&sql(&["j", "'$[x]'"]), false).is_err());
+    }
+
+    /// A REACH THE COMPILER MADE arrives as typed steps and is rendered by
+    /// PostgreSQL's own rules: a comma, a quote or a brace in a key is one
+    /// element, and a negative index counts from the end.
+    #[test]
+    fn pg_json_path_handlers_render_typed_steps() {
+        use crate::pipeline::asts::core::{Path, PathStep};
+        let text = rust_render_handler("pg_json_path_text").unwrap();
+        let path = Path::key("a,b")
+            .then(PathStep::Key("q\"k{}".to_string()))
+            .then(PathStep::Index(-1));
+        assert_eq!(
+            text(&[RenderArg::Sql("j"), RenderArg::Path(&path)], false).unwrap(),
+            r#"(CAST(j AS jsonb) #>> '{"a,b","q\"k{}",-1}')"#
+        );
+        // A handler with no path position refuses a reach rather than
+        // reading its steps as text.
+        let h = rust_render_handler("pg_group_concat").unwrap();
+        assert!(h(&[RenderArg::Path(&path)], false).is_err());
     }
 
     #[test]
     fn pg_group_concat_handler() {
         let h = rust_render_handler("pg_group_concat").unwrap();
         assert_eq!(
-            h(&["name"], false).unwrap(),
+            h(&sql(&["name"]), false).unwrap(),
             "string_agg(CAST(name AS text), ',')"
         );
         assert_eq!(
-            h(&["name", "'; '"], false).unwrap(),
+            h(&sql(&["name", "'; '"]), false).unwrap(),
             "string_agg(CAST(name AS text), '; ')"
         );
         assert_eq!(
-            h(&["name"], true).unwrap(),
+            h(&sql(&["name"]), true).unwrap(),
             "string_agg(DISTINCT CAST(name AS text), ',')"
         );
-        assert!(h(&[], false).is_err());
+        assert!(h(&sql(&[]), false).is_err());
     }
 
     #[test]

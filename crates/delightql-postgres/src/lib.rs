@@ -371,6 +371,7 @@ impl PgParty {
                 position: (i + 1) as u64,
                 name: name.as_bytes().to_vec(),
                 descriptor: dtype.as_bytes().to_vec(),
+                naming: delightql_protocol::Naming::Authored,
             })
             .collect();
 
@@ -573,16 +574,18 @@ impl Handler for PgParty {
         match term {
             // Orientation negotiation: intersect with what we
             // support ([Rows], like SqlParty), error on empty agreement.
-            // protocol_version/max_message_size/lease_ms echoed — the
-            // fatboy grows an opinion about the version string when it
-            // becomes a separately-released binary; the lease
-            // becomes load-bearing at spawn-on-demand.
+            // A foreign protocol version is refused; max_message_size and
+            // lease_ms are echoed — the lease becomes load-bearing at
+            // spawn-on-demand.
             ClientTerm::Version {
                 max_message_size,
                 protocol_version,
                 lease_ms,
                 orientations,
             } => {
+                if let Some(refusal) = delightql_protocol::version_refusal(&protocol_version) {
+                    return ServerTerm::Error(delightql_protocol::WireError::of(&refusal));
+                }
                 let supported = [Orientation::Rows];
                 let agreed: Vec<Orientation> = orientations
                     .iter()
@@ -680,7 +683,7 @@ mod tests {
         let party = party_on(conninfo)?;
         let client = RelayClient::new(DirectTransport::new(party));
         let VersionResult::Accepted(session) = client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Rows])
+            .version(1_000_000, delightql_protocol::PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Rows])
             .unwrap()
         else {
             panic!("handshake should succeed")
@@ -708,7 +711,7 @@ mod tests {
         let result = client
             .version(
                 1_000_000,
-                b("relay0"),
+                delightql_protocol::PROTOCOL_VERSION.to_vec(),
                 300_000,
                 vec![Orientation::Rows, Orientation::Columns],
             )
@@ -729,7 +732,7 @@ mod tests {
         let Some(party) = test_party() else { return };
         let client = RelayClient::new(DirectTransport::new(party));
         let result = client
-            .version(1_000_000, b("relay0"), 300_000, vec![Orientation::Columns])
+            .version(1_000_000, delightql_protocol::PROTOCOL_VERSION.to_vec(), 300_000, vec![Orientation::Columns])
             .unwrap();
         assert!(matches!(result, VersionResult::Rejected(_)));
     }
@@ -952,11 +955,13 @@ mod tests {
                 position: 1,
                 name: b("id"),
                 descriptor: b("int4"),
+                naming: delightql_protocol::Naming::Authored,
             },
             delightql_protocol::Dimension {
                 position: 2,
                 name: b("name"),
                 descriptor: b("text"),
+                naming: delightql_protocol::Naming::Authored,
             },
         ];
         let load = match session

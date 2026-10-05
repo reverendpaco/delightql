@@ -11,7 +11,7 @@ A citation is a special calling syntax for any function of zero arity.
 
 ```delightql
 version:() :  "v1.2.8"
-users(*)
+employee(*)
   |> ( :version as vrs)
 ```
 
@@ -26,7 +26,7 @@ with zero arguments is *usually* effectively a constant.
 A symbol is special syntax for a string.
 
 ```delightql
-users(*) |> +( ::ident as some_identifier )
+employee(*) |> +( ::ident as some_identifier )
 ```
 
 Unlike a citation which requires a definition to use,

@@ -15,15 +15,18 @@
 use super::Normalizer;
 use crate::diagnostic::{DdlHead, FactFunction, Internal, Parse, Semantic};
 use crate::error::{DelightQLError, Result};
+use crate::pipeline::asts::core::definitions::ClauseFormals;
 use crate::pipeline::asts::core::definitions::{
-    name_conflict, Fixpoint, HeadItem, HeadItems, HoParam, Offered, ResidualMode, ResidualSignature,
+    name_conflict, HeadItem, HeadItems, HoParam, Offered, ResidualMode, ResidualSignature,
 };
 use crate::pipeline::asts::core::{
     AnonRelation, AnonTable, Chain, ContextMode, DomainExpression, FunctionApplication, GroundForm,
     HeaderItem, Query, TabularBody, TabularRow, Unresolved,
 };
 use crate::pipeline::asts::core::{NamedReference, Reference};
-use crate::pipeline::asts::ddl::{ClauseDecl, DdlBody, DefKind, DefSubject, DefinitionFront, Head};
+use crate::pipeline::asts::ddl::{
+    BodyText, ClauseDecl, DdlBody, DefKind, DefSubject, DefinitionFront, Head,
+};
 use crate::pipeline::syntax::cst;
 use delightql_types::SqlIdentifier;
 
@@ -64,61 +67,43 @@ impl<'t> Normalizer<'t> {
                 let head = self.require(rule.head(), "a rule has a head")?;
                 let body = self.require(rule.body(), "a rule has a body")?;
                 let name = self.definition_subject(name)?;
-                let heading = self.heading(head.into())?;
-                let fixpoint = heading.fixpoint;
-                let head = heading.head;
+                let head = self.heading(head.into())?;
                 let query = self.relex_query(body)?;
                 let doc = self.doc_slot(rule.children().filter_map(doc_slot_of))?;
-                Ok(self.clause(
+                self.clause(
                     DefKind::View,
                     DefSubject::Named(name.name.clone()),
                     head,
-                    fixpoint,
                     DdlBody::Relational(query),
                     self.text(rule),
                     doc,
-                ))
+                )
             }
             cst::RuleForm::HoRule(rule) => {
                 let name = self.require(rule.name(), "a rule names its subject")?;
+                let head = self.require(rule.head(), "a rule has a head")?;
                 let body = self.require(rule.body(), "a rule has a body")?;
-                let mut params = Vec::new();
-                for child in rule.children() {
-                    if let cst::HoRuleChild::HoParam(param) = child {
-                        params.push(self.ho_param(param)?);
-                    }
-                }
-                let mut items = Vec::new();
-                let mut glob = false;
-                for item in rule.head() {
-                    match item {
-                        cst::HoRuleHead::HeadTerm(term) => items.push(self.head_term(term)?),
-                        cst::HoRuleHead::Glob(_) => glob = true,
-                        cst::HoRuleHead::CommaSigil(_) => {}
-                    }
-                }
-                let parameterized = !params.is_empty();
-                let head = Head::higher_order(
-                    params,
-                    if glob {
-                        HeadItems::Glob
-                    } else {
-                        HeadItems::Listed(items)
-                    },
-                );
-                let relational = self.deferrable(parameterized, self.text(body), |n| {
-                    Ok(DdlBody::Relational(n.relex_query(body)?))
+                let head = self.heading(head.into())?;
+                let parameterized = head.param_count() > 0;
+                let text = self.body_text(self.text(body));
+                let scope = Self::declared_scope(head.ho_params.as_deref().unwrap_or_default());
+                let own = scope.id();
+                let relational = self.deferrable(parameterized, Some(scope), |n| {
+                    let mut query = n.relex_query(body)?;
+                    query.locals.clause_formals = ClauseFormals::Marked(own);
+                    Ok(DdlBody::Relational(query))
                 })?;
                 let doc = self.doc_slot(rule.children().filter_map(ho_rule_doc))?;
-                Ok(self.clause(
-                    DefKind::HoView,
-                    DefSubject::Named(self.definition_subject(name)?.name.clone()),
-                    head,
-                    Fixpoint::Bag,
-                    relational,
-                    self.text(rule),
-                    doc,
-                ))
+                Ok(self
+                    .clause(
+                        DefKind::HoView,
+                        DefSubject::Named(self.definition_subject(name)?.name.clone()),
+                        head,
+                        relational,
+                        self.text(rule),
+                        doc,
+                    )?
+                    .with_body_text(text))
             }
             cst::RuleForm::FunctionRule(rule) => {
                 let name = self.require(rule.name(), "a rule names its subject")?;
@@ -132,29 +117,7 @@ impl<'t> Normalizer<'t> {
                     if let cst::FunctionRuleChild::FunctionParam(param) = child {
                         match param {
                             cst::FunctionParam::ContextMarker(marker) => {
-                                // ONE capture per signature: a second marker
-                                // would silently overwrite the first, so it
-                                // refuses instead of last-wins.
-                                if context != ContextMode::None {
-                                    return Err(DelightQLError::from(
-                                        DdlHead::DuplicateContextMarker {
-                                            message:
-                                                "a signature declares its capture once — a second \
-                                         context marker has nothing to add and would silently \
-                                         replace the first. Keep one marker"
-                                                    .to_string(),
-                                        },
-                                    ));
-                                }
-                                // THE MARKER LEADS. A context call supplies
-                                // `..` first and a positional call binds the
-                                // captures first, so a marker declared after
-                                // a parameter would silently reorder every
-                                // call.
-                                if !params.is_empty() {
-                                    return Err(Self::context_marker_position_refusal());
-                                }
-                                context = self.context_mode(marker)
+                                self.declare_context(&mut context, params.is_empty(), marker)?
                             }
                             param => params.push(self.function_param(param)?),
                         }
@@ -162,19 +125,21 @@ impl<'t> Normalizer<'t> {
                 }
                 let parameterized = !params.is_empty();
                 let head = Head::signature(params).with_context(context);
-                let scalar = self.deferrable(parameterized, self.text(body), |n| {
+                let text = self.body_text(self.text(body));
+                let scalar = self.deferrable(parameterized, None, |n| {
                     Ok(DdlBody::Scalar(n.domain_expression(body)?))
                 })?;
                 let doc = self.doc_slot(rule.children().filter_map(function_rule_doc))?;
-                Ok(self.clause(
-                    DefKind::Function,
-                    DefSubject::Named(self.definition_subject(name)?.name.clone()),
-                    head,
-                    Fixpoint::Bag,
-                    scalar,
-                    self.text(rule),
-                    doc,
-                ))
+                Ok(self
+                    .clause(
+                        DefKind::Function,
+                        DefSubject::Named(self.definition_subject(name)?.name.clone()),
+                        head,
+                        scalar,
+                        self.text(rule),
+                        doc,
+                    )?
+                    .with_body_text(text))
             }
             // The NULLARY function rule, paren-less; the citation `:pi` is
             // its consumer.
@@ -183,15 +148,14 @@ impl<'t> Normalizer<'t> {
                 let body = self.require(rule.body(), "a constant has a body")?;
                 let expression = self.domain_expression(body)?;
                 let doc = self.doc_slot(rule.children().filter_map(constant_doc))?;
-                Ok(self.clause(
+                self.clause(
                     DefKind::Function,
                     DefSubject::Named(self.identifier(name)),
                     Head::signature(Vec::new()),
-                    Fixpoint::Bag,
                     DdlBody::Scalar(expression),
                     self.text(rule),
                     doc,
-                ))
+                )
             }
             // The PREDICATE rule — truth category. The body's category is a
             // parse-level constraint, so `p(x) :- users` never reaches here.
@@ -211,15 +175,14 @@ impl<'t> Normalizer<'t> {
                     }
                 }
                 let doc = self.doc_slot(rule.children().filter_map(sigma_doc))?;
-                Ok(self.clause(
+                self.clause(
                     DefKind::Sigma,
                     DefSubject::Named(self.definition_subject(name)?.name.clone()),
                     Head::signature(params),
-                    Fixpoint::Bag,
                     DdlBody::Truth(condition),
                     self.text(rule),
                     doc,
-                ))
+                )
             }
             cst::RuleForm::EffectRule(rule) => {
                 let name = self.require(rule.name(), "a rule names its subject")?;
@@ -230,15 +193,19 @@ impl<'t> Normalizer<'t> {
                         params.push(self.ho_param(param)?);
                     }
                 }
-                let parameterized = !params.is_empty();
+                let scope = Self::declared_scope(&params);
                 let head = Head::higher_order(params, HeadItems::Glob);
                 // The effectual twin of the relational rule's `relex_query`:
                 // a let block, when one is written, and the chain it feeds.
-                let relational = self.deferrable(parameterized, self.text(body), |n| {
-                    Ok(DdlBody::Relational(n.effrelex_query(body)?))
-                })?;
+                // AN EFFECT BODY IS READ ONCE, HERE, as the query-scoped
+                // mirror's is: every invocation spends the body this reading
+                // keeps, so nothing waits for an argument, and a term that
+                // needs one refuses now under its own identity.
+                let own = scope.id();
+                let mut query = self.within_scope(scope, |n| n.effrelex_query(body))?;
+                query.locals.clause_formals = ClauseFormals::Marked(own);
                 let doc = self.doc_slot(rule.children().filter_map(effect_rule_doc))?;
-                Ok(self.clause(
+                self.clause(
                     DefKind::Effect,
                     // THE CATALOG SPELLING CARRIES THE MARK. An effect rule is
                     // registered under the name it is invoked by — the
@@ -249,20 +216,20 @@ impl<'t> Normalizer<'t> {
                         self.effect_subject_name(name)?,
                     )),
                     head,
-                    Fixpoint::Bag,
-                    relational,
+                    DdlBody::Relational(query),
                     self.text(rule),
                     doc,
-                ))
+                )
             }
         }
     }
 
-    /// A body whose head declares parameters cannot always be READ before a
-    /// call site supplies them: a bound naming a scalar formal has no integer
-    /// to be. That body is DEFERRED — the authored characters, held as such —
-    /// rather than fabricated with a stand-in value, and invocation
-    /// normalizes them again with the bindings in hand.
+    /// A body whose head declares parameters is DEFERRED where its reading
+    /// refuses with the compile-time integer identity (`semantic/limit/value`)
+    /// before a call site supplies anything — the clause keeps its authored
+    /// text, and invocation reads the text again. A scalar formal in a bound
+    /// or an ordinal is not such a refusal: it is recorded as the formal it
+    /// names.
     ///
     /// A SEMANTIC refusal is not a deferral. A rule the body breaks is broken
     /// whatever the arguments turn out to be, so it propagates eagerly and the
@@ -273,21 +240,61 @@ impl<'t> Normalizer<'t> {
     /// in hand, a body that still cannot read a term has been told what the
     /// term is — so the refusal is the answer, and deferring it again would
     /// hide the call site's own mistake behind a second wait.
+    ///
+    /// A relational higher-order clause reads its body within its own marked
+    /// `scope`; every later reading opens that scope again over the scopes
+    /// its [`BodyText`] records.
     fn deferrable(
         &mut self,
         parameterized: bool,
-        source: &str,
+        scope: Option<crate::pipeline::asts::core::definitions::MarkedScope>,
         body: impl FnOnce(&mut Self) -> Result<DdlBody>,
     ) -> Result<DdlBody> {
-        let source = source.to_string();
         let unbound = self.bindings().is_none();
-        match body(self) {
+        let read = match scope {
+            Some(scope) => self.within_scope(scope, body),
+            None => body(self),
+        };
+        match read {
             Ok(built) => Ok(built),
             Err(error) if parameterized && unbound && awaits_substitution(&error) => {
-                Ok(DdlBody::Deferred { source })
+                Ok(DdlBody::Deferred)
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// A parameterized body's own text, as it stands here: its characters
+    /// and the marked scopes around its clause.
+    pub(crate) fn body_text(&self, source: &str) -> BodyText {
+        BodyText {
+            source: source.to_string(),
+            enclosing: self.marked.clone(),
+        }
+    }
+
+    /// A QUERY-SCOPED PARAMETERIZED BODY, READ WHERE IT IS DECLARED, by the
+    /// same rule a consulted body is read by at its declaration: with none of
+    /// its own arguments in hand, a term that awaits a substitution waits for
+    /// a use, and every other refusal refuses now, whether or not anything
+    /// uses the definition. The reader is the body's own, over the same tree
+    /// and names, so nothing the body declares lands on the statement that
+    /// declares it — and no argument of an enclosing body stands in for one
+    /// of this definition's. It stands in the marked scopes the body is
+    /// written in, `scope` nearest: the formal NAMES around it, with no
+    /// actual of any, so a `$.x` that selects nothing refuses here, on either
+    /// neck. What it read is the body the clause keeps.
+    pub(crate) fn declared_body(
+        &self,
+        parameterized: bool,
+        scope: crate::pipeline::asts::core::definitions::MarkedScope,
+        body: impl FnOnce(&mut Normalizer<'t>) -> Result<DdlBody>,
+    ) -> Result<DdlBody> {
+        let mut reader = Normalizer::new(self.tree, std::rc::Rc::clone(&self.registry));
+        reader.system_child_block = self.system_child_block;
+        reader.stored_source = self.stored_source;
+        reader.marked = self.marked.clone();
+        reader.deferrable(parameterized, Some(scope), body)
     }
 
     fn effect_subject_name(&self, node: cst::EffectIdentifier<'t>) -> Result<String> {
@@ -431,11 +438,37 @@ impl<'t> Normalizer<'t> {
         }
     }
 
+    /// ONE CAPTURE PER SIGNATURE, AND IT LEADS — the judgment of a context
+    /// marker in any value-function head. A second marker would silently
+    /// replace the first, so it refuses rather than last-wins. A context
+    /// call supplies `..` first and a positional call binds the captures
+    /// first, so a marker declared after a parameter would silently reorder
+    /// every call. `leads` says whether no parameter precedes the marker.
+    pub(crate) fn declare_context(
+        &mut self,
+        context: &mut ContextMode,
+        leads: bool,
+        marker: cst::ContextMarker<'t>,
+    ) -> Result<()> {
+        if *context != ContextMode::None {
+            return Err(DelightQLError::from(DdlHead::DuplicateContextMarker {
+                message: "a signature declares its capture once — a second context marker has \
+                          nothing to add and would silently replace the first. Keep one marker"
+                    .to_string(),
+            }));
+        }
+        if !leads {
+            return Err(Self::context_marker_position_refusal());
+        }
+        *context = self.context_mode(marker);
+        Ok(())
+    }
+
     /// THE MARKER LEADS. The context capture is the signature's first
     /// declaration at both faces: a context call supplies `..` first, and a
     /// positional call binds the captures first — so a marker declared after
     /// a parameter would silently reorder every call.
-    pub(crate) fn context_marker_position_refusal() -> DelightQLError {
+    fn context_marker_position_refusal() -> DelightQLError {
         DelightQLError::from(DdlHead::ContextPosition {
             message: "the context capture leads the signature — a `..` declared after a \
              parameter would silently reorder every call"
@@ -496,19 +529,17 @@ impl<'t> Normalizer<'t> {
                 let subject_ident = self.definition_subject(name)?.name.clone();
                 let subject = subject_ident.as_str().to_string();
                 let (table, row_offers) = self.fact_body(&subject, body)?;
-                let mut decl = self.clause(
+                let decl = self.clause(
                     DefKind::Fact,
                     DefSubject::Named(subject_ident),
                     Head::glob(),
-                    Fixpoint::Bag,
                     DdlBody::Relational(Query::relational(Chain::authored(GroundForm::Literal(
                         AnonRelation::plain(table),
                     )))),
                     self.text(fact),
                     None,
-                );
-                decl.fact_row_offers = row_offers;
-                Ok(decl)
+                )?;
+                Ok(decl.with_fact_row_offers(row_offers))
             }
             // The PARAMETERIZED fact: a fact body behind a signature. Sugar
             // for the necked ho_rule-with-fact-body; ONE ELABORATION — so the
@@ -544,17 +575,16 @@ impl<'t> Normalizer<'t> {
                         ),
                     }));
                 }
-                Ok(self.clause(
+                self.clause(
                     DefKind::HoView,
                     DefSubject::Named(subject_ident),
                     Head::higher_order(params, items),
-                    Fixpoint::Bag,
                     DdlBody::Relational(Query::relational(Chain::authored(GroundForm::Literal(
                         AnonRelation::plain(table),
                     )))),
                     self.text(fact),
                     None,
-                ))
+                )
             }
         }
     }
@@ -759,11 +789,10 @@ impl<'t> Normalizer<'t> {
             }
         }
         let arms = self.require(Vec1::try_from_vec(arms), "a fact function has an arm")?;
-        Ok(self.clause(
+        self.clause(
             DefKind::FactFunction,
             DefSubject::Named(subject),
             Head::glob(),
-            Fixpoint::Bag,
             DdlBody::FactFunction(
                 crate::pipeline::asts::core::FactFunctionDefinition::assemble(FactFunctionMode {
                     inputs,
@@ -774,7 +803,7 @@ impl<'t> Normalizer<'t> {
             ),
             self.text(node),
             None,
-        ))
+        )
     }
 
     /// THE DECLARED INPUTS ARE THE OUTPUT CELLS' BINDERS.
@@ -855,42 +884,38 @@ impl<'t> Normalizer<'t> {
             &context,
         )?;
         let doc = self.doc_slot(node.children().filter_map(edge_doc))?;
-        Ok(self.clause(
+        self.clause(
             DefKind::Edge,
             DefSubject::edge(left_spelling, right_spelling, context),
             Head::glob(),
-            Fixpoint::Bag,
             DdlBody::Relational(query),
             self.text(node),
             doc,
-        ))
+        )
     }
 
     // -----------------------------------------------------------------
     // Shared clause assembly
     // -----------------------------------------------------------------
 
-    /// `fixpoint` is the flavor the AUTHORED head badged. Only a relational
-    /// rule head has a badge position — recursion is relation-form only — so
-    /// every other form states `Bag`, which is what an absent badge claims.
-    #[allow(clippy::too_many_arguments)]
+    /// The head carries the badge it was authored with. Only a relational
+    /// rule heading has a badge position — recursion is relation-form only —
+    /// so every other form's head is unbadged, which is what an absent badge
+    /// claims.
     pub(crate) fn clause(
         &self,
         kind: DefKind,
         subject: DefSubject,
         head: Head,
-        fixpoint: Fixpoint,
         body: DdlBody,
         full_source: &str,
         doc: Option<String>,
-    ) -> ClauseDecl {
-        DefinitionFront {
-            kind,
-            subject,
-            head,
-            fixpoint,
-        }
-        .into_clause_decl(body, full_source.to_string(), doc)
+    ) -> Result<ClauseDecl> {
+        Ok(DefinitionFront::new(kind, subject, head).into_clause_decl(
+            body,
+            full_source.to_string(),
+            doc,
+        ))
     }
 
     /// The doc slot after a neck, read WHOLE: the clause's documentation, and
@@ -979,7 +1004,7 @@ pub(crate) fn offers_agree_with_header(
 
 /// Whether a refusal says "not yet", rather than "never". Only the
 /// substituted-term identity does: everything else is a rule the body broke.
-pub(crate) fn awaits_substitution(error: &DelightQLError) -> bool {
+fn awaits_substitution(error: &DelightQLError) -> bool {
     matches!(error, DelightQLError::Semantic(Semantic::LimitValue { .. }))
 }
 
@@ -993,7 +1018,7 @@ fn doc_slot_of(child: cst::FoRuleChild<'_>) -> Option<cst::DocSlot<'_>> {
 fn ho_rule_doc(child: cst::HoRuleChild<'_>) -> Option<cst::DocSlot<'_>> {
     match child {
         cst::HoRuleChild::DocSlot(slot) => Some(slot),
-        _ => None,
+        cst::HoRuleChild::DefinitionNeck(_) => None,
     }
 }
 

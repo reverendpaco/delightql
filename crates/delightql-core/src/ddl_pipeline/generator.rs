@@ -5,10 +5,11 @@ use crate::pipeline::generator::{GeneratorError, SqlGenerator};
 
 use super::sql_ast::{SqlColumnDef, SqlCreateTable, SqlDefaultClause, SqlTableConstraint};
 
-/// Generate a SQL CREATE TABLE string from a SQL DDL AST.
+/// Generate a SQL CREATE TABLE string from a SQL DDL AST, under one baptism
+/// that takes each published name as its producer decided it.
 ///
 /// The bin registry is the same one the query generator consults: a CHECK's
-/// sigma predicate is rendered by the entity the resolver selected.
+/// sigma predicate is rendered by the entity the selection decided.
 pub fn generate(
     table: &SqlCreateTable,
     identities: &crate::names::Registry,
@@ -23,10 +24,7 @@ pub fn generate(
         }
         if let Some(default) = &column.default {
             match default {
-                SqlDefaultClause::Expression(expression)
-                | SqlDefaultClause::Generated {
-                    expr: expression, ..
-                } => collector.expression(expression),
+                SqlDefaultClause::Expression(expression) => collector.expression(expression),
             }
         }
     }
@@ -55,7 +53,7 @@ pub fn generate(
     }
     let bundle =
         crate::names::Bundle::gather(vec![collector.finish()]).reserve_authored(identities);
-    let baptised = crate::names::baptise(identities, &bundle).map_err(|error| {
+    let baptised = crate::names::baptism::baptise_decided(identities, &bundle).map_err(|error| {
         Internal::invariant(
             "ddl_pipeline::generator",
             format!("DDL naming failed: {error:?}"),
@@ -131,15 +129,6 @@ fn generate_column(
                 s.push_str(&gen.render_ddl_expression(expr, at)?);
                 if needs_parens {
                     s.push(')');
-                }
-            }
-            SqlDefaultClause::Generated { expr, kind } => {
-                s.push_str(" GENERATED ALWAYS AS (");
-                s.push_str(&gen.render_ddl_expression(expr, at)?);
-                s.push(')');
-                match kind {
-                    super::asts::GeneratedKind::Virtual => s.push_str(" VIRTUAL"),
-                    super::asts::GeneratedKind::Stored => s.push_str(" STORED"),
                 }
             }
         }
@@ -283,7 +272,7 @@ mod tests {
             columns: vec![SqlColumnDef {
                 not_null: true,
                 default: Some(SqlDefaultClause::Expression(SqlExpression::Literal(
-                    LiteralValue::Number("42".into()),
+                    LiteralValue::integer(42),
                 ))),
                 ..simple_col(&registry, table_id, "count", "INTEGER", 0)
             }],
@@ -302,7 +291,7 @@ mod tests {
         age.checks.push(SqlExpression::Binary {
             left: Box::new(SqlExpression::Column(age.column)),
             op: BinaryOperator::GreaterThan,
-            right: Box::new(SqlExpression::Literal(LiteralValue::Number("0".into()))),
+            right: Box::new(SqlExpression::Literal(LiteralValue::integer(0))),
         });
         let table = SqlCreateTable {
             table: table_id,

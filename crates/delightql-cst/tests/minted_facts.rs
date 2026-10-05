@@ -69,19 +69,48 @@ fn each_framed_artifact_moves_the_fingerprint() {
     }
 }
 
-/// The runtime fact names the one parser runtime this workspace links.
+/// The runtime fact names the one parser runtime this workspace links, and
+/// that runtime IS the generator pin: the relationship, read from the
+/// Makefile and the lockfile the way the build script reads them, not a
+/// literal this file would have to be edited to keep true.
 #[test]
 fn parser_runtime_names_the_linked_runtime() {
-    assert!(
-        delightql_cst::PARSER_RUNTIME.starts_with("tree-sitter-c2rust "),
-        "unexpected runtime spelling: {}",
-        delightql_cst::PARSER_RUNTIME
-    );
     let version = delightql_cst::PARSER_RUNTIME
-        .strip_prefix("tree-sitter-c2rust ")
-        .unwrap();
+        .strip_prefix("tree-sitter ")
+        .unwrap_or_else(|| panic!("unexpected runtime spelling: {}", delightql_cst::PARSER_RUNTIME));
+    let root = workspace_root();
+    let makefile = std::fs::read_to_string(root.join("Makefile")).expect("the Makefile");
+    let pin = makefile
+        .lines()
+        .find_map(|l| l.strip_prefix("TREE_SITTER_EXPECTED_VERSION"))
+        .and_then(|l| l.split_once('='))
+        .map(|(_, v)| v.trim().to_string())
+        .expect("the Makefile pins the generator");
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("the lockfile");
+    let facts = tuple::TupleFacts {
+        generator_pin: pin,
+        runtimes: tuple::lockfile_versions(&lock, "tree-sitter"),
+        highlighters: tuple::lockfile_versions(&lock, "tree-sitter-highlight"),
+    };
+    assert_eq!(tuple::judge(&facts).as_deref(), Ok(version), "{facts:?}");
     assert!(
-        version.split('.').count() >= 2 && version.chars().next().unwrap().is_ascii_digit(),
-        "the runtime fact must carry a resolved version: {version}"
+        (tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION..=tree_sitter::LANGUAGE_VERSION)
+            .contains(&delightql_cst::language().abi_version()),
+        "the generated parser's ABI is one the linked runtime reads"
     );
+}
+
+/// The judgment the build script applies, with each side of the
+/// relationship perturbed alone: the falsifiers live beside the authority
+/// (`generator/tuple.rs`), and this target compiles them.
+#[path = "../generator/tuple.rs"]
+#[allow(dead_code)]
+mod tuple;
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the workspace root")
+        .to_path_buf()
 }

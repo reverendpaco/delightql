@@ -38,9 +38,9 @@ The necks in delightql map to different types of scope and extent:
 The shadow neck defines a momentary definition with limited scope. The definition exists
 only for the single query in which it appears:
 
-```dql
-young(x) : users(x), age < 30
-young(*)
+```delightql
+short(name) : track(*), milliseconds < 60000
+short(*)
 ```
 
 
@@ -54,8 +54,9 @@ similarity to rules.
 # Rule Neck (`:-`{.delightql .sigil}) {.dqlh}
 
 
-```dql
-young_users(*) :- valid_users(*), age < 30
+```{.delightql .am}
+short_tracks(*) :- audio_tracks(*), milliseconds < 60000
+audio_tracks(*) :- track(*), media_type_id != 3
 ```
 
 The rule neck (`:-`{.delightql .sigil}) creates a definition that is equivalent to SQL's `CREATE TEMP VIEW`.

@@ -3,22 +3,22 @@
 Filter on reduced columns by placing a predicate after the `group by`:
 
 ```delightql
-employee(*)
-  |> %( Department ~> count:(*) as employee_count)
-      ,  employee_count > 50
+customer(*)
+  |> %( country ~> count:(*) as customer_count)
+      ,  customer_count > 4
 ```
 
-Read this as: "group employees by Department, count each group, then keep only
-groups with more than 50 rows."
+Read this as: "group customers by country, count each group, then keep only
+groups with more than 4 rows."
 
 
 ```sql
 select
-  Department,
-  count(*) as employee_count
-from employee
-  group by Department
-    having count(*) > 50;
+  country,
+  count(*) as customer_count
+from customer
+  group by country
+    having count(*) > 4;
 ```
 
 
@@ -35,28 +35,28 @@ from employee
 > equivalent to wrapping in a subquery and filtering with `WHERE`:
 >
 > ```sql
-> SELECT Department, count(*) AS employee_count
-> FROM employee
-> GROUP BY Department
-> HAVING count(*) > 50;
+> SELECT country, count(*) AS customer_count
+> FROM customer
+> GROUP BY country
+> HAVING count(*) > 4;
 >
 >
 > -- equivalent to:
 >
 > SELECT * FROM (
-> SELECT Department, count(*) AS employee_count
-> FROM employee
-> GROUP BY Department
-> ) WHERE employee_count > 50;
+> SELECT country, count(*) AS customer_count
+> FROM customer
+> GROUP BY country
+> ) WHERE customer_count > 4;
 > ```
 >
 > Because delightql has explicit order of operations, no separate syntax is
 > needed. The predicate simply follows the group by:
 >
-> ```dql
-> employee(*)
-> |> %(Department ~> count:(*) as employee_count),
-> employee_count > 50
+> ```delightql
+> customer(*)
+> |> %(country ~> count:(*) as customer_count),
+> customer_count > 4
 > ```
 >
-> Placing the filter earlier would be an error, `employee_count` does not exist until after the aggregation.
+> Placing the filter earlier would be an error, `customer_count` does not exist until after the aggregation.

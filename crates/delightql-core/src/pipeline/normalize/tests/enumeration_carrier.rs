@@ -276,6 +276,7 @@ fn a_reposition_addresses_by_the_one_reference_carrier() {
         match &spec.column {
             Reference::Named(_) => "named",
             Reference::Ordinal(_) => "ordinal",
+            Reference::Argument(_) => panic!("authored reposition cannot name an invocation input"),
             Reference::Physical(never) => match *never {},
         }
     };
@@ -314,7 +315,10 @@ fn json_access_and_a_path_binding_share_the_path_and_not_the_parent() {
             _ => None,
         })
         .expect("a destructure carries a tree pattern");
-    let crate::pipeline::asts::core::TreePattern::Record(record) = pattern else {
+    let crate::pipeline::asts::core::DestructurePattern::Scalar(
+        crate::pipeline::asts::core::TreePattern::Record(record),
+    ) = pattern
+    else {
         panic!("a record pattern is what `~= {{…}}` writes");
     };
     let members = record.members.iter().collect::<Vec<_>>();
@@ -334,10 +338,10 @@ fn json_access_and_a_path_binding_share_the_path_and_not_the_parent() {
         ],
     );
 
-    // And the readings a path answers, from the one place they are written.
-    assert_eq!(access.path.suffix(), ".a.b");
+    // And the readings a path answers, from the one place they are written:
+    // the NAME it publishes and the last KEY it names. It answers no text
+    // spelling of the reach — the generator renders its steps.
     assert_eq!(access.path.flattened(), "a_b");
-    assert_eq!(access.path.mapping_key(), "a.b");
     assert_eq!(access.path.last_key(), Some("b"));
 }
 
@@ -406,7 +410,6 @@ fn a_narrowing_reaches_an_index_by_index() {
         binding.path.steps().cloned().collect::<Vec<_>>(),
         vec![PathStep::Key("bye".to_string()), PathStep::Index(1)],
     );
-    assert_eq!(binding.path.suffix(), ".bye[1]");
     assert_eq!(binding.published_name(), "bye_1");
 }
 

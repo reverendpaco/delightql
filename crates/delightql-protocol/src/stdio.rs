@@ -145,7 +145,7 @@ mod tests {
             let responses = vec![
                 ServerMessage::Data(ServerTerm::Version {
                     max_message_size: 1_000_000,
-                    protocol_version: b("relay0"),
+                    protocol_version: PROTOCOL_VERSION.to_vec(),
                     lease_ms: 0,
                     orientations: vec![Orientation::Rows],
                 }),
@@ -155,6 +155,7 @@ mod tests {
                         position: 1,
                         name: b("name"),
                         descriptor: b("TEXT"),
+                        naming: crate::Naming::Authored,
                     }],
                 }),
                 ServerMessage::Data(ServerTerm::Data {
@@ -171,7 +172,7 @@ mod tests {
         let transport = StdioTransport::new(client_writer, client_end);
         let client = Client::new(transport);
         let mut session = match client
-            .version(1_000_000, b("relay0"), 0, vec![Orientation::Rows])
+            .version(1_000_000, PROTOCOL_VERSION.to_vec(), 0, vec![Orientation::Rows])
             .unwrap()
         {
             VersionResult::Accepted(s) => s,

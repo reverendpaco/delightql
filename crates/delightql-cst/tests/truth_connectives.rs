@@ -31,6 +31,7 @@ fn conjunction_children(tree: &delightql_cst::SyntaxTree) -> Vec<&'static str> {
             cst::ConjunctionExpressionChild::Membership(_) => "membership",
             cst::ConjunctionExpressionChild::RelationalMembership(_) => "relational_membership",
             cst::ConjunctionExpressionChild::HeadingCorrelation(_) => "correlation",
+            cst::ConjunctionExpressionChild::ExistsAnonGrelex(_) => "exists_anon",
         })
         .collect()
 }

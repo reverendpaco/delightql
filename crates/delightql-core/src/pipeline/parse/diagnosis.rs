@@ -84,10 +84,14 @@ pub(crate) fn diagnose(tokens: &[Token], source: &str) -> Option<DelightQLError>
         // The retired glyphs next: `==` recovers as two adjacent `=` tokens,
         // which the PONY pattern would otherwise read as two operators.
         .or_else(|| diagnose_retired_equality(&query_tokens(tokens)))
+        // A malformed `$.x` recovers as loose `$`/`.` characters beside a
+        // name, which the later patterns would read as a label or a path.
+        // It reads inline definition blocks too: no annotation spells `$`.
+        .or_else(|| diagnose_parameter_reference(tokens))
         .or_else(|| diagnose_structural_head(&query_tokens(tokens)))
         .or_else(|| diagnose_head_computes(&query_tokens(tokens)))
         .or_else(|| diagnose_comma_compound_value(&query_tokens(tokens)))
-        .or_else(|| diagnose_lift_tail(&query_tokens(tokens)))
+        .or_else(|| diagnose_lift_tail(&query_tokens(tokens), source))
         .or_else(|| diagnose_body_naming(&query_tokens(tokens)))
         .or_else(|| diagnose_bare_operator_guard(&query_tokens(tokens)))
         .or_else(|| diagnose_unmarked_effect_label(&query_tokens(tokens)))
@@ -118,6 +122,115 @@ fn diagnose_retired_assertion_annotation(source: &str) -> Option<DelightQLError>
      message: "the `(~~assert … ~~)` annotation has been removed — define a pure property rule and demand `assert!(property)(*)` on the relation being checked"
                 .to_string(),
  }))
+}
+
+/// A `$.x` GONE WRONG. The reference is one glued form — the sigil and the
+/// formal's name — standing where a value stands; the grammar can only say
+/// "unexpected token" about a sigil left unglued, a formal marked in its own
+/// head, or a reference asked to name or address a column. A bound read
+/// from a bare name is the retired spelling of the same reference.
+fn diagnose_parameter_reference(tokens: &[Token]) -> Option<DelightQLError> {
+    let tokens: Vec<&Token> = tokens.iter().filter(|token| !token.extra).collect();
+    let glued = |left: &Token, right: &Token| left.end == right.start;
+    let named = |token: &Token| is_name(token) || token.text.starts_with('`');
+    let refusal =
+        |message: String| Some(DelightQLError::from(Parse::ParameterReference { message }));
+    for (index, token) in tokens.iter().enumerate() {
+        // THE SIGIL, lexed whole or recovered as its two characters.
+        let after = match token.text.as_str() {
+            "$." => index + 1,
+            "$" if tokens
+                .get(index + 1)
+                .is_some_and(|dot| dot.text == "." && glued(token, dot)) =>
+            {
+                index + 2
+            }
+            "$" => {
+                if let Some(name) = tokens
+                    .get(index + 1)
+                    .filter(|name| glued(token, name) && named(name))
+                {
+                    return refusal(format!(
+                        "'${0}' is not a parameter reference: a scalar formal is read as \
+                         `$.{0}`, the sigil `$.` glued to its name",
+                        name.text
+                    ));
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let sigil_end = tokens[after - 1];
+        let Some(name) = tokens
+            .get(after)
+            .filter(|name| glued(sigil_end, name) && named(name))
+        else {
+            return refusal(
+                "`$.` must be glued to the name of a scalar formal: write `$.name`, with no \
+                 space between, and a name that begins with a letter or `_`"
+                    .to_string(),
+            );
+        };
+        if index > 0 && tokens[index - 1].text.eq_ignore_ascii_case("as") {
+            return refusal(format!(
+                "`$.{0}` reads a formal; it is a value, and `as` takes a new column name. A \
+                 column may share the formal's spelling: write `as {0}`",
+                name.text
+            ));
+        }
+        if index > 0 && matches!(tokens[index - 1].text.as_str(), "-(" | "*(") {
+            return refusal(format!(
+                "`$.{0}` reads a formal; it is a value and addresses no column. A column is \
+                 written bare",
+                name.text
+            ));
+        }
+        // A HEAD DECLARES: every token before the first neck of its clause.
+        let neck = tokens[index..]
+            .iter()
+            .position(|next| matches!(next.text.as_str(), ":-" | ":"))
+            .map(|offset| index + offset);
+        let clause_start = tokens[..index]
+            .iter()
+            .rposition(|prior| matches!(prior.text.as_str(), ":-" | ":"))
+            .map_or(0, |at| at + 1);
+        if let Some(neck) = neck {
+            let head = &tokens[clause_start..neck];
+            let is_head = head.iter().filter(|t| t.text == ")").count() >= 1
+                && tokens[neck].start > token.start
+                && head.iter().all(|t| {
+                    !matches!(t.text.as_str(), "|>" | "," | ";" | "@") || t.start > token.start
+                });
+            if is_head && tokens[clause_start..index].iter().any(|t| t.text == "(") {
+                return refusal(format!(
+                    "a formal is declared bare in its head — `{0}` — and read in the body as \
+                     `$.{0}`",
+                    name.text
+                ));
+            }
+        }
+    }
+    // THE RETIRED BOUND SPELLING: `#< n` read a formal bare.
+    for (index, token) in tokens.iter().enumerate() {
+        if !matches!(token.text.as_str(), "#<" | "#>" | "#") {
+            continue;
+        }
+        let at = if token.text == "#" {
+            match tokens.get(index + 1) {
+                Some(op) if matches!(op.text.as_str(), "<" | ">") => index + 2,
+                _ => continue,
+            }
+        } else {
+            index + 1
+        };
+        if let Some(name) = tokens.get(at).filter(|name| is_name(name)) {
+            return refusal(format!(
+                "a bound reads a formal as `$.{0}`: write `#< $.{0}`",
+                name.text
+            ));
+        }
+    }
+    None
 }
 
 /// The group openers a token stream nests through. A depth reader that misses
@@ -181,26 +294,45 @@ fn diagnose_structural_head(tokens: &[Token]) -> Option<DelightQLError> {
 /// group-modulo sigil wherever a relational reading is possible, so the guard
 /// has no derivation; the fix is the same parenthesization every composition
 /// needs.
+///
+/// THE DIAGNOSIS READS EXACTLY ONE GUARD: the truth expression from its `|`
+/// to the comma that starts the next parameter or the close of the group
+/// it stands in — never a sibling parameter's guard. Only operators AT THE
+/// GUARD'S OWN DEPTH compose: `(n | (n % 2) = 0)` has one operator at the
+/// guard's level, and the `%` inside the group is that group's business.
+/// A connective ends one window and opens the next, as it does at the value
+/// tier: `x > 1 and x < 5` is two comparisons of one operator each. Counting
+/// across any of those boundaries would blame a lawful guard for whatever
+/// else the statement got wrong.
 fn diagnose_bare_operator_guard(tokens: &[Token]) -> Option<DelightQLError> {
     let before = depths(tokens);
     for (index, token) in tokens.iter().enumerate() {
         if token.text != "|" || before[index] == 0 {
             continue;
         }
-        // The guard runs to the close of the group it stands in.
+        let depth = before[index];
+        // The guard runs to the next parameter or the close of its group.
         let end = (index + 1..tokens.len())
-            .find(|at| before[*at] < before[index])
+            .find(|at| before[*at] < depth || (before[*at] == depth && tokens[*at].text == ","))
             .unwrap_or(tokens.len());
-        let operators = tokens[index + 1..end]
-            .iter()
-            .filter(|token| INFIX_OPS.contains(&token.text.as_str()) || token.text == "=")
-            .count();
-        if operators >= 2 {
-            return Some(DelightQLError::from(Parse::GuardGrouping {
-                message: "a guard composes operators and DelightQL has no precedence — \
-                          parenthesize the arithmetic, e.g. `f:(n | (n % 2) = 0)`"
-                    .to_string(),
-            }));
+        let mut window = 0usize;
+        for at in index + 1..end {
+            if before[at] != depth {
+                continue;
+            }
+            let text = tokens[at].text.as_str();
+            if is_connective(&tokens[at]) {
+                window = 0;
+            } else if INFIX_OPS.contains(&text) || text == "=" {
+                window += 1;
+            }
+            if window >= 2 {
+                return Some(DelightQLError::from(Parse::GuardGrouping {
+                    message: "a guard composes operators and DelightQL has no precedence — \
+                              parenthesize the arithmetic, e.g. `f:(n | (n % 2) = 0)`"
+                        .to_string(),
+                }));
+            }
         }
     }
     None
@@ -258,7 +390,7 @@ fn diagnose_unmarked_effect_label(tokens: &[Token]) -> Option<DelightQLError> {
 /// A PURE HEAD OVER AN EFFECTFUL BODY. A relational rule's body is a `relex`
 /// and an effect rule's is an `effrelex`, so a head without `!` whose body
 /// demands a directive has no derivation — the rule the author broke is the
-/// effect algebra's R1, and the grammar can only say "unexpected token".
+/// receipt algebra's R1, and the grammar can only say "unexpected token".
 ///
 /// Keyed on what the author TYPED: a neck at group depth zero, a head left of
 /// it that carries no `!` on its own subject, and a directive call to the
@@ -506,13 +638,17 @@ fn diagnose_comma_compound_value(tokens: &[Token]) -> Option<DelightQLError> {
     None
 }
 
-/// A lift tail in a ONE-group call: `json_each(doc, path & value, type)`.
+/// A lift tail in a ONE-group call.
 ///
 /// `&` bounds arguments only where lifted rows follow in a two-group call
-/// (`f(users(*) & 1, 2)(*)`); a one-group call's parentheses are the access
-/// group, and a lifted tail has no meaning there. The projection the tail
-/// reaches for belongs to the ACCESS group.
-fn diagnose_lift_tail(tokens: &[Token]) -> Option<DelightQLError> {
+/// (`f(users(*) & 1, 2)(*)`); a one-group call's parentheses are the
+/// arguments alone, and a lifted tail has no meaning there. What the author
+/// reached for is read off the tail itself: bare names are a projection,
+/// which belongs to the ACCESS group (`json_each(doc, path)(value, type)`);
+/// anything else is rows, and the call is missing its access group
+/// (`like_any(x & "a"; "b")(*)`). The remedy is the author's own call,
+/// rewritten.
+fn diagnose_lift_tail(tokens: &[Token], source: &str) -> Option<DelightQLError> {
     let before = depths(tokens);
     for (index, token) in tokens.iter().enumerate() {
         if token.text != "&" || before[index] == 0 {
@@ -555,13 +691,40 @@ fn diagnose_lift_tail(tokens: &[Token]) -> Option<DelightQLError> {
                 continue;
             }
         }
+        let call = source.get(callee.start..tokens[close].end)?;
+        let args = source.get(tokens[open].end..token.start)?.trim();
+        let tail = source.get(token.end..tokens[close].start)?.trim();
+        let names_only = tokens[index + 1..close]
+            .iter()
+            .filter(|token| !token.extra)
+            .all(|token| token.text == "," || is_plain_name(&token.text));
+        // A remedy is copied, so it is shown whole; past a line's worth the
+        // arguments are elided rather than the shape.
+        let short = call.chars().count() <= LIFT_TAIL_ECHO;
+        let remedy = match (names_only, short) {
+            (true, true) => format!(
+                "a projection belongs to the ACCESS group: `{}({args})({tail})`",
+                callee.text
+            ),
+            (true, false) => format!(
+                "a projection belongs to the ACCESS group: `{}(…)({tail})`",
+                callee.text
+            ),
+            (false, true) => format!("lifted rows need the access group after them: `{call}(*)`"),
+            (false, false) => format!(
+                "lifted rows need the access group after them: `{}(… & …)(*)`",
+                callee.text
+            ),
+        };
+        let shown = if short {
+            call.to_string()
+        } else {
+            format!("{}(…)", callee.text)
+        };
         return Some(DelightQLError::from(Parse::LiftTail {
             message: format!(
                 "`&` bounds arguments only in a two-group call, where lifted rows \
-                 follow it; `{callee}(…)` has one group, and that group holds the \
-                 arguments alone. Projection belongs to the ACCESS group: \
-                 `{callee}(doc, path)(value, type)`",
-                callee = callee.text,
+                 follow it; `{shown}` has one group, so {remedy}"
             ),
         }));
     }
@@ -745,6 +908,17 @@ fn diagnose_metadata_induction(tokens: &[Token]) -> Option<DelightQLError> {
         }));
     }
     None
+}
+
+/// How long a call a lift-tail refusal echoes whole.
+const LIFT_TAIL_ECHO: usize = 72;
+
+/// A bare identifier: what a projection list spells, and a row of values
+/// does not.
+fn is_plain_name(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 fn is_name_start(c: char) -> bool {
@@ -1429,8 +1603,6 @@ mod tests {
     const EXTRA_SPELLINGS: &[(&str, &[&str])] = &[
         ("comment", &[" // a note\n"]),
         ("smart_comment", &[" (/* a note */) "]),
-        ("stop_point", &[" (!) ", " (/! halt !/) "]),
-        ("debug_point", &[" >>> "]),
     ];
 
     /// The shape is grammatical, so nothing the grammar declares EXTRA
@@ -1506,7 +1678,7 @@ mod tests {
         );
         // A CFE head opens with `:(` and lawfully declares callables.
         assert_ne!(
-            subcategory("transform_both:(f:(), col1, col2) : (col1 /-> f:() as x, col2)"),
+            subcategory("transform_both:(f:(), col1, col2) : (col1 >> f:() as x, col2)"),
             Some("head_computes".to_string())
         );
         // A plain listed head is not this shape, whatever else failed.
@@ -1539,6 +1711,10 @@ mod tests {
             subcategory(r#"json_each("[7,8]", "$" & value, type)"#).as_deref(),
             Some("lift_tail")
         );
+        assert_eq!(
+            subcategory(r#"ls(*), +like_any(ls.ns & "sys::%";"std::%")"#).as_deref(),
+            Some("lift_tail")
+        );
         // A second group makes the left one an ho_part, where `&` is lawful;
         // whatever else fails, it is not this teaching.
         assert_ne!(
@@ -1547,11 +1723,39 @@ mod tests {
         );
     }
 
+    /// The remedy is read off the tail and spelled with the author's own
+    /// call: bare names move into the access group; rows keep their place
+    /// and gain the access group after them.
+    #[test]
+    fn lift_tail_rewrites_the_authors_call() {
+        let message = |source: &str| {
+            let tree = crate::pipeline::syntax::Parser::new().parse_prompt(source);
+            diagnose(&tree.tokens(), tree.source())
+                .map(|d| d.to_string())
+                .unwrap_or_default()
+        };
+        let projection = message(r#"json_each("[7,8]", "$" & value, type)"#);
+        assert!(
+            projection.contains(r#"`json_each("[7,8]", "$")(value, type)`"#),
+            "{projection}"
+        );
+        let rows = message(r#"ls(*), +like_any(ls.ns & "sys::%";"std::%")"#);
+        assert!(
+            rows.contains(r#"`like_any(ls.ns & "sys::%";"std::%")(*)`"#),
+            "{rows}"
+        );
+        let long = message(&format!(
+            "t(*), +f(t.x & {})",
+            vec!["\"pattern-number-one\""; 6].join("; ")
+        ));
+        assert!(long.contains("`f(… & …)(*)`"), "{long}");
+    }
+
     /// A definition's body is one value; a row of named values refuses.
     #[test]
     fn body_naming_fires_on_a_named_row_body() {
         assert_eq!(
-            subcategory("t:(f:(), a, b) : (a /-> f:() as x, b /-> f:() as y)"),
+            subcategory("t:(f:(), a, b) : (a >> f:() as x, b >> f:() as y)"),
             Some("value_naming".to_string())
         );
     }

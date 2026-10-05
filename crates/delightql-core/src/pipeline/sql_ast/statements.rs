@@ -6,10 +6,6 @@ use super::query::QueryExpression;
 pub enum RelationTarget {
     Entity(crate::names::EntityId),
     Scope(crate::names::ScopeId),
-    QualifiedScope {
-        schema: String,
-        scope: crate::names::ScopeId,
-    },
 }
 
 /// A complete SQL statement - the root of our SQL AST
@@ -29,15 +25,6 @@ pub enum SqlStatement {
         /// Optional WITH clause for CTEs
         with_clause: Option<Vec<Cte>>,
         /// Query to populate the table
-        query: QueryExpression,
-    },
-    /// CREATE TEMPORARY VIEW statement (REPL-only)
-    CreateTempView {
-        /// Name of the temporary view
-        view: crate::names::ScopeId,
-        /// Optional WITH clause for CTEs
-        with_clause: Option<Vec<Cte>>,
-        /// Query definition for the view
         query: QueryExpression,
     },
     /// DELETE FROM statement
@@ -84,8 +71,24 @@ pub enum SqlStatement {
 }
 
 impl SqlStatement {
+    #[cfg(test)]
     pub fn with_ctes(with_clause: Option<Vec<Cte>>, query: QueryExpression) -> Self {
         Self::Query { with_clause, query }
+    }
+
+    /// The occurrence behind each column of the result this statement
+    /// returns, in position order. `None` at a position means no
+    /// occurrence stands there: SQL puts a value in the row, and a name the
+    /// engine chose. A statement that returns no result has no heading.
+    pub fn heading(&self) -> Option<Vec<Option<crate::names::ColId>>> {
+        match self {
+            SqlStatement::Query { query, .. } => query.heading(),
+            SqlStatement::CreateTempTable { .. }
+            | SqlStatement::DropTempTable { .. }
+            | SqlStatement::Delete { .. }
+            | SqlStatement::Update { .. }
+            | SqlStatement::Insert { .. } => None,
+        }
     }
 }
 
@@ -136,10 +139,9 @@ pub struct Cte {
     /// What the CTE is: an ordinary query, or a fixpoint that keeps its
     /// anchor and members apart.
     body: CteBody,
-    /// This reusable binding must be evaluated into storage once before any
-    /// reader spends it. The producer is semantic construction, not a
-    /// volatility-name list in SQL generation.
-    materialized_once: bool,
+    /// Optional names for a VALUES body. A target may accept the names only
+    /// on the WITH binding, not on a derived VALUES table.
+    column_names: Option<Vec<crate::names::ColId>>,
 }
 
 impl Cte {
@@ -148,7 +150,7 @@ impl Cte {
         Cte {
             scope,
             body: CteBody::Ordinary(query),
-            materialized_once: false,
+            column_names: None,
         }
     }
 
@@ -161,12 +163,16 @@ impl Cte {
         Cte {
             scope: fixpoint.scope(),
             body: CteBody::Fixpoint(fixpoint),
-            materialized_once: false,
+            column_names: None,
         }
     }
 
     pub fn scope(&self) -> crate::names::ScopeId {
         self.scope
+    }
+
+    pub fn column_names(&self) -> Option<&[crate::names::ColId]> {
+        self.column_names.as_deref()
     }
 
     pub fn body(&self) -> &CteBody {
@@ -177,14 +183,10 @@ impl Cte {
         matches!(self.body, CteBody::Fixpoint(_))
     }
 
-    pub(in crate::pipeline) fn requiring_materialization(mut self) -> Self {
-        debug_assert!(!self.is_recursive());
-        self.materialized_once = true;
-        self
-    }
-
-    pub fn materialized_once(&self) -> bool {
-        self.materialized_once
+    /// Every part of this binding's body, anchor first, in emission order —
+    /// for a pass that reads.
+    pub fn parts(&self) -> Vec<&QueryExpression> {
+        self.body.parts()
     }
 
     /// Every part of this binding's body, to rewrite in place. The variant
@@ -194,19 +196,4 @@ impl Cte {
         self.body.parts_mut()
     }
 
-    /// Rewrite every part of this binding's body, KEEPING the variant.
-    ///
-    /// Rebuilding through a constructor would silently answer a question
-    /// the rewrite was not asked, because the recursion decision was taken
-    /// long before this pass ran.
-    pub fn rewrite_parts<E>(
-        mut self,
-        mut rewrite: impl FnMut(QueryExpression) -> std::result::Result<QueryExpression, E>,
-    ) -> std::result::Result<Self, E> {
-        for part in self.body.parts_mut() {
-            let taken = std::mem::replace(part, QueryExpression::Values { rows: Vec::new() });
-            *part = rewrite(taken)?;
-        }
-        Ok(self)
-    }
 }

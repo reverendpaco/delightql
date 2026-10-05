@@ -12,7 +12,7 @@ mod support;
 
 use delightql_cst::cst::*;
 use delightql_cst::{CompanionColumn, Parser, Root, TypedNode};
-use support::{admits, admits_file, count, first, refuses_file, text_of, refuses_query};
+use support::{admits, admits_file, count, first, refuses_file, refuses_query, text_of};
 
 // ---------------------------------------------------------------------------
 // The relex line
@@ -714,9 +714,7 @@ fn one_separator_shape_serves_every_tabular_interior() {
 /// A declarable-and-inert mark would be syntax nothing could ever consume.
 #[test]
 fn a_fact_row_fills_a_sparse_column() {
-    let tree = admits_file(
-        "config(key, value, note? ---- \"a\", 1 ; \"b\", 2, _(note @ \"why\"))",
-    );
+    let tree = admits_file("config(key, value, note? ---- \"a\", 1 ; \"b\", 2, _(note @ \"why\"))");
     assert_eq!(count::<FactBody>(&tree), 1);
     assert_eq!(count::<SparseMark>(&tree), 1);
     assert_eq!(count::<SparseFill>(&tree), 1);
@@ -727,9 +725,7 @@ fn a_fact_row_fills_a_sparse_column() {
     assert_eq!(count::<SparseFill>(&anon), 1);
 
     // A multi-column fill is the one production's many-item case.
-    let many = admits_file(
-        "config(key, a?, b? ---- \"x\", _(a, b @ 1, 2))",
-    );
+    let many = admits_file("config(key, a?, b? ---- \"x\", _(a, b @ 1, 2))");
     assert_eq!(count::<SparseFill>(&many), 1);
     let fill = first::<SparseFill>(&many);
     assert_eq!(fill.column().count(), 2);
@@ -751,9 +747,8 @@ fn a_fact_function_arm_matches_and_does_not_test() {
     refuses_file("grade(score -> letter ---- score > 90 -> \"A\"; _ -> \"F\")");
 
     // The searched form's canonical spelling: a function rule, a case body.
-    let searched = admits_file(
-        "grade:(score) :- _:(score > 90 -> \"A\"; score > 80 -> \"B\"; _ -> \"F\")",
-    );
+    let searched =
+        admits_file("grade:(score) :- _:(score > 90 -> \"A\"; score > 80 -> \"B\"; _ -> \"F\")");
     assert_eq!(count::<FunctionRule>(&searched), 1);
     assert_eq!(count::<FactFunction>(&searched), 0);
 }
@@ -821,7 +816,7 @@ fn the_annotation_set_is_the_closed_one() {
     assert_eq!(
         count::<ReservedAnnotation>(&admits("users(*) (~~emit://file/out ~~)")),
         1,
-        "reserved room parses so the refusal can name the effect algebra"
+        "reserved room parses so the refusal can name the receipt algebra"
     );
 }
 

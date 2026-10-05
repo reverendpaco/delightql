@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 use clap::Parser;
-use sha2::{Digest, Sha256};
 
+use delightql_protocol::digest;
 use delightql_protocol::socket::SocketTransport;
 use delightql_protocol::{
-    AgreedOrientation, Cell, FetchResponse, Projection, QueryResponse, Session,
+    AgreedOrientation, Dimension, FetchResponse, Naming, Projection, QueryResponse, Session,
 };
 
 mod world;
@@ -215,16 +215,13 @@ impl Deadline {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum HashMode {
-    String,
-    Byte,
-}
-
 #[derive(Debug)]
 struct HashObservation {
-    digest: String,
+    digest: digest::Digest,
     empty_columns: Option<usize>,
+    /// The published heading: each column's name, and whether the compiler
+    /// minted it.
+    heading: Vec<(String, bool)>,
 }
 
 struct TestResultRow {
@@ -238,6 +235,13 @@ struct TestResultRow {
     run_id: i64,
     test_name: String,
     detail: String,
+    /// What the execution answered, whatever its status: the observed
+    /// baseline of a result, or the identity of a refusal. Two runs whose
+    /// statuses agree can still disagree here.
+    answer: String,
+    /// The answer's heading as a JSON list of `[name, minted]`; empty for a
+    /// refusal.
+    heading: String,
     duration_ms: f64,
 }
 
@@ -248,153 +252,6 @@ struct WorkerResult {
     meh: u32,
     output: Vec<String>,
     rows: Vec<TestResultRow>,
-}
-
-// ---------------------------------------------------------------------------
-// Hash computation
-// ---------------------------------------------------------------------------
-
-fn hex2hash(hex: &str) -> String {
-    let bytes: Vec<u8> = (0..hex.len())
-        .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect();
-
-    use std::io::Write;
-    let mut buf = Vec::new();
-    {
-        let mut encoder = base64::Base64Encoder::new(&mut buf);
-        encoder.write_all(&bytes).unwrap();
-    }
-    let b64 = String::from_utf8(buf).unwrap();
-
-    let safe: String = b64
-        .chars()
-        .map(|c| match c {
-            '/' => '_',
-            '+' => '-',
-            _ => c,
-        })
-        .collect();
-
-    safe[..8.min(safe.len())].to_string()
-}
-
-// Inline base64 encoder (no external dep)
-mod base64 {
-    use std::io::{self, Write};
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    pub struct Base64Encoder<'a> {
-        out: &'a mut Vec<u8>,
-        buf: [u8; 3],
-        len: usize,
-    }
-
-    impl<'a> Base64Encoder<'a> {
-        pub fn new(out: &'a mut Vec<u8>) -> Self {
-            Self {
-                out,
-                buf: [0; 3],
-                len: 0,
-            }
-        }
-        fn flush_block(&mut self) {
-            let b = self.buf;
-            self.out.push(ALPHABET[(b[0] >> 2) as usize]);
-            self.out
-                .push(ALPHABET[((b[0] & 0x03) << 4 | b[1] >> 4) as usize]);
-            if self.len > 1 {
-                self.out
-                    .push(ALPHABET[((b[1] & 0x0f) << 2 | b[2] >> 6) as usize]);
-            } else {
-                self.out.push(b'=');
-            }
-            if self.len > 2 {
-                self.out.push(ALPHABET[(b[2] & 0x3f) as usize]);
-            } else {
-                self.out.push(b'=');
-            }
-            self.buf = [0; 3];
-            self.len = 0;
-        }
-    }
-
-    impl Write for Base64Encoder<'_> {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            for &byte in data {
-                self.buf[self.len] = byte;
-                self.len += 1;
-                if self.len == 3 {
-                    self.flush_block();
-                }
-            }
-            Ok(data.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            if self.len > 0 {
-                self.flush_block();
-            }
-            Ok(())
-        }
-    }
-
-    impl Drop for Base64Encoder<'_> {
-        fn drop(&mut self) {
-            let _ = self.flush();
-        }
-    }
-}
-
-fn compute_data_hash(rows: &[Vec<Cell>]) -> String {
-    let mut row_hashes: Vec<String> = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut hasher = Sha256::new();
-        for cell in row {
-            match cell {
-                Some(bytes) if !bytes.is_empty() => {
-                    let text = String::from_utf8_lossy(bytes).to_string();
-                    if text.is_empty() {
-                        hasher.update(b"NULL");
-                    } else {
-                        hasher.update(text.as_bytes());
-                    }
-                }
-                _ => hasher.update(b"NULL"),
-            }
-            hasher.update(b"|");
-        }
-        row_hashes.push(format!("{:x}", hasher.finalize()));
-    }
-    row_hashes.sort();
-    let mut data_hasher = Sha256::new();
-    data_hasher.update(b"ROWS:");
-    for rh in &row_hashes {
-        data_hasher.update(rh.as_bytes());
-        data_hasher.update(b"\n");
-    }
-    format!("{:x}", data_hasher.finalize())
-}
-
-fn compute_byte_hash(rows: &[Vec<Cell>]) -> String {
-    let mut row_hashes: Vec<String> = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut row_hasher = Sha256::new();
-        for cell in row {
-            let mut cell_hasher = Sha256::new();
-            if let Some(bytes) = cell {
-                cell_hasher.update(bytes);
-            }
-            row_hasher.update(cell_hasher.finalize());
-        }
-        row_hashes.push(format!("{:x}", row_hasher.finalize()));
-    }
-    row_hashes.sort();
-    let mut data_hasher = Sha256::new();
-    for rh in &row_hashes {
-        data_hasher.update(rh.as_bytes());
-    }
-    format!("{:x}", data_hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +268,62 @@ fn query_error(identity: &[u8], message: &[u8]) -> String {
     }
 }
 
+/// The identity of a refusal, read from the account `query_error` writes;
+/// any other failure (a timeout, a transport or workspace failure) is
+/// answered by its own leading word. A statement expectation that met a
+/// different refusal names it after "but got: ", and that refusal is what
+/// the statement answered.
+fn refusal_answer(error: &str) -> String {
+    let rest = error.strip_prefix("query error: ").unwrap_or(error);
+    // "<expectation>: expected error <pattern> but got: <refusal>": the
+    // pattern is one authored token, so the refusal starts after it.
+    let missed = rest
+        .strip_prefix("delightql-error://runtime/expectation: expected error ")
+        .and_then(|after| after.split_once(' '))
+        .and_then(|(_, after)| after.strip_prefix("but got: "))
+        .filter(|got| got.starts_with("delightql-error://"));
+    let rest = missed.unwrap_or(rest);
+    if rest.starts_with("delightql-error://") {
+        return rest.split(": ").next().unwrap_or(rest).to_string();
+    }
+    error.split(':').next().unwrap_or(error).to_string()
+}
+
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn heading_json(heading: &[(String, bool)]) -> String {
+    let columns: Vec<String> = heading
+        .iter()
+        .map(|(name, minted)| format!("[{},{}]", json_string(name), minted))
+        .collect();
+    format!("[{}]", columns.join(","))
+}
+
+fn heading_of(dimensions: &[Dimension]) -> Vec<(String, bool)> {
+    dimensions
+        .iter()
+        .map(|d| {
+            (
+                String::from_utf8_lossy(&d.name).into_owned(),
+                d.naming == Naming::Minted,
+            )
+        })
+        .collect()
+}
+
 fn send_query_and_hash(
     session: &mut Session<SocketTransport>,
     query_text: &str,
@@ -418,26 +331,25 @@ fn send_query_and_hash(
     deadline: Deadline,
 ) -> Result<HashObservation, String> {
     deadline.remaining()?;
-    let (handle, column_count) = match session
-        .query(query_text.as_bytes().to_vec())
+    let (handle, heading) = match session
+        .query(delightql_cst::prompt_wrap(query_text).into_owned().into_bytes())
         .map_err(|e| deadline.attribute(format!("query: {}", e.message)))?
     {
-        QueryResponse::Header { handle, dimensions } => (handle, dimensions.len()),
+        QueryResponse::Header { handle, dimensions } => (handle, heading_of(&dimensions)),
         QueryResponse::Error(error) => {
             return Err(query_error(error.identity(), error.message()));
         }
     };
-    let mut all_rows: Vec<Vec<Cell>> = Vec::new();
+    let mut observation = digest::Observation::new();
     loop {
         // An unfold that never closes answers every fetch promptly and simply
-        // never sends End. Nothing but the wall clock stops it, and nothing
-        // but stopping it bounds the rows accumulating here.
+        // never sends End. Nothing but the wall clock stops it.
         deadline.remaining()?;
         match session
             .fetch(&handle, Projection::All, 10000, rows_orientation)
             .map_err(|e| deadline.attribute(format!("fetch: {}", e.message)))?
         {
-            FetchResponse::Data { cells } => all_rows.extend(cells),
+            FetchResponse::Data { cells } => observation.rows(&cells),
             FetchResponse::End => break,
             FetchResponse::Error(error) => {
                 return Err(format!(
@@ -449,127 +361,28 @@ fn send_query_and_hash(
     }
     let _ = session.close(handle);
     Ok(HashObservation {
-        digest: compute_data_hash(&all_rows),
-        empty_columns: all_rows.is_empty().then_some(column_count),
+        digest: observation.data(),
+        empty_columns: (observation.row_count() == 0).then_some(heading.len()),
+        heading,
     })
-}
-
-fn send_query_and_bhash(
-    session: &mut Session<SocketTransport>,
-    query_text: &str,
-    rows_orientation: AgreedOrientation,
-    deadline: Deadline,
-) -> Result<HashObservation, String> {
-    deadline.remaining()?;
-    let (handle, column_count) = match session
-        .query(query_text.as_bytes().to_vec())
-        .map_err(|e| deadline.attribute(format!("query: {}", e.message)))?
-    {
-        QueryResponse::Header { handle, dimensions } => (handle, dimensions.len()),
-        QueryResponse::Error(error) => {
-            return Err(query_error(error.identity(), error.message()));
-        }
-    };
-    let mut all_rows: Vec<Vec<Cell>> = Vec::new();
-    loop {
-        // An unfold that never closes answers every fetch promptly and simply
-        // never sends End. Nothing but the wall clock stops it, and nothing
-        // but stopping it bounds the rows accumulating here.
-        deadline.remaining()?;
-        match session
-            .fetch(&handle, Projection::All, 10000, rows_orientation)
-            .map_err(|e| deadline.attribute(format!("fetch: {}", e.message)))?
-        {
-            FetchResponse::Data { cells } => all_rows.extend(cells),
-            FetchResponse::End => break,
-            FetchResponse::Error(error) => {
-                return Err(format!(
-                    "fetch error: {}",
-                    String::from_utf8_lossy(error.message())
-                ));
-            }
-        }
-    }
-    let _ = session.close(handle);
-    Ok(HashObservation {
-        digest: compute_byte_hash(&all_rows),
-        empty_columns: all_rows.is_empty().then_some(column_count),
-    })
-}
-
-fn send_query_and_hash_dispatch(
-    session: &mut Session<SocketTransport>,
-    query_text: &str,
-    rows_orientation: AgreedOrientation,
-    mode: HashMode,
-    deadline: Deadline,
-) -> Result<HashObservation, String> {
-    match mode {
-        HashMode::String => send_query_and_hash(session, query_text, rows_orientation, deadline),
-        HashMode::Byte => send_query_and_bhash(session, query_text, rows_orientation, deadline),
-    }
-}
-
-/// The AUTHORED extent of each query in a submission, in order.
-///
-/// The sequence root draws these boundaries; a text scan for a separator would
-/// have to know which newline is inside a template and which ends a query — a
-/// question the parse has already answered.
-/// A DEFECTIVE SOURCE HAS NO BOUNDARIES, so it is ONE submission and the
-/// server answers it. The runner splits where the sequence root draws lines
-/// and has no parse teaching of its own to offer — inventing one here would
-/// hide the compiler's, which is the answer the test is about.
-fn split_queries(source: &str) -> Result<Vec<String>, String> {
-    use delightql_cst::cst;
-
-    let tree = delightql_cst::Parser::new().parse_query_sequence(source);
-    if tree.has_defects() {
-        return Ok(vec![source.to_string()]);
-    }
-    let Some(cst::SourceFileChild::QuerySequenceRoot(root)) = tree.root_branch() else {
-        return Ok(vec![source.to_string()]);
-    };
-    let Some(sequence) = root.children().find_map(|child| match child {
-        cst::QuerySequenceRootChild::QuerySequence(sequence) => Some(sequence),
-        cst::QuerySequenceRootChild::QuerySequenceHeader(_) => None,
-    }) else {
-        return Ok(vec![source.to_string()]);
-    };
-    let queries: Vec<String> = sequence
-        .children()
-        .filter_map(|child| match child {
-            cst::QuerySequenceChild::Relex(relex) => tree.byte_range(relex),
-            cst::QuerySequenceChild::Effrelex(effrelex) => tree.byte_range(effrelex),
-        })
-        .map(|range| source[range].to_string())
-        .collect();
-
-    if queries.is_empty() {
-        return Err("no queries found in source".into());
-    }
-    Ok(queries)
 }
 
 fn send_sequential_and_hash(
     session: &mut Session<SocketTransport>,
     dql: &str,
     rows_orientation: AgreedOrientation,
-    mode: HashMode,
     deadline: Deadline,
 ) -> Result<HashObservation, String> {
-    let queries = split_queries(dql)?;
+    // THE STATEMENT BOUNDARIES ARE CORE'S: the CLI, the C ABI and this runner
+    // divide a submission by the one splitter, so no lane can disagree with
+    // another about where a statement — and the blocks it carries — ends.
+    let queries = delightql_core::api::split_queries(dql)?;
     let mut last = None;
     for q in &queries {
         // The clock belongs to the TEST, so the whole submission spends one
         // budget: a file whose setup is instant and whose last query never
         // returns must not get a fresh allowance at each step.
-        last = Some(send_query_and_hash_dispatch(
-            session,
-            q,
-            rows_orientation,
-            mode,
-            deadline,
-        )?);
+        last = Some(send_query_and_hash(session, q, rows_orientation, deadline)?);
     }
     last.ok_or_else(|| "no queries found in source".to_string())
 }
@@ -615,9 +428,9 @@ fn observed_baseline(
         }
     }
     if hashtype == Some("shash") {
-        observation.digest.clone()
+        observation.digest.hex()
     } else {
-        hex2hash(&observation.digest)
+        observation.digest.pin()
     }
 }
 
@@ -634,6 +447,19 @@ fn judge(
     let dur = format_duration(elapsed);
     let duration_ms = elapsed.as_secs_f64() * 1000.0;
     let is_error_test = hashtype.as_deref() == Some("error");
+    let (answer, heading) = match &exec_result {
+        Ok(observation) => (
+            observed_baseline(
+                observation,
+                hashtype.as_deref(),
+                expected_hash
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("EMPTY:")),
+            ),
+            heading_json(&observation.heading),
+        ),
+        Err(e) => (refusal_answer(e), String::new()),
+    };
     let empty_error_expectation = is_error_test
         && expected_hash
             .as_deref()
@@ -710,6 +536,8 @@ fn judge(
         run_id,
         test_name: test_name.to_string(),
         detail,
+        answer,
+        heading,
         duration_ms,
     });
 
@@ -874,14 +702,10 @@ fn execute(
     orientation: AgreedOrientation,
     deadline: Deadline,
 ) -> Result<HashObservation, String> {
-    let mode = match run.hashtype.as_deref() {
-        Some("bhash") => HashMode::Byte,
-        _ => HashMode::String,
-    };
     if run.sequential {
-        send_sequential_and_hash(session, &run.dql, orientation, mode, deadline)
+        send_sequential_and_hash(session, &run.dql, orientation, deadline)
     } else {
-        send_query_and_hash_dispatch(session, &run.dql, orientation, mode, deadline)
+        send_query_and_hash(session, &run.dql, orientation, deadline)
     }
 }
 
@@ -1030,8 +854,27 @@ fn copy_databases_to_work_dir(
 fn write_results_db(path: &Path, rows: &[TestResultRow]) -> Result<(), String> {
     let conn =
         Connection::open(path).map_err(|e| format!("open results db {}: {}", path.display(), e))?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|e| format!("set WAL: {}", e))?;
+    // Runners of one suite run write this database at once; a writer waits
+    // its turn rather than losing its rows. The journal mode is the file's,
+    // and the switch to it can be refused without waiting while another
+    // runner makes it, so it is re-read and retried until it holds.
+    conn.busy_timeout(Duration::from_secs(60))
+        .map_err(|e| format!("set busy timeout: {}", e))?;
+    let mut attempts = 0;
+    loop {
+        let switched = conn.pragma_update(None, "journal_mode", "WAL");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .map_err(|e| format!("read journal mode: {}", e))?;
+        if mode.eq_ignore_ascii_case("wal") {
+            break;
+        }
+        attempts += 1;
+        if attempts == 200 {
+            return Err(format!("set WAL: {:?}", switched.err()));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS test_result (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1041,7 +884,9 @@ fn write_results_db(path: &Path, rows: &[TestResultRow]) -> Result<(), String> {
             test_name TEXT NOT NULL,
             detail TEXT NOT NULL DEFAULT '',
             duration_ms REAL NOT NULL,
-            run_id INTEGER NOT NULL DEFAULT -1
+            run_id INTEGER NOT NULL DEFAULT -1,
+            answer TEXT NOT NULL DEFAULT '',
+            heading TEXT NOT NULL DEFAULT ''
         )",
     )
     .map_err(|e| format!("create table: {}", e))?;
@@ -1061,14 +906,35 @@ fn write_results_db(path: &Path, rows: &[TestResultRow]) -> Result<(), String> {
         )
         .map_err(|e| format!("add run_id: {}", e))?;
     }
+    // Runners of one suite run write one database at once, so a column
+    // another runner added between the look and the ALTER is the outcome
+    // wanted, not a failure: the look is repeated before anything is lost.
+    let has_column = |column: &str| {
+        conn.prepare("SELECT 1 FROM pragma_table_info('test_result') WHERE name = ?1")
+            .and_then(|mut stmt| stmt.exists([column]))
+            .map_err(|e| format!("inspect results schema: {}", e))
+    };
+    for column in ["answer", "heading"] {
+        if !has_column(column)? {
+            let added = conn.execute_batch(&format!(
+                "ALTER TABLE test_result ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+            ));
+            if let Err(e) = added {
+                if !has_column(column)? {
+                    return Err(format!("add {column}: {}", e));
+                }
+            }
+        }
+    }
 
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| format!("begin transaction: {}", e))?;
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO test_result (status, ball, test_name, detail, duration_ms, run_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            "INSERT INTO test_result \
+             (status, ball, test_name, detail, duration_ms, run_id, answer, heading) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
         ).map_err(|e| format!("prepare insert: {}", e))?;
         for row in rows {
             stmt.execute(rusqlite::params![
@@ -1077,7 +943,9 @@ fn write_results_db(path: &Path, rows: &[TestResultRow]) -> Result<(), String> {
                 row.test_name,
                 row.detail,
                 row.duration_ms,
-                row.run_id
+                row.run_id,
+                row.answer,
+                row.heading
             ])
             .map_err(|e| format!("insert: {}", e))?;
         }
@@ -1099,6 +967,26 @@ fn run_ball(
 
     let conn = Connection::open(ball_path)
         .map_err(|e| format!("open ball {}: {}", ball_path.display(), e))?;
+
+    // The digest the ball's baselines were pinned under must be the one this
+    // runner computes; otherwise every verdict would compare two framings.
+    let pinned_under: String = conn
+        .query_row("SELECT version FROM baseline_digest", [], |row| row.get(0))
+        .map_err(|e| {
+            format!(
+                "ball {} records no baseline digest: {}",
+                ball_path.display(),
+                e
+            )
+        })?;
+    if pinned_under != digest::VERSION {
+        return Err(format!(
+            "ball {} pins baselines under {}; this runner computes {}",
+            ball_path.display(),
+            pinned_under,
+            digest::VERSION
+        ));
+    }
 
     // Phase 1: Extract databases to temp directory
     let tmpdir = PathBuf::from(format!(
@@ -1530,7 +1418,7 @@ fn serve_stub_connection(
         let reply = match term {
             ClientTerm::Version { .. } => ServerTerm::Version {
                 max_message_size: 1_000_000,
-                protocol_version: b"relay0".to_vec(),
+                protocol_version: delightql_protocol::PROTOCOL_VERSION.to_vec(),
                 lease_ms: 300_000,
                 orientations: vec![Orientation::Rows],
             },
@@ -1554,6 +1442,7 @@ fn serve_stub_connection(
                         position: 1,
                         name: b"k".to_vec(),
                         descriptor: b"INTEGER".to_vec(),
+                        naming: delightql_protocol::Naming::Authored,
                     }],
                 }
             }
@@ -1572,14 +1461,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        compute_data_hash, judge, observed_baseline, query_error, send_query_and_hash, Deadline,
+        digest, judge, observed_baseline, query_error, send_query_and_hash, Deadline,
         HashObservation, Link, RunOrder, WorkerResult, World,
     };
 
     fn empty(columns: usize) -> HashObservation {
         HashObservation {
-            digest: compute_data_hash(&[]),
+            digest: digest::data(&[]),
             empty_columns: Some(columns),
+            heading: Vec::new(),
         }
     }
 
@@ -1765,10 +1655,10 @@ mod tests {
     fn query_refusal_preserves_its_structured_identity() {
         assert_eq!(
             query_error(
-                b"delightql-error://semantic/setop/correspondence/ambiguous",
-                b"more than one column corresponds"
+                b"delightql-error://semantic/set_operation/column_name_mismatch",
+                b"one operand does not publish every name"
             ),
-            "query error: delightql-error://semantic/setop/correspondence/ambiguous: more than one column corresponds"
+            "query error: delightql-error://semantic/set_operation/column_name_mismatch: one operand does not publish every name"
         );
     }
 
@@ -1826,6 +1716,135 @@ mod tests {
         assert_eq!(result.errors, 0);
         assert_eq!(result.failed, 0);
         assert_eq!(result.rows[0].status, "PASS");
+    }
+
+    /// A PASS records what it answered: two runs that both pass a loosely
+    /// written refusal pin can still have refused differently.
+    #[test]
+    fn a_pass_records_the_refusal_identity_it_answered() {
+        let mut result = worker_result();
+        judge(
+            "ball",
+            1,
+            "loose-pin",
+            Err(query_error(
+                b"delightql-error://semantic/constraint/context",
+                b"a message: with a colon",
+            )),
+            &Some("delightql-error://semantic/constraint".to_string()),
+            &Some("error".to_string()),
+            Duration::from_secs(0),
+            &mut result,
+        );
+        assert_eq!(result.rows[0].status, "PASS");
+        assert_eq!(
+            result.rows[0].answer,
+            "delightql-error://semantic/constraint/context"
+        );
+        assert_eq!(result.rows[0].heading, "");
+    }
+
+    /// A result's answer is its observed baseline and its heading, whatever
+    /// the pin; a failure that is not a refusal is answered by its own kind.
+    #[test]
+    fn a_result_records_its_baseline_and_heading() {
+        let mut result = worker_result();
+        let mut observation = empty(2);
+        observation.heading = vec![("k".to_string(), false), ("id⊥\"x".to_string(), true)];
+        judge(
+            "ball",
+            1,
+            "rows",
+            Ok(observation),
+            &Some("EMPTY:2".to_string()),
+            &None,
+            Duration::from_secs(0),
+            &mut result,
+        );
+        assert_eq!(result.rows[0].status, "PASS");
+        assert_eq!(result.rows[0].answer, "EMPTY:2");
+        assert_eq!(result.rows[0].heading, r#"[["k",false],["id⊥\"x",true]]"#);
+
+        judge(
+            "ball",
+            2,
+            "silent",
+            Err("timeout: no answer within 30s".to_string()),
+            &Some("EMPTY:2".to_string()),
+            &None,
+            Duration::from_secs(0),
+            &mut result,
+        );
+        assert_eq!(result.rows[1].answer, "timeout");
+    }
+
+    /// Runners that write one fresh results database at once each keep every
+    /// row: a column another runner added first is not a failure.
+    #[test]
+    fn concurrent_runners_lose_no_rows_on_a_fresh_results_database() {
+        let dir = std::env::temp_dir().join(format!("dql-runner-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("results.db");
+        let writers: Vec<_> = (0..8)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let rows: Vec<super::TestResultRow> = (0..10)
+                        .map(|i| super::TestResultRow {
+                            status: "PASS".to_string(),
+                            ball: format!("ball{w}"),
+                            run_id: i,
+                            test_name: format!("t{i}"),
+                            detail: String::new(),
+                            answer: "x".to_string(),
+                            heading: "[]".to_string(),
+                            duration_ms: 0.0,
+                        })
+                        .collect();
+                    super::write_results_db(&path, &rows)
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap().expect("a runner's rows are written");
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM test_result", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 80);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A statement expectation that met another refusal is answered by that
+    /// refusal; one whose statement succeeded is answered by the expectation.
+    #[test]
+    fn a_missed_statement_expectation_answers_with_the_refusal_it_met() {
+        assert_eq!(
+            super::refusal_answer(
+                "query error: delightql-error://runtime/expectation: expected error \
+                 error://semantic/resolution/schema but got: \
+                 delightql-error://operational/uncovered: not yet: a form"
+            ),
+            "delightql-error://operational/uncovered"
+        );
+        assert_eq!(
+            super::refusal_answer(
+                "query error: delightql-error://runtime/expectation: statement \
+                 succeeded; expected an error"
+            ),
+            "delightql-error://runtime/expectation"
+        );
+        // A message that itself says "but got: " is not read as a missed
+        // expectation.
+        assert_eq!(
+            super::refusal_answer(
+                "query error: delightql-error://semantic/constraint: a but got: \
+                 delightql-error://b: c"
+            ),
+            "delightql-error://semantic/constraint"
+        );
     }
 }
 

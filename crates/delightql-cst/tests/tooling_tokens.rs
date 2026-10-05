@@ -16,8 +16,8 @@
 mod support;
 
 use delightql_cst::cst::*;
-use delightql_cst::{Parser, TypedNode};
-use support::{admits, admits_file, count, first};
+use delightql_cst::{Parser, TypedNode, EXTRA_KINDS};
+use support::{admits, admits_file, count, first, refuses};
 
 /// Every meaningful token is addressable, with the exact bytes the author
 /// wrote under it.
@@ -59,7 +59,7 @@ fn every_meaningful_token_has_a_named_node_and_a_span() {
 
     addressable!("users(*) |> (a)", PipeOperator, "|>");
     addressable!("users(*) !> log!(*)", UnwrapPipeOperator, "!>");
-    addressable!("users(*) |> (a /-> f:(@))", FunctionPipeOperator, "/->");
+    addressable!("users(*) |> (a >> f:(@))", FunctionPipeOperator, ">>");
 
     addressable!("users(*) ~> count:(*) as n", ReductionSigil, "~>");
     addressable!("users(*), doc ~= {a}", DestructureSigil, "~=");
@@ -85,6 +85,7 @@ fn every_meaningful_token_has_a_named_node_and_a_span() {
     addressable!("_(a? @ 1)", SparseMark, "?");
     addressable!("users(*) ^", MetaSigil, "^");
     addressable!("users(*) +-", SignedWitnessSigil, "+-");
+    addressable!("users(*), a = $.k", ParameterSigil, "$.");
 
     addressable!("a(*) || b(*)", PositionalUnionSigil, "||");
     addressable!("a(*) |;| b(*)", SmartUnionSigil, "|;|");
@@ -185,17 +186,24 @@ fn the_anaphors_are_distinguished_by_level_not_by_glyph() {
     assert_eq!(count::<Disregarded>(&deictic), 0);
 }
 
-/// Session tools carry no semantics but must stay addressable: a formatter has
-/// to preserve them and an editor has to colour them.
+/// The smart comment is the one delimited extra: it carries no semantics but
+/// stays addressable, so a formatter can preserve it and an editor can colour
+/// it. Nothing else stands between two tokens without a production — no stop
+/// or debug marker is an extra, so those spellings refuse as any unrecognized
+/// spelling does.
 #[test]
-fn session_tools_are_addressable_without_being_continuations() {
-    let tree = admits("users(*) (/* doc */) (!) >>>, age > 3");
+fn the_smart_comment_is_the_one_delimited_extra() {
+    let tree = admits("users(*) (/* doc */), age > 3");
     assert_eq!(count::<SmartComment>(&tree), 1);
-    assert_eq!(count::<StopPoint>(&tree), 1);
-    assert_eq!(count::<DebugPoint>(&tree), 1);
     assert_eq!(
         count::<Continuation>(&tree),
         count::<Continuation>(&admits("users(*), age > 3")),
-        "a session tool does not change the chain around it"
+        "a smart comment does not change the chain around it"
     );
+    let mut extras: Vec<&str> = EXTRA_KINDS.to_vec();
+    extras.sort_unstable();
+    assert_eq!(extras, ["comment", "smart_comment"]);
+    refuses("users(*) (!), age > 3");
+    refuses("users(*) (/! halt !/), age > 3");
+    refuses("users(*) >>>, age > 3");
 }

@@ -1,0 +1,29 @@
+ls(*) :-
+  (~~docs
+    What answers a bare name at the prompt: the entities of home, of every
+    namespace the session enlists into home, of the namespaces those expose
+    (transitively), and the session objects that stand in for a table of one
+    of them, each with the namespace it lives in and its entity type. A
+    listing, not a selection: a name two namespaces hold is listed twice, and
+    only the resolver says what a bare mention selects. The prompt is named
+    (home) rather than read from the caller, because a rule's body resolves
+    in its own namespace.
+  ~~)
+  sys::ns.namespace(*), fq_name = "home" |> (id as ns_id) : open
+  sys::ns.namespace(*) as h, h.fq_name = "home"
+  , sys::ns.enlisted_namespace(*) as en, en.to_namespace_id = h.id
+  |> (en.from_namespace_id as ns_id) : open
+  open(*), sys::ns.exposed_namespace(*) as x, x.exposing_namespace_id = ns_id
+  |> (x.exposed_namespace_id as ns_id) : open
+
+  open(*), sys::ns.activated_entity(*) as ae, ae.namespace_id = ns_id
+  |> (ae.entity_id as entity_id, ae.namespace_id as at) : listed
+  open(*), sys::ns.session_overlay(*) as o, o.durable_namespace_id = ns_id
+  , sys::ns.activated_entity(*) as ae, ae.entity_id = o.entity_id
+  |> (ae.entity_id as entity_id, ae.namespace_id as at) : listed
+
+  listed(*)
+  , sys::ns.namespace(*) as n, n.id = at
+  , sys::entities.entity(*) as e, e.id = entity_id
+  , sys::entities.entity_type_enum(*) as t, t.id = e.type
+  |> (e.name as name, n.fq_name as namespace, t.variant as type)

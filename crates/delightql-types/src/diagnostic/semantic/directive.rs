@@ -31,6 +31,24 @@ pub enum Directive {
     #[error("Validation error: {message}")]
     ConsultExists { message: String },
 
+    /// retract! selects its target through ordinary selection; a target
+    /// nothing answers has no family to remove.
+    #[leaf("retract/missing", class = Syntax, summary = "retract! selected no definition.")]
+    #[error("Validation error: {message}")]
+    RetractMissing { message: String },
+
+    /// Only a session-authored definition in `home` or a mutable scratch
+    /// namespace may be retracted: a data entity, a system entity, a
+    /// consulted source's definition, a CTE, and a relational alias refuse.
+    #[leaf("retract/ownership", class = Syntax, summary = "retract! targets an identity it may not remove.")]
+    #[error("Validation error: {message}")]
+    RetractOwnership { message: String },
+
+    /// A definition or grounding still depends on the selected identity.
+    #[leaf("retract/dependency", class = Syntax, summary = "retract! targets a depended-on identity.")]
+    #[error("Validation error: {message}")]
+    RetractDependency { message: String },
+
     /// Where a directive may stand: some only in a liminal program, some
     /// only as a pipe terminal.
     #[family(

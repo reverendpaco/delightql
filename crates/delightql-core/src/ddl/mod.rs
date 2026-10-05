@@ -8,8 +8,8 @@
 //! - `reconstruct`: Reads stored definition source back into a typed group
 
 pub mod analyzer;
-#[cfg(not(target_arch = "wasm32"))]
+pub mod correspondence;
 pub mod lifecycle;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod manifest;
+pub mod manifest_contract;
 pub mod reconstruct;

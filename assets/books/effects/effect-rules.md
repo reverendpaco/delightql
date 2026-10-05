@@ -6,16 +6,18 @@ An effect rule is a rule where the functor name has a `!` in the head. It can be
 Effect rules allow the programmer to genereate their own reusable effects.
 
 
-```delightql
+```{.delightql .am}
+?- mount!("etl.sqlite", "etl")(*)
+
 quarantine!(Bad(*))(*) :-
-    Bad(*) |> insert!(warehouse.orders_quarantine(*))(*)
+    Bad(*) |> insert!(etl.partner_sale_quarantine(*))(*)
 
 stage!(*) :-
-    recent_orders(*) |> temp_table!(staged)
+    etl.partner_sale_2025_07_31(*) |> temp_table!(staged(*))(*)
 
-load!(*) :-
-    staged(*), +customers(customer_id), amount > 0
-      |> insert!(warehouse.orders(*))(*)
+load!(Good(*))(*) :-
+    Good(*), +customer(, email = buyer_email), quantity > 0
+      |> insert!(etl.partner_sale_line(*))(*)
 
 ```
 

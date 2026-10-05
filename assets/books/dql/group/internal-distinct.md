@@ -3,18 +3,18 @@
 Some aggregates accept a distinct modifier on their input. The INNER-MODULO sigil `%`{.delightql .sigil} prefixes the column:
 
 ```{.delightql .numberLines}
-employee(*)
-    |>  %( Department ~>
-            count:(%LastName) ,
-            count:(%BirthDate))
+customer(*)
+    |>  %( country ~>
+            count:(%city) ,
+            count:(%support_rep_id))
 ```
 
 
 ```sql
 select
-  Department,
-  count(distinct LastName),
-  count(distinct BirthDate)
-from employee
-  group by Department;
+  country,
+  count(distinct city),
+  count(distinct support_rep_id)
+from customer
+  group by country;
 ```

@@ -9,19 +9,19 @@ does not deduplicate its members merely because their values agree.
 **Simple example:**
 ```delightql
 employee(*)
-  %( Gender ,"people": ~> { Title, State } as title_and_state)
+  |> %( city ~> { title, state } as title_and_state)
 ```
 
-The tree grouping variables above are `Gender` alone. Within each of these
-groups `{Title, State}` do not require distinctness.
+The tree grouping variables above are `city` alone. Within each of these
+groups `{title, state}` do not require distinctness.
 
 **Simple example:**
 ```delightql
 employee(*)
-  ~> { Title, State } as title_and_state
+  ~> { title, state } as title_and_state
 ```
 
-Returns one row containing an array of all `{Title, State}`
+Returns one row containing an array of all `{title, state}`
 combinations.  No grouping variables mean this is a whole-group
 tree group and the number of rows in the starting table will
 equal the number of rows in the array.
@@ -30,50 +30,51 @@ equal the number of rows in the array.
 
 ```delightql
 employee(*)
-  ~> { Title,
-       "people": ~> {FirstName, LastName},
-       State } as people_by_title_and_state
+  ~> { title,
+       "people": ~> {first_name, last_name},
+       city } as people_by_title_and_city
 ```
 
 Returns a single-row, single-column table:
 
 
 +----------------------------------------------------------------+
-| people_by_title_and_state                                      |
+| people_by_title_and_city                                       |
 +================================================================+
-|  ```                                                           |
+|  ```json                                                       |
 |     [                                                          |
-|      { "Title": "Account Representative",                      |
-|        "State": "PA",                                          |
+|      { "title": "General Manager",                             |
+|        "city": "Edmonton",                                     |
 |        "people": [                                             |
-|          { "FirstName": "Stafani", "LastName": "Hurton" },     |
-|          { "FirstName": "Jenda", "LastName": "Bownd" }         |
+|          { "first_name": "Andrew", "last_name": "Adams" }      |
 |        ]                                                       |
 |      },                                                        |
-|      { "Title": "Programmer",                                  |
-|        "State": "PA",                                          |
+|      { "title": "IT Manager",                                  |
+|        "city": "Calgary",                                      |
 |        "people": [                                             |
-|          { "FirstName": "Clareta", "LastName": "Cuss" }        |
+|          { "first_name": "Michael", "last_name": "Mitchell" }  |
 |        ]                                                       |
 |      },                                                        |
-|      { "Title": "Programmer",                                  |
-|        "State": "GA",                                          |
+|      { "title": "IT Staff",                                    |
+|        "city": "Lethbridge",                                   |
 |        "people": [                                             |
-|          { "FirstName": "Anita", "LastName": "Aburrow" }       |
+|          { "first_name": "Robert", "last_name": "King" },      |
+|          { "first_name": "Laura", "last_name": "Callahan" }    |
 |        ]                                                       |
 |      },                                                        |
-|      { "Title": "VP",                                          |
-|        "State": "OH",                                          |
+|      { "title": "Sales Manager",                               |
+|        "city": "Calgary",                                      |
 |        "people": [                                             |
-|          { "FirstName": "Drusi", "LastName": "Sachno" }        |
+|          { "first_name": "Nancy", "last_name": "Edwards" }     |
 |        ]                                                       |
 |      },                                                        |
-|      { "Title": "VP",                                          |
-|        "State": "PA",                                          |
+|      { "title": "Sales Support Agent",                         |
+|        "city": "Calgary",                                      |
 |        "people": [                                             |
-|          { "FirstName": "Frazer", "LastName": "Vido" },        |
-|      { "FirstName": "Corney", "LastName": "Treherne" }         |
-|                               ]                                |
+|          { "first_name": "Jane", "last_name": "Peacock" },     |
+|          { "first_name": "Margaret", "last_name": "Park" },    |
+|          { "first_name": "Steve", "last_name": "Johnson" }     |
+|        ]                                                       |
 |      }                                                         |
 |    ]                                                           |
 |   ```                                                          |
@@ -86,20 +87,20 @@ intermediates:
 SELECT
   json_group_array(
     json_object(
-      'Title', Title,
-      'State', State,
+      'title', title,
+      'city', city,
       'people', people
     )
-  ) AS people_by_title_and_state
+  ) AS people_by_title_and_city
 FROM (
   SELECT
-    Title,
-    State,
+    title,
+    city,
     json_group_array(
-      json_object('FirstName', FirstName, 'LastName', LastName)
+      json_object('first_name', first_name, 'last_name', last_name)
     ) AS people
   FROM employee
-  GROUP BY Title, State
+  GROUP BY title, city
 );
 ```
 
@@ -110,16 +111,16 @@ data.
 
 **Three-level example:**
 ```delightql
-employee(*)
-  ~> { Title,
-       "people_by_state":
-         ~> { State,
-              "people": ~> {FirstName, LastName} } }
-    as people_by_state_within_title
+customer(*)
+  ~> { country,
+       "customers_by_city":
+         ~> { city,
+              "customers": ~> {first_name, last_name} } }
+    as customers_by_city_within_country
 ```
 
-Groups first by `Title`, then within each title by `State`, then collects
-people within each state.
+Groups first by `country`, then within each country by `city`, then collects
+customers within each city.
 
 **Sibling tree groups:**
 
@@ -127,18 +128,18 @@ people within each state.
 Multiple nested groups at the same level share their parent's context but are
 otherwise independent:
 ```delightql
-employee(*)
-  ~> { Title,
-       "people_by_state": ~> { State, "people": ~> {FirstName, LastName} },
-       "cities": ~> [City] }
+customer(*)
+  ~> { country,
+       "customers_by_city": ~> { city, "customers": ~> {first_name, last_name} },
+       "reps": ~> [support_rep_id] }
     as nested_with_siblings
 ```
 
-The `people_by_state` and `cities` tree groups are siblings -- both nested
-within `Title`, neither containing the other.
+The `customers_by_city` and `reps` tree groups are siblings -- both nested
+within `country`, neither containing the other.
 
 Sibling tree groups share their parent's context but aggregate independently.
-The relationship between siblings---which person was in which city -- is not
+The relationship between siblings---which customer had which support rep -- is not
 preserved. This is inherent to the structure: siblings represent independent
 projections of the grouped data. [Trees with siblings satisfy TNF-G but not
 TNF-R; they cannot round-trip losslessly. (See Appendix A.)]{.sidenote}

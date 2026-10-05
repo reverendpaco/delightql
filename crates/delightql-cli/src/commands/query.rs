@@ -58,14 +58,10 @@ fn make_connection(
     }
 }
 
-/// Execute a query string: create session via handle, call exec_ng.
-///
-/// Human-output modes (`--to results` / default) get the console
-/// sink: mid-run `stdout!` result sets print live as the run executes
-/// (EFFECT-ALGEBRA §5; the run's return value still arrives as the ordinary
-/// result). Machine modes (`--to hash`, `--to sql`, …) install NO sink so
-/// their output stays a single machine-readable value — both halves pinned
-/// by `tests/stdout_ship.rs`.
+/// Execute a query string on the road its `--to` chooses (exec_ng owns the
+/// choice). The one-shot road is the console: mid-run `stdout!` result
+/// sets print live as an executing run proceeds (EFFECT-ALGEBRA §5; the
+/// run's return value still arrives as the ordinary result).
 fn run_query(
     source: &str,
     handle: &mut dyn delightql_core::api::DqlHandle,
@@ -75,43 +71,16 @@ fn run_query(
     no_sanitize: bool,
     sequential: bool,
 ) -> Result<()> {
-    let console_sink = matches!(to, None | Some(args::Stage::Results));
-    let hooks = if console_sink {
-        delightql_core::api::SessionHooks {
-            on_ship: Some(Box::new(
-                move |columns: &[String], rows: &[Vec<Option<Vec<u8>>>]| {
-                    // The display boundary: cells become text HERE, where
-                    // the choice of what to print for an absent one is the
-                    // console's to make.
-                    let display_rows: Vec<Vec<String>> = rows
-                        .iter()
-                        .map(|row| crate::exec_ng::cells_to_display(row))
-                        .collect();
-                    let output = crate::output_format::format_output_with_zebra(
-                        columns,
-                        &display_rows,
-                        output_format,
-                        None,
-                        no_headers,
-                        no_sanitize,
-                    );
-                    print!("{}", output);
-                },
-            )),
-        }
-    } else {
-        delightql_core::api::SessionHooks::default()
-    };
-    let mut session = handle
-        .session_with_hooks(hooks)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
     exec_ng::execute_query(
         source,
-        &mut *session,
+        handle,
         to,
-        output_format,
-        no_headers,
-        no_sanitize,
+        exec_ng::Rendering {
+            format: output_format,
+            no_headers,
+            no_sanitize,
+        },
+        exec_ng::ShippedSets::Console,
         sequential,
     )?;
     Ok(())

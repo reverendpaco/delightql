@@ -3,28 +3,22 @@
 The RENAME-COVER operator `*(  )`{.delightql .sigil} renames specified columns while passing all others through:
 
 ```delightql
-employee_2019(*)
-  |> *( FamilyName as LastName)
+track(*)
+  |> *( name as track_name)
 ```
 
 ```sql
 select
-    EmployeeId,
-    FamilyName as LastName,
-    FirstName,
-    Title,
-    ReportsTo,
-    BirthDate,
-    HireDate,
-    Address,
-    City,
-    State,
-    Country,
-    PostalCode,
-    Phone,
-    Fax,
-    Email
-from employee_2019;
+    track_id,
+    name as track_name,
+    album_id,
+    media_type_id,
+    genre_id,
+    composer,
+    milliseconds,
+    bytes,
+    unit_price
+from track;
 ```
 
 Rename cover preserves column count and column ordinality -- only the names change.

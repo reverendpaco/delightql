@@ -173,12 +173,33 @@ impl ReplParserBudgets {
     }
 }
 
+/// What the prompt reads: queries (the default), definitions, or SQL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputMode {
+    /// One DQL goal per submission; the host writes the prompt wrap.
+    Query,
+    /// DQL definitions, sent as written and admitted into `home`.
+    Definitions,
+    /// Raw SQL on the session's database.
+    Sql,
+}
+
+impl InputMode {
+    /// The `repl::config.option` spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InputMode::Query => "query",
+            InputMode::Definitions => "ddl",
+            InputMode::Sql => "sql",
+        }
+    }
+}
+
 /// The typed operational state. Private fields; see the module doc.
 pub struct ReplConfig {
     output_format: OutputFormat,
     target_stage: Option<Stage>,
-    sql_mode: bool,
-    zebra_mode: Option<usize>,
+    input_mode: InputMode,
     no_headers: bool,
     show_meta_output: bool,
     multiline: bool,
@@ -191,8 +212,7 @@ impl ReplConfig {
         ReplConfig {
             output_format,
             target_stage: None,
-            sql_mode: false,
-            zebra_mode: None,
+            input_mode: InputMode::Query,
             no_headers: false,
             show_meta_output: true,
             multiline: true,
@@ -211,12 +231,8 @@ impl ReplConfig {
         self.target_stage
     }
 
-    pub fn sql_mode(&self) -> bool {
-        self.sql_mode
-    }
-
-    pub fn zebra_mode(&self) -> Option<usize> {
-        self.zebra_mode
+    pub fn input_mode(&self) -> InputMode {
+        self.input_mode
     }
 
     pub fn no_headers(&self) -> bool {
@@ -255,26 +271,8 @@ impl ReplConfig {
         self.target_stage = stage;
     }
 
-    pub(super) fn set_input_mode_sql(&mut self, sql: bool) {
-        self.sql_mode = sql;
-    }
-
-    /// Zebra accepts 0/1 (off) or 2..=4 colors; anything else refuses and
-    /// changes nothing.
-    pub(super) fn set_zebra_mode(&mut self, colors: usize) -> Result<(), String> {
-        match colors {
-            0 | 1 => {
-                self.zebra_mode = None;
-                Ok(())
-            }
-            2..=4 => {
-                self.zebra_mode = Some(colors);
-                Ok(())
-            }
-            other => Err(format!(
-                "zebra supports 2-4 colors (0 disables), not {other}"
-            )),
-        }
+    pub(super) fn set_input_mode(&mut self, mode: InputMode) {
+        self.input_mode = mode;
     }
 
     pub(super) fn set_no_headers(&mut self, no_headers: bool) {
@@ -310,13 +308,12 @@ impl ReplConfig {
             Some(Stage::Results) => "results",
             Some(Stage::Fingerprint) => "fingerprint",
             Some(Stage::Hash) => "hash",
-            Some(Stage::ByteHash) => "bhash",
             Some(Stage::TotalHash) => "totalhash",
         }
     }
 
     pub fn output_format_rendered(&self) -> String {
-        format!("{:?}", self.output_format).to_lowercase()
+        self.output_format.name().to_string()
     }
 
     /// Every option row this configuration projects, rendered from the typed
@@ -338,15 +335,9 @@ impl ReplConfig {
             ),
             (
                 "input_mode",
-                if self.sql_mode { "sql" } else { "dql" }.to_string(),
+                self.input_mode.as_str().to_string(),
                 "enum",
-                "dql",
-            ),
-            (
-                "zebra_columns",
-                self.zebra_mode.unwrap_or(0).to_string(),
-                "integer",
-                "0",
+                "query",
             ),
             ("multiline", self.multiline.to_string(), "boolean", "true"),
             ("headers", (!self.no_headers).to_string(), "boolean", "true"),
@@ -401,46 +392,6 @@ mod tests {
                     .any(|(name, ..)| *name == operation.option_name()),
                 "{} must project an option row",
                 operation.as_str()
-            );
-        }
-    }
-
-    /// Configuration writer census, source half: the private fields make
-    /// outside assignment a compile error; THIS pins that the only
-    /// assignment sites inside the module are the constructor and the typed
-    /// operations. Field inventory: output_format, target_stage, sql_mode,
-    /// zebra_mode, no_headers, show_meta_output, multiline, parser_budgets.
-    #[test]
-    fn the_only_field_writers_are_construction_and_typed_operations() {
-        const SRC: &str = include_str!("config.rs");
-        for field in [
-            "output_format",
-            "target_stage",
-            "sql_mode",
-            "zebra_mode",
-            "no_headers",
-            "show_meta_output",
-            "multiline",
-            "parser_budgets",
-            "editor_helpers",
-        ] {
-            let assignments = SRC
-                .lines()
-                .filter(|l| l.trim_start().starts_with(&format!("self.{field} =")))
-                .count();
-            let allowed = match field {
-                // zebra has two lawful arms (off and colored).
-                "zebra_mode" => 2,
-                // budgets are construction-set until a `.repl` control lands.
-                "parser_budgets" => 0,
-                // the breaker mutates through the shared policy's typed
-                // operations, never by field assignment.
-                "editor_helpers" => 0,
-                _ => 1,
-            };
-            assert_eq!(
-                assignments, allowed,
-                "field '{field}': every writer must be one typed operation"
             );
         }
     }
@@ -513,21 +464,5 @@ mod tests {
         assert_eq!(row(&config).3, "true", "the default is enabled");
         config.editor_helper_policy().trip();
         assert_eq!(row(&config).1, "false", "the row renders the policy");
-    }
-
-    /// Invalid zebra values change nothing.
-    #[test]
-    fn invalid_zebra_values_change_none() {
-        let mut config = ReplConfig::new(OutputFormat::Table);
-        config.set_zebra_mode(3).unwrap();
-        assert_eq!(config.zebra_mode(), Some(3));
-        assert!(config.set_zebra_mode(9).is_err());
-        assert_eq!(
-            config.zebra_mode(),
-            Some(3),
-            "a refused value changes nothing"
-        );
-        config.set_zebra_mode(0).unwrap();
-        assert_eq!(config.zebra_mode(), None);
     }
 }

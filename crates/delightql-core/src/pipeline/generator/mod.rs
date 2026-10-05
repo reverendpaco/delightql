@@ -21,6 +21,7 @@ use std::fmt::Write;
 
 mod config;
 mod dialect;
+
 #[cfg(test)]
 mod dialect_tests;
 mod errors;
@@ -29,10 +30,12 @@ mod literals;
 mod operators;
 
 pub use config::GeneratorConfig;
-pub use dialect::{RowClauseStyle, SqlDialect};
+pub use dialect::{DocumentNumberCategory, RowClauseStyle, SqlDialect};
 pub use errors::GeneratorError;
 
-pub fn baptise_statements<'registry>(
+/// [`baptise_statements`] for statements whose name status their producer
+/// decided (`names::baptism::baptise_decided`).
+pub(crate) fn baptise_statements_decided<'registry>(
     identities: &'registry crate::names::Registry,
     statements: &[&SqlStatement],
 ) -> Result<Baptised<'registry>, GeneratorError> {
@@ -45,7 +48,7 @@ pub fn baptise_statements<'registry>(
             .collect(),
     )
     .reserve_authored(identities);
-    crate::names::baptise(identities, &bundle)
+    crate::names::baptism::baptise_decided(identities, &bundle)
         .map_err(|error| GeneratorError::Error(format!("SQL naming failed: {error:?}")))
 }
 
@@ -56,7 +59,7 @@ pub fn baptise_statements<'registry>(
 /// a subquery beneath one belongs to that subquery's own emission.
 fn reads_scope(table: &TableExpression, scope: ScopeId) -> bool {
     match table {
-        TableExpression::Scope(found) | TableExpression::QualifiedScope { scope: found, .. } => {
+        TableExpression::Scope(found) => {
             *found == scope
         }
         TableExpression::Join { left, right, .. } => {
@@ -110,14 +113,31 @@ pub struct SqlGenerator<'names, 'registry> {
     /// Bin cartridge registry for resolving rewrite-rule predicates.
     /// None for standalone/utility generation paths.
     bin_registry: Option<Arc<BinCartridgeRegistry>>,
+    /// The statement has not been legalized and is rendered to be read, not
+    /// run (`inspecting`).
+    inspecting: bool,
 }
 
 impl<'names, 'registry> SqlGenerator<'names, 'registry> {
+    /// Render a SQL-layer domain expression to a string.
+    ///
+    /// Used by the DDL pipeline generator for CHECK/DEFAULT expressions.
+    #[cfg(test)]
+    pub(crate) fn render_expression(
+        &self,
+        expr: &DomainExpression,
+        at: ScopeId,
+    ) -> Result<String, GeneratorError> {
+        let mut sql = String::new();
+        self.generate_domain_expression(&mut sql, expr, Some(Emitting::at(at)))?;
+        Ok(sql)
+    }
     pub fn new(names: &'names Baptised<'registry>) -> Self {
         SqlGenerator {
             names,
             config: GeneratorConfig::default(),
             bin_registry: None,
+            inspecting: false,
         }
     }
 
@@ -143,17 +163,23 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         self
     }
 
-    /// Render a SQL-layer domain expression to a string.
-    ///
-    /// Used by the DDL pipeline generator for CHECK/DEFAULT expressions.
-    pub(crate) fn render_expression(
+    /// Whether each column of `statement`'s result is authored or minted,
+    /// in position order. Answered by the generator because the bundle it
+    /// spells with is the one that drew the names. A position no occurrence
+    /// stands at carries a name the engine chose, which nobody authored.
+    pub fn heading_naming(
         &self,
-        expr: &DomainExpression,
-        at: ScopeId,
-    ) -> Result<String, GeneratorError> {
-        let mut sql = String::new();
-        self.generate_domain_expression(&mut sql, expr, Some(Emitting::at(at)))?;
-        Ok(sql)
+        statement: &SqlStatement,
+    ) -> Option<Vec<delightql_protocol::Naming>> {
+        statement.heading().map(|heading| {
+            heading
+                .into_iter()
+                .map(|slot| match slot {
+                    Some(col) if !self.names.drew(col) => delightql_protocol::Naming::Authored,
+                    _ => delightql_protocol::Naming::Minted,
+                })
+                .collect()
+        })
     }
 
     /// Render a DDL CHECK or DEFAULT expression. SQL column definitions do
@@ -295,7 +321,11 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         }
     }
 
-    fn write_entity(&self, sql: &mut String, entity: EntityId) -> Result<(), GeneratorError> {
+    pub(crate) fn write_entity(
+        &self,
+        sql: &mut String,
+        entity: EntityId,
+    ) -> Result<(), GeneratorError> {
         self.write_name(sql, |names, output| names.write_entity(entity, output))
     }
 
@@ -321,12 +351,6 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         for argument in arguments {
             let mut rendered = String::new();
             match argument {
-                TvfArgument::Literal(value) => literals::generate_literal(
-                    &mut rendered,
-                    value,
-                    self.config.dialect,
-                    &self.config.dialect_pack,
-                )?,
                 TvfArgument::Column(column) => {
                     self.write_ref(&mut rendered, *column, at)?;
                 }
@@ -340,14 +364,35 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
              text: &str,
              stropped: bool,
              intrinsic: Option<crate::names::Intrinsic>| {
-                let guarded_args = if intrinsic == Some(crate::names::Intrinsic::JsonEachArray) {
+                let tvf_key = intrinsic.map_or_else(
+                    || format!("tvf.{}", text.to_ascii_lowercase()),
+                    |intrinsic| format!("tvf.{intrinsic:?}"),
+                );
+                let rule = match intrinsic {
+                    Some(intrinsic) => self
+                        .config
+                        .dialect_pack
+                        .render_intrinsic_tvf(self.config.dialect.family_name(), intrinsic),
+                    None => self
+                        .config
+                        .dialect_pack
+                        .render(self.config.dialect.family_name(), &tvf_key),
+                };
+                // A target template owns its complete call and guard. Only
+                // the generic json_each spelling needs this operation's
+                // target judgment; otherwise a PostgreSQL template would be
+                // judged by a guard it never emits.
+                let guarded_args = if intrinsic == Some(crate::names::Intrinsic::JsonEachArray)
+                    && rule.is_none()
+                {
                     rendered_args
                         .iter()
                         .map(|argument| {
                             format!(
-                            "CASE WHEN json_valid({argument}) AND json_type({argument}) = 'array' \
-                             THEN {argument} END"
-                        )
+                                "CASE WHEN json_valid({argument}) AND json_type({argument}) = '{}' \
+                                 THEN {argument} END",
+                                self.config.dialect.json_each_array_guard_type()
+                            )
                         })
                         .collect::<Vec<_>>()
                 } else {
@@ -364,20 +409,6 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                     output.push(')');
                 };
 
-                let tvf_key = intrinsic.map_or_else(
-                    || format!("tvf.{}", text.to_ascii_lowercase()),
-                    |intrinsic| format!("tvf.{intrinsic:?}"),
-                );
-                let rule = match intrinsic {
-                    Some(intrinsic) => self
-                        .config
-                        .dialect_pack
-                        .render_intrinsic_tvf(self.config.dialect.family_name(), intrinsic),
-                    None => self
-                        .config
-                        .dialect_pack
-                        .render(self.config.dialect.family_name(), &tvf_key),
-                };
                 match rule {
                     Some(rule) if rule.rule_kind == "template" => {
                         let body = rule.template()?;
@@ -506,66 +537,65 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         self.write_report_literal(sql, |names, out| names.write_answers_to(scope, out))
     }
 
-    fn write_json_path(
+    /// A PUBLISHED COLUMN READ AS A MEMBER: the one key of the reach is the
+    /// column's emitted spelling, which baptism supplies here. The reach is
+    /// then a typed path like any other and takes the same road to the
+    /// target.
+    fn published_json_path(
         &self,
-        sql: &mut String,
-        write_segments: impl FnOnce(&Baptised<'registry>, &mut SqlOut<'_>),
-    ) -> Result<(), GeneratorError> {
-        sql.push_str("'$");
-        let mut path_writer = |output: &mut String, text: &str, _stropped: bool| {
-            output.push_str(".\"");
-            output.push_str(
-                &text
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\'', "''"),
-            );
-            output.push('"');
-            Ok(())
-        };
-        let mut output = SqlOut::new(sql, &mut path_writer);
-        write_segments(self.names, &mut output);
-        output.finish().map_err(GeneratorError::Error)?;
-        sql.push('\'');
-        Ok(())
-    }
-
-    fn write_published_json_path(
-        &self,
-        sql: &mut String,
         column: ColId,
-    ) -> Result<(), GeneratorError> {
+    ) -> Result<crate::pipeline::asts::core::Path, GeneratorError> {
         if !self.names.knows_column(column) {
             return Err(GeneratorError::Error(format!(
                 "JSON-path column {column:?} was not included in the baptism bundle"
             )));
         }
-        self.write_json_path(sql, |names, output| names.write_column(column, output))
+        let mut key = String::new();
+        let mut key_writer = |output: &mut String, text: &str, _stropped: bool| {
+            output.push_str(text);
+            Ok(())
+        };
+        let mut output = SqlOut::new(&mut key, &mut key_writer);
+        self.names.write_column(column, &mut output);
+        output.finish().map_err(GeneratorError::Error)?;
+        Ok(crate::pipeline::asts::core::Path::key(key))
     }
 
-    /// A typed reach, rendered: keys quoted and escaped, indices
-    /// subscripted. One renderer, so a reach means the same thing wherever
-    /// it was declared.
-    fn write_typed_json_path(&self, sql: &mut String, path: &crate::pipeline::asts::core::Path) {
-        use crate::pipeline::asts::core::PathStep;
-        sql.push_str("'$");
-        for step in path.steps() {
-            match step {
-                PathStep::Key(key) => {
-                    sql.push_str(".\"");
-                    sql.push_str(
-                        &key.replace('\\', "\\\\")
-                            .replace('"', "\\\"")
-                            .replace('\'', "''"),
-                    );
-                    sql.push('"');
+    /// A typed reach, rendered in THIS TARGET'S path representation by the
+    /// dialect's one renderer.
+    fn write_typed_json_path(
+        &self,
+        sql: &mut String,
+        path: &crate::pipeline::asts::core::Path,
+    ) -> Result<(), GeneratorError> {
+        sql.push_str(
+            &self
+                .config
+                .dialect
+                .json_path_literal(path)
+                .map_err(GeneratorError::Error)?,
+        );
+        Ok(())
+    }
+
+    /// THE REACHES AMONG A CALL'S ARGUMENTS, as typed paths: a reach the
+    /// compiler made travels to a `rust_handler` as its steps, so a handler
+    /// that must spell a path in its target's representation renders the
+    /// steps rather than re-reading a spelling meant for another target. A
+    /// published column read as a member is the one-key path baptism names.
+    fn argument_paths(
+        &self,
+        args: &[DomainExpression],
+    ) -> Result<Vec<Option<crate::pipeline::asts::core::Path>>, GeneratorError> {
+        args.iter()
+            .map(|arg| match arg {
+                DomainExpression::JsonPathLiteral(path) => Ok(Some(path.clone())),
+                DomainExpression::PublishedJsonPathLiteral(column) => {
+                    self.published_json_path(*column).map(Some)
                 }
-                PathStep::Index(index) => {
-                    sql.push_str(&format!("[{index}]"));
-                }
-            }
-        }
-        sql.push('\'');
+                _ => Ok(None),
+            })
+            .collect()
     }
 
     fn write_relation_target(
@@ -578,18 +608,6 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                 self.write_entity(sql, *entity)
             }
             crate::pipeline::sql_ast::statements::RelationTarget::Scope(scope) => {
-                self.write_scope(sql, *scope)
-            }
-            crate::pipeline::sql_ast::statements::RelationTarget::QualifiedScope {
-                schema,
-                scope,
-            } => {
-                if schema == "temp" {
-                    sql.push_str("\"temp\"");
-                } else {
-                    sql.push_str(schema);
-                }
-                sql.push('.');
                 self.write_scope(sql, *scope)
             }
         }
@@ -635,6 +653,46 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
             self.generate_domain_expression(sql, arg, at)?;
         }
         sql.push(')');
+        Ok(())
+    }
+
+    /// Emit a call a dialect render rule spells: a rename keeps the call
+    /// shape, a full template and a handler compose from the rendered
+    /// arguments.
+    fn write_ruled_call(
+        &self,
+        sql: &mut String,
+        plan: RuledCall<'_>,
+        fn_key: &str,
+        args: &[DomainExpression],
+        distinct: bool,
+        at: Option<Emitting>,
+    ) -> Result<(), GeneratorError> {
+        match plan {
+            RuledCall::Template(template) => {
+                if distinct {
+                    return Err(GeneratorError::Error(format!(
+                        "render rule '{}' is a full template and cannot carry DISTINCT",
+                        fn_key
+                    )));
+                }
+                let rendered = self.render_fn_args(args, at)?;
+                let refs: Vec<&str> = rendered.iter().map(String::as_str).collect();
+                let applied = crate::pipeline::dialect_pack::apply_template(template, &refs)
+                    .map_err(|e| GeneratorError::Error(format!("{}: {}", fn_key, e)))?;
+                sql.push_str(&applied);
+            }
+            RuledCall::Handler(handler) => {
+                let rendered = self.render_fn_args(args, at)?;
+                let paths = self.argument_paths(args)?;
+                let applied = handler(&render_args(&paths, &rendered), distinct)
+                    .map_err(|e| GeneratorError::Error(format!("{}: {}", fn_key, e)))?;
+                sql.push_str(&applied);
+            }
+            RuledCall::Rename(new_name) => {
+                self.write_fn_call(sql, new_name, args, distinct, at)?;
+            }
+        }
         Ok(())
     }
 
@@ -702,33 +760,6 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                 }
 
                 // Generate the query that populates the table
-                self.generate_query_expression(&mut sql, query, 0)?;
-            }
-            SqlStatement::CreateTempView {
-                view,
-                with_clause,
-                query,
-            } => {
-                // Generate CREATE TEMPORARY VIEW statement
-                sql.push_str("CREATE TEMPORARY VIEW ");
-                self.write_scope(&mut sql, *view)?;
-                sql.push_str(" AS ");
-
-                if self.config.pretty_print {
-                    sql.push('\n');
-                }
-
-                // Generate WITH clause if present
-                if let Some(ctes) = with_clause {
-                    self.generate_with_clause(&mut sql, ctes, 0)?;
-                    if self.config.pretty_print {
-                        sql.push('\n');
-                    } else {
-                        sql.push(' ');
-                    }
-                }
-
-                // Generate the query that defines the view
                 self.generate_query_expression(&mut sql, query, 0)?;
             }
             SqlStatement::Delete {
@@ -847,30 +878,17 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
 
             // CTE name
             self.write_scope(sql, cte.scope())?;
-            if cte.materialized_once() {
-                // ONCE-ONLY IS A TARGET CAPABILITY, and this is where the
-                // target answers. A closed configured rule value is
-                // evaluated where it is constructed and read wherever it
-                // is spent; three families say so in the CTE itself.
-                // MySQL and SQL Server have no spelling that forbids
-                // re-evaluation, so a plain CTE there would silently
-                // re-run a volatile configuration once per spend. The
-                // refusal is the honest answer; emitting `AS (` would be
-                // a guarantee the target does not make.
-                match self.config.dialect {
-                    SqlDialect::SQLite | SqlDialect::PostgreSQL | SqlDialect::DuckDB => {
-                        sql.push_str(" AS MATERIALIZED (");
+            if let Some(columns) = cte.column_names() {
+                sql.push('(');
+                for (position, column) in columns.iter().enumerate() {
+                    if position > 0 {
+                        sql.push_str(", ");
                     }
-                    SqlDialect::MySQL | SqlDialect::SqlServer => {
-                        return Err(GeneratorError::Error(format!(
-                            "{:?} cannot guarantee the required once-only materialization of a closed configured rule value",
-                            self.config.dialect
-                        )));
-                    }
+                    self.write_column(sql, *column)?;
                 }
-            } else {
-                sql.push_str(" AS (");
+                sql.push(')');
             }
+            sql.push_str(" AS (");
 
             // CTE body (indented if pretty printing)
             if self.config.pretty_print {
@@ -906,7 +924,7 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         match body {
             CteBody::Ordinary(query) => self.generate_query_expression(sql, query, indent),
             CteBody::Fixpoint(fixpoint) => {
-                self.generate_query_expression(sql, fixpoint.anchor(), indent)?;
+                self.generate_fixpoint_term(sql, fixpoint.anchor(), indent, true)?;
                 for member in fixpoint.members() {
                     if self.config.pretty_print {
                         sql.push('\n');
@@ -920,11 +938,32 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                     } else {
                         sql.push(' ');
                     }
-                    self.generate_query_expression(sql, member, indent)?;
+                    self.generate_fixpoint_term(sql, member, indent, false)?;
                 }
                 Ok(())
             }
         }
+    }
+
+    #[stacksafe::stacksafe]
+    fn generate_fixpoint_term(
+        &self,
+        sql: &mut String,
+        query: &QueryExpression,
+        indent: usize,
+        anchor: bool,
+    ) -> Result<(), GeneratorError> {
+        if anchor
+            && self.config.dialect.compound_term_requires_derived_limit()
+            && matches!(query, QueryExpression::Select(select) if select.limit().is_some())
+        {
+            sql.push_str("SELECT * FROM (");
+            self.generate_query_expression(sql, query, indent)?;
+            sql.push(')');
+        } else {
+            self.generate_query_expression(sql, query, indent)?;
+        }
+        Ok(())
     }
 
     #[stacksafe::stacksafe]
@@ -960,34 +999,6 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
 
                 // Generate right side
                 self.generate_query_expression(sql, right, indent)?;
-            }
-            QueryExpression::Values { rows } => {
-                sql.push_str("VALUES ");
-                for (i, row) in rows.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(", ");
-                    }
-                    sql.push('(');
-                    for (j, expr) in row.iter().enumerate() {
-                        if j > 0 {
-                            sql.push_str(", ");
-                        }
-                        self.generate_domain_expression(sql, expr, None)?;
-                    }
-                    sql.push(')');
-                }
-            }
-            QueryExpression::WithCte { ctes, query } => {
-                // A NESTED WITH IS THE SAME WITH. One road writes the
-                // clause — recursion keyword, once-only materialization,
-                // each body — so a target's materialization answer cannot
-                // be given twice and differ.
-                self.indent(sql, indent);
-                self.generate_with_clause(sql, ctes, indent)?;
-                if self.config.pretty_print {
-                    sql.push('\n');
-                }
-                self.generate_query_expression(sql, query, indent)?;
             }
         }
 
@@ -1096,7 +1107,7 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                self.generate_domain_expression(sql, expr, Some(at))?;
+                self.generate_key(sql, expr, at, "GROUP BY")?;
             }
         }
 
@@ -1222,15 +1233,6 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
     ) -> Result<(), GeneratorError> {
         match table {
             TableExpression::Scope(scope) => self.write_scope(sql, *scope)?,
-            TableExpression::QualifiedScope { schema, scope } => {
-                if schema == "temp" {
-                    sql.push_str("\"temp\"");
-                } else {
-                    sql.push_str(schema);
-                }
-                sql.push('.');
-                self.write_scope(sql, *scope)?;
-            }
             TableExpression::Entity { entity, alias } => {
                 // A ground carries its occurrence scope so references have
                 // something to qualify by, and that scope usually ends up
@@ -1300,20 +1302,6 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                         sql.push_str(" ON ");
                         self.generate_domain_expression(sql, expr, Some(at))?;
                     }
-                    // Each pair is written as the equality of its two exact
-                    // slots, each under its own qualifier: nothing here
-                    // depends on the two sides sharing characters.
-                    JoinCondition::Merge(pairs) => {
-                        sql.push_str(" ON ");
-                        for (i, pair) in pairs.iter().enumerate() {
-                            if i > 0 {
-                                sql.push_str(" AND ");
-                            }
-                            self.write_ref(sql, pair.left, at)?;
-                            sql.push_str(" = ");
-                            self.write_ref(sql, pair.right, at)?;
-                        }
-                    }
                     JoinCondition::Cartesian => {
                         // A deliberate cross spells no condition; dialects
                         // that reject the bare form were legalized upstream.
@@ -1357,10 +1345,11 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                 self.write_column_literal(sql, *column)?;
             }
             DomainExpression::PublishedJsonPathLiteral(column) => {
-                self.write_published_json_path(sql, *column)?;
+                let path = self.published_json_path(*column)?;
+                self.write_typed_json_path(sql, &path)?;
             }
             DomainExpression::JsonPathLiteral(path) => {
-                self.write_typed_json_path(sql, path);
+                self.write_typed_json_path(sql, path)?;
             }
             DomainExpression::ScopeNameLiteral(scope) => {
                 self.write_scope_literal(sql, *scope)?;
@@ -1419,15 +1408,13 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                 sql.push_str("CAST(");
                 self.generate_domain_expression(sql, expr, at)?;
                 sql.push_str(" AS ");
-                let type_key = format!("type.{}", type_name.to_ascii_lowercase());
-                match self
-                    .config
-                    .dialect_pack
-                    .render(self.config.dialect.family_name(), &type_key)
-                {
-                    Some(rule) => sql.push_str(rule.template().map_err(GeneratorError::Error)?),
-                    None => sql.push_str(&type_name.to_ascii_uppercase()),
-                }
+                sql.push_str(
+                    &self
+                        .config
+                        .dialect_pack
+                        .type_spelling(self.config.dialect.family_name(), type_name)
+                        .map_err(GeneratorError::Error)?,
+                );
                 sql.push(')');
             }
             DomainExpression::Function {
@@ -1464,73 +1451,97 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                     ),
                 };
 
-                enum FnRender<'a> {
-                    Canonical,
-                    Rename(&'a str),
-                    Template(&'a str),
-                    Handler(crate::pipeline::dialect_pack::RustRenderHandler),
-                }
-                let plan = match rule {
-                    None => FnRender::Canonical,
-                    Some(rule) if rule.rule_kind == "template" => {
-                        let body = rule.template().map_err(GeneratorError::Error)?;
-                        if body.contains('{') {
-                            FnRender::Template(body)
-                        } else {
-                            FnRender::Rename(body)
-                        }
-                    }
-                    Some(rule) if rule.rule_kind == "rust_handler" => {
-                        let handler =
-                            crate::pipeline::dialect_pack::rust_render_handler(&rule.body)
-                                .ok_or_else(|| {
-                                    GeneratorError::Error(format!(
-                                        "{}: unknown rust_handler '{}'",
-                                        fn_key, rule.body
-                                    ))
-                                })?;
-                        FnRender::Handler(handler)
-                    }
-                    Some(rule) => {
-                        return Err(GeneratorError::Error(format!(
-                            "{}: unsupported rule_kind '{}' (no interpreter built for it)",
-                            fn_key, rule.rule_kind
-                        )));
-                    }
-                };
-
-                match plan {
-                    FnRender::Template(template) => {
-                        if *distinct {
-                            return Err(GeneratorError::Error(format!(
-                                "render rule '{}' is a full template and cannot carry DISTINCT",
-                                fn_key
-                            )));
-                        }
-                        let rendered = self.render_fn_args(args, at)?;
-                        let refs: Vec<&str> = rendered.iter().map(String::as_str).collect();
-                        let applied =
-                            crate::pipeline::dialect_pack::apply_template(template, &refs)
-                                .map_err(|e| GeneratorError::Error(format!("{}: {}", fn_key, e)))?;
-                        sql.push_str(&applied);
-                    }
-                    FnRender::Handler(handler) => {
-                        let rendered = self.render_fn_args(args, at)?;
-                        let refs: Vec<&str> = rendered.iter().map(String::as_str).collect();
-                        let applied = handler(&refs, *distinct)
-                            .map_err(|e| GeneratorError::Error(format!("{}: {}", fn_key, e)))?;
-                        sql.push_str(&applied);
-                    }
-                    FnRender::Rename(new_name) => {
-                        self.write_fn_call(sql, new_name, args, *distinct, at)?;
-                    }
-                    FnRender::Canonical => {
+                match RuledCall::of(rule, &fn_key)? {
+                    None => {
                         // The arbitrary-witness form's canonical spelling is
                         // the bare argument (sqlite's relaxed GROUP BY) —
                         // identity isn't expressible as a rename row, so this
                         // one canonical rule lives in code like the rest of
                         // the canonical spellings.
                         if name
+                            == &crate::pipeline::sql_ast::FunctionName::Intrinsic(
+                                crate::names::Intrinsic::JsonEachDocument,
+                            )
+                        {
+                            // THE ELEMENT AS ONE DOCUMENT, decided from the
+                            // TVF's `type` column. A container element's
+                            // value is its document; an atom's is quoted
+                            // into one. The subtype `json_quote` would read
+                            // on its own is not a value and does not survive
+                            // a sorter or a materialized subquery.
+                            let [value, kind] = args.as_slice() else {
+                                return Err(GeneratorError::Error(format!(
+                                    "{}: expects (value, kind), got {} arguments",
+                                    fn_key,
+                                    args.len()
+                                )));
+                            };
+                            sql.push_str("CASE WHEN ");
+                            self.generate_domain_expression(sql, kind, at)?;
+                            sql.push_str(" IN ('object', 'array') THEN ");
+                            self.generate_domain_expression(sql, value, at)?;
+                            sql.push_str(" ELSE json_quote(");
+                            self.generate_domain_expression(sql, value, at)?;
+                            sql.push_str(") END");
+                        } else if name
+                            == &crate::pipeline::sql_ast::FunctionName::Intrinsic(
+                                crate::names::Intrinsic::JsonScalar,
+                            )
+                        {
+                            let [value] = args.as_slice() else {
+                                return Err(GeneratorError::Error(format!(
+                                    "{}: expects exactly 1 argument, got {}",
+                                    fn_key,
+                                    args.len()
+                                )));
+                            };
+                            let mut member = String::new();
+                            self.generate_domain_expression(&mut member, value, at)?;
+                            write_exact_real(sql, &member, ExactReal::Member);
+                        } else if name
+                            == &crate::pipeline::sql_ast::FunctionName::Intrinsic(
+                                crate::names::Intrinsic::JsonLabel,
+                            )
+                        {
+                            let [value] = args.as_slice() else {
+                                return Err(GeneratorError::Error(format!(
+                                    "{}: expects exactly 1 argument, got {}",
+                                    fn_key,
+                                    args.len()
+                                )));
+                            };
+                            let mut key = String::new();
+                            self.generate_domain_expression(&mut key, value, at)?;
+                            write_exact_real(sql, &key, ExactReal::Label);
+                        } else if name
+                            == &crate::pipeline::sql_ast::FunctionName::Intrinsic(
+                                crate::names::Intrinsic::Exact,
+                            )
+                        {
+                            // SQLite compares under a column's declared
+                            // collation unless an operand states its own. A
+                            // postfix collation binds tighter than every
+                            // operator, so an operand that is an operation is
+                            // parenthesized to keep it whole.
+                            let [value] = args.as_slice() else {
+                                return Err(GeneratorError::Error(format!(
+                                    "{}: expects exactly 1 argument, got {}",
+                                    fn_key,
+                                    args.len()
+                                )));
+                            };
+                            let operation = matches!(
+                                value,
+                                DomainExpression::Binary { .. }
+                                    | DomainExpression::Unary { .. }
+                                    | DomainExpression::Observation { .. }
+                            );
+                            if operation {
+                                sql.push('(');
+                            }
+                            self.generate_domain_expression(sql, value, at)?;
+                            sql.push_str(if operation { ") COLLATE BINARY" } else { " COLLATE BINARY" });
+                        } else if name
                             == &crate::pipeline::sql_ast::FunctionName::Intrinsic(
                                 crate::names::Intrinsic::Arbitrary,
                             )
@@ -1562,6 +1573,9 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                             self.write_fn_call(sql, &spelled, args, *distinct, at)?;
                         }
                     }
+                    Some(ruled) => {
+                        self.write_ruled_call(sql, ruled, &fn_key, args, *distinct, at)?
+                    }
                 }
             }
             DomainExpression::WindowFunction {
@@ -1572,21 +1586,24 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                 order_by,
                 frame,
             } => {
-                // Function call — a window callee is an admitted name like
-                // any other and takes the same per-dialect callee law.
-                let spelled = self.callee_spelling(name)?;
-                sql.push_str(&spelled);
-                sql.push('(');
-                if *distinct {
-                    sql.push_str("DISTINCT ");
-                }
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(", ");
+                // A window callee is an admitted name like any other: it takes
+                // the same per-dialect callee law and the same render rule as
+                // its plain call, and the window clause stands after the call
+                // the rule spelled.
+                let fn_key = format!("fn.{}", name.to_ascii_lowercase());
+                let rule = self
+                    .config
+                    .dialect_pack
+                    .render(self.config.dialect.family_name(), &fn_key);
+                match RuledCall::of(rule, &fn_key)? {
+                    None => {
+                        let spelled = self.callee_spelling(name)?;
+                        self.write_fn_call(sql, &spelled, args, *distinct, at)?;
                     }
-                    self.generate_domain_expression(sql, arg, at)?;
+                    Some(ruled) => {
+                        self.write_ruled_call(sql, ruled, &fn_key, args, *distinct, at)?
+                    }
                 }
-                sql.push(')');
 
                 // OVER clause
                 sql.push_str(" OVER (");
@@ -1780,8 +1797,9 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
                         })?;
                     // For predicate handlers the flag is NEGATED (they own
                     // their negation spelling; no outer NOT is added).
+                    let paths = self.argument_paths(args)?;
                     sql.push_str(
-                        &handler(&refs, negated)
+                        &handler(&render_args(&paths, &rendered), negated)
                             .map_err(|e| GeneratorError::Error(format!("{}: {}", rule_id, e)))?,
                     );
                     return Ok(());
@@ -1810,8 +1828,10 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
             ))
         })?;
 
-        // The identity the resolver selected: a qualified citation names its
-        // namespace exactly, a bare one is the universally visible entity.
+        // The identity the resolver selected: both qualified and bare sigma
+        // citations carry the exact namespace/name that answered selection.
+        // An empty namespace remains only for hand-built SQL-AST fixtures;
+        // resolved calls never take that registration-order road.
         let entity = registry
             .lookup_qualified_entity(namespace, name)
             .ok_or_else(|| {
@@ -1845,6 +1865,32 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         Ok(())
     }
 
+    /// Write one ORDER BY or GROUP BY key. The AST holds every key as a
+    /// value, and SQL reads an integer literal there as a select-list
+    /// position. Legalization leaves no such key, so one here is refused
+    /// rather than written with another meaning, unless the statement is
+    /// only being shown.
+    fn generate_key(
+        &self,
+        sql: &mut String,
+        key: &DomainExpression,
+        at: Emitting,
+        clause: &str,
+    ) -> Result<(), GeneratorError> {
+        if key.reads_as_position() {
+            if !self.inspecting {
+                return Err(GeneratorError::Error(format!(
+                    "a {clause} key SQL would read as a position reached generation: {key:?}"
+                )));
+            }
+            sql.push_str("<value ");
+            self.generate_domain_expression(sql, key, Some(at))?;
+            sql.push('>');
+            return Ok(());
+        }
+        self.generate_domain_expression(sql, key, Some(at))
+    }
+
     /// Generate an ORDER BY term
     fn generate_order_term(
         &self,
@@ -1852,7 +1898,7 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         term: &OrderTerm,
         at: Emitting,
     ) -> Result<(), GeneratorError> {
-        self.generate_domain_expression(sql, term.expr(), Some(at))?;
+        self.generate_key(sql, term.expr(), at, "ORDER BY")?;
         if let Some(dir) = term.direction() {
             sql.push(' ');
             sql.push_str(match dir {
@@ -1881,7 +1927,6 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
 
         // Frame mode
         match frame.mode {
-            SqlFrameMode::Groups => sql.push_str("GROUPS"),
             SqlFrameMode::Rows => sql.push_str("ROWS"),
             SqlFrameMode::Range => sql.push_str("RANGE"),
         }
@@ -1931,4 +1976,114 @@ impl<'names, 'registry> SqlGenerator<'names, 'registry> {
         }
         Ok(())
     }
+}
+
+/// A `rust_handler`'s argument row: the typed path where the argument is a
+/// reach, the rendered SQL text elsewhere.
+/// A call a dialect render rule spells, read once from the rule's kind: a
+/// bare-name template renames and keeps the call shape and DISTINCT, a
+/// template with placeholders re-renders from the rendered arguments, and a
+/// handler names a compiled lowering. No rule is the canonical call.
+enum RuledCall<'a> {
+    Rename(&'a str),
+    Template(&'a str),
+    Handler(crate::pipeline::dialect_pack::RustRenderHandler),
+}
+
+impl<'a> RuledCall<'a> {
+    fn of(
+        rule: Option<&'a crate::pipeline::dialect_pack::RenderRule>,
+        fn_key: &str,
+    ) -> Result<Option<Self>, GeneratorError> {
+        let Some(rule) = rule else {
+            return Ok(None);
+        };
+        match rule.rule_kind.as_str() {
+            "template" => {
+                let body = rule.template().map_err(GeneratorError::Error)?;
+                Ok(Some(if body.contains('{') {
+                    RuledCall::Template(body)
+                } else {
+                    RuledCall::Rename(body)
+                }))
+            }
+            "rust_handler" => crate::pipeline::dialect_pack::rust_render_handler(&rule.body)
+                .map(|handler| Some(RuledCall::Handler(handler)))
+                .ok_or_else(|| {
+                    GeneratorError::Error(format!(
+                        "{}: unknown rust_handler '{}'",
+                        fn_key, rule.body
+                    ))
+                }),
+            other => Err(GeneratorError::Error(format!(
+                "{}: unsupported rule_kind '{}' (no interpreter built for it)",
+                fn_key, other
+            ))),
+        }
+    }
+}
+
+fn render_args<'a>(
+    paths: &'a [Option<crate::pipeline::asts::core::Path>],
+    rendered: &'a [String],
+) -> Vec<crate::pipeline::dialect_pack::RenderArg<'a>> {
+    paths
+        .iter()
+        .zip(rendered.iter())
+        .map(|(path, sql)| match path {
+            Some(path) => crate::pipeline::dialect_pack::RenderArg::Path(path),
+            None => crate::pipeline::dialect_pack::RenderArg::Sql(sql),
+        })
+        .collect()
+}
+
+/// Where SQLite writes a REAL the language places in a document.
+#[derive(Clone, Copy)]
+enum ExactReal {
+    /// A member: a JSON number.
+    Member,
+    /// A key: the text of the number.
+    Label,
+}
+
+/// SQLite's admission of a value into a document the language makes.
+///
+/// SQLite prints a REAL with fifteen significant digits both into a
+/// document and into a key, so two REALs that differ past the fifteenth
+/// digit enter a document as the same number, or two partitions under one
+/// key. A REAL is therefore written in the fewest of fifteen, sixteen or
+/// seventeen digits whose text SQLite converts back to the same REAL — the
+/// comparison runs the very conversion a document read or a cast of the key
+/// performs, so the value reads back as itself. The `!` flag lifts printf's
+/// sixteen-digit cap and keeps a decimal point, so an integral REAL stays
+/// REAL; the `0` flag spells an infinity as `9.0e+999`, which reads back.
+/// Fifteen digits is the writer's own spelling of a finite REAL, so a REAL
+/// it already carried keeps its bytes.
+///
+/// SQLite's decimal conversions are exact only at moderate magnitudes; a
+/// REAL no spelling returns refuses at runtime through a JSON path error
+/// carrying `INEXACT_DOCUMENT_REAL` and the value, never by carrying a
+/// neighbouring number. Every other storage class is the value itself, so a
+/// container a path extraction yields keeps its JSON subtype through the
+/// CASE. The value is evaluated for its storage class, again for each
+/// spelling tried, and again for the one written.
+fn write_exact_real(sql: &mut String, value: &str, place: ExactReal) {
+    write!(sql, "CASE WHEN typeof({value}) <> 'real' THEN {value}")
+        .expect("Writing to String cannot fail");
+    for digits in [15, 16, 17] {
+        let text = format!("printf('%!0.{digits}g', {value})");
+        let written = match place {
+            ExactReal::Member => format!("json({text})"),
+            ExactReal::Label => text.clone(),
+        };
+        write!(sql, " WHEN CAST({text} AS REAL) = {value} THEN {written}")
+            .expect("Writing to String cannot fail");
+    }
+    write!(
+        sql,
+        " ELSE json_extract('null', '{}: no spelling of ' || quote({value}) || \
+         ' reads back as the same REAL') END",
+        delightql_types::INEXACT_DOCUMENT_REAL
+    )
+    .expect("Writing to String cannot fail");
 }

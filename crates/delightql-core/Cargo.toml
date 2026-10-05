@@ -33,17 +33,16 @@ bincode = "1.3"  # For serializing AST to BLOB
 smallvec = { version = "1.13", features = ["serde"] }  # For efficient namespace path storage (0-2 item optimization)
 stacksafe = { version = "1", features = ["serde"] }
 base64 = "0.22"
+# The session catalog's SQLite, on every target: bundled natively, and on
+# wasm32-unknown-unknown supplied by rusqlite's default ffi-sqlite-wasm-rs.
+rusqlite.workspace = true
 
 [features]
 recursion_stats = []
 
-# WASM support: getrandom with js feature for wasm32 targets
+# WASM support: getrandom with js feature for wasm32 targets.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
-
-# Non-WASM: rusqlite for database introspection (WASM uses sql.js in browser)
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -56,4 +55,3 @@ proptest = "1.4"
 # wildcard instead of grepping for characters that appear in patterns too.
 syn = { version = "2", features = ["full", "visit"] }
 rusqlite.workspace = true  # For tests only
-

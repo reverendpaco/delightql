@@ -69,15 +69,6 @@ impl Limit {
         }
     }
 
-    /// The same clause with a maximum supplied. The offset it already
-    /// carries says where that maximum starts counting.
-    pub fn capped_at(&self, count: i64) -> Self {
-        Limit {
-            count: Some(count),
-            offset: self.offset,
-        }
-    }
-
     pub fn count(&self) -> Option<i64> {
         self.count
     }

@@ -505,17 +505,52 @@ pub struct ColumnNameTemplate {
     pub template: String,
 }
 
-// Re-cored from refined.rs
+/// The join a refined member realizes: every member of a run the product's
+/// road compiles is required, so its join is inner.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum JoinType {
-    /// Regular inner join (comma without markers)
     Inner,
-    /// Left outer join (? on right table)
-    LeftOuter,
-    /// Right outer join (? on left table)
-    RightOuter,
-    /// Full outer join (? on both tables)
-    FullOuter,
+}
+
+/// A JOIN MEMBER'S ROLE: `?` written on the member makes it optional.
+///
+/// Fixed where the member is built from syntax — a comma member, a leading
+/// access, an edge peer — and carried by the member step itself. A relation
+/// substituted into the member (a formal's actual, a view's body, a lifted
+/// literal) has no say in it: the role is the member's, not the relation's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToLispy)]
+pub enum MemberRole {
+    #[lispy("member_role:required")]
+    Required,
+    #[lispy("member_role:optional")]
+    Optional,
+}
+
+/// WHAT ONE MEMBER STEP STATES ABOUT ITS RUN: the role of the member it
+/// joins and, on the step completing a leading optional access, that the
+/// lead is optional too. The only way a run's first relation is optional is
+/// `h?(…), m(…)`, and that is one join, so the lead's role belongs to the
+/// step that completes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToLispy)]
+pub enum JoinRoles {
+    /// `…, m(…)` / `…, m?(…)`: the member joins what stands to its left.
+    #[lispy("join_roles:member")]
+    Member(MemberRole),
+    /// `h?(…), m(…)` / `h?(…), m?(…)`: the member completes the join its
+    /// optional leading access began.
+    #[lispy("join_roles:after_optional_lead")]
+    AfterOptionalLead(MemberRole),
+}
+
+impl JoinRoles {
+    /// An ordinary required comma member.
+    pub const REQUIRED: JoinRoles = JoinRoles::Member(MemberRole::Required);
+
+    pub fn member(&self) -> MemberRole {
+        match self {
+            JoinRoles::Member(role) | JoinRoles::AfterOptionalLead(role) => *role,
+        }
+    }
 }
 
 /// THE SEMANTIC PIPE-OPERATOR PRODUCTION: what an anonymous `|>` step can
@@ -603,33 +638,16 @@ pub struct AppliedCell<P: Phase = Unresolved> {
     pub expr: DomainExpression<P>,
 }
 
-#[derive(Debug, Clone, PartialEq, ToLispy)]
-#[lispy("resolved_interior_grounding")]
-pub struct ResolvedInteriorGrounding {
-    pub column: crate::relation::PortId,
-    pub value: String,
-}
-
 /// The drill as AUTHORED: the interior column and selections by name,
-/// groundings as literal pairs.
+/// groundings as each position and the literal it is fixed to, kept as the
+/// literal it is (a text spelling cannot tell the string "1" from 1).
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("authored_drill")]
 pub struct AuthoredDrill {
     pub column: String,
     pub glob: bool,
     pub columns: Vec<String>,
-    pub groundings: Vec<(String, String)>,
-}
-
-/// The drill, BOUND: the interior column and selections as occurrences.
-/// The glob is spent at binding — what remains is what it selected.
-#[derive(Debug, Clone, PartialEq, ToLispy)]
-#[lispy("bound_drill")]
-pub struct BoundDrill {
-    pub column: crate::relation::PortId,
-    pub columns: Vec<crate::relation::PortId>,
-    pub selection: crate::relation::form::DrillSelection,
-    pub groundings: Vec<ResolvedInteriorGrounding>,
+    pub groundings: Vec<(usize, crate::pipeline::asts::core::LiteralValue)>,
 }
 
 #[cfg(test)]
@@ -646,7 +664,6 @@ mod landed_member {
                         name: delightql_types::SqlIdentifier::new("t"),
                     },
                 ),
-                outer: false,
             },
         ))
     }
@@ -673,7 +690,7 @@ mod landed_member {
             HoArgument::Value(super::super::expressions::ArgumentValue::plain(
                 crate::pipeline::asts::core::DomainExpression::Application(
                     crate::pipeline::asts::core::FunctionApplication::Ground(
-                        crate::pipeline::asts::core::LiteralValue::Number("1".into()),
+                        crate::pipeline::asts::core::LiteralValue::integer(1),
                     ),
                 ),
             )),

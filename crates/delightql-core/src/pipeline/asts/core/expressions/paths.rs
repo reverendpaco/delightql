@@ -40,6 +40,11 @@ impl PathStep {
 
 /// A reach, spelled `(. key)+`. Non-empty by construction: a path with no
 /// steps reaches nothing, and no surface derives one.
+///
+/// A PATH IS NEVER SPELLED AS TEXT INSIDE THE COMPILER. Its steps travel
+/// typed into the SQL AST (`JsonPathLiteral`) and the generator's one
+/// renderer writes them; nothing renders a reach to a string that a later
+/// reader would have to parse back into steps.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 #[lispy("path")]
 pub struct Path(Vec1<PathStep>);
@@ -51,32 +56,28 @@ impl Path {
         Vec1::try_from_vec(steps).map(Self)
     }
 
+    /// A one-step reach to a key: what a keyed binding, a binder, or a
+    /// record member reads in the object it stands in. The key is data —
+    /// a dot, a bracket or a quote inside it is content, never a second
+    /// step.
+    pub fn key(key: impl Into<String>) -> Self {
+        Self(Vec1::new(PathStep::Key(key.into())))
+    }
+
+    /// A one-step reach to a position in a container.
+    pub fn index(index: i64) -> Self {
+        Self(Vec1::new(PathStep::Index(index)))
+    }
+
+    /// The reach extended by one more step.
+    pub fn then(self, step: PathStep) -> Self {
+        let (head, mut tail) = self.0.into_head_tail();
+        tail.push(step);
+        Self(Vec1::with_tail(head, tail))
+    }
+
     pub fn steps(&self) -> impl Iterator<Item = &PathStep> {
         self.0.iter()
-    }
-
-    /// The reach in JSON-path suffix spelling: `.key` for a key, `[n]` for
-    /// an index. What precedes it — a `$` root, a source column — belongs to
-    /// whoever applies the path.
-    pub fn suffix(&self) -> String {
-        let mut spelling = String::new();
-        for step in self.steps() {
-            match step {
-                PathStep::Key(key) => {
-                    spelling.push('.');
-                    spelling.push_str(key);
-                }
-                PathStep::Index(index) => spelling.push_str(&format!("[{index}]")),
-            }
-        }
-        spelling
-    }
-
-    /// The same reach as a destructuring MAPPING key: the suffix without a
-    /// leading separator, because the mapping's source is named beside it.
-    pub fn mapping_key(&self) -> String {
-        let suffix = self.suffix();
-        suffix.strip_prefix('.').unwrap_or(&suffix).to_string()
     }
 
     /// The name a reach PUBLISHES when nothing renamed it: `.a.b` → `a_b`.

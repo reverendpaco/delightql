@@ -112,6 +112,67 @@ fn every_entrance_names_itself() {
     );
 }
 
+/// THE HOST WRITES THE WRAP. Unmarked text a user typed becomes a goal in
+/// canonical text, read by the submission entrance as written — the same
+/// tree the prompt entrance reads, with the marker counted as authored.
+/// Text that names its own entrance goes as written.
+#[test]
+fn the_prompt_wrap_is_the_host_s_and_counted() {
+    use delightql_cst::prompt_wrap;
+    let typed = "users(*) |> (id)";
+    let sent = prompt_wrap(typed);
+    assert_eq!(sent, "?- users(*) |> (id)");
+
+    let submitted = Parser::new().parse_submission(&sent);
+    assert_eq!(submitted.entrance(), Root::DefinitionFile);
+    assert!(!submitted.has_defects(), "{:?}", submitted.defects());
+    assert_eq!(count::<TopLevelGoal>(&submitted), 1);
+    assert_eq!(submitted.source(), sent);
+
+    let prompted = Parser::new().parse_prompt(typed);
+    assert_eq!(count::<TopLevelGoal>(&prompted), 1);
+    assert_eq!(prompted.source(), typed);
+
+    let bad = Parser::new().parse_submission(&prompt_wrap("~~~ nonsense"));
+    let first = bad.defects().first().cloned().expect("a defect");
+    assert_eq!(first.start.column, 3, "the marker is authored bytes");
+
+    for named in [
+        "#!dql query-sequence\nusers(*)",
+        "users(*)\n#!dql query-sequence\n",
+    ] {
+        assert_eq!(prompt_wrap(named), named, "a named entrance is not framed twice");
+    }
+}
+
+/// THE MARKER SELECTS: each companion root admits its own cell category
+/// alone. A value where a constraint belongs, or a key sigil where a value
+/// belongs, is a defect at the cell's bytes — never a well-formed tree of
+/// the other category.
+#[test]
+fn a_companion_marker_admits_only_its_own_category() {
+    let mut p = Parser::new();
+    let value_as_constraint = p.parse_companion_cell(CompanionColumn::Constraint, "7");
+    assert!(
+        value_as_constraint.has_defects(),
+        "a bare value is not a constraint: {:?}",
+        value_as_constraint.defects()
+    );
+    let sigil_as_default = p.parse_companion_cell(CompanionColumn::Default, "%%");
+    assert!(
+        sigil_as_default.has_defects(),
+        "a key sigil is not a default value: {:?}",
+        sigil_as_default.defects()
+    );
+    let truth_as_constraint = p.parse_companion_cell(CompanionColumn::Constraint, "@ > 0");
+    assert!(!truth_as_constraint.has_defects(), "{:?}", truth_as_constraint.defects());
+    let value_as_default = p.parse_companion_cell(CompanionColumn::Default, "7");
+    assert!(!value_as_default.has_defects(), "{:?}", value_as_default.defects());
+    // A crossed truth is a value, so it stands in a default cell.
+    let crossed_as_default = p.parse_companion_cell(CompanionColumn::Default, "1 = 1");
+    assert!(!crossed_as_default.has_defects(), "{:?}", crossed_as_default.defects());
+}
+
 // ---------------------------------------------------------------------------
 // Finding 4 — synthetic selectors are not authored coordinates
 // ---------------------------------------------------------------------------

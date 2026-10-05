@@ -5,37 +5,17 @@ SQL's `UNION/UNION-ALL` position is irrelevant. The resulting schema
 is adopted from the first relation:
 
 ```delightql
-employee_2019(*)
-  |;|  employee_2018(*)
-  |;|  employee_2018(*)
+genre_2024(*)
+  |;|  genre_2025(*)
 ```
 
 
 ```sql
 SELECT
-  EmployeeId, LastName,
-  FirstName, Title, ReportsTo,
-  BirthDate, HireDate,
-  Address, City, State,
-  Country, PostalCode, Phone,
-  Fax, Email
-FROM employee_2019
+  genre_id, name
+FROM genre_2024
 UNION ALL
 SELECT
-  EmployeeId, LastName,
-  FirstName, Title, ReportsTo,
-  BirthDate, HireDate,
-  Address, City, State,
-  Country, PostalCode, Phone,
-  Fax, Email
-FROM employee_2018
-UNION ALL
-SELECT
-  EmployeeId, LastName,
-  FirstName, Title, ReportsTo,
-  BirthDate, HireDate,
-  Address, City, State,
-  Country, PostalCode, Phone,
-  Fax, Email
-FROM employee_2018;
+  genre_id, name  -- genre_2025 stores (name, genre_id)
+FROM genre_2025;
 ```

@@ -35,14 +35,17 @@ position performs the SAME correlated expansion and retains only the
 interior heading:
 
 ```delightql
-R(*).t(*)          // expand t; keep R's context beside each child
-R(*) |> .t(*)      // the same expansion; keep only t's columns
-R(*) |> .t(a, b)   // argumentative narrowing (positional bind)
+// expand staff; keep City beside each child
+employee(*) |> %(city ~> {last_name, title} as staff).staff(*)
+// the same expansion; keep only staff's columns
+employee(*) |> %(city ~> {last_name, title} as staff) |> .staff(*)
+// argumentative narrowing (positional bind)
+employee(*) |> %(city ~> {last_name, title} as staff) |> .staff(name, title)
 ```
 
 The two forms agree on row count, duplicate multiplicity, parent/child
 correspondence, and empty/NULL interiors; they differ only in retained
-context — `R(*) |> .t(*)`{.delightql} is exactly `R(*).t(*) |> (t.*)`{.delightql}.
+context — `… |> .staff(*)`{.delightql} is exactly `….staff(*) |> (staff.*)`{.delightql}.
 Parenthesized access — postfix or post-pipe, glob or argumentative —
 requires a statically known tree-group interior; over external JSON every
 parenthesized form is refused, because the compiler cannot discover keys
@@ -54,7 +57,7 @@ a missing declared key yields NULL without suppressing the row).
 **Example -- CTE drill-down:**
 
 ```delightql
-users(*) |> %(country ~> {first_name, last_name} as people) : by_country
+customer(*) |> %(country ~> {first_name, last_name} as people) : by_country
 by_country(*).people(*)
 ```
 
@@ -65,7 +68,7 @@ grouping level.
 
 ```delightql
 main::(*).entities(*).columns(*)
-  , entity_name = "users"
+  , entities.name = "employee"
 ```
 
 Each `.name(*)`{.delightql} step explodes one level of nesting. Columns from all prior

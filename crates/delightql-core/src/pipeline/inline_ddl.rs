@@ -8,33 +8,98 @@
 //! inside load publication), namespace collision, redefinition, registration,
 //! and rollback through whatever transaction the caller already holds.
 
-use crate::diagnostic::Runtime;
 use crate::error::Result;
+use crate::host::CompilerHost;
 use crate::system::DelightQLSystem;
 
 use super::asts::unresolved as ast_unresolved;
 
-/// Register the inline blocks attached to a prompt submission in their ruled
-/// `home` / `home::<suffix>` namespaces. Both ordinary and typed-effect prompt
-/// execution enter here before resolving the submission body.
+/// THE BLOCKS A STATEMENT TRAILS, held for the executor that runs it.
+///
+/// They are admitted once the statement has run — its effects performed and
+/// its result obtained — and never before, so a block trailing an `enlist!`
+/// or `alias!` is admitted in that directive's lexical world. A statement
+/// that fails admits none of them: its program stops there.
+#[derive(Debug)]
+#[must_use = "a statement's trailing blocks are admitted by the executor that ran it"]
+pub(crate) struct Trailing(Vec<ast_unresolved::InlineDdlSpec>);
+
+impl Trailing {
+    /// The blocks written after one statement's head, in authored order.
+    pub(crate) fn after(blocks: Vec<ast_unresolved::InlineDdlSpec>) -> Self {
+        Trailing(blocks)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Admit the blocks: the statement they trail has run.
+    pub(crate) fn admit(self, system: &mut DelightQLSystem) -> Result<()> {
+        register_prompt_blocks(self.0, system)
+    }
+}
+
+/// Register the inline blocks a prompt statement carries in their ruled
+/// `home` / `home::<suffix>` namespaces, in authored order. Each block is its
+/// own load and captures the session's lexical world as it stands when the
+/// block is admitted.
 pub(crate) fn register_prompt_blocks(
     blocks: impl IntoIterator<Item = ast_unresolved::InlineDdlSpec>,
     system: &mut DelightQLSystem,
 ) -> Result<()> {
     for ddl in blocks {
-        let namespace = match ddl.namespace.as_deref() {
-            Some(suffix) => {
-                let fq = format!("home::{suffix}");
-                crate::system::validate_user_namespace_target(&fq)?;
-                fq
-            }
-            None => "home".to_string(),
-        };
-        register_inline_ddl_block(&ddl.body, &namespace, system).map_err(|error| {
-            Runtime::catalog(format!("Inline DDL error: {error}"), "inline DDL")
-        })?;
+        if !ddl.body.is_empty() {
+            system.require(
+                crate::host::Capability::SessionCatalog,
+                "inline DDL registration",
+            )?;
+        }
+        let namespace = prompt_namespace(&ddl);
+        if ddl.namespace.is_some() {
+            crate::system::validate_user_namespace_target(&namespace)?;
+        }
+        register_inline_ddl_block(&ddl.body, &namespace, system)?;
     }
     Ok(())
+}
+
+/// Where a prompt block lands: `home`, or the `home::<suffix>` it names.
+fn prompt_namespace(ddl: &ast_unresolved::InlineDdlSpec) -> String {
+    match ddl.namespace.as_deref() {
+        Some(suffix) => format!("home::{suffix}"),
+        None => "home".to_string(),
+    }
+}
+
+/// Every entity a prompt block defines, as `(namespace, entity)`: one per
+/// subject, in authored order, where [`register_prompt_blocks`] lands it —
+/// nested blocks joined onto their parent's namespace.
+pub(crate) fn prompt_block_entities(ddl: &ast_unresolved::InlineDdlSpec) -> Vec<(String, String)> {
+    fn walk(
+        body: &ast_unresolved::InlineDdlBody,
+        namespace: &str,
+        out: &mut Vec<(String, String)>,
+    ) {
+        let mut seen: Vec<&crate::pipeline::asts::ddl::DefSubject> = Vec::new();
+        for clause in &body.definitions {
+            let subject = clause.front().subject();
+            if !seen.contains(&subject) {
+                seen.push(subject);
+                out.push((namespace.to_string(), subject.catalog_name()));
+            }
+        }
+        for block in &body.ddl_blocks {
+            let child = match &block.namespace {
+                Some(suffix) => format!("{namespace}::{suffix}"),
+                None => namespace.to_string(),
+            };
+            walk(&block.body, &child, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&ddl.body, &prompt_namespace(ddl), &mut out);
+    out
 }
 
 /// Register one TYPED inline DDL block: this block's clauses, then its
@@ -53,6 +118,8 @@ pub fn register_inline_ddl_block(
         return Ok(Vec::new());
     }
 
+    // A registration refusal keeps its own identity — a head law is the
+    // head law's, whichever road registered the family.
     let published = system
         // Inline DDL blocks have no liminal space: the scratch namespace's
         // liminal is empty because it is created by other means, not
@@ -60,13 +127,8 @@ pub fn register_inline_ddl_block(
         .publish(crate::system::PreparedLoad::inline(
             namespace,
             body.definitions.clone(),
-        ))
-        .map_err(|e| {
-            Runtime::catalog(
-                format!("Inline DDL registration failed: {}", e),
-                "consult error",
-            )
-        })?;
+        ))?;
+    crate::pipeline::middle::api::judge_declared_heads(system, namespace, published.relational_families())?;
     let replaced_entities = published.replaced_entities().to_vec();
 
     // Nested blocks are subordinate to this one: same transaction, child

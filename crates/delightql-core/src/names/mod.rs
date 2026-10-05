@@ -58,34 +58,31 @@
 //!    to the old one, because the compiler still holds the pre-optimization
 //!    tree and a mutated identity would silently reinterpret it.
 //!
-//! # Open, and deliberately not decided here
+//! # Stropping, and what is still open
 //!
-//! Whether a stropped spelling and an unstropped one that fold alike are
-//! the same identity. This module follows the tree's existing law —
-//! canonical bytes, folded iff unstropped — under which `` `name` `` and
-//! `name` ARE one `Sym` while `` `Name` `` and `name` are not. That is an
-//! inherited behaviour, not a ruling, and it is stated here because the
-//! interner is where it becomes load-bearing.
+//! Canonical bytes are folded iff unstropped, so `` `name` `` and `name`
+//! are one `Sym`: stropping opens no second publication namespace, and one
+//! declaration publishing both refuses. Whether `` `Name` `` and `name`,
+//! which this interner keeps apart, are one identity is not decided here;
+//! SQL emission folds case regardless, so baptism draws both wherever the
+//! two meet in one emitted heading.
 
-use crate::diagnostic::{DelightQLError, Resolution, Setop};
 pub mod baptism;
 pub mod birth;
-#[cfg(test)]
-mod fences;
 pub mod id;
 pub mod identifier;
+pub mod mint;
 pub mod origin;
-pub mod policy;
 pub mod registry;
-pub mod scope;
 pub mod sink;
 
 #[cfg(test)]
 pub use baptism::BaptismError;
-pub use baptism::{baptise, Baptised, Bundle, Statement};
-pub use birth::CteLabel;
+#[cfg(test)]
+pub use baptism::baptise;
+pub use baptism::{Baptised, Bundle, Statement};
 pub use id::{
-    CallableCategory, CallableId, ColId, DmlVerb, EntityId, FnId, ScopeId, Spelling, Sym,
+    CallableId, ColId, DmlVerb, EntityId, FnId, ScopeId, Spelling, Sym,
 };
 pub use identifier::{
     CteName, DefinitionName, PublishedName, ReferenceName, RenameName, StageName,
@@ -93,29 +90,10 @@ pub use identifier::{
 #[cfg(test)]
 pub use origin::FunctionSpellingError;
 pub use origin::{
-    Addressing, CteRole, FnOrigin, HoRole, Intrinsic, ScopeKind, ScratchRole, ValueFacts,
-    ValueShape, WrapReason,
+    Addressing, FnOrigin, Intrinsic, Provenance, ScopeKind, ScratchRole, WrapReason,
 };
-pub use registry::{CorrespondenceError, Registry};
-pub use scope::DuplicateScopePolicy;
-pub use sink::{SqlOut, Teaching};
-
-impl From<CorrespondenceError> for crate::error::DelightQLError {
-    fn from(error: CorrespondenceError) -> Self {
-        match error {
-            CorrespondenceError::Ambiguous => {
-                DelightQLError::from(Setop::CorrespondenceAmbiguous {
-                    message: "more than one column corresponds to one output slot".to_string(),
-                })
-            }
-            CorrespondenceError::Opaque => DelightQLError::from(Resolution::Schema {
-                message: "an operand's heading is not published by the target, so there is \
-                     nothing to pair the other operand's columns with"
-                    .to_string(),
-            }),
-        }
-    }
-}
+pub use registry::Registry;
+pub use sink::SqlOut;
 
 #[cfg(test)]
 mod tests;

@@ -21,6 +21,7 @@ use super::specs::GroupSpec;
 use super::{Chain, DomainExpression, GroundForm, TruthExpression};
 use crate::diagnostic::DdlHead;
 use crate::error::{DelightQLError, Result};
+use crate::lispy::ToLispy;
 use delightql_types::SqlIdentifier;
 
 /// The fixpoint flavor a head authors, typed. THE BADGE CHOOSES THE UNION.
@@ -155,43 +156,6 @@ pub struct ResidualSignature {
     pub output: HeadItems,
 }
 
-impl ResidualSignature {
-    /// Whether two declarations promise the same ordered structural
-    /// contract. Parameter names explain positions but do not participate;
-    /// relation headings and the published heading do.
-    pub(crate) fn same_shape(&self, other: &Self) -> bool {
-        fn same_heading(left: &HeadItems, right: &HeadItems) -> bool {
-            match (left, right) {
-                (HeadItems::Glob, HeadItems::Glob) => true,
-                (HeadItems::Listed(left), HeadItems::Listed(right)) => {
-                    left.len() == right.len()
-                        && left
-                            .iter()
-                            .zip(right)
-                            .all(|(left, right)| left.offered_name() == right.offered_name())
-                }
-                (HeadItems::Glob, HeadItems::Listed(_))
-                | (HeadItems::Listed(_), HeadItems::Glob) => false,
-            }
-        }
-
-        self.remaining.len() == other.remaining.len()
-            && self
-                .remaining
-                .iter()
-                .zip(&other.remaining)
-                .all(|(left, right)| match (left, right) {
-                    (
-                        ResidualMode::Relation { cols: left, .. },
-                        ResidualMode::Relation { cols: right, .. },
-                    ) => same_heading(left, right),
-                    (ResidualMode::Scalar { .. }, ResidualMode::Scalar { .. }) => true,
-                    (ResidualMode::Relation { .. }, ResidualMode::Scalar { .. })
-                    | (ResidualMode::Scalar { .. }, ResidualMode::Relation { .. }) => false,
-                })
-            && same_heading(&self.output, &other.output)
-    }
-}
 
 impl HeadItems {
     pub fn listed(&self) -> Option<&[HeadItem]> {
@@ -268,6 +232,11 @@ pub struct Head {
     pub context: ContextMode,
     /// The output head.
     pub items: HeadItems,
+    /// The fixpoint flavor the head badged (`c%(*)`, `c%(s)(*)`, `… : c%`).
+    /// The badge is a claim about the SUBJECT, so the assembler judges it
+    /// across the subject's clauses; whether the subject is a fixpoint at
+    /// all is decided only where its self-reference binds.
+    pub fixpoint: Fixpoint,
 }
 
 impl Head {
@@ -276,6 +245,7 @@ impl Head {
             ho_params: None,
             context: ContextMode::None,
             items: HeadItems::Glob,
+            fixpoint: Fixpoint::Bag,
         }
     }
 
@@ -284,6 +254,7 @@ impl Head {
             ho_params: None,
             context: ContextMode::None,
             items: HeadItems::Listed(items),
+            fixpoint: Fixpoint::Bag,
         }
     }
 
@@ -293,6 +264,7 @@ impl Head {
             ho_params: Some(params),
             context: ContextMode::None,
             items: HeadItems::Glob,
+            fixpoint: Fixpoint::Bag,
         }
     }
 
@@ -302,12 +274,26 @@ impl Head {
             ho_params: Some(params),
             context: ContextMode::None,
             items,
+            fixpoint: Fixpoint::Bag,
         }
     }
 
     pub fn with_context(mut self, context: ContextMode) -> Self {
         self.context = context;
         self
+    }
+
+    /// The same head, wearing the badge `fixpoint` names.
+    pub fn badged(mut self, fixpoint: Fixpoint) -> Self {
+        self.fixpoint = fixpoint;
+        self
+    }
+
+    /// What a clause keeps once its projection is spent: a glob, still
+    /// wearing the badge — spending the contract does not withdraw the
+    /// subject's claim about its fixpoint.
+    pub fn spent(&self) -> Self {
+        Head::glob().badged(self.fixpoint)
     }
 
     pub fn is_glob(&self) -> bool {
@@ -344,12 +330,15 @@ pub struct HeadAssembly {
     /// glob group: a glob head publishes the body's heading untouched, so
     /// there is no head-declared heading to publish instead.
     pub canonical_names: Option<Vec<SqlIdentifier>>,
+    /// The badge every clause agreed on.
+    pub fixpoint: Fixpoint,
 }
 
 impl HeadAssembly {
-    pub fn glob() -> Self {
+    fn glob(fixpoint: Fixpoint) -> Self {
         HeadAssembly {
             canonical_names: None,
+            fixpoint,
         }
     }
 }
@@ -433,38 +422,18 @@ pub fn name_conflict(
     })
 }
 
-/// What an all-ground unnamed position receives.
-///
-/// Fact syntax authenticates its positions: `f(1, 2)` is legal while the
-/// ordinary rule `f(*) :- _(1, 2)` refuses under the Ground-Position Naming
-/// Rule. The policy is the GROUP's provenance — chosen where every clause is
-/// known — not a per-clause exception inside the contest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroundNaming {
-    /// The Ground-Position Naming Rule: refuse the unnamed position.
-    Refuse,
-    /// A fact-only definition where nobody offers: position N receives the
-    /// canonical fact name `subject|N|` — the same bytes ordinal addressing
-    /// spells, so the published name and the canonical address coincide.
-    FactCanonical,
-}
-
-/// The one fallible assembler: arity, the per-position name-offer
-/// contest, the Ground-Position rule, and output-heading collision run
-/// HERE, once, for every neck, before any scope is minted. There is no
-/// second place clauses meet, so a silent NULL-padded union and a
-/// first-wins heading have nowhere to happen.
+/// The head assembler: arity, the per-position name-offer contest, the
+/// Ground-Position rule, and output-heading collision. A family's parameter
+/// row and badge are judged where it is declared, by the program
+/// middle's one family-signature judgment, on both necks.
 ///
 /// `subject` names the entity for teaching. `heads` are the group's clause
 /// heads in authored order.
-pub fn assemble(
-    subject: &str,
-    heads: &[&Head],
-    ground_naming: GroundNaming,
-) -> Result<HeadAssembly> {
+pub fn assemble(subject: &str, heads: &[&Head]) -> Result<HeadAssembly> {
     let Some(first) = heads.first() else {
-        return Ok(HeadAssembly::glob());
+        return Ok(HeadAssembly::glob(Fixpoint::Bag));
     };
+    let fixpoint = first.fixpoint;
 
     // A glob head is open and a listed head is a closed contract. One
     // subject cannot be both.
@@ -478,7 +447,7 @@ pub fn assemble(
         }));
     }
     if first.is_glob() {
-        return Ok(HeadAssembly::glob());
+        return Ok(HeadAssembly::glob(fixpoint));
     }
 
     let listed: Vec<&[HeadItem]> = heads
@@ -529,14 +498,8 @@ pub fn assemble(
         // The Ground-Position Naming Rule: a position every clause supplies
         // with ground terms must carry a name. An unnamed position is the
         // only state a public name can silently spring from — a later lvar
-        // clause would rename it with no warning. Fact syntax authenticates
-        // its positions, so a fact-only group receives the canonical fact
-        // name instead of the refusal.
+        // clause would rename it with no warning.
         let Some((name, _)) = winner else {
-            if ground_naming == GroundNaming::FactCanonical {
-                canonical.push(SqlIdentifier::new(format!("{subject}|{}|", pos + 1)));
-                continue;
-            }
             let n = heads.len();
             return Err(DelightQLError::from(DdlHead::UnnamedGroundPosition {
                 message: format!(
@@ -584,6 +547,7 @@ pub fn assemble(
 
     Ok(HeadAssembly {
         canonical_names: Some(canonical),
+        fixpoint,
     })
 }
 
@@ -629,7 +593,10 @@ pub trait HeadedClause: Sized {
 #[stacksafe::stacksafe]
 pub fn chain_publishes_names<P: Phase>(chain: &Chain<P>) -> bool {
     let mut publishes = match chain.head().form() {
-        GroundForm::Literal(table) => table.table.body.header.is_some(),
+        GroundForm::Literal(table) => table
+            .table()
+            .map(|table| table.body.header.is_some())
+            .unwrap_or(false),
         GroundForm::Reference(_) => true,
     };
     for continuation in chain.forms() {
@@ -832,16 +799,25 @@ pub fn project_body_through_head(
 
 impl crate::lispy::ToLispy for Head {
     fn to_lispy(&self) -> String {
+        let badge = match self.fixpoint {
+            Fixpoint::Bag => String::new(),
+            Fixpoint::Deduplicating => {
+                format!(
+                    "(fixpoint {}) ",
+                    crate::lispy::ToLispy::to_lispy(&self.fixpoint)
+                )
+            }
+        };
         match &self.ho_params {
             Some(params) => {
                 let params: Vec<String> = params.iter().map(HoParam::to_lispy).collect();
                 format!(
-                    "(head (params {}) {})",
+                    "(head {badge}(params {}) {})",
                     params.join(" "),
                     self.items.render()
                 )
             }
-            None => format!("(head {})", self.items.render()),
+            None => format!("(head {badge}{})", self.items.render()),
         }
     }
 }
@@ -941,15 +917,57 @@ mod tests {
     fn a_glob_group_declares_no_heading() {
         let head = Head::glob();
         let assembly =
-            assemble("g", &[&head, &head], GroundNaming::Refuse).expect("glob group assembles");
+            assemble("g", &[&head, &head]).expect("glob group assembles");
         assert_eq!(assembly.canonical_names, None);
+    }
+
+    /// The assembly answers the badge the family's clauses wear.
+    #[test]
+    fn the_assembly_answers_the_badge_every_clause_wears() {
+        let glob = Head::glob().badged(Fixpoint::Deduplicating);
+        let assembly =
+            assemble("c", &[&glob, &glob]).expect("one badge, one claim");
+        assert_eq!(assembly.fixpoint, Fixpoint::Deduplicating);
+
+        let unbadged = Head::glob();
+        assert_eq!(
+            assemble("c", &[&unbadged])
+                .expect("an unbadged clause")
+                .fixpoint,
+            Fixpoint::Bag
+        );
+
+        let parameterized = Head::higher_order(
+            vec![HoParam::Scalar {
+                name: SqlIdentifier::new("s"),
+                guard: None,
+                callable: false,
+            }],
+            HeadItems::Listed(vec![HeadItem::plumb("v")]),
+        );
+        let badged = parameterized.clone().badged(Fixpoint::Deduplicating);
+        assert_eq!(
+            assemble("c", &[&badged, &badged])
+                .expect("a badged parameterized family")
+                .fixpoint,
+            Fixpoint::Deduplicating
+        );
+    }
+
+    /// A spent head keeps the subject's badge.
+    #[test]
+    fn a_spent_head_keeps_its_badge() {
+        let head = listed(vec![HeadItem::plumb("a")]).badged(Fixpoint::Deduplicating);
+        let spent = head.spent();
+        assert!(spent.is_glob());
+        assert_eq!(spent.fixpoint, Fixpoint::Deduplicating);
     }
 
     #[test]
     fn mixing_glob_and_listed_heads_refuses() {
         let glob = Head::glob();
         let one = listed(vec![HeadItem::plumb("a")]);
-        let err = assemble("m", &[&glob, &one], GroundNaming::Refuse).unwrap_err();
+        let err = assemble("m", &[&glob, &one]).unwrap_err();
         assert_eq!(
             err.error_uri(),
             "delightql-error://semantic/ddl/head/mixed_forms"
@@ -960,7 +978,7 @@ mod tests {
     fn clause_arity_must_agree() {
         let one = listed(vec![HeadItem::plumb("a")]);
         let two = listed(vec![HeadItem::plumb("a"), HeadItem::plumb("b")]);
-        let err = assemble("p", &[&one, &two], GroundNaming::Refuse).unwrap_err();
+        let err = assemble("p", &[&one, &two]).unwrap_err();
         assert_eq!(err.error_uri(), "delightql-error://semantic/ddl/head/arity");
     }
 
@@ -968,7 +986,7 @@ mod tests {
     fn differing_offers_at_one_position_refuse() {
         let left = listed(vec![HeadItem::plumb("id")]);
         let right = listed(vec![HeadItem::plumb("age")]);
-        let err = assemble("q", &[&left, &right], GroundNaming::Refuse).unwrap_err();
+        let err = assemble("q", &[&left, &right]).unwrap_err();
         assert_eq!(
             err.error_uri(),
             "delightql-error://semantic/ddl/head/name_conflict"
@@ -983,14 +1001,14 @@ mod tests {
             Some("id"),
         )]);
         let assembly =
-            assemble("q", &[&left, &right], GroundNaming::Refuse).expect("the label conforms");
+            assemble("q", &[&left, &right]).expect("the label conforms");
         assert_eq!(names(&assembly), vec!["id"]);
     }
 
     #[test]
     fn a_position_every_clause_grounds_must_be_named() {
         let head = listed(vec![item(ground("VIP"), None), HeadItem::plumb("id")]);
-        let err = assemble("b", &[&head], GroundNaming::Refuse).unwrap_err();
+        let err = assemble("b", &[&head]).unwrap_err();
         assert_eq!(
             err.error_uri(),
             "delightql-error://semantic/ddl/head/unnamed_ground_position"
@@ -1004,7 +1022,7 @@ mod tests {
             HeadItem::plumb("id"),
         ]);
         let assembly =
-            assemble("b", &[&head], GroundNaming::Refuse).expect("the label names the position");
+            assemble("b", &[&head]).expect("the label names the position");
         assert_eq!(names(&assembly), vec!["tag", "id"]);
     }
 
@@ -1015,7 +1033,7 @@ mod tests {
         let grounded = listed(vec![item(ground("VIP"), None)]);
         let named = listed(vec![HeadItem::plumb("tag")]);
         let assembly =
-            assemble("b", &[&grounded, &named], GroundNaming::Refuse).expect("one offer suffices");
+            assemble("b", &[&grounded, &named]).expect("one offer suffices");
         assert_eq!(names(&assembly), vec!["tag"]);
     }
 
@@ -1028,7 +1046,7 @@ mod tests {
         ]);
         let bare = listed(vec![item(ground("y"), None), HeadItem::plumb("last")]);
         let assembly =
-            assemble("t", &[&labelled, &bare], GroundNaming::Refuse).expect("one offer suffices");
+            assemble("t", &[&labelled, &bare]).expect("one offer suffices");
         assert_eq!(names(&assembly), vec!["tag", "last"]);
     }
 
@@ -1038,7 +1056,7 @@ mod tests {
         // Unanimous, so no contest.
         let plumbed = listed(vec![HeadItem::plumb("country")]);
         let laundered = listed(vec![item(ground("x"), Some("country"))]);
-        let assembly = assemble("c", &[&plumbed, &laundered], GroundNaming::Refuse)
+        let assembly = assemble("c", &[&plumbed, &laundered])
             .expect("agreement is not conflict");
         assert_eq!(names(&assembly), vec!["country"]);
     }
@@ -1046,7 +1064,7 @@ mod tests {
     #[test]
     fn two_positions_may_not_publish_one_name() {
         let head = listed(vec![HeadItem::plumb("id"), HeadItem::plumb("id")]);
-        let err = assemble("c", &[&head], GroundNaming::Refuse).unwrap_err();
+        let err = assemble("c", &[&head]).unwrap_err();
         assert_eq!(
             err.error_uri(),
             "delightql-error://semantic/ddl/head/name_collision"
@@ -1059,7 +1077,7 @@ mod tests {
             HeadItem::plumb("id"),
             item(Supply::Ref(SqlIdentifier::new("other")), Some("id")),
         ]);
-        let err = assemble("c", &[&head], GroundNaming::Refuse).unwrap_err();
+        let err = assemble("c", &[&head]).unwrap_err();
         assert_eq!(
             err.error_uri(),
             "delightql-error://semantic/ddl/head/name_collision"
@@ -1086,5 +1104,193 @@ mod tests {
     #[test]
     fn an_unlabelled_ground_abstains() {
         assert!(item(ground("VIP"), None).offered_name().is_none());
+    }
+}
+
+/// HOW ONE CLAUSE'S SCALAR FORMALS ARE ADDRESSED IN ITS BODY. Positions
+/// never come from a sibling's declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClauseFormals {
+    /// A value or truth clause: each declared name binds bare, to the
+    /// argument position it stands at.
+    Bare(Vec<(delightql_types::SqlIdentifier, usize)>),
+    /// A relational or effect higher-order clause, read within the marked
+    /// scope the id names. Its scalar formals are addressed only as `$.x`,
+    /// which the reading already selected in that scope: no name of the
+    /// clause enters the body's lexical scope, and each invocation of the
+    /// clause stands that scope over its own actuals.
+    Marked(MarkedScopeId),
+}
+
+impl Default for ClauseFormals {
+    fn default() -> Self {
+        ClauseFormals::Bare(Vec::new())
+    }
+}
+
+impl ToLispy for ClauseFormals {
+    fn to_lispy(&self) -> String {
+        match self {
+            ClauseFormals::Bare(entries) => format!(
+                "(clause_formals:bare {})",
+                entries
+                    .iter()
+                    .map(|(name, position)| format!("({} {position})", name.to_lispy()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            ClauseFormals::Marked(_) => "(clause_formals:marked)".to_string(),
+        }
+    }
+}
+
+/// ONE READING'S MARKED SCOPE: a relational or effect higher-order clause as
+/// one reading of its text opened it. Minted fresh for every reading, so a
+/// selection made in one reading can be answered only by an invocation of
+/// the clause that reading produced — never by another scope that happens
+/// to stand at the same depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MarkedScopeId(u64);
+
+impl MarkedScopeId {
+    fn mint() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        MarkedScopeId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// An invocation input, outside the authored identifier namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, delightql_macros::ToLispy)]
+pub struct ArgumentPosition(usize);
+
+impl ArgumentPosition {
+    pub(crate) fn new(position: usize) -> Self {
+        Self(position)
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// A display label only; binding keys are `ArgumentPosition` values.
+pub(crate) fn argument_name(position: usize) -> delightql_types::SqlIdentifier {
+    delightql_types::SqlIdentifier::new(format!("argument {}", position + 1))
+}
+
+/// A DEFINITION-OWNED SCALAR REFERENCE, selected where it was read: the
+/// marked scope that declares the formal, as that reading opened it, and
+/// the formal's argument position there. It carries no spelling, so nothing
+/// can read a name back out of it and bind that name elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FormalSelector {
+    scope: MarkedScopeId,
+    position: ArgumentPosition,
+}
+
+impl FormalSelector {
+    pub(crate) fn scope(self) -> MarkedScopeId {
+        self.scope
+    }
+
+    pub(crate) fn position(self) -> ArgumentPosition {
+        self.position
+    }
+}
+
+impl ToLispy for FormalSelector {
+    fn to_lispy(&self) -> String {
+        format!("(formal position:{})", self.position.0)
+    }
+}
+
+/// ONE MARKED SCOPE: a relational or effect higher-order clause and its
+/// scalar formals by argument position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkedScope {
+    id: MarkedScopeId,
+    formals: Vec<(delightql_types::SqlIdentifier, usize)>,
+}
+
+impl MarkedScope {
+    /// One clause's scope, from its own parameter row, freshly minted for
+    /// the reading about to open it. A ground member declares no formal;
+    /// only a scalar formal is addressable.
+    pub(crate) fn of_clause(params: &[HoParam]) -> Self {
+        let formals: Vec<_> = params
+            .iter()
+            .enumerate()
+            .filter_map(|(position, param)| match param {
+                HoParam::Scalar { name, .. } => Some((name.clone(), position)),
+                _ => None,
+            })
+            .collect();
+        MarkedScope {
+            id: MarkedScopeId::mint(),
+            formals,
+        }
+    }
+
+    pub(crate) fn id(&self) -> MarkedScopeId {
+        self.id
+    }
+}
+
+/// THE MARKED SCOPES A TEXT IS READ UNDER, nearest first: every relational
+/// or effect higher-order clause the text stands in. `$.x` selects the
+/// nearest scope that declares `x`. A value function, a contextual
+/// function, a truth rule or a lambda opens no scope here, so its bare
+/// formals neither populate nor interrupt this space.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MarkedScopes(Vec<MarkedScope>);
+
+impl MarkedScopes {
+    /// These scopes with `scope` standing nearest.
+    pub(crate) fn within(&self, scope: MarkedScope) -> Self {
+        let mut scopes = Vec::with_capacity(self.0.len() + 1);
+        scopes.push(scope);
+        scopes.extend(self.0.iter().cloned());
+        MarkedScopes(scopes)
+    }
+
+    /// The formal `name` selects: the nearest scope declaring it.
+    pub(crate) fn select(&self, name: &delightql_types::SqlIdentifier) -> Option<FormalSelector> {
+        self.0.iter().find_map(|scope| {
+            scope
+                .formals
+                .iter()
+                .find(|(declared, _)| declared == name)
+                .map(|(_, position)| FormalSelector {
+                    scope: scope.id,
+                    position: ArgumentPosition(*position),
+                })
+        })
+    }
+}
+
+impl ClauseFormals {
+    pub(crate) fn cfe(formals: &super::CfeFormals) -> Self {
+        ClauseFormals::Bare(
+            formals
+                .iter()
+                .enumerate()
+                .map(|(position, formal)| (formal.name.clone(), position))
+                .collect(),
+        )
+    }
+
+    /// Whether the clause opens no frame: a clause with no bare names. A
+    /// marked clause always opens its scope, even over no scalar formal,
+    /// so a selection of it is answered wherever the clause is invoked.
+    pub(crate) fn is_empty(&self) -> bool {
+        matches!(self, ClauseFormals::Bare(entries) if entries.is_empty())
+    }
+
+    /// The marked scope a higher-order clause's reading opened, if it is one.
+    pub(crate) fn marked_scope(&self) -> Option<MarkedScopeId> {
+        match self {
+            ClauseFormals::Marked(scope) => Some(*scope),
+            ClauseFormals::Bare(_) => None,
+        }
     }
 }

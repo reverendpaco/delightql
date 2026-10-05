@@ -52,21 +52,31 @@ pub fn handle_jstruct_command(
     let output_format = format.unwrap_or(OutputFormat::Table);
 
     let mut handle = connection::open_handle(connection::SessionProfile::client())?;
-    let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
+    {
+        let mut session = handle.session().map_err(|e| anyhow::anyhow!("{}", e))?;
+        // A higher-order directive writes both groups: `(arguments)(receipt
+        // access)`. A lone group is receipt access by position, so dropping
+        // the `(*)` binds zero arguments and the demand refuses on arity.
+        crate::exec_ng::run_dql_query(
+            &format!("mount!(\"{}\", \"main\")(*)", db_path_str),
+            &mut *session,
+        )?;
+    }
 
-    // A higher-order directive writes both groups: `(arguments)(receipt
-    // access)`. A lone group is receipt access by position, so dropping the
-    // `(*)` binds zero arguments and the demand refuses on arity.
-    crate::exec_ng::run_dql_query(
-        &format!("mount!(\"{}\", \"main\")(*)", db_path_str),
-        &mut *session,
-    )?;
-
-    let result =
-        crate::exec_ng::execute_query(query, &mut *session, to, output_format, false, false, false);
+    let result = crate::exec_ng::execute_query(
+        query,
+        &mut *handle,
+        to,
+        crate::exec_ng::Rendering {
+            format: output_format,
+            no_headers: false,
+            no_sanitize: false,
+        },
+        crate::exec_ng::ShippedSets::Discarded,
+        false,
+    );
 
     // Drop SQLite connections before unlinking the temp file
-    drop(session);
     drop(handle);
     let _ = std::fs::remove_file(&temp_path);
 

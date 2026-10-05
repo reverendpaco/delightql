@@ -74,11 +74,12 @@ fn get_config() -> &'static HighlightConfig {
 /// process boundary is its containment.
 pub fn highlight_spans(
     parser: &mut delightql_cst::Parser,
+    entrance: &str,
     line: &str,
     should_cancel: &mut dyn FnMut(usize) -> bool,
 ) -> Option<Vec<super::worker::HighlightSpan>> {
     match get_config() {
-        HighlightConfig::Hardcoded => hardcoded_spans(parser, line, should_cancel),
+        HighlightConfig::Hardcoded => hardcoded_spans(parser, entrance, line, should_cancel),
         HighlightConfig::FromFile(query_src) => Some(query_capture_spans(line, query_src)),
     }
 }
@@ -149,10 +150,11 @@ fn class_colors() -> HashMap<&'static str, String> {
 /// Hardcoded classes from the typed CST, under the cooperative deadline.
 fn hardcoded_spans(
     parser: &mut delightql_cst::Parser,
+    entrance: &str,
     line: &str,
     should_cancel: &mut dyn FnMut(usize) -> bool,
 ) -> Option<Vec<super::worker::HighlightSpan>> {
-    let tree = match parser.parse_prompt_cancellable(line, should_cancel) {
+    let tree = match super::worker::parse_helper_text(parser, entrance, line, should_cancel) {
         delightql_cst::CancellableParse::Completed(tree) => tree,
         delightql_cst::CancellableParse::Cancelled { .. } => return None,
     };
@@ -189,7 +191,7 @@ fn query_capture_spans(line: &str, query_src: &str) -> Vec<super::worker::Highli
     let highlight_names = scm_highlight_names();
     config.configure(&highlight_names);
     let mut highlighter = Highlighter::new();
-    let Ok(events) = highlighter.highlight(&config, line.as_bytes(), None, |_| None) else {
+    let Ok(events) = highlighter.highlight(&config, line.as_bytes(), None, None, |_| None) else {
         return Vec::new();
     };
     let mut spans = Vec::new();
@@ -359,7 +361,7 @@ fn highlight_from_query_with_theme<'a>(
 
     // Highlight the code
     let mut highlighter = Highlighter::new();
-    let highlights = match highlighter.highlight(&config, line.as_bytes(), None, |_| None) {
+    let highlights = match highlighter.highlight(&config, line.as_bytes(), None, None, |_| None) {
         Ok(h) => h,
         Err(_) => return highlight_hardcoded(line), // Fallback
     };

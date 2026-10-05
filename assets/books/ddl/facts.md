@@ -20,9 +20,9 @@ Standard facts sharing the same functor name must be co-located -- no other defi
 ## Stacked Facts {.dqlh}
 
 Define tabular data with headers:
-```delightql
-employee(
-  EmployeeId , FirstName     , LastName
+```{.delightql .am}
+staff(
+  employee_id , first_name     , last_name
   -------------------
   0  , "Gusti"       , "Parlor" ;
   1  , "Diane-marie" , "McHenry" ;
@@ -41,7 +41,9 @@ _(first_name, last_name
   "Gusti"       , "Parlor" ;
   "Diane-marie" , "McHenry"
 )
+```
 
+```{.delightql .am}
 // Stacked fact (assertion mode)
 names(first_name, last_name
   --------------
@@ -54,9 +56,9 @@ names(first_name, last_name
 
 Delightql implements facts as views by default, not tables:
 
-```delightql
-employee(
-  EmployeeId , FirstName     , LastName
+```{.delightql .am}
+staff(
+  employee_id , first_name     , last_name
   -------------------
   0  , "Gusti"       , "Parlor" ;
   1  , "Diane-marie" , "McHenry" ;
@@ -64,8 +66,8 @@ employee(
 )
 ```
 ```sql
-CREATE TEMP VIEW employee AS
-  SELECT 0 AS EmployeeId, 'Gusti' AS FirstName, 'Parlor' AS LastName
+CREATE TEMP VIEW staff AS
+  SELECT 0 AS employee_id, 'Gusti' AS first_name, 'Parlor' AS last_name
   UNION ALL SELECT 1, 'Diane-marie', 'McHenry'
   UNION ALL SELECT 2, 'Ced', 'Mainds';
 ```
@@ -78,7 +80,7 @@ Stacked facts support the same sparse column syntax as anonymous tables.
 Mark optional columns with `?` in the header, then use `_(col @ val)` fills
 in data rows:
 
-```delightql
+```{.delightql .am}
 config(
   key, value, description?, deprecated?
   --------------------------------------
@@ -90,7 +92,7 @@ config(
 
 This is equivalent to the fully-expanded form:
 
-```delightql
+```{.delightql .am}
 config(
   key, value, description, deprecated
   ------------------------------------

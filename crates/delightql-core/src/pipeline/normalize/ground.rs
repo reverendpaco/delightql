@@ -80,7 +80,7 @@ impl<'t> Normalizer<'t> {
                     message: format!("invalid hex literal: {text}"),
                 })
             })?;
-            return Ok(LiteralValue::Number(value.to_string()));
+            return Ok(LiteralValue::integer(value));
         }
         if let Some(digits) = text.strip_prefix("0o").or_else(|| text.strip_prefix("0O")) {
             let value = u64::from_str_radix(digits, 8).map_err(|_| {
@@ -88,9 +88,15 @@ impl<'t> Normalizer<'t> {
                     message: format!("invalid octal literal: {text}"),
                 })
             })?;
-            return Ok(LiteralValue::Number(value.to_string()));
+            return Ok(LiteralValue::integer(value));
         }
-        Ok(LiteralValue::Number(text.replace('_', "")))
+        // The one place a spelling becomes a category: integer, decimal, or
+        // the exponent-bearing approximate form.
+        Ok(LiteralValue::Number(
+            crate::pipeline::asts::core::NumericLiteral::from_decimal_spelling(
+                text.replace('_', ""),
+            ),
+        ))
     }
 
     /// `b64:"…"` — the encoding is transport, so it is spent here and the

@@ -67,6 +67,7 @@
 //! fields, so the pairing of host, image, connection, guard and identities
 //! cannot be re-assembled elsewhere.
 
+use super::population::ensure_catalog_initialized;
 use super::DelightQLSystem;
 use crate::bin_cartridge::registry::BinCartridgeRegistry;
 use crate::bootstrap::guard::BootstrapGuard;
@@ -83,6 +84,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
+
+mod sys_tables;
 
 /// The pristine world's transient ledgers begin empty. Compilation carried
 /// out to construct the world — stdlib overlays, seed programs — is not any
@@ -118,6 +121,48 @@ const NORMALIZE_TRANSIENT_LEDGERS: &str = "\
 const RESTAMP_WORLD_CLOCKS: &str = "\
     UPDATE cartridge SET creation_time = strftime('%s', 'now'); \
     UPDATE activated_entity SET activation_time = strftime('%s', 'now');";
+
+/// THE CATALOG KNOWS EVERY NAMESPACE A MENTION CAN REACH. Each embedded
+/// module's row is seeded here, empty, as the system namespace it is (THE
+/// SESSION START: `std` is the language's library, system territory); the
+/// module's consult at image construction finds the row and fills it. A
+/// module whose namespace a bin cartridge already created keeps that row's
+/// identity and is stamped system, so no consult claims it as a library.
+fn seed_embedded_module_namespaces(conn: &Connection) -> Result<()> {
+    for (namespace_fq, _) in crate::stdlib_manifest::STDLIB_MODULES {
+        let mut specs = crate::import::namespace::parse_namespace_path(conn, namespace_fq)
+            .map_err(|e| {
+                Runtime::catalog(
+                    format!("Failed to construct module namespace '{namespace_fq}': {e}"),
+                    e.to_string(),
+                )
+            })?;
+        for spec in &mut specs {
+            if spec.fq_name == *namespace_fq {
+                spec.kind = crate::namespace::NamespaceKind::System;
+                spec.provenance = Some("bootstrap".into());
+                spec.source_path = Some(format!("embedded://{namespace_fq}"));
+            }
+        }
+        crate::import::namespace::create_namespace_hierarchy(conn, &specs).map_err(|e| {
+            Runtime::catalog(
+                format!("Failed to seed module namespace '{namespace_fq}': {e}"),
+                e.to_string(),
+            )
+        })?;
+        conn.execute(
+            "UPDATE namespace SET kind = ?2, provenance = 'bootstrap', source_path = ?3
+             WHERE fq_name = ?1 AND (kind IS NULL OR kind = 'unknown')",
+            rusqlite::params![
+                namespace_fq,
+                crate::namespace::NamespaceKind::System.spelling(),
+                format!("embedded://{namespace_fq}")
+            ],
+        )
+        .map_err(|e| catalog_error(&format!("stamp module namespace '{namespace_fq}' as a system namespace"), e))?;
+    }
+    Ok(())
+}
 
 fn catalog_error(operation: &str, e: impl std::fmt::Display) -> DelightQLError {
     Runtime::catalog(operation, format!("SQLite error: {}", e))
@@ -281,6 +326,7 @@ impl CanonicalCatalog {
                         e.to_string(),
                     )
                 })?;
+        seed_embedded_module_namespaces(&bootstrap_conn)?;
         // Register the primary (user) connection in bootstrap metadata.
         // Determine connection type ID from database type string (case-insensitive)
         let db_type_lower = db_type.to_lowercase();
@@ -535,23 +581,27 @@ impl CanonicalCatalog {
         // Register the burned identifier table (rows authored in
         // bootstrap/schema.sql) as sys::identifiers.identifier. Its own cartridge so the bulk
         // activation above cannot leak it into bare `sys`.
-        super::register_sys_identifier_table(&bootstrap_conn, bootstrap_conn_id)?;
+        sys_tables::register_sys_identifier_table(&bootstrap_conn, bootstrap_conn_id)?;
 
         // sys::diagnostics.finding: the session's own refusals and selftest
         // findings, queryable. Own cartridge for the same reason.
-        super::register_sys_diagnostics_table(&bootstrap_conn, bootstrap_conn_id)?;
+        sys_tables::register_sys_diagnostics_table(&bootstrap_conn, bootstrap_conn_id)?;
 
         // sys::format: the burned formatter style-bundle table (book row
         // = frozen defaults).
-        super::register_sys_format_table(&bootstrap_conn, bootstrap_conn_id)?;
+        sys_tables::register_sys_format_table(&bootstrap_conn, bootstrap_conn_id)?;
+
+        // sys::config: the keys core declares, and the settings table the
+        // host's boot rows and the session's rows are written into.
+        crate::settings::register_sys_config_tables(&bootstrap_conn, bootstrap_conn_id)?;
 
         // sys::connections: the curated safe-subset `connection` entity
         // (non-secret columns only). Own cartridge so the bulk activation
         // above cannot leak it into bare `sys`.
-        super::register_sys_connection_table(&bootstrap_conn, bootstrap_conn_id)?;
+        sys_tables::register_sys_connection_table(&bootstrap_conn, bootstrap_conn_id)?;
         // sys::ns: curated public-column `namespace` entity (the physical
         // table carries the internal mount relation).
-        super::register_sys_ns_namespace_table(&bootstrap_conn, bootstrap_conn_id)?;
+        sys_tables::register_sys_ns_namespace_table(&bootstrap_conn, bootstrap_conn_id)?;
 
         // Installation is complete: SEAL the catalog. Everything the
         // canonical schema authority and the registrations above created is
@@ -589,19 +639,22 @@ impl CanonicalCatalog {
         // unsized by the coercion in the same expression. From here on no
         // road holds a `DelightQLSystem` as a value.
         let host: Box<DelightQLSystem> = Box::new(DelightQLSystem::<[(); 0]> {
+            #[cfg(not(target_arch = "wasm32"))]
+            capabilities: crate::host::HostCapabilities::native(),
+            #[cfg(target_arch = "wasm32")]
+            capabilities: crate::host::HostCapabilities::browser(),
             connection,
             bootstrap_connection,
             schema: Some(schema),
             connection_map,
             introspector,
             bin_registry,
-            namespace_authoritative: true,
             connection_factory: None,
             schema_map: HashMap::new(),
+            introspector_map: HashMap::new(),
             catalog_cartridge_id: Cell::new(None),
             db_type: db_type.to_string(),
             effects_executed: Cell::new(0),
-            session_materialized_names: Cell::new(false),
             active_liminal_program: RefCell::new(None),
             session_health: SessionHealth::default(),
             byte_bindings: HashMap::new(),
@@ -620,8 +673,8 @@ impl CanonicalCatalog {
 // =============================================================================
 
 /// THE CONSTRUCTION CARRIER: a host running on the construction connection
-/// over a catalog that is sealed but not finalized — no universal overlay
-/// consulted, no seed run, no catalog cartridge. It owns no image and has
+/// over a catalog that is sealed but not finalized — no embedded module
+/// consulted, no seed docs written, no catalog cartridge. It owns no image and has
 /// no reset; the one thing that can be done with it is `finalize`, and
 /// nothing can take the host out of it.
 pub(crate) struct Construction {
@@ -630,15 +683,15 @@ pub(crate) struct Construction {
 }
 
 impl Construction {
-    /// THE TRANSITION THAT PROVES CANONICAL FINALIZATION: consult the
-    /// universal stdlib overlays, run the embedded seed programs, install
-    /// the catalog cartridge — the compiler-driven startup effects — and
+    /// THE TRANSITION THAT PROVES CANONICAL FINALIZATION: consult every
+    /// embedded module, write the seed docs, install the catalog cartridge —
+    /// the startup effects — and
     /// then, from the very connection they ran on, freeze the image. This
     /// is the only road to a `PristineImage`, so every image is the image
     /// of a finalized world. A failure here is a startup failure: a world
     /// missing an overlay would otherwise be frozen into every session.
-    pub(crate) fn finalize(self) -> Result<Finalized> {
-        self.finalize_after(|_, _| {})
+    pub(crate) fn finalize(self, boot: &crate::settings::Admitted) -> Result<Finalized> {
+        self.finalize_after(boot, |_, _| {})
     }
 
     /// TEST-ONLY: finalize, then let a test alter the finalized world on
@@ -651,18 +704,31 @@ impl Construction {
         self,
         tamper: impl FnOnce(&Connection, &BootstrapGuard),
     ) -> Result<Finalized> {
-        self.finalize_after(tamper)
+        let boot = crate::settings::BootSettings::new()
+            .state(crate::settings::BASE_DIRECTORY, None)
+            .admit()?;
+        self.finalize_after(&boot, tamper)
     }
 
     fn finalize_after(
         self,
+        boot: &crate::settings::Admitted,
         before_freeze: impl FnOnce(&Connection, &BootstrapGuard),
     ) -> Result<Finalized> {
         let Construction {
             mut host,
             universal_namespaces,
         } = self;
-        for ns in &universal_namespaces {
+        // Every embedded module is populated in the pristine image: the
+        // session starts with the language's library in the tree, and no
+        // selection runs a population act.
+        let embedded = crate::stdlib_manifest::STDLIB_MODULES.iter().map(|(ns, _)| ns.to_string());
+        let populated: Vec<String> = universal_namespaces
+            .iter()
+            .cloned()
+            .chain(embedded.filter(|ns| !universal_namespaces.contains(ns)))
+            .collect();
+        for ns in &populated {
             match host.ensure_stdlib_loaded(ns) {
                 super::StdlibLoad::Loaded
                 | super::StdlibLoad::AlreadyLoaded
@@ -677,7 +743,7 @@ impl Construction {
                 }
             }
         }
-        host.run_seed_programs()?;
+        host.write_seed_docs()?;
         let image = {
             let bootstrap_conn = host.bootstrap_connection.lock().map_err(|e| {
                 Runtime::poisoned(
@@ -685,12 +751,14 @@ impl Construction {
                     format!("Connection was poisoned: {}", e),
                 )
             })?;
-            // The catalog cartridge is a closed fact of the pristine image,
-            // not an accident of what the seeds happened to touch.
+            // The catalog cartridge is a closed fact of the pristine image.
             {
                 let _catalog_window = host.bootstrap_guard.catalog_window();
-                super::ensure_catalog_initialized(&host.catalog_cartridge_id, &bootstrap_conn)?;
+                ensure_catalog_initialized(&host.catalog_cartridge_id, &bootstrap_conn)?;
             }
+            // The host's boot rows are part of the image, so every reset
+            // restores them and no session row survives one.
+            boot.write_boot(&bootstrap_conn)?;
             before_freeze(&bootstrap_conn, &host.bootstrap_guard);
             PristineImage::freeze(&bootstrap_conn)?
         };
@@ -742,6 +810,10 @@ pub(crate) struct ReadySystem {
 }
 
 impl ReadySystem {
+    pub(crate) fn compiler_host_mut(&mut self) -> &mut DelightQLSystem {
+        &mut self.host
+    }
+
     /// Create a native DelightQL system from an injected connection.
     ///
     /// Native startup is the one place the pristine world is CONSTRUCTED:
@@ -754,14 +826,42 @@ impl ReadySystem {
     /// * `connection` - User database connection trait object (for execution)
     /// * `introspector` - Backend-specific introspector for discovering schema
     /// * `db_type` - Database type string ("sqlite", "duckdb", "postgres")
+    pub(crate) fn booted(
+        connection: Arc<Mutex<dyn DatabaseConnection>>,
+        introspector: Box<dyn crate::bootstrap::introspect::DatabaseIntrospector>,
+        db_type: &str,
+        boot: &crate::settings::Admitted,
+    ) -> Result<Self> {
+        Self::construct(connection, introspector, db_type)?
+            .finalize(boot)?
+            .publish()
+    }
+
+    /// A system for a test, booted as a host with no filesystem: its base
+    /// directory is stated as none, so a relative path refuses.
+    #[cfg(test)]
     pub(crate) fn new(
         connection: Arc<Mutex<dyn DatabaseConnection>>,
         introspector: Box<dyn crate::bootstrap::introspect::DatabaseIntrospector>,
         db_type: &str,
     ) -> Result<Self> {
-        Self::construct(connection, introspector, db_type)?
-            .finalize()?
-            .publish()
+        Self::stating(
+            connection,
+            introspector,
+            db_type,
+            crate::settings::BootSettings::new().state(crate::settings::BASE_DIRECTORY, None),
+        )
+    }
+
+    /// A world booted on the settings a test states.
+    #[cfg(test)]
+    pub(crate) fn stating(
+        connection: Arc<Mutex<dyn DatabaseConnection>>,
+        introspector: Box<dyn crate::bootstrap::introspect::DatabaseIntrospector>,
+        db_type: &str,
+        boot: crate::settings::BootSettings,
+    ) -> Result<Self> {
+        Self::booted(connection, introspector, db_type, &boot.admit()?)
     }
 
     /// The construction phase of `new`: the canonical catalog, wrapped for
@@ -804,6 +904,7 @@ impl ReadySystem {
         let candidate = self.image.instantiate()?;
 
         self.host.detach_imported_schemas()?;
+        self.host.drop_session_pool()?;
 
         candidate.install_into(&mut self.host)?;
 
@@ -841,6 +942,109 @@ impl Deref for ReadySystem {
 impl DerefMut for ReadySystem {
     fn deref_mut(&mut self) -> &mut DelightQLSystem {
         &mut self.host
+    }
+}
+
+impl DelightQLSystem {
+    /// DETACH every imported schema from the user connection, keeping
+    /// `main`, `temp` and `sys` (the in-memory ATTACH that carries session
+    /// tables; its rows are cleared by the world that replaces them).
+    fn detach_imported_schemas(&self) -> Result<()> {
+        let user_conn = self.connection.lock().map_err(|e| {
+            Runtime::poisoned(
+                "Failed to acquire user connection lock for reinit",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        let schemas: Vec<String> = match user_conn.query_all_rows("PRAGMA database_list", &[]) {
+            Ok((_cols, rows)) => rows
+                .iter()
+                .filter_map(|row| row.get(1).and_then(|v| v.as_wire_text()))
+                .filter(|s| s != "main" && s != "temp" && s != "sys")
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for schema in &schemas {
+            // A failed DETACH must ABORT the reinit: proceeding would replace
+            // the catalog — and every recorded cleanup identity — while the
+            // database stays physically attached.
+            if let Err(e) = user_conn.execute(&format!("DETACH DATABASE '{}'", schema), &[]) {
+                return Err(Runtime::catalog(
+                    format!(
+                        "reset aborted: could not DETACH '{}' — the session \
+                         catalog is left intact: {}",
+                        schema, e
+                    ),
+                    e.to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop every table and view in the user connection's session pool, its
+    /// TEMP schema: the world a reset installs records no session object,
+    /// so one left behind would answer a later statement's unqualified
+    /// spelling of its name. SQLite lists its pool in `temp.sqlite_master`; a
+    /// connection of another engine keeps its pool. A failed drop aborts the
+    /// reset, as a failed DETACH does.
+    fn drop_session_pool(&self) -> Result<()> {
+        if !self.db_type.eq_ignore_ascii_case("sqlite") {
+            return Ok(());
+        }
+        let user_conn = self.connection.lock().map_err(|e| {
+            Runtime::poisoned(
+                "Failed to acquire user connection lock for reinit",
+                format!("Connection was poisoned: {}", e),
+            )
+        })?;
+        // One object at a time, through the one row read every connection
+        // answers: each drop removes the row the next read would return.
+        let mut dropped: Vec<String> = Vec::new();
+        while let Some(row) = user_conn
+            .query_row_values("SELECT type, name FROM temp.sqlite_master WHERE type IN ('table', 'view') LIMIT 1", &[])
+            .map_err(|e| Runtime::catalog("reset aborted: could not read the session pool", e.to_string()))?
+        {
+            let (Some(kind), Some(name)) = (
+                row.first().and_then(|v| v.as_wire_text()),
+                row.get(1).and_then(|v| v.as_wire_text()),
+            ) else {
+                return Err(Runtime::catalog(
+                    "reset aborted: a session pool row names no object",
+                    format!("{row:?}"),
+                ));
+            };
+            if dropped.contains(&name) {
+                return Err(Runtime::catalog("reset aborted: a dropped session object is still listed", name));
+            }
+            let object = if kind == "view" { "VIEW" } else { "TABLE" };
+            let statement = format!("DROP {object} IF EXISTS temp.\"{}\"", name.replace('"', "\"\""));
+            user_conn.execute(&statement, &[]).map_err(|e| {
+                Runtime::catalog(
+                    format!("reset aborted: could not drop the session object '{name}'"),
+                    e.to_string(),
+                )
+            })?;
+            dropped.push(name);
+        }
+        Ok(())
+    }
+
+    /// The pristine image's entity docs: the doc act's facts, written once
+    /// at construction from `seed/docs.tsv` (target, tab, doc per line).
+    fn write_seed_docs(&mut self) -> Result<()> {
+        const SEED_DOCS: &str = include_str!("../../seed/docs.tsv");
+        let mut entries = Vec::new();
+        for line in SEED_DOCS.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let Some((target, doc)) = line.split_once('\t') else {
+                return Err(Runtime::catalog(
+                    format!("seed doc line without a tab: '{line}'"),
+                    "Seed docs",
+                ));
+            };
+            entries.push((target.to_string(), doc.to_string()));
+        }
+        self.set_entity_docs_atomic(&entries).map(|_| ())
     }
 }
 
@@ -1015,6 +1219,7 @@ impl ReadyWorld {
         host.connection_map
             .insert(facts.primary_connection_id, Arc::clone(&host.connection));
         host.schema_map.clear();
+        host.introspector_map.clear();
         host.schema = Some(Box::new(
             crate::bootstrap_schema::BootstrapBackedSchema::new(host.bootstrap_connection.clone()),
         ));
@@ -1157,6 +1362,63 @@ mod tests {
             .unwrap();
         assert_eq!(cartridge, instance.facts.catalog_cartridge_id);
     }
+
+    /// A captured import must be keyed by a load ACTIVATED IN its namespace:
+    /// no catalog write can publish a capture under a namespace other than
+    /// the load's owner. Taken over a fully instantiated catalog, whose
+    /// `activated_entity` rows are the real pairings: a `(namespace, load)`
+    /// the catalog activates is accepted; the same load under a DIFFERENT
+    /// namespace is refused by the trigger; a NULL load (a facade) is
+    /// exempt. This is the publication half of the sealed-load relationship.
+    #[test]
+    fn a_capture_must_be_keyed_by_a_load_in_its_namespace() {
+        let finalized = pristine_world_tests::finalized();
+        let instance = finalized.image.instantiate().unwrap();
+        let conn = instance.connection_for_test();
+        // A real pairing and a second, DIFFERENT namespace that the same
+        // load does not activate.
+        let (owner_ns, load): (i64, i64) = conn
+            .query_row(
+                "SELECT namespace_id, cartridge_id FROM activated_entity LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let foreign_ns: i64 = conn
+            .query_row(
+                "SELECT id FROM namespace WHERE id <> ?1
+                 AND id NOT IN (SELECT namespace_id FROM activated_entity WHERE cartridge_id = ?2)
+                 LIMIT 1",
+                [owner_ns, load],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let owned = conn.execute(
+            "INSERT INTO lexical_import (namespace_id, cartridge_id, imported_namespace_id)
+             VALUES (?1, ?2, ?1)",
+            [owner_ns, load],
+        );
+        assert!(
+            owned.is_ok(),
+            "a load activated in the namespace is accepted: {owned:?}"
+        );
+        let mismatched = conn.execute(
+            "INSERT INTO lexical_import (namespace_id, cartridge_id, imported_namespace_id)
+             VALUES (?1, ?2, ?1)",
+            [foreign_ns, load],
+        );
+        assert!(
+            mismatched.is_err(),
+            "a load that activates nothing in the namespace must be refused"
+        );
+        let facade = conn.execute(
+            "INSERT INTO lexical_import (namespace_id, cartridge_id, imported_namespace_id)
+             VALUES (?1, NULL, ?1)",
+            [foreign_ns],
+        );
+        assert!(facade.is_ok(), "a facade's NULL load is exempt: {facade:?}");
+    }
 }
 
 #[cfg(test)]
@@ -1165,7 +1427,7 @@ mod pristine_world_tests {
     //! semantic rows and behavior rather than private names: a reset world
     //! is a fresh, private, complete instance of the one pristine world,
     //! with its connection policy restored and its identities reconciled.
-    use super::super::ensure_catalog_initialized;
+    use super::super::population::ensure_catalog_initialized;
     use super::*;
     use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
     use delightql_types::test_utils::MockDatabaseConnection;
@@ -1197,7 +1459,11 @@ mod pristine_world_tests {
 
     /// A finalized world with its frozen image, not yet published.
     pub(super) fn finalized() -> Finalized {
-        construction().finalize().expect("finalize")
+        let boot = crate::settings::BootSettings::new()
+            .state(crate::settings::BASE_DIRECTORY, None)
+            .admit()
+            .expect("boot");
+        construction().finalize(&boot).expect("finalize")
     }
 
     /// A foreign key the schema declares: `connection.connection_type`
@@ -1555,5 +1821,34 @@ mod pristine_world_tests {
         drop(conn);
         assert!(system.get_connection(2).is_ok());
         assert!(system.health_incident().is_none());
+    }
+}
+
+#[cfg(test)]
+mod seed_doc_tests {
+    //! The pristine image's entity docs are written once at construction
+    //! from `seed/docs.tsv`; every line names an entity the image holds.
+
+    use super::ReadySystem;
+    use delightql_types::introspect::{DatabaseIntrospector, DiscoveredEntity};
+    use delightql_types::test_utils::MockDatabaseConnection;
+    use delightql_types::Result;
+    use std::sync::{Arc, Mutex};
+
+    struct EmptyIntrospector;
+    impl DatabaseIntrospector for EmptyIntrospector {
+        fn introspect_entities(&self) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![])
+        }
+        fn introspect_entities_in_schema(&self, _schema: &str) -> Result<Vec<DiscoveredEntity>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn the_seed_docs_land_in_the_pristine_image() {
+        let conn = Arc::new(Mutex::new(MockDatabaseConnection::new()));
+        ReadySystem::new(conn, Box::new(EmptyIntrospector), "sqlite")
+            .expect("construction writes every seed doc");
     }
 }

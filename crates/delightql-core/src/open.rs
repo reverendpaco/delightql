@@ -58,6 +58,7 @@ impl<'a> api::DqlSession for DqlSessionImpl<'a> {
                         name: String::from_utf8_lossy(&d.name).to_string(),
                         descriptor: String::from_utf8_lossy(&d.descriptor).to_string(),
                         position: i,
+                        naming: d.naming,
                     })
                     .collect();
                 Ok(QueryResult { handle, columns })
@@ -107,7 +108,7 @@ fn make_backend_session(backend: Box<dyn Handler + Send>) -> Result<BackendSessi
     match client
         .version(
             1_000_000,
-            b"relay0".to_vec(),
+            delightql_protocol::PROTOCOL_VERSION.to_vec(),
             300_000,
             vec![Orientation::Rows],
         )
@@ -130,39 +131,14 @@ impl api::DqlHandle for DqlHandleImpl {
         &mut self,
         hooks: api::SessionHooks,
     ) -> Result<Box<dyn api::DqlSession + '_>, String> {
-        // Take the stored backend, or recreate from the SAME connection.
-        // Using handler_factory (not factory.create) ensures the handler wraps
-        // the same connection where mount! did ATTACH.
-        let backend = match self.initial_backend.take() {
-            Some(b) => b,
-            None => (self.handler_factory)(),
-        };
+        self.open_session(crate::compiler_limits::Admission::Execute, hooks)
+    }
 
-        let backend_session = make_backend_session(backend)?;
-
-        let mut relay = RelayParty::new(&mut self.system, backend_session);
-        relay.set_danger_overrides(self.danger_overrides.clone());
-        if hooks.on_ship.is_some() {
-            relay.set_hooks(crate::relay::RelayHooks {
-                on_ship: hooks.on_ship,
-                ..Default::default()
-            });
-        }
-        let transport = DirectTransport::new(relay);
-        let client = Client::new(transport);
-
-        match client
-            .version(
-                1_000_000,
-                b"relay0".to_vec(),
-                300_000,
-                vec![Orientation::Rows],
-            )
-            .map_err(|e| format!("Relay version handshake failed: {}", e.message))?
-        {
-            VersionResult::Accepted(session) => Ok(Box::new(DqlSessionImpl { session })),
-            VersionResult::Rejected(error) => Err(ApiError::received(&error).to_string()),
-        }
+    fn observation_session(&mut self) -> Result<Box<dyn api::DqlSession + '_>, String> {
+        self.open_session(
+            crate::compiler_limits::Admission::Observe,
+            api::SessionHooks::default(),
+        )
     }
 
     fn create_relay(&mut self) -> Result<Box<dyn api::ServerRelay + '_>, String> {
@@ -173,6 +149,10 @@ impl api::DqlHandle for DqlHandleImpl {
         };
 
         let backend_session = make_backend_session(backend)?;
+        // A session starts from the host's boot values.
+        self.system
+            .clear_session_settings()
+            .map_err(|e| e.to_string())?;
         let mut relay = RelayParty::new(&mut self.system, backend_session);
         relay.set_danger_overrides(self.danger_overrides.clone());
         Ok(Box::new(relay))
@@ -237,6 +217,61 @@ impl api::DqlHandle for DqlHandleImpl {
 }
 
 impl DqlHandleImpl {
+    /// The one session constructor: a relay over the handle's system and a
+    /// fresh backend handler, under the admission the caller's road is
+    /// entitled to. Every session of either kind is made here, so the
+    /// observing kind cannot be assembled with an executing relay.
+    fn open_session(
+        &mut self,
+        admission: crate::compiler_limits::Admission,
+        hooks: api::SessionHooks,
+    ) -> Result<Box<dyn api::DqlSession + '_>, String> {
+        // Take the stored backend, or recreate from the SAME connection.
+        // Using handler_factory (not factory.create) ensures the handler wraps
+        // the same connection where mount! did ATTACH.
+        let backend = match self.initial_backend.take() {
+            Some(b) => b,
+            None => (self.handler_factory)(),
+        };
+
+        let backend_session = make_backend_session(backend)?;
+
+        // A session starts from the host's boot values.
+        self.system
+            .clear_session_settings()
+            .map_err(|e| e.to_string())?;
+        let mut relay = match admission {
+            crate::compiler_limits::Admission::Execute => {
+                RelayParty::new(&mut self.system, backend_session)
+            }
+            crate::compiler_limits::Admission::Observe => {
+                RelayParty::observing(&mut self.system, backend_session)
+            }
+        };
+        relay.set_danger_overrides(self.danger_overrides.clone());
+        if hooks.on_ship.is_some() {
+            relay.set_hooks(crate::relay::RelayHooks {
+                on_ship: hooks.on_ship,
+                ..Default::default()
+            });
+        }
+        let transport = DirectTransport::new(relay);
+        let client = Client::new(transport);
+
+        match client
+            .version(
+                1_000_000,
+                delightql_protocol::PROTOCOL_VERSION.to_vec(),
+                300_000,
+                vec![Orientation::Rows],
+            )
+            .map_err(|e| format!("Relay version handshake failed: {}", e.message))?
+        {
+            VersionResult::Accepted(session) => Ok(Box::new(DqlSessionImpl { session })),
+            VersionResult::Rejected(error) => Err(ApiError::received(&error).to_string()),
+        }
+    }
+
     /// Get shared access to the underlying system (crate-internal only).
     pub(crate) fn system(&self) -> &DelightQLSystem {
         &self.system
@@ -262,19 +297,25 @@ impl DqlHandleImpl {
 pub fn open(
     factory: Box<dyn ConnectionFactory>,
     mount_factory: Option<Box<dyn delightql_types::ConnectionFactory>>,
-) -> Result<Box<dyn api::DqlHandle>, String> {
-    let created = factory
-        .create(":memory:")
-        .map_err(|e| format!("Failed to create initial connection: {}", e))?;
+    boot: crate::settings::BootSettings,
+) -> crate::Result<Box<dyn api::DqlHandle>> {
+    // The contract comes first: a host that has not stated what only it can
+    // know is refused before any connection or catalog exists.
+    let boot = boot.admit()?;
+    let created = factory.create(":memory:")?;
 
-    // On native, `ReadySystem::new` constructs, finalizes (stdlib
+    // On native, `ReadySystem::booted` constructs, finalizes (stdlib
     // overlays, seed programs), freezes and instantiates the pristine
     // world: the handle receives the one reset-capable type, which cannot
     // exist without the image every reset installs. On wasm the name is
     // the wasm system itself, which has no bootstrap catalog and no reset
     // (`reinit_bootstrap` refuses there); it is not given a pretend image.
-    let mut system = ReadySystem::new(created.connection, created.introspector, &created.db_type)
-        .map_err(|e| format!("{}", e))?;
+    let mut system = ReadySystem::booted(
+        created.connection,
+        created.introspector,
+        &created.db_type,
+        &boot,
+    )?;
     if let Some(mf) = mount_factory {
         system.set_connection_factory(mf);
     }

@@ -58,6 +58,9 @@ impl<'t> Normalizer<'t> {
                 self.relational_membership(membership)
             }
             cst::TruthExpression::Existence(existence) => self.existence(existence),
+            cst::TruthExpression::ExistsAnonGrelex(existence) => {
+                self.anonymous_existence(existence)
+            }
             cst::TruthExpression::SigmaApplication(application) => {
                 self.sigma_application(application)
             }
@@ -82,6 +85,7 @@ impl<'t> Normalizer<'t> {
                 | Child::RelationalMembership(_)
                 | Child::Negation(_)
                 | Child::Existence(_)
+                | Child::ExistsAnonGrelex(_)
                 | Child::SigmaApplication(_)
                 | Child::ParenthesizedTruth(_) => continue,
             };
@@ -126,6 +130,7 @@ impl<'t> Normalizer<'t> {
             Child::Membership(membership) => self.membership(membership)?,
             Child::RelationalMembership(membership) => self.relational_membership(membership)?,
             Child::Existence(existence) => self.existence(existence)?,
+            Child::ExistsAnonGrelex(existence) => self.anonymous_existence(existence)?,
             Child::SigmaApplication(application) => self.sigma_application(application)?,
         }))
     }
@@ -381,6 +386,7 @@ impl<'t> Normalizer<'t> {
             rows,
             negated,
             source: crate::pipeline::asts::core::MembershipSource::In,
+            matching: (),
         }))
     }
 
@@ -400,6 +406,7 @@ impl<'t> Normalizer<'t> {
                 relation: Box::new(subquery),
                 addressing: ProbeAddressing { identifier },
                 negated,
+                matching: (),
             },
         ))
     }
@@ -438,6 +445,58 @@ impl<'t> Normalizer<'t> {
         }
     }
 
+    /// Anonymous existence is the anonymous-table spelling of membership.
+    /// Every truth position and the comma continuation reach this one
+    /// construction, so consulted bodies cannot acquire a private evaluator.
+    pub(crate) fn anonymous_existence(&mut self, node: cst::ExistsAnonGrelex<'t>) -> Result<Truth> {
+        let mut body = None;
+        let mut opener = None;
+        for child in node.children() {
+            match child {
+                cst::ExistsAnonGrelexChild::AnonBody(node) => body = Some(node),
+                cst::ExistsAnonGrelexChild::ExistsAnonOpen(node) => opener = Some(node),
+            }
+        }
+        let table = self.anon_body(self.require(body, "an anonymous membership has a body")?)?;
+        let opener = self.require(opener, "an anonymous membership carries polarity")?;
+        let header = table.body.header.ok_or_else(|| {
+            DelightQLError::from(crate::diagnostic::AnonBinding::WitnessShape {
+                message: "a witness anonymous table is a membership test and needs headers"
+                    .to_string(),
+            })
+        })?;
+        let mut probes = header
+            .into_vec()
+            .into_iter()
+            .map(|item| {
+                item.slot.into_term().ok_or_else(|| {
+                    Internal::invariant(
+                        "normalize::truth",
+                        "an anonymous membership header has a value",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let probe = if probes.len() == 1 {
+            Probe::Value(Box::new(probes.pop().expect("one probe")))
+        } else {
+            Probe::Row(Vec2::try_from_vec(probes).ok_or_else(|| {
+                Internal::invariant("normalize::truth", "an anonymous membership has a probe")
+            })?)
+        };
+        let rows = table
+            .body
+            .rows
+            .map(|row| ValueRow((*row.0).map(crate::pipeline::asts::core::Datum::into_value)));
+        Ok(TruthExpression::Membership(Membership {
+            probe,
+            negated: self.text(opener).starts_with('\\'),
+            rows,
+            source: crate::pipeline::asts::core::MembershipSource::WitnessAnon,
+            matching: (),
+        }))
+    }
+
     /// The ONE existence carrier. Both the truth-position spelling and the
     /// value-position one reach here; the difference is which position asked,
     /// and the position is what the surrounding node already decided.
@@ -458,9 +517,8 @@ impl<'t> Normalizer<'t> {
     ) -> Result<Truth> {
         let (identifier, _) = self.relation_identifier(callee)?;
         // A dequalifying access inside the probe — `+orders(*.(status))` —
-        // is the read's own correlation to the row the probe stands in,
-        // and the resolver performs it where it resolves that read; the
-        // access stays on the mention that carries it.
+        // is the read's own correlation to the row the probe stands in;
+        // the access stays on the mention that carries it.
         let subquery = self.interior_relation(callee, ho_part, interior)?;
         Ok(TruthExpression::Existence(Existence {
             polarity,

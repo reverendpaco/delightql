@@ -91,6 +91,43 @@ pub fn introspect_sqlite_database(
     Ok(entities)
 }
 
+/// The columns of a stored table on the runtime database whose values its
+/// storage computes (a generated column: `table_xinfo`'s `hidden` 2 for a
+/// virtual one, 3 for a stored one), by name. An unqualified name reads the
+/// temp schema's table, then main's. `None` for a view, a virtual table, or
+/// a relation the database does not hold, as SQLite's own `table_list`
+/// classes it.
+pub fn generated_columns(conn: &Connection, schema: Option<&str>, table_name: &str) -> Result<Option<Vec<String>>> {
+    let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let schemas: Vec<String> = match schema {
+        Some(s) => vec![s.to_string()],
+        None => vec!["temp".to_string(), "main".to_string()],
+    };
+    for owner in schemas {
+        let mut listed = conn.prepare(&format!("PRAGMA {}.table_list({})", quoted(&owner), quoted(table_name)))?;
+        let kinds: Vec<String> = listed
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<std::result::Result<_, _>>()?;
+        let Some(kind) = kinds.first() else {
+            continue;
+        };
+        if kind != "table" {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(&format!("PRAGMA {}.table_xinfo({})", quoted(&owner), quoted(table_name)))?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(6)?)))?;
+        let mut computed = Vec::new();
+        for row in rows {
+            let (name, hidden) = row?;
+            if matches!(hidden, 2 | 3) {
+                computed.push(name);
+            }
+        }
+        return Ok(Some(computed));
+    }
+    Ok(None)
+}
+
 /// Introspect columns for a specific table using PRAGMA table_xinfo
 ///
 /// Internal helper function that queries SQLite's PRAGMA table_xinfo to discover

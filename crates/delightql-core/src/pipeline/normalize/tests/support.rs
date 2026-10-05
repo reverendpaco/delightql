@@ -56,7 +56,7 @@ pub fn definition(source: &str) -> ClauseDecl {
 /// relational — a deferred payload or a value rule — which reads as "no shape
 /// to assert" at every caller.
 pub fn lispy_body(clause: &ClauseDecl) -> String {
-    match &clause.body {
+    match clause.body() {
         crate::pipeline::asts::ddl::DdlBody::Relational(query) => lispy(query),
         _ => String::new(),
     }

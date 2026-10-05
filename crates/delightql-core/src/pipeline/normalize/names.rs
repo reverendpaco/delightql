@@ -14,11 +14,13 @@
 //! reassemble.
 
 use super::Normalizer;
-use crate::diagnostic::{Internal, Semantic};
+use crate::diagnostic::{Internal, Resolution};
 use crate::error::{DelightQLError, Result};
 use crate::pipeline::asts::core::metadata::NamespacePath;
 use crate::pipeline::asts::core::QualifiedName;
-use crate::pipeline::asts::vocabulary::{Mark, Namespace, Ref, ResolutionMode, Vec1};
+use crate::pipeline::asts::vocabulary::{
+    Mark, Namespace, QualifierRoute, Ref, ResolutionMode, Vec1,
+};
 use crate::pipeline::syntax::cst;
 use delightql_types::SqlIdentifier;
 
@@ -56,8 +58,21 @@ impl<'t> Normalizer<'t> {
 
     /// A namespace's segments, outermost first — `lib::math` is
     /// `[lib, math]`.
-    pub(crate) fn namespace_segments(&self, node: cst::Namespace<'t>) -> Vec<SqlIdentifier> {
-        node.children().map(|part| self.identifier(part)).collect()
+    /// The one CST-boundary decode of a written namespace: its route (exact,
+    /// or the self-relative `.::child`) and its segments in path order.
+    pub(crate) fn namespace_parts(
+        &self,
+        node: cst::Namespace<'t>,
+    ) -> (QualifierRoute, Vec<SqlIdentifier>) {
+        let mut route = QualifierRoute::Exact;
+        let mut segments = Vec::new();
+        for child in node.children() {
+            match child {
+                cst::NamespaceChild::SelfRelative(_) => route = QualifierRoute::SelfRelative,
+                cst::NamespaceChild::Identifier(part) => segments.push(self.identifier(part)),
+            }
+        }
+        (route, segments)
     }
 
     fn namespace_of(&self, qual: Option<cst::NamespaceQual<'t>>) -> Result<Namespace> {
@@ -66,18 +81,22 @@ impl<'t> Normalizer<'t> {
             return Ok(Namespace::Ambient);
         };
         let path = self.require(qual.child(), "a namespace qualifier has a namespace")?;
-        let parts: Vec<_> = self
-            .namespace_segments(path)
+        let (route, segments) = self.namespace_parts(path);
+        let parts: Vec<_> = segments
             .into_iter()
             .map(|segment| {
                 self.registry
                     .intern(segment.as_str(), segment.is_stropped())
             })
             .collect();
-        Ok(Namespace::Path(self.require(
+        let parts = self.require(
             Vec1::try_from_vec(parts),
             "a namespace has at least one segment",
-        )?))
+        )?;
+        Ok(match route {
+            QualifierRoute::Exact => Namespace::Path(parts),
+            QualifierRoute::SelfRelative => Namespace::SelfRelative(parts),
+        })
     }
 
     /// The one CST-boundary decode of a written reference.
@@ -196,20 +215,15 @@ impl<'t> Normalizer<'t> {
             None => NamespacePath::empty(),
             Some(qual) => {
                 let path = self.require(qual.child(), "a namespace qualifier has a namespace")?;
-                NamespacePath::from_parts(
-                    self.namespace_segments(path)
-                        .into_iter()
-                        .map(|segment| self.admit_reference(segment))
-                        .collect::<Result<Vec<_>>>()?
-                        .into_iter()
-                        .map(|segment| segment.as_str().to_string())
-                        .collect(),
-                )
-                .map_err(|error| {
-                    crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
-                        message: format!("invalid namespace path: {error:?}"),
-                    })
-                })?
+                let (route, segments) = self.namespace_parts(path);
+                let parts = segments
+                    .into_iter()
+                    .map(|segment| self.admit_reference(segment))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|segment| segment.as_str().to_string())
+                    .collect();
+                routed_path(route, parts)?
             }
         };
         Ok(QualifiedName {
@@ -226,17 +240,14 @@ impl<'t> Normalizer<'t> {
             return Ok(NamespacePath::empty());
         };
         let path = self.require(qual.child(), "a namespace qualifier has a namespace")?;
-        NamespacePath::from_parts(
-            self.namespace_segments(path)
+        let (route, segments) = self.namespace_parts(path);
+        routed_path(
+            route,
+            segments
                 .into_iter()
                 .map(|segment| segment.as_str().to_string())
                 .collect(),
         )
-        .map_err(|error| {
-            crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
-                message: format!("invalid namespace path: {error:?}"),
-            })
-        })
     }
 
     /// A qualifier in reference position. The deictic `_` names a RELATION —
@@ -278,6 +289,20 @@ impl Qualified {
     }
 }
 
+/// A written path under its route: the exact path, or the self-relative
+/// child route the world resolves.
+fn routed_path(route: QualifierRoute, parts: Vec<String>) -> Result<NamespacePath> {
+    match route {
+        QualifierRoute::Exact => NamespacePath::from_parts(parts),
+        QualifierRoute::SelfRelative => NamespacePath::self_relative(parts),
+    }
+    .map_err(|error| {
+        crate::diagnostic::DelightQLError::from(crate::diagnostic::Parse::General {
+            message: format!("invalid namespace path: {error:?}"),
+        })
+    })
+}
+
 /// An authored identifier, keeping its stroppedness — for a reader holding
 /// the tree rather than the normalizer.
 ///
@@ -302,85 +327,56 @@ fn strop_interior(text: &str) -> &str {
         .unwrap_or(text)
 }
 
-/// A scalar parameter reference: `A SCALAR PARAMETER IS CODE, NOT DATA`. The
-/// term is a bare name and nothing row-dependent; WHICH names qualify is a
-/// resolution judgment, not this layer's.
+/// A DEFINITION-OWNED SCALAR REFERENCE, `$.x`: selected here, in the marked
+/// scopes this text is read under, nearest first. What leaves is the
+/// selection — never the spelling — so no later stage can bind the name to
+/// anything else.
 impl<'t> Normalizer<'t> {
-    pub(crate) fn scalar_parameter(
+    pub(crate) fn parameter_reference(
         &self,
-        node: cst::ScalarParameterReference<'t>,
-    ) -> Result<SqlIdentifier> {
-        match self.require(node.child(), "a scalar parameter has a spelling")? {
-            cst::ScalarParameterReferenceChild::Identifier(name) => Ok(self.identifier(name)),
-            cst::ScalarParameterReferenceChild::StroppedForm(name) => {
-                Ok(SqlIdentifier::stropped(strop_interior(self.text(name))))
+        node: cst::ParameterReference<'t>,
+    ) -> Result<crate::pipeline::asts::core::definitions::FormalSelector> {
+        let name = match self.require(node.name(), "a parameter reference names its formal")? {
+            cst::ParameterReferenceName::Identifier(name) => self.identifier(name),
+            cst::ParameterReferenceName::StroppedForm(name) => {
+                SqlIdentifier::stropped(strop_interior(self.text(name)))
             }
-        }
+        };
+        self.marked.select(&name).ok_or_else(|| {
+            DelightQLError::from(Resolution::Parameter {
+                message: format!(
+                    "'$.{name}' names no scalar formal of a higher-order definition it stands \
+                     in. `$.x` reads a formal declared by the relational or effect \
+                     higher-order clause the reference is written in, or by one enclosing \
+                     it; a column is written bare, and a value function's or lambda's \
+                     parameter is written bare too"
+                ),
+            })
+        })
     }
 
-    /// A compile-time integer: a literal, or a definition parameter whose
-    /// value is substituted before the ordinary resolved query exists.
+    /// A compile-time integer position (FN.40): the number written, or the
+    /// scalar formal written there, recorded by the selection its `$.x`
+    /// makes. What a formal stands for at a use is not decided here.
     pub(crate) fn compile_time_integer(
         &mut self,
         node: cst::CompileTimeInteger<'t>,
         position: &'static str,
-    ) -> Result<i64> {
+    ) -> Result<crate::pipeline::asts::core::CompileTimeInteger> {
+        use crate::pipeline::asts::core::CompileTimeInteger;
         match node {
             cst::CompileTimeInteger::Number(number) => {
                 let text = self.text(number);
-                text.parse::<i64>().map_err(|_| {
+                text.parse::<i64>().map(CompileTimeInteger::Number).map_err(|_| {
                     Internal::invariant(
                         "normalize::names",
                         format!("{position} takes a whole number; '{text}' is not one"),
                     )
                 })
             }
-            cst::CompileTimeInteger::ScalarParameterReference(parameter) => {
-                self.substituted_integer(self.scalar_parameter(parameter)?, position)
+            cst::CompileTimeInteger::ParameterReference(parameter) => {
+                self.parameter_reference(parameter).map(CompileTimeInteger::Formal)
             }
-        }
-    }
-
-    /// The value a definition parameter was substituted with. Code, not data:
-    /// the substitution happens before the ordinary resolved query exists, so
-    /// a name with no binding is a refusal here rather than a bind parameter
-    /// carried forward.
-    fn substituted_integer(&self, name: SqlIdentifier, position: &'static str) -> Result<i64> {
-        use crate::pipeline::asts::core::LiteralValue;
-
-        // No fabricated stand-in: a bound with nothing to substitute is not a
-        // bound of zero. A definition body that cannot be read until its
-        // parameters arrive is DEFERRED by the road that owns it, and this
-        // refusal is what tells that road so.
-        let Some(bindings) = self.features.ho_bindings.as_ref() else {
-            return Err(DelightQLError::from(Semantic::LimitValue {
-                message: format!(
-                    "{position} names '{name}', which is an identifier with no active \
-                     higher-order scalar binding"
-                ),
-            }));
-        };
-        match bindings.scalar_literals.get(name.as_str()) {
-            Some(LiteralValue::Number(number)) => {
-                number.replace('_', "").parse::<i64>().map_err(|_| {
-                    DelightQLError::from(Semantic::LimitValue {
-                        message: format!(
-                            "{position} takes a whole number; '{name}' is bound to {number}"
-                        ),
-                    })
-                })
-            }
-            Some(_) => Err(DelightQLError::from(Semantic::LimitValue {
-                message: format!(
-                    "{position} takes a whole number; '{name}' is bound to a non-numeric value"
-                ),
-            })),
-            None => Err(DelightQLError::from(Semantic::LimitValue {
-                message: format!(
-                    "{position} names '{name}', which is not a scalar parameter of this \
-                     higher-order expansion"
-                ),
-            })),
         }
     }
 }

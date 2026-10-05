@@ -96,6 +96,7 @@ impl SisoParty {
                 position: (i + 1) as u64,
                 name: name.as_bytes().to_vec(),
                 descriptor: b"TEXT".to_vec(),
+                naming: delightql_protocol::Naming::Authored,
             })
             .collect();
 
@@ -173,6 +174,9 @@ impl Handler for SisoParty {
                 lease_ms,
                 orientations,
             } => {
+                if let Some(refusal) = delightql_protocol::version_refusal(&protocol_version) {
+                    return ServerTerm::Error(delightql_protocol::WireError::of(&refusal));
+                }
                 let supported = vec![Orientation::Rows];
                 let agreed: Vec<Orientation> = orientations
                     .iter()

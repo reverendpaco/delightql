@@ -114,63 +114,6 @@ fn sentinel(tag: &str) -> Chain<Unresolved> {
     }))
 }
 
-/// The consulted-view edge, proven in the phase whose trees can hold one.
-///
-/// A consulted view is the resolver's own product: `Unresolved::Consulted` is
-/// uninhabited, so the authored-phase matrix above cannot carry one. The edge
-/// is still query-bearing and still has to be walked, so it is pinned here
-/// instead of going unpinned.
-#[test]
-fn the_walk_reaches_a_consulted_views_body() {
-    use crate::pipeline::asts::core::Resolved;
-
-    let registry = crate::relation::Planning::open(crate::names::Registry::new(&[]));
-    let spelling = registry.intern("v", false);
-    let _ = spelling;
-    let scope = crate::relation::any_relation(&registry);
-    let body = registry
-        .authority()
-        .ground_read(Access::All, false, scope)
-        .expect("a ground read");
-    let view = Chain::<Resolved>::ground(
-        registry
-            .authority()
-            .wrapping_head(crate::pipeline::asts::core::GroundForm::Reference(
-                Relation::ConsultedView {
-                    body: Box::new(Query::relational(body)),
-                    outer: false,
-                },
-            ))
-            .expect("a consulted head"),
-    );
-
-    #[derive(Default)]
-    struct Seen(Vec<String>);
-    impl AstVisit<Resolved> for Seen {
-        /// The head is where a ground read AND the relation it publishes
-        /// both are, so what the walk reached is named from there.
-        fn enter_relational(
-            &mut self,
-            chain: &crate::pipeline::ast_resolved::Chain,
-        ) -> Result<Descent> {
-            if let crate::pipeline::asts::core::GroundForm::Reference(Relation::Ground { .. }) =
-                chain.head().form()
-            {
-                self.0.push(format!("{:?}", chain.head().result()));
-            }
-            Ok(Descent::Continue)
-        }
-    }
-
-    let mut seen = Seen::default();
-    walk_visit_relational(&mut seen, &view).expect("walk ok");
-    assert!(
-        seen.0.iter().any(|tag| *tag == format!("{scope:?}")),
-        "the walk did not descend into the consulted view's body; reached: {:?}",
-        seen.0
-    );
-}
-
 /// Collects the tags of every functor sentinel the walk enters.
 #[derive(Default)]
 struct SentinelCollector {
@@ -193,7 +136,7 @@ fn chain(exprs: Vec<Chain<Unresolved>>) -> Chain<Unresolved> {
             left.then(Step::authored(Continuation::Member {
                 rhs: right,
                 correlation: None,
-                join_type: None,
+                join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
             }))
         })
         .expect("at least one carrier")
@@ -283,6 +226,7 @@ fn r_i4_recursion_closure_matrix() {
                 identifier: qn("f"),
             },
             negated: false,
+            matching: (),
         }),
         origin: FilterOrigin::UserWritten,
     }));
@@ -291,7 +235,7 @@ fn r_i4_recursion_closure_matrix() {
     let correlation = sentinel("join_left").then(Step::authored(Continuation::Member {
         rhs: sentinel("join_right"),
         correlation: Some(MemberCorrelation::Condition(inner_exists("correlation"))),
-        join_type: None,
+        join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
     }));
 
     // Finding 4 — EACH Pipe-operator argument form carries a query-bearing edge.
@@ -321,7 +265,7 @@ fn r_i4_recursion_closure_matrix() {
                 crate::pipeline::asts::core::NamedOutItem::authored(
                     DomainExpression::Application(
                         crate::pipeline::asts::core::FunctionApplication::Ground(
-                            crate::pipeline::asts::core::LiteralValue::Number("1".to_string()),
+                            crate::pipeline::asts::core::LiteralValue::integer(1),
                         ),
                     ),
                     "b".into(),
@@ -392,7 +336,6 @@ fn r_i4_recursion_closure_matrix() {
             subquery: Box::new(sentinel("inner_relation_subquery")),
         },
         alias: None,
-        outer: false,
     }));
 
     let body = chain(vec![
@@ -421,7 +364,6 @@ fn r_i4_recursion_closure_matrix() {
                 horizon: crate::pipeline::asts::core::LexicalHorizon::all(),
                 head: crate::pipeline::asts::core::definitions::Head::glob(),
                 origin: Default::default(),
-                fixpoint: crate::pipeline::asts::vocabulary::Fixpoint::Bag,
             },
         ))
         .expect("one authored binding");
@@ -748,10 +690,10 @@ fn r_i4_recursion_closure_matrix_extended() {
     carriers.push(general_with_func(
         "record_src",
         crate::pipeline::asts::core::FunctionApplication::Enclyph(Enclyph::Record(Record::plain(
-            Vec1::new(RecordMember::Keyed {
+            vec![RecordMember::Keyed {
                 key: "k".to_string(),
                 value: Box::new(scalar_sub("record_member")),
-            }),
+            }],
         ))),
     ));
 
@@ -759,11 +701,11 @@ fn r_i4_recursion_closure_matrix_extended() {
     // its expressions beside the record occurrence it analyzes.
     let planned_record =
         crate::pipeline::asts::core::FunctionApplication::Enclyph(Enclyph::Record(Record::plain(
-            Vec1::new(RecordMember::SelfKeyed(NamedReference(AuthoredColumn {
+            vec![RecordMember::SelfKeyed(NamedReference(AuthoredColumn {
                 name: "k".into(),
                 qualifier: None,
                 namespace_path: NamespacePath::empty(),
-            }))),
+            }))],
         )));
     carriers.push(pipe_with(
         "cte_req_src",
@@ -784,6 +726,7 @@ fn r_i4_recursion_closure_matrix_extended() {
                         nested_members_info: vec![],
                     },
                 }],
+                collection: crate::pipeline::asts::core::Collection::Tree,
             },
         }),
     ));
@@ -940,12 +883,11 @@ fn skip_subtree_prunes_exactly_its_subtree() {
             subquery: Box::new(sentinel("under_pruned")),
         },
         alias: None,
-        outer: false,
     }));
     let tree = pruned.then(Step::authored(Continuation::Member {
         rhs: sentinel("sibling"),
         correlation: None,
-        join_type: None,
+        join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
     }));
 
     let mut c = PruneInnerRelations::default();
@@ -995,10 +937,10 @@ fn break_stops_the_walk_promptly() {
         rhs: sentinel("second").then(Step::authored(Continuation::Member {
             rhs: sentinel("third"),
             correlation: None,
-            join_type: None,
+            join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
         })),
         correlation: None,
-        join_type: None,
+        join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
     }));
 
     let mut c = BreakAt {
@@ -1049,10 +991,10 @@ fn err_hook_short_circuits_the_walk() {
         rhs: sentinel("boom").then(Step::authored(Continuation::Member {
             rhs: sentinel("after"),
             correlation: None,
-            join_type: None,
+            join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
         })),
         correlation: None,
-        join_type: None,
+        join: crate::pipeline::asts::core::JoinRoles::REQUIRED,
     }));
 
     let mut c = FailAt {

@@ -22,12 +22,13 @@ use crate::pipeline::asts::core::operators::{FrameBound, WindowFrame};
 use crate::pipeline::asts::core::ArgumentValue;
 use crate::pipeline::asts::core::{
     Access, AnonTable, BagCorrelation, Chain, Continuation, CorrPred, Datum, DelegateSpec,
-    DomainExpression, Enclyph, ErJoinStep, FunctionApplication, Glob, GroupSpec, HeaderItem,
-    MemberCorrelation, MetadataGroup, MetadataTarget, NamedOutItem, NamedReference, OrderingSpec,
-    OutItem, PatternTarget, Phase, PipeOp, Query, Record, RecordMember, RecordPattern,
-    RecordPatternMember, ReductionItem, ReductionPlan, Reference, RegexSelector, Relation,
-    RenameSource, RenameSpec, RepositionSpec, SelectorItem, Slot, Spread, TabularBody, TabularRow,
-    TreeGroupPlan, TreePattern, TruthExpression, Tuple, TupleElement, WholeHeading,
+    DestructurePattern, DomainExpression, Enclyph, ErJoinStep, FunctionApplication, Glob,
+    GroupSpec, HeaderItem, IterationPattern, MemberCorrelation, MetadataBinding, MetadataGroup,
+    MetadataTarget, NamedOutItem, NamedReference, NestedPattern, OrderingSpec, OutItem,
+    PatternTarget, Phase, PipeOp, Query, Record, RecordMember, RecordPattern, RecordPatternMember,
+    ReductionItem, ReductionPlan, Reference, RegexSelector, Relation, RenameSource, RenameSpec,
+    RepositionSpec, SelectorItem, Slot, Spread, TabularBody, TabularRow, TreeGroupPlan,
+    TreePattern, TruthExpression, Tuple, TupleElement, WholeHeading,
 };
 use crate::pipeline::asts::core::{
     Comparison, Existence, Membership, Probe, RelationalMembership, SigmaApplication, ValueRow,
@@ -82,12 +83,6 @@ macro_rules! same_phase_payload_folds {
         ) -> crate::error::Result<<$phase as crate::pipeline::asts::core::Phase>::ScalarOutput> {
             Ok(output)
         }
-        fn fold_destructure(
-            &mut self,
-            destructure: <$phase as crate::pipeline::asts::core::Phase>::Destructure,
-        ) -> crate::error::Result<<$phase as crate::pipeline::asts::core::Phase>::Destructure> {
-            Ok(destructure)
-        }
         fn fold_drill(
             &mut self,
             drill: <$phase as crate::pipeline::asts::core::Phase>::Drill,
@@ -122,6 +117,18 @@ macro_rules! same_phase_payload_folds {
             &mut self,
             binder: <$phase as crate::pipeline::asts::core::Phase>::Binder,
         ) -> crate::error::Result<<$phase as crate::pipeline::asts::core::Phase>::Binder> {
+            Ok(binder)
+        }
+        fn fold_pattern_binder(
+            &mut self,
+            binder: <$phase as crate::pipeline::asts::core::Phase>::PatternBinder,
+        ) -> crate::error::Result<<$phase as crate::pipeline::asts::core::Phase>::PatternBinder> {
+            Ok(binder)
+        }
+        fn fold_reach_binder(
+            &mut self,
+            binder: <$phase as crate::pipeline::asts::core::Phase>::ReachBinder,
+        ) -> crate::error::Result<<$phase as crate::pipeline::asts::core::Phase>::ReachBinder> {
             Ok(binder)
         }
         fn fold_placeholder(
@@ -159,207 +166,6 @@ macro_rules! same_phase_payload_folds {
 
 pub(crate) use same_phase_payload_folds;
 
-/// The answer for a payload that does not exist yet when this fold runs.
-///
-/// A slot the authored phase holds nothing for is minted by the pass that
-/// decides it — the resolver, where a self-reference binds or a pattern's
-/// columns come into being. A fold walking past cannot supply the value,
-/// and there is no default to hand back either: a default IS an answer, and
-/// inventing one is how several passes came to disagree about the same
-/// fact.
-macro_rules! minted_where_it_is_decided {
-    ($($method:ident -> $target:ty : $what:literal),+ $(,)?) => {
-        $(
-            fn $method(&mut self, _: ()) -> crate::error::Result<$target> {
-                Err(Internal::invariant("phase_payload", concat!(
-                        $what,
-                        " is minted where it is decided, and this fold is not that place",
-                    )))
-            }
-        )+
-    };
-}
-
-/// The answer for a column reference at the edge out of the authored phase.
-///
-/// A name is bound where it is resolved: against a heading, in a scope. A
-/// fold walking past one holds neither, so it refuses instead of carrying
-/// characters into a phase whose column IS an identity — the panic that used
-/// to catch this stood at the far end of the pipeline, in the lowering.
-/// A column an earlier pass already bound travels forward as itself: whoever
-/// bound it had the heading this fold does not.
-macro_rules! column_is_bound_where_it_is_resolved {
-    () => {
-        fn fold_col(
-            &mut self,
-            column: crate::pipeline::asts::core::AuthoredColumn,
-        ) -> crate::error::Result<crate::pipeline::asts::core::ColumnOccurrence> {
-            let crate::pipeline::asts::core::AuthoredColumn { name, .. } = column;
-            Err(Internal::invariant(
-                "lvar",
-                format!(
-                    "the column reference '{name}' is bound where it is resolved, \
-                     and this fold walked past a name nobody looked up"
-                ),
-            ))
-        }
-    };
-}
-
-pub(crate) use column_is_bound_where_it_is_resolved;
-
-/// The answer for a caller-pattern BINDER at the edge out of the authored
-/// phase.
-///
-/// A slot binds a name to a dimension of the relation it stands in. A fold
-/// walking past one has no relation and no dimension, so it refuses. The
-/// pattern resolver, which has both, builds its own slots.
-macro_rules! binder_is_bound_where_the_pattern_is_resolved {
-    () => {
-        fn fold_binder(
-            &mut self,
-            binder: crate::pipeline::asts::core::WrittenBinder,
-        ) -> crate::error::Result<crate::relation::PortId> {
-            Err(Internal::invariant(
-                "slot_bind",
-                format!(
-                    "the slot binding '{}' is bound where the caller pattern is \
-                     resolved, and this fold walked past a pattern nobody bound",
-                    binder.name
-                ),
-            ))
-        }
-    };
-}
-
-pub(crate) use binder_is_bound_where_the_pattern_is_resolved;
-
-/// The answer for a pipe LANDING at the edge out of the authored phase.
-///
-/// `@` names which formal receives the piped relation, and the invocation
-/// that reads it records that as an argument role. A landing reaching a fold
-/// is one no invocation read: there is no pipe for it to name, so it is
-/// refused rather than carried into a tree where it would stand for a value
-/// nobody supplied.
-macro_rules! a_landing_is_consumed_where_the_pipe_is_applied {
-    () => {
-        fn fold_placeholder(
-            &mut self,
-            _: crate::pipeline::asts::core::AtSign,
-        ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-            Err($crate::diagnostic::DelightQLError::from(
-                $crate::diagnostic::Ho::PipeLanding {
-                    message: "`@` names the parameter a piped relation lands at, and this one \
-                 stands in no invocation under a pipe"
-                        .to_string(),
-                },
-            ))
-        }
-    };
-}
-
-pub(crate) use a_landing_is_consumed_where_the_pipe_is_applied;
-
-/// The answer for a CONTEXT MARKER at the edge out of the authored phase.
-///
-/// `..` selects a context-aware definition's calling mode, and the call's
-/// instantiation consumes it. A marker reaching a fold is one no
-/// instantiation read: the callee declares no context, or the marker stands
-/// where no call is being instantiated at all.
-macro_rules! a_context_marker_is_consumed_where_the_call_instantiates {
-    () => {
-        fn fold_context_marker(
-            &mut self,
-            _: crate::pipeline::asts::core::ContextMarker,
-        ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-            Err($crate::diagnostic::DelightQLError::from(
-                $crate::diagnostic::Resolution::ContextMarkerPosition {
-                    message:
-                        "`..` selects the context calling mode of a context-aware definition, \
-                 and this call instantiates none"
-                            .to_string(),
-                },
-            ))
-        }
-    };
-}
-
-pub(crate) use a_context_marker_is_consumed_where_the_call_instantiates;
-
-/// The answer for a POSITION at the edge out of the authored phase.
-///
-/// `|2|` and `|1:3|` are spellings of a column reference, answered against a
-/// heading exactly as a name is. A fold with no heading cannot answer one, so
-/// it refuses. It does not hand back an underscore: a position that unifies
-/// with nothing is a different query from the one that was written.
-macro_rules! position_is_resolved_against_a_heading {
-    () => {
-        fn fold_column_ordinal(
-            &mut self,
-            ordinal: crate::pipeline::asts::core::ColumnOrdinal,
-        ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-            Err(Internal::invariant(
-                "column_ordinal",
-                format!(
-                    "the column position '{}' is resolved against a heading, and \
-                     this fold walked past one with no heading to answer it",
-                    crate::lispy::ToLispy::to_lispy(&ordinal)
-                ),
-            ))
-        }
-
-        fn fold_column_range(
-            &mut self,
-            range: crate::pipeline::asts::core::ColumnRange,
-        ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-            Err(Internal::invariant(
-                "column_range",
-                format!(
-                    "the column range '{}' is resolved against a heading, and this \
-                     fold walked past one with no heading to answer it",
-                    crate::lispy::ToLispy::to_lispy(&range)
-                ),
-            ))
-        }
-    };
-}
-
-pub(crate) use position_is_resolved_against_a_heading;
-
-/// The answer for a payload that CANNOT exist on either side of this edge.
-///
-/// There is no value to receive and none to return, so the body is a match
-/// with no arms — the compiler proves it cannot run.
-macro_rules! uninhabited_payload_folds {
-    ($($method:ident),+ $(,)?) => {
-        $(
-            fn $method(
-                &mut self,
-                payload: crate::pipeline::asts::vocabulary::Never,
-            ) -> crate::error::Result<crate::pipeline::asts::vocabulary::Never> {
-                match payload {}
-            }
-        )+
-    };
-}
-
-pub(crate) use uninhabited_payload_folds;
-
-/// The answer for a payload already decided when this fold runs: it travels
-/// forward unchanged, and there is no door here that re-decides it.
-macro_rules! decided_payload_travels_forward {
-    ($($method:ident($payload:ty)),+ $(,)?) => {
-        $(
-            fn $method(&mut self, payload: $payload) -> crate::error::Result<$payload> {
-                Ok(payload)
-            }
-        )+
-    };
-}
-
-pub(crate) use decided_payload_travels_forward;
-pub(crate) use minted_where_it_is_decided;
-
 // =============================================================================
 // Trait
 // =============================================================================
@@ -389,6 +195,14 @@ pub(crate) use minted_where_it_is_decided;
 /// what it IS was decided where it was built.
 #[allow(unused_variables)]
 pub trait AstTransform<P: Phase, Q: Phase> {
+    fn enter_clause(
+        &mut self,
+        _: &crate::pipeline::asts::core::definitions::ClauseFormals,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn leave_clause(&mut self, _: &crate::pipeline::asts::core::definitions::ClauseFormals) {}
+
     // -- Payload folds: required, one per phase-selected field ----------------
 
     /// A binding's decided-once recursion fact.
@@ -405,8 +219,6 @@ pub trait AstTransform<P: Phase, Q: Phase> {
     /// The ONE column a scalarized relation publishes.
     fn fold_scalar_output(&mut self, output: P::ScalarOutput) -> Result<Q::ScalarOutput>;
 
-    /// The columns a destructuring pattern produces.
-    fn fold_destructure(&mut self, destructure: P::Destructure) -> Result<Q::Destructure>;
     fn fold_drill(&mut self, drill: P::Drill) -> Result<Q::Drill>;
 
     /// A positional column reference.
@@ -423,6 +235,12 @@ pub trait AstTransform<P: Phase, Q: Phase> {
 
     /// The name a caller-pattern slot offers.
     fn fold_binder(&mut self, binder: P::Binder) -> Result<Q::Binder>;
+
+    /// A destructure pattern's like-named binder.
+    fn fold_pattern_binder(&mut self, binder: P::PatternBinder) -> Result<Q::PatternBinder>;
+
+    /// What a destructure pattern's reach publishes under.
+    fn fold_reach_binder(&mut self, binder: P::ReachBinder) -> Result<Q::ReachBinder>;
 
     /// The `@` that names which formal receives a piped relation.
     fn fold_placeholder(&mut self, landing: P::Placeholder) -> Result<Q::Placeholder>;
@@ -553,6 +371,18 @@ pub trait AstTransform<P: Phase, Q: Phase> {
     fn transform_frame_bound(&mut self, b: FrameBound<P>) -> Result<FrameBound<Q>> {
         walk_transform_frame_bound(self, b)
     }
+
+    // -- Position announcements -------------------------------------------------
+
+    /// WHETHER THE WALK NOW STANDS IN A REDUCTION'S VALUE POSITION, where a
+    /// value is computed over its group rather than from one row. The group
+    /// walk announces it around each value item and restores the previous
+    /// answer, which this returns. A position, not a node: a fold answers
+    /// nothing with it, and one with no use for it ignores it.
+    fn stand_in_reduction(&mut self, reducing: bool) -> bool {
+        let _ = reducing;
+        false
+    }
 }
 
 // =============================================================================
@@ -643,7 +473,13 @@ pub fn walk_transform_group_spec<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Si
                 .into_iter()
                 .map(|item| walk_transform_out_item(t, item))
                 .collect::<Result<Vec<_>>>()?,
-            reductions: reductions.try_map(|item| walk_transform_reduction_item(t, item))?,
+            reductions: reductions.try_map(|item| {
+                let reducing = matches!(item, ReductionItem::Out(_));
+                let was = t.stand_in_reduction(reducing);
+                let walked = walk_transform_reduction_item(t, item);
+                t.stand_in_reduction(was);
+                walked
+            })?,
             plan: transform_reduction_plan(t, plan)?,
         }),
     }
@@ -735,6 +571,9 @@ pub fn walk_transform_reference<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Siz
             Ok(Reference::Named(NamedReference(t.fold_col(column)?)))
         }
         Reference::Ordinal(ordinal) => Ok(Reference::Ordinal(t.fold_column_ordinal(ordinal)?)),
+        Reference::Argument(position) => Ok(Reference::Argument(Q::admit_argument(
+            P::into_argument(position),
+        )?)),
         Reference::Physical(column) => Ok(Reference::Physical(Q::admit_physical(
             P::into_physical(column)?,
         )?)),
@@ -747,18 +586,28 @@ pub fn walk_transform_enclyph<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized
 ) -> Result<Enclyph<Q>> {
     match enclyph {
         Enclyph::Record(record) => Ok(Enclyph::Record(Record {
-            members: record.members.try_map(|m| t.transform_record_member(m))?,
+            members: record
+                .members
+                .into_iter()
+                .map(|m| t.transform_record_member(m))
+                .collect::<Result<Vec<_>>>()?,
         })),
         Enclyph::EmptyRecord(_) => Ok(Enclyph::EmptyRecord(Q::admit_empty_record()?)),
         Enclyph::Tuple(tuple) => Ok(Enclyph::Tuple(Box::new(Tuple {
-            elements: tuple.elements.try_map(|e| {
-                Ok::<_, crate::error::DelightQLError>(match e {
-                    TupleElement::Value(value) => TupleElement::Value(t.transform_domain(value)?),
-                    TupleElement::Spread(spread) => {
-                        TupleElement::Spread(walk_transform_spread(t, spread)?)
-                    }
+            elements: tuple
+                .elements
+                .into_iter()
+                .map(|e| {
+                    Ok::<_, crate::error::DelightQLError>(match e {
+                        TupleElement::Value(value) => {
+                            TupleElement::Value(t.transform_domain(value)?)
+                        }
+                        TupleElement::Spread(spread) => {
+                            TupleElement::Spread(walk_transform_spread(t, spread)?)
+                        }
+                    })
                 })
-            })?,
+                .collect::<Result<Vec<_>>>()?,
         }))),
     }
 }
@@ -842,8 +691,9 @@ pub fn walk_transform_metadata_group<P: Phase, Q: Phase, F: AstTransform<P, Q> +
     })
 }
 
-/// A PATTERN CROSSES AS A PATTERN. Its binders are phase-selected; its keys,
-/// reaches and names are spec material that no phase decides.
+/// A PATTERN CROSSES AS A PATTERN. What each member publishes is
+/// phase-selected and crosses with the member; its keys and reaches are spec
+/// material that no phase decides.
 pub fn walk_transform_tree_pattern<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
     t: &mut F,
     pattern: TreePattern<P>,
@@ -853,39 +703,98 @@ pub fn walk_transform_tree_pattern<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
             members: record.members.try_map(|member| -> Result<_> {
                 match member {
                     RecordPatternMember::Binder(binder) => {
-                        Ok(RecordPatternMember::Binder(t.fold_binder(binder)?))
+                        Ok(RecordPatternMember::Binder(t.fold_pattern_binder(binder)?))
                     }
                     RecordPatternMember::Keyed { key, binder } => Ok(RecordPatternMember::Keyed {
                         key,
                         binder: t.fold_binder(binder)?,
                     }),
-                    RecordPatternMember::Nested {
-                        key,
-                        iteration,
-                        pattern,
-                    } => Ok(RecordPatternMember::Nested {
-                        key,
-                        iteration,
-                        pattern: Box::new(walk_transform_tree_pattern(t, *pattern)?),
-                    }),
-                    RecordPatternMember::Path(binding) => Ok(RecordPatternMember::Path(binding)),
-                    RecordPatternMember::Metadata { key, target } => {
-                        Ok(RecordPatternMember::Metadata {
-                            key: t.fold_binder(key)?,
-                            target: match target {
-                                PatternTarget::Pattern(inner) => PatternTarget::Pattern(Box::new(
-                                    walk_transform_tree_pattern(t, *inner)?,
-                                )),
-                                PatternTarget::Disregarded => PatternTarget::Disregarded,
-                            },
+                    RecordPatternMember::Nested { key, target } => {
+                        Ok(RecordPatternMember::Nested {
+                            key,
+                            target: Box::new(match *target {
+                                NestedPattern::Navigate(pattern) => NestedPattern::Navigate(
+                                    walk_transform_tree_pattern(t, pattern)?,
+                                ),
+                                NestedPattern::Iterate(pattern) => NestedPattern::Iterate(
+                                    walk_transform_iteration_pattern(t, pattern)?,
+                                ),
+                            }),
                         })
                     }
+                    RecordPatternMember::Path(binding) => Ok(RecordPatternMember::Path(
+                        crate::pipeline::asts::core::PathBinding {
+                            path: binding.path,
+                            binder: t.fold_reach_binder(binding.binder)?,
+                        },
+                    )),
+                    RecordPatternMember::Metadata(binding) => Ok(RecordPatternMember::Metadata(
+                        walk_transform_metadata_binding(t, binding)?,
+                    )),
                     RecordPatternMember::Disregarded => Ok(RecordPatternMember::Disregarded),
                 }
             })?,
         })),
-        TreePattern::Array(array) => Ok(TreePattern::Array(array)),
+        TreePattern::Array(array) => Ok(TreePattern::Array(
+            crate::pipeline::asts::core::ArrayPattern {
+                members: array.members.try_map(|member| -> Result<_> {
+                    Ok(crate::pipeline::asts::core::ArrayPatternMember {
+                        path: member.path,
+                        binder: t.fold_reach_binder(member.binder)?,
+                    })
+                })?,
+            },
+        )),
     }
+}
+
+pub fn walk_transform_iteration_pattern<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
+    t: &mut F,
+    pattern: IterationPattern<P>,
+) -> Result<IterationPattern<Q>> {
+    Ok(match pattern {
+        IterationPattern::Tree(pattern) => {
+            IterationPattern::Tree(walk_transform_tree_pattern(t, pattern)?)
+        }
+        IterationPattern::ScalarArray(binder) => {
+            IterationPattern::ScalarArray(t.fold_binder(binder)?)
+        }
+    })
+}
+
+pub fn walk_transform_destructure_pattern<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
+    t: &mut F,
+    pattern: DestructurePattern<P>,
+) -> Result<DestructurePattern<Q>> {
+    Ok(match pattern {
+        DestructurePattern::Scalar(pattern) => {
+            DestructurePattern::Scalar(walk_transform_tree_pattern(t, pattern)?)
+        }
+        DestructurePattern::Iterate(pattern) => {
+            DestructurePattern::Iterate(walk_transform_iteration_pattern(t, pattern)?)
+        }
+    })
+}
+
+/// A metadata level crosses as a level: its key is phase-selected, and its
+/// target crosses as whatever it is — a collector pattern, another level,
+/// or nothing.
+pub fn walk_transform_metadata_binding<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
+    t: &mut F,
+    binding: MetadataBinding<P>,
+) -> Result<MetadataBinding<Q>> {
+    Ok(MetadataBinding {
+        key: t.fold_binder(binding.key)?,
+        target: match binding.target {
+            PatternTarget::Pattern(inner) => {
+                PatternTarget::Pattern(Box::new(walk_transform_iteration_pattern(t, *inner)?))
+            }
+            PatternTarget::Binding(nested) => {
+                PatternTarget::Binding(Box::new(walk_transform_metadata_binding(t, *nested)?))
+            }
+            PatternTarget::Disregarded => PatternTarget::Disregarded,
+        },
+    })
 }
 
 pub fn walk_transform_case<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
@@ -1062,6 +971,7 @@ pub fn walk_transform_boolean<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized
             rows,
             negated,
             source,
+            matching,
         }) => Ok(TruthExpression::Membership(Membership {
             probe: transform_probe(t, probe)?,
             rows: rows.try_map(|row| -> Result<_> {
@@ -1069,12 +979,14 @@ pub fn walk_transform_boolean<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized
             })?,
             negated,
             source,
+            matching,
         })),
         TruthExpression::RelationalMembership(RelationalMembership {
             probe,
             relation,
             addressing,
             negated,
+            matching,
         }) => Ok(TruthExpression::RelationalMembership(
             RelationalMembership {
                 probe: transform_probe(t, probe)?,
@@ -1083,6 +995,7 @@ pub fn walk_transform_boolean<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized
                     addressing,
                 )?,
                 negated,
+                matching,
             },
         )),
         TruthExpression::Sigma(SigmaApplication { proof, polarity }) => {
@@ -1208,6 +1121,33 @@ pub fn transform_fact_function_mode<P: Phase, Q: Phase, F: AstTransform<P, Q> + 
     })
 }
 
+/// The walk, as the clause-selection carrier asks for it: a guard crosses
+/// through the walk's truth fold and a result through its domain fold.
+struct ArmCrossing<'t, F: ?Sized>(&'t mut F);
+
+impl<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>
+    crate::pipeline::asts::core::ClauseCrossing<P, Q> for ArmCrossing<'_, F>
+{
+    type Error = crate::error::DelightQLError;
+
+    fn enter(
+        &mut self,
+        formals: &crate::pipeline::asts::core::definitions::ClauseFormals,
+    ) -> Result<()> {
+        self.0.enter_clause(formals)
+    }
+    fn leave(&mut self, formals: &crate::pipeline::asts::core::definitions::ClauseFormals) {
+        self.0.leave_clause(formals);
+    }
+    fn guard(&mut self, guard: TruthExpression<P>) -> Result<TruthExpression<Q>> {
+        self.0.transform_boolean(guard)
+    }
+
+    fn result(&mut self, result: DomainExpression<P>) -> Result<DomainExpression<Q>> {
+        self.0.transform_domain(result)
+    }
+}
+
 pub fn walk_transform_function<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>(
     t: &mut F,
     func: FunctionApplication<P>,
@@ -1265,18 +1205,7 @@ pub fn walk_transform_function<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Size
         )),
         // The synthesized SELECTION carries clause bodies, ordinary values.
         FunctionApplication::ClauseSelection(selection) => Ok(
-            FunctionApplication::ClauseSelection(crate::pipeline::asts::core::ClauseSelection {
-                arms: selection
-                    .arms
-                    .into_iter()
-                    .map(|arm| -> Result<_> {
-                        Ok(crate::pipeline::asts::core::ClauseArm {
-                            guard: arm.guard.map(|g| t.transform_boolean(g)).transpose()?,
-                            result: t.transform_domain(arm.result)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            }),
+            FunctionApplication::ClauseSelection(selection.cross(&mut ArmCrossing(t))?),
         ),
         FunctionApplication::Case(case) => Ok(FunctionApplication::Case(t.transform_case(case)?)),
         FunctionApplication::Scalarized(relation) => Ok(FunctionApplication::Scalarized(
@@ -1554,21 +1483,14 @@ pub fn walk_transform_continuation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
             )?,
         )),
         Continuation::Bound { bound } => Ok(Continuation::Bound { bound }),
-        Continuation::Destructure {
-            source,
-            pattern,
-            mode,
-            schema,
-        } => Ok(Continuation::Destructure {
+        Continuation::Destructure { source, pattern } => Ok(Continuation::Destructure {
             source: Box::new(t.transform_domain(*source)?),
-            pattern: walk_transform_tree_pattern(t, pattern)?,
-            mode,
-            schema: t.fold_destructure(schema)?,
+            pattern: walk_transform_destructure_pattern(t, pattern)?,
         }),
         Continuation::Member {
             rhs,
             correlation,
-            join_type,
+            join,
         } => Ok(Continuation::Member {
             rhs: t.transform_relational_action(rhs)?.into_inner(),
             correlation: Q::admit_member_correlation(
@@ -1576,10 +1498,10 @@ pub fn walk_transform_continuation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
                     .map(|c| transform_member_correlation(t, c))
                     .transpose()?,
             )?,
-            // A comma with no decided orientation is an inner join, and the
-            // refined phase works with a decided one: the narrowing is the
-            // phases' answer, made here for every member that crosses.
-            join_type: Q::join_orientation(join_type),
+            // The member's join crosses through the phases' one door: roles
+            // stay roles, a decided type stays decided, and no walk turns
+            // one into the other.
+            join: Q::admit_member_join(P::into_member_join(join))?,
         }),
         Continuation::BagOp {
             operator,
@@ -1617,6 +1539,7 @@ pub fn walk_transform_continuation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?
                 left_spelling: step.left_spelling,
                 right_spelling: step.right_spelling,
                 rhs: t.transform_relational(step.rhs)?,
+                role: step.role,
             })?))
         }
         Continuation::Structural(step) => Ok(Continuation::Structural(
@@ -1655,17 +1578,12 @@ pub fn walk_transform_structural_step<P: Phase, Q: Phase, F: AstTransform<P, Q> 
         StructuralForm::Drill { drill } => StructuralForm::Drill {
             drill: t.fold_drill(drill)?,
         },
-        StructuralForm::Narrow {
-            nest,
-            pattern,
-            schema,
-        } => StructuralForm::Narrow {
+        StructuralForm::Narrow { nest, pattern } => StructuralForm::Narrow {
             nest: t.transform_reference(nest)?,
             pattern: match walk_transform_tree_pattern(t, TreePattern::Record(pattern))? {
                 TreePattern::Record(pattern) => pattern,
                 TreePattern::Array(_) => unreachable!("a record pattern crosses as one"),
             },
-            schema: t.fold_destructure(schema)?,
         },
     };
     Ok(StructuralStep {
@@ -1673,7 +1591,6 @@ pub fn walk_transform_structural_step<P: Phase, Q: Phase, F: AstTransform<P, Q> 
         named: crate::pipeline::asts::core::phases::carry_stage_name::<P, Q>(named)?,
     })
 }
-
 
 /// The deferred items of a pattern cross as VALUES: each keeps the position
 /// it was minted for and its value takes the leaf hook.
@@ -1691,6 +1608,7 @@ pub fn walk_transform_inner_relation<P: Phase, Q: Phase, F: AstTransform<P, Q> +
     t: &mut F,
     pattern: InnerRelationPattern<P>,
 ) -> Result<InnerRelationPattern<Q>> {
+    use crate::pipeline::asts::core::expressions::relational::CorrelatedInterior;
     match pattern {
         InnerRelationPattern::Indeterminate {
             identifier,
@@ -1699,48 +1617,33 @@ pub fn walk_transform_inner_relation<P: Phase, Q: Phase, F: AstTransform<P, Q> +
             identifier,
             subquery: Box::new(t.transform_relational_action(*subquery)?.into_inner()),
         }),
-        InnerRelationPattern::UncorrelatedDerivedTable {
+        InnerRelationPattern::DerivedTable {
             identifier,
             subquery,
             is_consulted_view,
-        } => Ok(InnerRelationPattern::UncorrelatedDerivedTable {
+            deferred,
+        } => Ok(InnerRelationPattern::DerivedTable {
             identifier,
             subquery: Box::new(t.transform_relational_action(*subquery)?.into_inner()),
             is_consulted_view,
-        }),
-        InnerRelationPattern::CorrelatedScalarJoin {
-            identifier,
-            correlation_filters,
-            deferred,
-            subquery,
-        } => Ok(InnerRelationPattern::CorrelatedScalarJoin {
-            identifier,
-            correlation_filters: correlation_filters
-                .into_iter()
-                .map(|f| t.transform_boolean(f))
-                .collect::<Result<Vec<_>>>()?,
             deferred: transform_deferred(t, deferred)?,
-            subquery: Box::new(t.transform_relational_action(*subquery)?.into_inner()),
         }),
-        InnerRelationPattern::CorrelatedGroupJoin {
-            identifier,
-            correlation_filters,
-            aggregations,
-            deferred,
-            subquery,
-        } => Ok(InnerRelationPattern::CorrelatedGroupJoin {
-            identifier,
-            correlation_filters: correlation_filters
-                .into_iter()
-                .map(|f| t.transform_boolean(f))
-                .collect::<Result<Vec<_>>>()?,
-            aggregations: aggregations
-                .into_iter()
-                .map(|e| t.transform_domain(e))
-                .collect::<Result<Vec<_>>>()?,
-            deferred: transform_deferred(t, deferred)?,
-            subquery: Box::new(t.transform_relational_action(*subquery)?.into_inner()),
-        }),
+        // A correlated interior crosses within its phase by rebuilding what
+        // it holds; a phase that holds none refuses at the door.
+        InnerRelationPattern::Correlated(interior) => {
+            let CorrelatedInterior {
+                identifier,
+                subquery,
+                deferred,
+            } = P::into_correlated_interior(interior);
+            Ok(InnerRelationPattern::Correlated(
+                Q::admit_correlated_interior(CorrelatedInterior {
+                    identifier,
+                    subquery: Box::new(t.transform_relational_action(*subquery)?.into_inner()),
+                    deferred: transform_deferred(t, deferred)?,
+                })?,
+            ))
+        }
     }
 }
 
@@ -1757,22 +1660,15 @@ pub fn walk_transform_relation<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Size
             call: transform_sealed_call(t, call)?,
             alias: crate::pipeline::asts::core::phases::carry_stage_name::<P, Q>(alias)?,
         }),
-        Relation::Ground { mention, outer } => Ok(Relation::Ground {
+        Relation::Ground { mention } => Ok(Relation::Ground {
             mention: t.transform_mention(mention)?,
-            outer,
         }),
-        Relation::InnerRelation {
-            pattern,
-            alias,
-            outer,
-        } => Ok(Relation::InnerRelation {
+        Relation::InnerRelation { pattern, alias } => Ok(Relation::InnerRelation {
             pattern: walk_transform_inner_relation(t, pattern)?,
             alias,
-            outer,
         }),
-        Relation::ConsultedView { body, outer } => Ok(Relation::ConsultedView {
+        Relation::ConsultedView { body } => Ok(Relation::ConsultedView {
             body: Box::new(t.transform_query(*body)?),
-            outer,
         }),
     }
 }
@@ -1845,6 +1741,7 @@ pub fn transform_reduction_plan<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Siz
                 })
             })
             .collect::<Result<Vec<_>>>()?,
+        collection: plan.collection,
     })
 }
 
@@ -1864,6 +1761,7 @@ pub fn walk_transform_spread<P: Phase, Q: Phase, F: AstTransform<P, Q> + ?Sized>
         })),
         Spread::Regex(regex) => Ok(Spread::Regex(RegexSelector {
             pattern: regex.pattern,
+            case: regex.case,
             authored: Q::admit_enumeration()?,
         })),
         Spread::PositionalSpan(range) => Ok(Spread::PositionalSpan(t.fold_column_range(range)?)),
@@ -1894,6 +1792,7 @@ pub fn walk_transform_rename_source<P: Phase, Q: Phase, F: AstTransform<P, Q> + 
         }
         RenameSource::Regex(regex) => Ok(RenameSource::Regex(RegexSelector {
             pattern: regex.pattern,
+            case: regex.case,
             authored: Q::admit_enumeration()?,
         })),
         RenameSource::Glob(glob) => Ok(RenameSource::Glob(Glob {

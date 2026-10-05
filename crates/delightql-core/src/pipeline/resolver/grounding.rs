@@ -1,106 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Eklund
-//! Grounding support: function inlining and view expansion
-//!
 
-use crate::diagnostic::{Constraint, Internal, Parse, Semantic};
-use crate::error::{DelightQLError, Result};
-use crate::pipeline::ast_unresolved;
-use crate::pipeline::asts::core::Unresolved;
+use crate::diagnostic::Internal;
+use crate::error::Result;
 use crate::pipeline::asts::ddl::{
     Clause, DefKind, HeadItems, HoColumnKind, HoGroundPattern, HoParam, HoPositionInfo,
 };
-
-// ============================================================================
-// Multi-clause selection synthesis
-// ============================================================================
-
-/// Assemble a `ClauseSelection` from multiple guarded function clauses,
-/// leaving parameter Lvars intact (no substitution).
-///
-/// THE SYNTHESIZED SELECTION IS ITS OWN SHAPE: the arms carry clause BODIES
-/// under the clause's own guard. The authored `CaseExpression` is a
-/// different carrier — an author wrote it — so neither is spelled with the
-/// other's type.
-///
-/// Used when converting multi-clause DDL functions into CfeDefinitions; the
-/// formals stand as ordinary named references until the frame answers them.
-pub(crate) fn build_case_body_from_clauses(
-    name: &str,
-    clauses: Vec<Clause>,
-) -> Result<ast_unresolved::DomainExpression> {
-    let mut arms: Vec<crate::pipeline::asts::core::ClauseArm<Unresolved>> = Vec::new();
-
-    for clause in &clauses {
-        let params = clause.params();
-
-        // A CLAUSE'S BODY IS WHAT IT COMPUTES.
-        let body = clause.as_scalar_body().ok_or_else(|| {
-            DelightQLError::from(Constraint::General {
-                message: format!(
-                    "Expected scalar body for multi-clause function '{name}', got relational"
-                ),
-            })
-        })?;
-
-        let guard = params.iter().find_map(|p| match p {
-            HoParam::Scalar { guard, .. } => guard.as_ref(),
-            _ => None,
-        });
-        arms.push(crate::pipeline::asts::core::ClauseArm {
-            guard: guard.cloned(),
-            result: body.clone(),
-        });
-    }
-
-    Ok(ast_unresolved::DomainExpression::Application(
-        ast_unresolved::FunctionApplication::ClauseSelection(
-            crate::pipeline::asts::core::ClauseSelection { arms },
-        ),
-    ))
-}
-
-// ============================================================================
-// Parameter substitution (used by sigma predicates)
-// ============================================================================
-
-/// The window builtins' signature judgment — the ONE authority, consulted
-/// from the ordinary Standard-application road for authored and rebuilt
-/// invocations alike. The keyword "function" is the refusal's badge.
-pub(super) fn judge_window_row(
-    fold: &super::resolver_fold::ResolverFold,
-    callee_name: &str,
-    supplied: usize,
-) -> Result<()> {
-    let Some((min, max)) = fold.core.built_in.window_signature(callee_name) else {
-        return Ok(());
-    };
-    if supplied < min as usize || supplied > max as usize {
-        return Err(DelightQLError::from(Parse::Function {
-    message: format!(
-            "the window function '{callee_name}' takes {} argument{}; the invocation hands it {supplied}",
-            if min == max {
-                min.to_string()
-            } else {
-                format!("{min} to {max}")
-            },
-            if max == 1 { "" } else { "s" },
-        ),
-}));
-    }
-    Ok(())
-}
 
 /// Compute cross-clause unified position analysis for all HO parameter positions.
 ///
 /// For each position 0..max_params across all clauses:
 /// - Determines column_kind: Glob/Argumentative/Scalar
 /// - Records scalar ground-pattern evidence across the complete clause set
-/// - Collects ground_values: Vec<(ordinal, value)>
-/// - Determines column_name: from free-variable clauses (must agree)
-///
-/// This replaces `extract_ground_scalar_info()` + `validate_mixed_ground_params()`
-/// with a single, complete analysis computed at consult time.
+/// - Labels scalar inputs by position and retains their binders with clause ownership
 pub(crate) fn build_ho_position_analysis(
     group: &crate::pipeline::asts::ddl::DefinitionGroup,
 ) -> Vec<HoPositionInfo> {
@@ -112,12 +24,10 @@ pub(crate) fn build_ho_position_analysis(
     build_ho_position_analysis_from_heads(&heads)
 }
 
-/// Build position analysis from a set of HO head param lists.
-///
-/// Accepts pre-extracted heads so callers that only have heads (not whole
-/// clauses) can use this directly — e.g., the deferred-body HO view path in
-/// system.rs where each clause's head is parsed individually.
-pub(crate) fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec<HoPositionInfo> {
+/// Build position analysis from every head of one family. Private: an
+/// analysis over fewer heads than the family has would be a clause's row
+/// posing as the family's.
+fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec<HoPositionInfo> {
     if heads.is_empty() {
         return Vec::new();
     }
@@ -132,10 +42,9 @@ pub(crate) fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec
         let mut has_scalar = false;
         let mut has_ground_scalar = false;
         let mut rule_signatures = Vec::new();
-        let mut ground_values: Vec<(usize, String)> = Vec::new();
         let mut column_name: Option<delightql_types::SqlIdentifier> = None;
 
-        for (clause_ordinal, head) in heads.iter().enumerate() {
+        for head in heads.iter() {
             if let Some(param) = head.get(pos) {
                 match param {
                     HoParam::Relation {
@@ -172,12 +81,8 @@ pub(crate) fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec
                             column_name = Some(name.clone());
                         }
                     }
-                    HoParam::Scalar { name, .. } => {
+                    HoParam::Scalar { .. } => {
                         has_scalar = true;
-                        // Free variable — contributes the declared name
-                        if column_name.is_none() {
-                            column_name = Some(name.clone());
-                        }
                     }
                     HoParam::Rule { name, signature } => {
                         rule_signatures.push(signature);
@@ -185,21 +90,19 @@ pub(crate) fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec
                             column_name = Some(name.clone());
                         }
                     }
-                    HoParam::Ground { text, .. } => {
+                    HoParam::Ground { .. } => {
                         has_ground_scalar = true;
-                        ground_values.push((clause_ordinal, text.clone()));
-                        // A ground position contributes no column NAME: its
-                        // spelling is the literal. The canonical name comes
-                        // from a sibling clause that binds the position.
+                        // A ground member selects its argument position; its
+                        // literal never names a family input.
                     }
                 }
             }
         }
 
+        // The family's clauses agree on one rule-valued contract at the
+        // position: the family-signature judgment refused them otherwise
+        // where the family was declared.
         let column_kind = if let Some(signature) = rule_signatures.first() {
-            debug_assert!(rule_signatures
-                .iter()
-                .all(|candidate| candidate.same_shape(signature)));
             HoColumnKind::Rule((*signature).clone())
         } else if has_glob {
             HoColumnKind::TableGlob
@@ -219,237 +122,177 @@ pub(crate) fn build_ho_position_analysis_from_heads(heads: &[&[HoParam]]) -> Vec
             None
         };
 
+        if column_kind == HoColumnKind::Scalar {
+            column_name = Some(crate::pipeline::asts::core::definitions::argument_name(pos));
+        }
         positions.push(HoPositionInfo {
             position: pos,
             column_kind,
             ground_pattern,
-            ground_values,
             column_name,
         });
     }
 
     positions
 }
-pub(crate) use crate::pipeline::query_features::HoParamBindings;
 
-/// CONSULT-TIME PLACEHOLDER BINDINGS for a parameterized definition parsed
-/// before any call supplies actuals: every relation formal and scalar
-/// formal reads a proffer the carrier authority minted, and a ground
-/// position reads its constant. Analysis only.
-pub(crate) fn create_proffer_bindings(
-    head: &crate::pipeline::asts::ddl::Head,
-    identities: &crate::relation::Planning,
-) -> crate::error::Result<HoParamBindings> {
-    let mut bindings = HoParamBindings {
-        formals: crate::defuse::carriers::RelationFormals::proffered(head, identities)?,
-        ..HoParamBindings::default()
-    };
-    for param in head.ho_params.as_deref().unwrap_or_default() {
-        match param {
-            HoParam::Relation { .. } => {}
-            HoParam::Scalar { name, .. } => {
-                bindings.scalar_formals.insert(name.to_string());
-            }
-            HoParam::Rule { .. } => {
-                // A rule formal is answered only by a closed residual value
-                // in the definition-use frame. It is neither a scalar
-                // proffer nor a relation carrier.
-            }
-            HoParam::Ground { name, text } => {
-                // A ground position is a constant, not a parameter.
-                bindings.scalar_literals.insert(
-                    name.to_string(),
-                    crate::pipeline::asts::core::LiteralValue::from_stored_ground(text),
-                );
-            }
-        }
-    }
-    Ok(bindings)
+/// THE FAMILY'S DECLARED ROW: what a definition family declares at each
+/// parameter position, judged across EVERY clause. One clause's head is only
+/// that clause's pattern row — a ground member and a free binder may share a
+/// position, and clause order is the author's — so no clause stands for the
+/// family. This value is built only from a complete group, and it is the one
+/// place a family's declared row is read from.
+#[derive(Debug, Clone)]
+pub(crate) struct FamilySignature {
+    params: Vec<HoParam>,
 }
 
-/// Synthesize an anonymous table `_(col1, col2 ---- v1, v2; v3, v4)` from column names and rows.
-///
-/// Routes through the DQL body parser — no mini-pipeline.
-/// The lift's rows, headed by the names the parameter declares.
-///
-/// `None` for anything that is not a bare headerless literal: a relation the
-/// author named, an interior, a membership form, or a table that already
-/// carries its own header row. Those bind through the carrier, where a
-/// reference has a scope to resolve in; only a self-contained literal can
-/// stand in the body under a heading the DECLARATION supplies.
-///
-/// Widths that disagree are left alone, so the arity check reports the
-/// mismatch against the relation the author wrote rather than against a
-/// silently repaired one.
-pub(crate) fn lifted_rows_under_declared_names(
-    relation: &ast_unresolved::Chain,
-    columns: &[String],
-) -> Option<ast_unresolved::Chain> {
-    if !relation.continuations().is_empty() {
-        return None;
+impl FamilySignature {
+    /// The declared row of `group`, from all of its clauses.
+    pub(crate) fn of(group: &crate::pipeline::asts::ddl::DefinitionGroup) -> Result<Self> {
+        let clauses = group.clauses();
+        let heads: Vec<&[HoParam]> = clauses.iter().map(Clause::params).collect();
+        let positions = build_ho_position_analysis_from_heads(&heads);
+        let params = call_row(clauses, &positions)?;
+        Ok(FamilySignature { params })
     }
-    let ast_unresolved::GroundForm::Literal(table) = relation.head().form() else {
-        return None;
-    };
-    if table.table.body.header.is_some() || table.alias.is_some() || table.outer {
-        return None;
+
+    /// The call row: one callable formal per position. A position some
+    /// clauses ground and others bind is a scalar formal; the clause patterns
+    /// apply only after admission.
+    pub(crate) fn params(&self) -> &[HoParam] {
+        &self.params
     }
-    if table
-        .table
-        .body
-        .rows
-        .iter()
-        .any(|row| row.len() != columns.len())
-    {
-        return None;
-    }
-    let headers: Vec<ast_unresolved::DomainExpression> = columns
-        .iter()
-        .map(|name| ast_unresolved::DomainExpression::lvar_builder(name.clone()).build())
-        .collect();
-    let mut headed = table.clone();
-    headed.table.body.header = Some(crate::pipeline::asts::core::TabularRow(Box::new(
-        crate::pipeline::asts::vocabulary::Vec1::try_from_vec(
-            headers
-                .into_iter()
-                .map(|term| crate::pipeline::asts::core::HeaderItem {
-                    slot: crate::pipeline::asts::core::Slot::classify(term),
-                    sparse: false,
-                })
-                .collect(),
-        )
-        .expect("a declared heading is nonempty"),
-    )));
-    Some(ast_unresolved::Chain::authored(
-        ast_unresolved::GroundForm::Literal(headed),
-    ))
 }
 
-/// The anonymous table a lifted argument becomes: named columns and one row
-/// per supplied tuple.
-///
-/// BUILT, NOT SPELLED. The values arrive as literals and the table is a
-/// carrier; rendering them into `_(col ---- val)` text and parsing that back
-/// would put a round trip through the grammar in the middle of a construction
-/// that already has everything it needs — and would have to re-quote every
-/// value correctly to survive it.
-pub(crate) fn lift_scalars_to_anonymous_table(
-    column_names: &[String],
-    rows: &[Vec<crate::pipeline::asts::core::LiteralValue>],
-) -> Result<ast_unresolved::Chain> {
-    if let Some(row) = rows.iter().find(|row| row.len() != column_names.len()) {
-        return Err(DelightQLError::from(Semantic::Arity {
-            message: format!(
-                "a lifted row carries {} value(s); the heading names {}",
-                row.len(),
-                column_names.len()
-            ),
-        }));
-    }
-    let column_headers = Some(
-        column_names
+/// Project each analyzed position into its one callable formal. The source
+/// parameter a formal copies its shape from is searched for across every
+/// clause, never taken from the first.
+fn call_row(clauses: &[Clause], positions: &[HoPositionInfo]) -> Result<Vec<HoParam>> {
+    let source_at = |position: usize, accepts: fn(&HoParam) -> bool| {
+        clauses
             .iter()
-            .map(|name| ast_unresolved::DomainExpression::lvar_builder(name.clone()).build())
-            .collect(),
-    );
-    let rows = rows
+            .filter_map(|clause| clause.params().get(position))
+            .find(|param| accepts(param))
+    };
+    let missing = |position: usize| {
+        Internal::invariant(
+            "grounding::call_row",
+            format!("the family has no source parameter for analyzed position {position}"),
+        )
+    };
+
+    positions
         .iter()
-        .map(|row| {
-            row.iter()
-                .map(|value| {
-                    ast_unresolved::DomainExpression::Application(
-                        ast_unresolved::FunctionApplication::Ground(value.clone()),
-                    )
-                })
-                .collect()
+        .map(|position| {
+            let name = position
+                .column_name
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| missing(position.position))?;
+            match (&position.column_kind, &position.ground_pattern) {
+                (HoColumnKind::TableGlob, _) => Ok(HoParam::Relation {
+                    name,
+                    cols: HeadItems::Glob,
+                }),
+                (HoColumnKind::TableArgumentative(_), _) => {
+                    let HoParam::Relation { cols, .. } = source_at(position.position, |param| {
+                        matches!(
+                            param,
+                            HoParam::Relation {
+                                cols: HeadItems::Listed(_),
+                                ..
+                            }
+                        )
+                    })
+                    .ok_or_else(|| missing(position.position))?
+                    else {
+                        unreachable!("the source predicate admits only listed relations")
+                    };
+                    Ok(HoParam::Relation {
+                        name,
+                        cols: cols.clone(),
+                    })
+                }
+                (HoColumnKind::Rule(signature), _) => Ok(HoParam::Rule {
+                    name,
+                    signature: signature.clone(),
+                }),
+                (HoColumnKind::Scalar, Some(HoGroundPattern::AllClauses)) => {
+                    let HoParam::Ground { text, .. } = source_at(position.position, |param| {
+                        matches!(param, HoParam::Ground { .. })
+                    })
+                    .ok_or_else(|| missing(position.position))?
+                    else {
+                        unreachable!("the source predicate admits only ground parameters")
+                    };
+                    Ok(HoParam::Ground {
+                        name,
+                        text: text.clone(),
+                    })
+                }
+                (HoColumnKind::Scalar, None | Some(HoGroundPattern::SomeClauses)) => {
+                    let HoParam::Scalar { callable, .. } = source_at(position.position, |param| {
+                        matches!(param, HoParam::Scalar { .. })
+                    })
+                    .ok_or_else(|| missing(position.position))?
+                    else {
+                        unreachable!("the source predicate admits only scalar parameters")
+                    };
+                    Ok(HoParam::Scalar {
+                        name,
+                        guard: None,
+                        callable: *callable,
+                    })
+                }
+            }
         })
-        .collect::<Vec<_>>();
-    let table = crate::pipeline::asts::core::AnonTable::from_values(column_headers, rows)
-        .ok_or_else(|| {
-            Internal::invariant(
-                "resolver::grounding",
-                "a lifted table has a nonempty heading and body",
-            )
-        })?;
-    Ok(ast_unresolved::Chain::authored(
-        ast_unresolved::GroundForm::Literal(crate::pipeline::asts::core::AnonRelation::plain(
-            table,
-        )),
-    ))
+        .collect()
 }
 
 #[cfg(test)]
-mod clause_selection_tests {
-    //! THE SYNTHESIZED SELECTION IS ITS OWN SHAPE.
-    //!
-    //! A multi-clause value rule assembles into `ClauseSelection`, whose arms
-    //! carry what a CLAUSE computes — its body, an ordinary value, a crossed
-    //! truth included. The authored CASE carrier is a different thing and is
-    //! pinned separately.
+mod family_signature_tests {
+    //! THE DECLARED ROW IS THE FAMILY'S. The same clauses in either order
+    //! give one row and the same ground evidence. A ground member fixes a
+    //! value position, and the head law keeps each position one role across
+    //! the family, so no row is read from a family that disagrees.
 
-    use super::build_case_body_from_clauses;
+    use super::FamilySignature;
     use crate::ddl::reconstruct;
-    use crate::pipeline::asts::core::{DomainExpression, FunctionApplication};
+    use crate::pipeline::asts::ddl::HoParam;
 
-    /// The selection a source's clauses assemble into.
-    fn selection(source: &str) -> crate::pipeline::asts::core::ClauseSelection {
-        let group = reconstruct::group(source).expect("the group reconstructs");
-        let body =
-            build_case_body_from_clauses("f", group.into_clauses()).expect("the clauses assemble");
-        match body {
-            DomainExpression::Application(
-                crate::pipeline::asts::core::FunctionApplication::ClauseSelection(selection),
-            ) => selection,
-            other => panic!("expected a clause selection, got {other:?}"),
+    fn signature(clauses: &[&str]) -> FamilySignature {
+        let group = reconstruct::group(&clauses.join("\n")).expect("the group reconstructs");
+        FamilySignature::of(&group).expect("the row projects")
+    }
+
+    const GROUND: &str = "bump!(1)(*) :- _(n @ 100) |> insert!(log(*))(*)";
+    const FREE: &str = "bump!(k)(*) :- _(n @ $.k) |> insert!(log(*))(*)";
+
+    #[test]
+    fn clause_order_does_not_change_the_declared_row() {
+        let ground_first = signature(&[GROUND, FREE]);
+        let ground_second = signature(&[FREE, GROUND]);
+        assert_eq!(ground_first.params(), ground_second.params());
+        assert!(matches!(
+            ground_first.params(),
+            [HoParam::Scalar { name, .. }] if name.as_str() == "argument 1"
+        ));
+    }
+
+    #[test]
+    fn a_ground_member_beside_a_relation_formal_never_assembles() {
+        let relation = "put!(T(*))(*) :- T(*) |> insert!(log(*))(*)";
+        let ground = "put!(1)(*) :- _(n @ 100) |> insert!(log(*))(*)";
+        for clauses in [[relation, ground], [ground, relation]] {
+            let group = reconstruct::group(&clauses.join("\n")).expect("the head assembler judges no parameter row");
+            let err = crate::pipeline::middle::api::judge_declared_family(&group, true)
+                .expect_err("the roles disagree where the family is declared");
+            assert_eq!(
+                err.error_uri(),
+                "delightql-error://semantic/ddl/head/param_arity"
+            );
         }
     }
 
-    /// Whether an arm's result is a crossed truth.
-    fn crossed(arm: &crate::pipeline::asts::core::ClauseArm) -> bool {
-        matches!(
-            arm.result,
-            DomainExpression::Application(FunctionApplication::Crossed(_))
-        )
-    }
-
-    /// BOTH CLAUSES CROSSED. An existence read as a value is a lawful
-    /// value-rule body, so two of them are a lawful group.
-    #[test]
-    fn every_clause_may_compute_a_crossing() {
-        let selection = selection(concat!(
-            "served:(uid | uid > 5) :- +orders(, user_id = uid)\n",
-            "served:(uid) :- +reviews(, user_id = uid)"
-        ));
-        assert_eq!(selection.arms.len(), 2);
-        assert!(selection.arms.iter().all(crossed));
-        // The guardless clause is the group's default, and there is one.
-        assert_eq!(
-            selection.arms.iter().filter(|a| a.guard.is_none()).count(),
-            1
-        );
-    }
-
-    /// MIXED IS ADMITTED. A clause computes a value either way, and the
-    /// value-rule law does not tell a crossing from an ordinary value.
-    #[test]
-    fn clauses_may_mix_crossed_and_domain_results() {
-        let selection = selection(concat!(
-            "mixed:(uid | uid > 5) :- +orders(, user_id = uid)\n",
-            "mixed:(uid) :- false"
-        ));
-        assert_eq!(selection.arms.len(), 2);
-        assert!(crossed(&selection.arms[0]));
-        assert!(!crossed(&selection.arms[1]));
-    }
-
-    /// The control: neither clause crossed, and the same shape carries them.
-    #[test]
-    fn a_domain_valued_group_uses_the_same_selection() {
-        let selection = selection(concat!(
-            "plain:(uid | uid > 5) :- \"high\"\n",
-            "plain:(uid) :- \"low\""
-        ));
-        assert_eq!(selection.arms.len(), 2);
-        assert!(!selection.arms.iter().any(crossed));
-    }
 }

@@ -11,12 +11,16 @@ use super::chain::Chain;
 use super::domain::DomainExpression;
 use super::functions::SealedCall;
 use super::helpers::QualifiedName;
-use super::truth::TruthExpression;
 use crate::{lispy::ToLispy, ToLispy};
 use delightql_types::SqlIdentifier;
 
-/// Semantic patterns for INNER-RELATION
-/// These capture the distinct compilation strategies for derived tables
+/// THE DERIVED-TABLE PATTERNS of an inner relation: how the body inside the
+/// parens is realized where the interior stands.
+///
+/// An interior is classified once, by the refiner, over its resolved body.
+/// A body that reads the enclosing row is CORRELATED, a dependent member,
+/// and the product's road refuses it there — so the refined phase holds no
+/// correlated interior.
 #[derive(Debug, Clone, PartialEq, ToLispy)]
 pub enum InnerRelationPattern<P: Phase = Unresolved> {
     /// Indeterminate: Builder couldn't determine pattern yet
@@ -27,43 +31,41 @@ pub enum InnerRelationPattern<P: Phase = Unresolved> {
         subquery: Box<Chain<P>>,
     },
 
-    /// UDT: Uncorrelated Derived Table
-    /// Simple projection/transformation with no correlation to outer query
+    /// A derived table: the body evaluated whole where the interior stands.
     /// Compiles to: (SELECT ... FROM table) AS derived
-    #[lispy("pattern:udt")]
-    UncorrelatedDerivedTable {
+    ///
+    /// The body may still owe support past its heading — an interior
+    /// occurrence a deferred value reads — which its boundary emits beside
+    /// the heading for the enclosing join to read.
+    #[lispy("pattern:derived")]
+    DerivedTable {
         identifier: QualifiedName,
         subquery: Box<Chain<P>>,
-        /// Whether this UDT wraps a consulted view (vs a regular table(|> pipeline)).
+        /// Whether this derived table wraps a consulted view (vs a regular table(|> pipeline)).
         /// When true and option://generation/rule/inlining/view is ON, the transformer
         /// lifts this to a CTE instead of inlining as a subquery.
         is_consulted_view: bool,
-    },
-
-    /// CDT-SJ: Correlated Derived Table - Scalar Join
-    /// Has correlation predicate, no aggregation, no LIMIT
-    /// Compiles to: JOIN with correlation predicate hoisted to ON clause
-    #[lispy("pattern:cdt-sj")]
-    CorrelatedScalarJoin {
-        identifier: QualifiedName,
-        correlation_filters: Vec<TruthExpression<P>>,
         /// The positions the enclosing join computes for this boundary.
         deferred: Vec<DeferredItem<P>>,
-        subquery: Box<Chain<P>>,
     },
 
-    /// CDT-GJ: Correlated Derived Table - Group Join
-    /// Has correlation + aggregation
-    /// Compiles to: JOIN with GROUP BY on correlation key
-    #[lispy("pattern:cdt-gj")]
-    CorrelatedGroupJoin {
-        identifier: QualifiedName,
-        correlation_filters: Vec<TruthExpression<P>>,
-        aggregations: Vec<DomainExpression<P>>,
-        /// The positions the enclosing join computes for this boundary.
-        deferred: Vec<DeferredItem<P>>,
-        subquery: Box<Chain<P>>,
-    },
+    /// A CORRELATED INTERIOR: a body that reads the enclosing row, still
+    /// standing on its source population. Admitted in the resolved phase
+    /// alone ([`Phase::CorrelatedInterior`]); the refined phase cannot hold
+    /// one.
+    #[lispy("pattern:correlated")]
+    Correlated(P::CorrelatedInterior),
+}
+
+/// A CORRELATED INTERIOR, as classification names it: the body with its
+/// correlated restrictions in place, and the positions the enclosing join
+/// computes for its boundary.
+#[derive(Debug, Clone, PartialEq, ToLispy)]
+#[lispy("correlated_interior")]
+pub struct CorrelatedInterior<P: Phase> {
+    pub identifier: QualifiedName,
+    pub subquery: Box<Chain<P>>,
+    pub deferred: Vec<DeferredItem<P>>,
 }
 
 /// ONE POSITION THE ENCLOSING JOIN COMPUTES for a derived table: a
@@ -82,20 +84,6 @@ pub struct DeferredItem<P: Phase> {
     port: crate::relation::PortId,
     /// The value the join computes.
     value: DomainExpression<P>,
-}
-
-impl<P: Phase<Output = crate::relation::PortId>> DeferredItem<P> {
-    /// THE ONE MINT: from a publication item WHOLE — the value the item
-    /// states and the port the authority wrote for that very position —
-    /// where the record says the publication stated the position as
-    /// evaluated at the boundary. No road takes a port beside a value.
-    pub fn of(item: &super::super::OneOut<P>, registry: &crate::names::Registry) -> Option<Self> {
-        let port = *item.output();
-        crate::relation::deferred_by_publication(registry, port).then(|| DeferredItem {
-            port,
-            value: item.expr.clone(),
-        })
-    }
 }
 
 impl<P: Phase> DeferredItem<P> {
@@ -128,16 +116,28 @@ impl<P: Phase> InnerRelationPattern<P> {
     pub fn subquery(&self) -> &Chain<P> {
         match self {
             InnerRelationPattern::Indeterminate { subquery, .. }
-            | InnerRelationPattern::UncorrelatedDerivedTable { subquery, .. }
-            | InnerRelationPattern::CorrelatedScalarJoin { subquery, .. }
-            | InnerRelationPattern::CorrelatedGroupJoin { subquery, .. } => subquery,
+            | InnerRelationPattern::DerivedTable { subquery, .. } => subquery,
+            InnerRelationPattern::Correlated(interior) => {
+                &P::correlated_interior(interior).subquery
+            }
+        }
+    }
+
+    /// The name the interior was written under.
+    pub fn identifier(&self) -> &QualifiedName {
+        match self {
+            InnerRelationPattern::Indeterminate { identifier, .. }
+            | InnerRelationPattern::DerivedTable { identifier, .. } => identifier,
+            InnerRelationPattern::Correlated(interior) => {
+                &P::correlated_interior(interior).identifier
+            }
         }
     }
 
     /// REBUILD THE CHAIN THIS PATTERN IS A DERIVED TABLE OF.
     ///
     /// Every classification wraps exactly one, so a walk that rebuilds the
-    /// subquery reaches it here rather than re-listing the four variants at
+    /// subquery reaches it here rather than re-listing the variants at
     /// each pass. The rewrite is handed the OPERAND alone and the
     /// classification is rebuilt around it, so a rebuild of the inside
     /// never moves what the derived table is.
@@ -153,49 +153,42 @@ impl<P: Phase> InnerRelationPattern<P> {
                 identifier,
                 subquery: Box::new(nested(*subquery)?),
             },
-            InnerRelationPattern::UncorrelatedDerivedTable {
+            InnerRelationPattern::DerivedTable {
                 identifier,
                 subquery,
                 is_consulted_view,
-            } => InnerRelationPattern::UncorrelatedDerivedTable {
+                deferred,
+            } => InnerRelationPattern::DerivedTable {
                 identifier,
                 subquery: Box::new(nested(*subquery)?),
                 is_consulted_view,
+                deferred,
             },
-            InnerRelationPattern::CorrelatedScalarJoin {
-                identifier,
-                correlation_filters,
-                deferred,
-                subquery,
-            } => InnerRelationPattern::CorrelatedScalarJoin {
-                identifier,
-                correlation_filters,
-                deferred,
-                subquery: Box::new(nested(*subquery)?),
-            },
-            InnerRelationPattern::CorrelatedGroupJoin {
-                identifier,
-                correlation_filters,
-                aggregations,
-                deferred,
-                subquery,
-            } => InnerRelationPattern::CorrelatedGroupJoin {
-                identifier,
-                correlation_filters,
-                aggregations,
-                deferred,
-                subquery: Box::new(nested(*subquery)?),
-            },
+            InnerRelationPattern::Correlated(interior) => {
+                let CorrelatedInterior {
+                    identifier,
+                    subquery,
+                    deferred,
+                } = P::into_correlated_interior(interior);
+                InnerRelationPattern::Correlated(P::admit_correlated_interior(
+                    CorrelatedInterior {
+                        identifier,
+                        subquery: Box::new(nested(*subquery)?),
+                        deferred,
+                    },
+                )?)
+            }
         })
     }
 
     /// The positions the enclosing join computes for this derived table.
     pub fn deferred(&self) -> &[DeferredItem<P>] {
         match self {
-            InnerRelationPattern::Indeterminate { .. }
-            | InnerRelationPattern::UncorrelatedDerivedTable { .. } => &[],
-            InnerRelationPattern::CorrelatedScalarJoin { deferred, .. }
-            | InnerRelationPattern::CorrelatedGroupJoin { deferred, .. } => deferred,
+            InnerRelationPattern::Indeterminate { .. } => &[],
+            InnerRelationPattern::DerivedTable { deferred, .. } => deferred,
+            InnerRelationPattern::Correlated(interior) => {
+                &P::correlated_interior(interior).deferred
+            }
         }
     }
 }
@@ -300,72 +293,6 @@ impl GroundMention {
     }
 }
 
-#[cfg(test)]
-mod mention_tests {
-    use super::super::super::metadata::NamespacePath;
-    use super::*;
-
-    fn name(text: &str) -> QualifiedName {
-        QualifiedName {
-            namespace_path: NamespacePath::empty(),
-            name: text.into(),
-        }
-    }
-
-    /// A scratch row only the authority can allocate — the point of the
-    /// scratch and receipt mentions is that their lookup key is its
-    /// receipt and not characters.
-    fn scratch() -> crate::relation::ScratchRow {
-        crate::relation::any_scratch(&crate::names::Registry::new(&[]))
-    }
-
-    /// A receipt read addresses its row by the receipt, so there is no
-    /// spelling to hand back — and asking is how a caller learns that,
-    /// rather than by matching the alternative itself.
-    #[test]
-    fn only_a_named_mention_answers_with_a_spelling() {
-        assert_eq!(
-            GroundMention::named(name("users"))
-                .identifier()
-                .map(|q| q.name.to_string()),
-            Some("users".to_string())
-        );
-        assert!(GroundMention::Receipt {
-            receipt: crate::relation::NamedScratch::for_test(scratch(), "valid".into()),
-            alias: None,
-        }
-        .identifier()
-        .is_none());
-        assert!(GroundMention::Scratch { row: scratch() }
-            .identifier()
-            .is_none());
-    }
-
-    /// A named mention and a receipt read carry an alias: a user-facing
-    /// access redirected through its snapshot keeps the `as` its author
-    /// wrote, and the snapshot substitution relies on that. A scratch read
-    /// has nothing written on it.
-    #[test]
-    fn named_and_receipt_mentions_carry_the_authored_alias() {
-        assert_eq!(
-            GroundMention::aliased(name("users"), Some("u".into()))
-                .alias()
-                .map(ToString::to_string),
-            Some("u".to_string())
-        );
-        assert_eq!(
-            GroundMention::Receipt {
-                receipt: crate::relation::NamedScratch::for_test(scratch(), "valid".into()),
-                alias: Some("v".into()),
-            }
-            .alias()
-            .map(ToString::to_string),
-            Some("v".to_string())
-        );
-        assert!(GroundMention::Scratch { row: scratch() }.alias().is_none());
-    }
-}
-
 /// AN INTERIOR REALIZED: the classification the pattern takes, and how the
 /// body it now holds relates to the body the interior stood over.
 ///
@@ -387,12 +314,6 @@ pub struct Realized<P: Phase> {
 enum RealizedBody {
     /// The interior keeps the body it stood over.
     Kept,
-    /// The body is replaced by a rebuild the authority judged: `of` is the
-    /// operand the replacement names, `now` the relation it publishes.
-    Replaced {
-        of: crate::relation::SemanticRelation,
-        now: crate::relation::SemanticRelation,
-    },
 }
 
 impl<P: Phase> Realized<P> {
@@ -405,24 +326,6 @@ impl<P: Phase> Realized<P> {
         }
     }
 
-    /// A classification over a REPLACED body: the replacement's own chain
-    /// is what `shape` is handed and what the pattern holds, and the
-    /// operand the replacement names is what the carrier judges against.
-    pub fn replaced(
-        replacement: crate::relation::Replacement<P>,
-        shape: impl FnOnce(Box<Chain<P>>) -> InnerRelationPattern<P>,
-    ) -> Self
-    where
-        P: Phase<Scope = crate::relation::SemanticRelation>,
-    {
-        let of = replacement.of();
-        let now = replacement.published();
-        Realized {
-            pattern: shape(Box::new(replacement.into_chain())),
-            body: RealizedBody::Replaced { of, now },
-        }
-    }
-
     /// JUDGE the realization against the body the head stood over, and open
     /// it. The chain carrier's road.
     pub(super) fn judged(
@@ -432,7 +335,6 @@ impl<P: Phase> Realized<P> {
         let holds = P::into_scope(self.pattern.subquery().published());
         let lawful = match self.body {
             RealizedBody::Kept => holds == stood_over,
-            RealizedBody::Replaced { of, now } => stood_over == Some(of) && holds == Some(now),
         };
         if !lawful {
             return Err(crate::diagnostic::Internal::invariant(
@@ -445,11 +347,6 @@ impl<P: Phase> Realized<P> {
         Ok(self.pattern)
     }
 
-    /// Open the realization without the carrier's judgment: the
-    /// phase-crossing road, where the head crosses by its own crossing.
-    pub(crate) fn into_pattern(self) -> InnerRelationPattern<P> {
-        self.pattern
-    }
 }
 
 /// Base relations - sources of data
@@ -464,7 +361,7 @@ pub enum Relation<P: Phase = Unresolved> {
     /// there is no second variant for the post-resolution shape to drift
     /// into.
     #[lispy("relation:ground")]
-    Ground { mention: P::Mention, outer: bool },
+    Ground { mention: P::Mention },
     /// Every named relational callable, including TVFs and higher-order
     /// applications, uses the same call payload as scalar positions.
     ///
@@ -490,7 +387,6 @@ pub enum Relation<P: Phase = Unresolved> {
     InnerRelation {
         pattern: InnerRelationPattern<P>,
         alias: Option<SqlIdentifier>,
-        outer: bool,
     },
     /// Consulted view expansion: view body inlined as a subquery.
     /// Holds a full Query (not just a chain) to support CTEs in view definitions.
@@ -502,10 +398,7 @@ pub enum Relation<P: Phase = Unresolved> {
     /// holding the spelling beside that boundary is free to disagree with
     /// it.
     #[lispy("relation:consulted-view")]
-    ConsultedView {
-        body: Box<super::super::Query<P>>,
-        outer: bool,
-    },
+    ConsultedView { body: Box<super::super::Query<P>> },
 }
 
 impl<P: Phase> Relation<P> {
@@ -522,22 +415,6 @@ impl<P: Phase> Relation<P> {
         }
     }
 
-    /// MARK THIS RELATION AN OUTER-JOIN OPERAND.
-    ///
-    /// Outerness says how the relation is JOINED, not what it publishes:
-    /// every row it produces is a row it produced, and the join law decides
-    /// which of them survive. So this reaches the ORIENTATION FIELD and has
-    /// no spelling for anything else — a head cannot become a different
-    /// relation through it.
-    pub fn mark_outer(&mut self, orientation: bool) {
-        match self {
-            Relation::Ground { outer, .. }
-            | Relation::InnerRelation { outer, .. }
-            | Relation::ConsultedView { outer, .. } => *outer = orientation,
-            Relation::FunctorCall { .. } => {}
-        }
-    }
-
     /// REBUILD THE RELATIONAL OPERAND STANDING INSIDE THIS RELATION.
     ///
     /// A derived table is a derived table OF a chain, and that chain is the
@@ -550,14 +427,9 @@ impl<P: Phase> Relation<P> {
         nested: impl FnOnce(Chain<P>) -> crate::error::Result<Chain<P>>,
     ) -> crate::error::Result<Self> {
         match self {
-            Relation::InnerRelation {
-                pattern,
-                alias,
-                outer,
-            } => Ok(Relation::InnerRelation {
+            Relation::InnerRelation { pattern, alias } => Ok(Relation::InnerRelation {
                 pattern: pattern.rebuilding_subquery(nested)?,
                 alias,
-                outer,
             }),
             named @ (Relation::Ground { .. }
             | Relation::FunctorCall { .. }
@@ -566,12 +438,3 @@ impl<P: Phase> Relation<P> {
     }
 }
 
-/// The post-resolution phases: the mention is spent and the head's own
-/// result answers for the relation.
-impl<P: Phase<Mention = (), Scope = crate::relation::SemanticRelation>> Relation<P> {
-    /// A ground relation as the resolver produces one: addressed by nothing
-    /// else, because the mention is spent.
-    pub fn ground(outer: bool) -> Self {
-        Relation::Ground { mention: (), outer }
-    }
-}

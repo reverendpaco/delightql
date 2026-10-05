@@ -65,16 +65,16 @@ impl BinEntity for MountTreePredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for MountTreePredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],
@@ -92,37 +92,35 @@ impl EffectExecutable for MountTreePredicate {
 
         let db_uri = extract_string_literal(&arguments[0], "db_uri")?;
         let namespace = extract_string_literal(&arguments[1], "namespace")?;
-
-        if namespace.is_empty() {
-            return Err(DelightQLError::from(DirectiveBinding::Value {
-                message: "mount_tree!() namespace cannot be empty".to_string(),
-            }));
-        }
-
-        // Propagate UNWRAPPED (mount!'s precedent): mount_database_tree's own
-        // errors already carry the "mount_tree!() failed:" prefix and typed
-        // badges (the namespace/name/reserved guard, the SQLite refusal).
-        let created = system.mount_database_tree(&db_uri, &namespace)?;
-
-        // The created sub-namespaces are the receipt's `returned` tree:
-        // "which schemas did I mount?" is answered by DRILLING the
-        // payload with ordinary operators — never a JSON-array string
-        // column. An empty
-        // enumeration ships the all-NULL contributor row, which elides
-        // to `[]`.
-        let returned_rows: Vec<Vec<Option<String>>> = if created.is_empty() {
-            vec![vec![None]]
-        } else {
-            created.iter().map(|ns| vec![Some(ns.clone())]).collect()
-        };
+        let returned_rows = mount_tree_act(system, &db_uri, &namespace)?;
         Ok(EntityResult::Relation(super::descriptor_tree_receipt(
             "mount_tree",
             &[Some(db_uri.clone()), Some(namespace.clone())],
-            &["namespace"],
+            crate::pipeline::asts::effects::ReceiptPayload::Namespaces.heading().unwrap_or_default(),
             &returned_rows,
             alias,
         )))
     }
+}
+
+/// THE ACT: mount every schema `db_uri` holds as a sub-namespace of
+/// `namespace`, and answer one row per created sub-namespace
+/// (`⟦namespace⟧`); none is the empty payload.
+pub(crate) fn mount_tree_act(
+    system: &mut crate::system::DelightQLSystem,
+    db_uri: &str,
+    namespace: &str,
+) -> Result<Vec<Vec<Option<String>>>> {
+    if namespace.is_empty() {
+        return Err(DelightQLError::from(DirectiveBinding::Value {
+            message: "mount_tree!() namespace cannot be empty".to_string(),
+        }));
+    }
+    // Propagate UNWRAPPED (mount!'s precedent): mount_database_tree's own
+    // errors already carry the "mount_tree!() failed:" prefix and typed
+    // badges (the namespace/name/reserved guard, the SQLite refusal).
+    let created = system.mount_database_tree(db_uri, namespace)?;
+    Ok(created.into_iter().map(|ns| vec![Some(ns)]).collect())
 }
 
 /// Extract a string literal value from a DomainExpression

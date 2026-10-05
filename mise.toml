@@ -9,12 +9,17 @@
 # exported, read automatically by mise).
 
 # Tool requirements
-# Note: tree-sitter CLI is managed via Makefile (cargo install from git)
-# Run `make ensure-tree-sitter` to install the version pinned to Cargo.toml
+# The tree-sitter CLI is not listed here: `make ensure-tree-sitter` installs
+# the version pinned in the Makefile (cargo install --locked), and
+# delightql-cst's build.rs refuses any other version.
+# uv runs the asset bundler that delightql-cli's build.rs invokes.
 [tools]
-rust = "1.90"
+rust = "1.99"
 node = "latest"
 bats = "latest"
+uv = "latest"
+# zig cross-compiles the Linux release tarballs (`make dist`).
+zig = "0.14.1"
 
 [tasks.build-node]
 description = "Build Node.js binding (koffi + C-ABI)"

@@ -8,27 +8,17 @@ In other words, all set operators are `ALL`-flavored.
 If set semantics are required, use `DISTINCT ALL` via `|> %(*)`{.delightql}.
 
 ```delightql
-employee_2019(*) |;| employee_2018(*) |> %(*)
+genre_2024(*) |;| genre_2025(*) |> %(*)
 ```
 
 ```sql
 SELECT
-  EmployeeId, LastName,
-  FirstName, Title, ReportsTo,
-  BirthDate, HireDate,
-  Address, City, State,
-  Country, PostalCode, Phone,
-  Fax, Email
-FROM employee_2019
+  genre_id, name
+FROM genre_2024
   UNION  --- NOT UNION ALL
 SELECT
-  EmployeeId, LastName,
-  FirstName, Title, ReportsTo,
-  BirthDate, HireDate,
-  Address, City, State,
-  Country, PostalCode, Phone,
-  Fax, Email
-FROM employee_2018;
+  genre_id, name
+FROM genre_2025;
 ```
 
 which is equivalent to
@@ -36,22 +26,12 @@ which is equivalent to
 ```sql
 SELECT DISTINCT * FROM
   (SELECT
-    EmployeeId, LastName,
-    FirstName, Title, ReportsTo,
-    BirthDate, HireDate,
-    Address, City, State,
-    Country, PostalCode, Phone,
-    Fax, Email
-  FROM employee_2019
+    genre_id, name
+  FROM genre_2024
     UNION ALL
   SELECT
-    EmployeeId, LastName,
-    FirstName, Title, ReportsTo,
-    BirthDate, HireDate,
-    Address, City, State,
-    Country, PostalCode, Phone,
-    Fax, Email
-  FROM employee_2018)
+    genre_id, name
+  FROM genre_2025)
 ;
 ```
 

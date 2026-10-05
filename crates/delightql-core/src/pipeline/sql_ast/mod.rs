@@ -52,12 +52,12 @@ pub mod walk;
 // consumer names a type, not the file it was written in.
 pub use builders::SelectBuilder;
 pub use expressions::{
-    DomainExpression, FunctionName, SqlFrameBound, SqlFrameMode, SqlPredicate, SqlWindowFrame,
+    DomainExpression, FunctionName, SqlFrameBound, SqlFrameMode, SqlWindowFrame,
     WhenClause,
 };
 pub use operators::{BinaryOperator, UnaryOperator};
 pub use ordering::{OrderDirection, OrderTerm};
-pub use query::{QueryExpression, SelectStatement, SetOperator};
-pub use select_items::{Publishes, SelectItem};
+pub use query::{QueryExpression, SelectStatement, SetOperator, WholeInputGrouping};
+pub use select_items::SelectItem;
 pub use statements::{Cte, CteBody, SqlStatement};
-pub use table::{JoinCondition, JoinType, MergedSlots, TableExpression, TvfArgument};
+pub use table::{JoinCondition, JoinType, TableExpression, TvfArgument};

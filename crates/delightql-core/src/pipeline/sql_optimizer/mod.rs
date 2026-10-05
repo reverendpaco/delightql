@@ -36,7 +36,11 @@ pub enum OptimizationLevel {
 
 /// Main entry point for SQL optimization
 /// Takes a SQL AST v3 and returns an optimized version
-pub fn optimize(statement: SqlStatement, level: OptimizationLevel) -> Result<SqlStatement> {
+pub fn optimize(
+    statement: SqlStatement,
+    level: OptimizationLevel,
+    target: &crate::pipeline::aggregate_catalog::TargetAggregates,
+) -> Result<SqlStatement> {
     log::debug!("SQL Optimizer: Starting with level {:?}", level);
 
     if matches!(level, OptimizationLevel::None) {
@@ -47,7 +51,7 @@ pub fn optimize(statement: SqlStatement, level: OptimizationLevel) -> Result<Sql
     // PASS 1: Cleanup (Level >= Basic)
     let stmt = if level >= OptimizationLevel::Basic {
         log::debug!("SQL Optimizer: Running cleanup pass");
-        pass_cleanup(statement)?
+        pass_cleanup(statement, target)?
     } else {
         statement
     };

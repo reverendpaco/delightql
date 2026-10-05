@@ -71,6 +71,16 @@ pub(crate) fn liminal_receipt_for(name: &str, args: &[String]) -> crate::system:
         // doc!'s direct receipt is the interior `input` echo; its ledger
         // row stays flat (target, doc) like consult's.
         "doc" => vec![("target".to_string(), arg(0)), ("doc".to_string(), arg(1))],
+        // mount!'s and enlist!'s direct receipts carry the interior `input`
+        // echo; their ledger rows stay flat.
+        "mount" => vec![
+            ("path".to_string(), arg(0)),
+            ("namespace".to_string(), arg(1)),
+        ],
+        "enlist" => vec![
+            ("namespace".to_string(), arg(0)),
+            ("into".to_string(), arg(1)),
+        ],
         // expose!'s variadic echoes take the glob-join convention
         // (`namespace`, `namespace_2`, …) — genuinely runtime-shaped.
         "expose" => args
@@ -146,16 +156,16 @@ impl BinEntity for ConsultPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for ConsultPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],
@@ -428,10 +438,10 @@ pub(crate) fn execute_liminal_forms(
     for form in forms {
         let directive = match form {
             ConsultedForm::Definition(clause) => {
-                if !defined.contains(&clause.front.subject) {
-                    defined.push(clause.front.subject.clone());
+                if !defined.contains(&clause.front().subject()) {
+                    defined.push(clause.front().subject().clone());
                     prepared.settle(PreparedRow::Settled(crate::system::LiminalRow::Define {
-                        entity: clause.front.subject.catalog_name(),
+                        entity: clause.front().subject().catalog_name(),
                     }));
                 }
                 prepared.define(clause);
@@ -548,58 +558,22 @@ pub(crate) fn prove_witnesses(
     Ok(settled)
 }
 
-/// Prove one relational goal: YES when the body holds of any row.
-///
-/// THE GOAL IS COMPILED WHOLE. Its declarations are its own — the same
-/// entrance the prompt uses (`Pipeline::from_goal`) spends its danger and
-/// option acknowledgments and registers its subordinate blocks. An ordinary
-/// `assert!` effect may be demanded by the goal through the same typed plan;
-/// it is not a separately compiled consultation sidecar.
+/// Prove one relational goal: YES when the body holds of any row. The goal
+/// is the new middle's to compile and run, in the consulted namespace; a
+/// failure to prove it aborts the load.
 fn prove_goal(
     system: &mut crate::system::DelightQLSystem,
     namespace: &str,
     goal: crate::pipeline::normalize::Goal,
     canonical: &str,
 ) -> Result<bool> {
-    let compiled = crate::pipeline::Pipeline::new_consulted_goal(
-        goal,
-        system,
-        namespace,
-        crate::relation::Planning::open(crate::names::Registry::new(&[])),
-    )
-    .compile()
-    .map_err(|e| witness_failed(canonical, e))?;
-
-    // A LOAD MAY NOT WRITE USER DATA. The grammar already bars a directive
-    // from a relational goal; this is the second fence, on what the goal
-    // COMPILED to, so no future lowering can make a witness mutate.
-    if compiled.kind != crate::pipeline::compiled_query::SqlKind::Query {
-        return Err(DelightQLError::from(Consult::WitnessReadOnly {
-            message: format!(
-                "the consulted goal '?- {canonical}' compiled to a statement that writes: \
-                 a consultation may READ user data only, through a top-level goal that \
-                 proves and records a YES/NO witness"
-            ),
-        }));
-    }
-
-    // The goal executes on the connection resolution routed it to, exactly
-    // as the same body would at the prompt.
-    let connection = match compiled.connection_id {
-        Some(id) => system.get_connection(id)?,
-        None => std::sync::Arc::clone(&system.connection),
-    };
-    let conn = connection.lock().map_err(|e| {
-        Runtime::poisoned(
-            "Failed to acquire the connection lock for a consulted goal",
-            format!("Connection was poisoned: {e}"),
-        )
-    })?;
-
-    let (_, rows) = conn
-        .query_all_rows(&compiled.primary_sql, &[])
-        .map_err(|e| witness_failed(canonical, e))?;
-    Ok(!rows.is_empty())
+    crate::pipeline::middle::api::prove_goal(system, namespace, goal).map_err(|e| match e {
+        // A form no road covers is that, not a failed witness; a goal that
+        // writes keeps its own identity.
+        DelightQLError::Operational(crate::diagnostic::Operational::Uncovered { .. }) => e,
+        DelightQLError::Semantic(crate::diagnostic::Semantic::Consult(_)) => e,
+        e => witness_failed(canonical, e),
+    })
 }
 
 /// Whether a check's one cell says yes.
@@ -634,13 +608,20 @@ pub(crate) fn execute_consult(
     // namespace, so surface `consult!`, embedded `consult!` directives, and
     // `consult_tree!`'s per-file namespaces all pass through here.
     crate::system::validate_user_namespace_target(namespace)?;
+    crate::system::validate_producer_target(namespace, crate::system::Producer::Library)?;
 
     // THE LIFECYCLE REFUSAL: ordinary consult! creates ONE
     // namespace from ONE source. An existing destination refuses with the
     // lifecycle teaching; the caller chooses reload or deletion — never a
     // silent merge, and never an append: no later source joins an existing
     // consulted namespace.
-    if system.namespace_exists(namespace)? {
+    // A structural node (no kind, no entities, no backing) is claimed whole
+    // by an explicit consultation (ONE NAME POOL PER NODE).
+    let structural = matches!(
+        crate::host::CompilerHost::namespace_kind(&*system, namespace)?,
+        Some(crate::namespace::NamespaceKind::Unknown)
+    );
+    if !structural && system.namespace_exists(namespace)? {
         return Err(DelightQLError::from(Directive::ConsultExists {
             message: format!(
                 "consult! creates namespace '{namespace}' from one source, and it \
@@ -651,8 +632,9 @@ pub(crate) fn execute_consult(
         }));
     }
 
-    // Resolve relative path against session CWD (for test isolation).
-    let resolved_path = crate::session_cwd::resolve_path(file_path);
+    // A relative path resolves against the base directory in force; there is
+    // no fallback to the process directory.
+    let resolved_path = system.resolve_path(file_path)?;
     let file_path = resolved_path.display().to_string();
     let file_path = file_path.as_str();
 
@@ -705,6 +687,7 @@ fn consult_body(
     // namespace, no concat additions, no ledger. The result propagates
     // IMMEDIATELY: inline blocks must not run after a failed registration.
     let published = system.publish(load)?;
+    crate::pipeline::middle::api::judge_declared_heads(system, namespace, published.relational_families())?;
     let definitions_loaded = published.definitions_loaded();
 
     // Nested consultations share the outer program savepoint. There is no
@@ -740,12 +723,10 @@ fn consult_body(
     Ok(definitions_loaded)
 }
 
-/// Wrap a GENERIC parse failure from a consulted file in the consult!()
-/// context (a `database_error`, so its class is `error://runtime` like every
-/// other consult refusal), while letting every refusal that carries an
-/// identity of its own — a semantic refusal such as the effect-algebra's
-/// liminal eligibility and R-rule badges, or a parse TEACHING such as the
-/// no-precedence refusal — pass through UNWRAPPED, keeping its badge legible.
+/// Preserve a parse failure from a consulted file as the parse judgment over
+/// those bytes. Consultation supplies where the bytes came from; it does not
+/// turn syntax into a runtime failure. Semantic refusals likewise keep their
+/// own identity. Only an untyped failure is wrapped in consult context.
 /// Used by both the extraction parse (complete-form segmentation) and the
 /// cleaned-source parse so the two stages fail identically.
 fn wrap_consult_parse_error(e: DelightQLError, file_path: &str) -> DelightQLError {
@@ -754,12 +735,9 @@ fn wrap_consult_parse_error(e: DelightQLError, file_path: &str) -> DelightQLErro
         // such as liminal eligibility and R-rule badges are what the load
         // publishes.
         DelightQLError::Semantic(_) => e,
-        // A TEACHING KEEPS ITS IDENTITY, wherever in the file the author made
-        // the mistake it names: re-wrapping it would bury the identity the
-        // teaching exists to publish. Only the generic refusal — the text
-        // failed to parse, and nothing more is known — is a consult failure
-        // and is wrapped as one.
-        DelightQLError::Parse(ref parse) if !parse.is_generic() => e,
+        // The parser's identity belongs to the source bytes, not to the road
+        // by which those bytes arrived.
+        DelightQLError::Parse(_) => e,
         e => Runtime::General {
             message: format!("consult!() failed to parse '{}': {}", file_path, e),
             details: "Parse error".to_string(),
@@ -875,7 +853,11 @@ impl Consulted {
             &tree,
             std::rc::Rc::new(crate::names::Registry::new(&[])),
         )?;
-        let crate::pipeline::normalize::Normalized { forms, declared } = normalized;
+        let crate::pipeline::normalize::Normalized {
+            forms,
+            declared: _,
+            blocks,
+        } = normalized;
         // AUTHORED ORDER SURVIVES THE READ. Every form keeps its position in
         // one sequence, because the ledger this load writes is one row per
         // form in file-appearance order.
@@ -887,7 +869,7 @@ impl Consulted {
                     admit_liminal_declarations(&goal)?;
                     match goal.category {
                         GoalCategory::Effectual => {
-                            ConsultedForm::Directive(liminal_directive(&goal.query)?)
+                            ConsultedForm::Directive(liminal_directive(goal.query())?)
                         }
                         GoalCategory::Relational => {
                             let canonical =
@@ -900,9 +882,13 @@ impl Consulted {
                 }
             });
         }
+        // A consultation runs its blocks after its definitions whichever
+        // side of a goal they stand on; authored order is leading, then
+        // trailing.
+        let crate::pipeline::asts::unresolved::StatementBlocks { leading, trailing } = blocks;
         Ok(Consulted {
             forms: consulted,
-            ddl_blocks: declared.ddl_blocks,
+            ddl_blocks: leading.into_iter().chain(trailing).collect(),
         })
     }
 
@@ -997,7 +983,7 @@ fn admit_liminal_declarations(goal: &crate::pipeline::normalize::Goal) -> Result
              acknowledge",
         );
     }
-    if !goal.declared.ddl_blocks.is_empty() {
+    if !goal.blocks.is_empty() {
         return refuse(
             "a subordinate DDL block",
             "a block belongs to its FILE and is processed in the consultation's own \
@@ -1728,33 +1714,6 @@ mod liminal_ledger_tests {
         );
     }
 
-    /// The corresponding-union declared-addition columns arrive in
-    /// first-appearance order across the file's mixed row schemas (enlist!
-    /// contributes namespace+into, alias! adds shorthand, THE DEFINE ROW adds
-    /// entity) — the schema the catalog drill presents (end-to-end:
-    /// effects/liminal--45).
-    #[test]
-    fn liminal_echo_union_is_first_appearance_ordered() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = write_file(
-            &dir,
-            "union.dql",
-            "?- enlist!(\"main\")(*)\n?- alias!(\"main\", \"m1\")(*)\n\nr(*) :- _(x @ 1)\n",
-        );
-        let mut system = fresh_system();
-        execute_consult(&mut system, &path, "unionns", None).expect("consult must load");
-        let (fq, union) = system
-            .liminal_echo_columns("unionns")
-            .expect("ledger read")
-            .expect("namespace must exist");
-        assert_eq!(fq, "unionns");
-        assert_eq!(
-            union,
-            vec!["namespace", "into", "shorthand", "entity"],
-            "union corresponding, first appearance wins the position"
-        );
-    }
-
     /// An aborted load leaves no namespace and no ledger — the ledger's
     /// existence is the success signal. Abort road: the file's second
     /// directive fails, so load publication (and the receipt write inside its
@@ -1796,7 +1755,7 @@ mod liminal_ledger_tests {
     fn liminal_ledger_registration_refusal_rolls_ledger_back() {
         let dir = tempfile::tempdir().expect("tempdir");
         // R1 violation: a pure-named rule whose body ends in a directive —
-        // refused by validate_effect_algebra_discipline during publication,
+        // refused when its family is assembled during publication,
         // after the liminal directives executed and receipts were staged.
         let path = write_file(
             &dir,
@@ -1857,15 +1816,6 @@ mod liminal_ledger_tests {
             vec!["enlist!", "DEFINE"],
             "reconsult replaces the ledger whole — no residue of the first load"
         );
-        let (_, union) = system
-            .liminal_echo_columns("rens")
-            .expect("read")
-            .expect("ns");
-        assert_eq!(
-            union,
-            vec!["namespace", "into", "entity"],
-            "the union schema shrinks with the replacement: alias!'s shorthand is gone"
-        );
     }
 
     /// The ledger dies with its namespace (unconsult) — catalog state,
@@ -1899,18 +1849,11 @@ mod liminal_ledger_tests {
     }
 
     /// A namespace created by other means has an EMPTY liminal: `main`
-    /// (a data namespace) exists but was never consulted — the drill's
-    /// schema source reports the bare receipt prefix (no echo columns) over
-    /// zero receipt rows.
+    /// (a data namespace) exists but was never consulted, and holds no
+    /// receipt rows.
     #[test]
     fn liminal_ledger_empty_for_non_consulted() {
         let system = fresh_system();
-        let (fq, union) = system
-            .liminal_echo_columns("main")
-            .expect("read")
-            .expect("main exists");
-        assert_eq!(fq, "main");
-        assert!(union.is_empty(), "no receipts, no echo columns");
         assert_eq!(
             system
                 .liminal_ledger_operations("main")
@@ -1998,20 +1941,24 @@ mod wrapper_tests {
         assert_eq!(kept.id().hierarchy(), "parse/pony");
     }
 
-    /// The generic refusal says only that the text failed to parse, so it is
-    /// the consult failure it always was.
     #[test]
-    fn a_generic_failure_is_a_consult_failure() {
+    fn a_query_sequence_category_refusal_keeps_its_identity() {
+        let category = DelightQLError::from(Parse::FileCategory);
+        let kept = wrap_consult_parse_error(category, "ddl/queries.dql");
+        assert_eq!(kept.id().hierarchy(), "parse/file_category");
+        assert!(kept
+            .to_string()
+            .contains("query-sequence file cannot be consulted"));
+    }
+
+    /// A generic parse judgment is still a parse judgment when the bytes came
+    /// from a consulted file.
+    #[test]
+    fn a_generic_failure_keeps_its_identity() {
         let generic = DelightQLError::from(Parse::Ddl {
             message: "Syntax error".to_string(),
         });
-        let wrapped = wrap_consult_parse_error(generic, "ddl/predicates.dql");
-        assert!(matches!(wrapped, DelightQLError::Runtime(_)), "{wrapped:?}");
-        assert!(
-            wrapped
-                .to_string()
-                .contains("consult!() failed to parse 'ddl/predicates.dql'"),
-            "{wrapped}"
-        );
+        let kept = wrap_consult_parse_error(generic, "ddl/predicates.dql");
+        assert_eq!(kept.id().hierarchy(), "parse/ddl");
     }
 }

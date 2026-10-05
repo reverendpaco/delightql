@@ -4,13 +4,13 @@ Every compilation error carries a hierarchical URI that identifies
 the error category. Error hooks use these URIs for prefix matching:
 
 ```delightql
--- matches any DQL semantic error
+// matches any DQL semantic error
 users(*) |> (foo.*) (~~error://semantic ~~)
 
--- matches only table resolution failures
+// matches only table resolution failures
 nonexistent_table(*) (~~error://semantic/resolution/table ~~)
 
--- matches any error at all
+// matches any error at all
 bad_query(*) (~~error ~~)
 ```
 
@@ -73,7 +73,7 @@ finds malformed structure. The problem is syntactic.
 | `delightql-error://parse/literal` | Malformed literal | `0xGG`, `0o89` |
 | `delightql-error://parse/expression` | Malformed expression | `x +`, empty expression |
 | `delightql-error://parse/anon` | Malformed anonymous table | `_(a @ 2, 3)` |
-| `delightql-error://parse/pipe` | Malformed pipe expression | `x /->` |
+| `delightql-error://parse/pipe` | Malformed pipe expression | `x >>` |
 | `delightql-error://parse/function` | Malformed function call | missing name, lambda body |
 | `delightql-error://parse/case` | Malformed CASE expression | missing arm, missing result |
 | `delightql-error://parse/window` | Malformed window spec | invalid frame mode |

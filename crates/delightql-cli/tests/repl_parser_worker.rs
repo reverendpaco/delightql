@@ -16,16 +16,25 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use delightql_cli::repl::config::{ReplEditorHelperPolicy, ReplParserBudgets, ReplParserOperation};
 use delightql_cli::client::context::Mode;
 use delightql_cli::client::database::ClientDatabase;
+use delightql_cli::repl::config::{ReplEditorHelperPolicy, ReplParserBudgets, ReplParserOperation};
 use delightql_cli::repl::parser_worker::{ParserWorkerController, ProbeOutcome};
-use delightql_cli::repl::worker::{read_frame, write_frame, WorkerRequest, WorkerResponse, WorkerResult};
+use delightql_cli::repl::worker::{
+    read_frame, write_frame, WorkerRequest, WorkerResponse, WorkerResult,
+};
 
-/// The minimized deterministic freeze trigger from the diagnosis: the
-/// c2rust runtime's error recovery loops on it below the cooperative
-/// checkpoints, so only the process boundary contains it.
+/// The minimized input that once froze the parser worker: a pre-0.25.3
+/// Tree-sitter runtime took its version-cap exit before its end-of-input
+/// exit and looped in error recovery below the cooperative checkpoints.
+/// The linked runtime orders those exits correctly, so this input ANSWERS;
+/// it is kept as that non-regression witness only. Containment is driven
+/// through the controller's stall seam, never through a grammar accident.
 const TOXIC: &str = "(~~ddln(*)_(1):a a(),|1|<";
+
+/// The input whose request the live worker is asked to stall on: ordinary
+/// bytes, so the incident evidence is about the containment, not the parse.
+const STALLED: &str = "users(*), a = 1";
 
 /// A generous outer deadline for any single contained operation.
 const OUTER_DEADLINE: Duration = Duration::from_secs(20);
@@ -87,8 +96,16 @@ fn prefix_wellformedness_is_not_monotonic_through_the_worker() {
     let flips = ladder.windows(2).filter(|w| w[0] != w[1]).count();
     assert!(flips >= 3, "expected several transitions, saw {flips}");
     assert!(well_formed(&worker, line).unwrap());
-    assert_eq!(well_formed(&worker, ""), Some(false), "empty is not runnable");
-    assert_eq!(well_formed(&worker, ".help"), Some(false), "dot-commands are not queries");
+    assert_eq!(
+        well_formed(&worker, ""),
+        Some(false),
+        "empty is not runnable"
+    );
+    assert_eq!(
+        well_formed(&worker, ".help"),
+        Some(false),
+        "dot-commands are not queries"
+    );
 }
 
 /// Unicode and multiline inputs round-trip the framed wire.
@@ -96,7 +113,10 @@ fn prefix_wellformedness_is_not_monotonic_through_the_worker() {
 fn multiline_unicode_requests_answer() {
     let worker = controller(None);
     let input = "users(*)\n  |> (naïve, δ→ε)\n";
-    assert!(well_formed(&worker, input).is_some(), "the wire must answer");
+    assert!(
+        well_formed(&worker, input).is_some(),
+        "the wire must answer"
+    );
     match worker.probe(ReplParserOperation::SyntaxHighlight, input, None) {
         ProbeOutcome::Answer(WorkerResult::Highlights { .. }) => {}
         other => panic!(
@@ -106,28 +126,59 @@ fn multiline_unicode_requests_answer() {
     }
 }
 
-/// The real minimized trigger, contained: the probe returns within the
-/// outer deadline, the exact input lands in the timeout table, and the
-/// controller keeps answering. Measured on this runtime, the cooperative
-/// deadline reaches the trigger (the recovery loop crosses the runtime's
-/// checkpoints under the progress-callback option), so containment is the
-/// cooperative road and the worker survives; were it ever to stop polling,
-/// the kill road below (`a_nonresponsive_worker_is_killed...`) is the
-/// deterministic proof of the hard boundary.
+/// The historical trigger terminates on the linked runtime: the probe
+/// ANSWERS a defective tree within the budget, no incident is written, and
+/// the worker that served it is the worker that serves the next request.
+/// This is the runtime-level fence for the end-of-input recovery defect;
+/// a runtime that looped again would time out here.
 #[test]
-fn the_real_trigger_is_contained_captured_and_survivable() {
+fn the_historical_trigger_answers_within_the_budget() {
+    let db = Arc::new(ClientDatabase::open_on(Mode::Other).expect("live database"));
+    let (worker, _policy) = controller_with_policy(Some(Arc::clone(&db)));
+    assert_eq!(well_formed(&worker, "users(*)"), Some(true));
+
+    let started = Instant::now();
+    let outcome = worker.probe(ReplParserOperation::PromptWellFormed, TOXIC, None);
+    assert!(started.elapsed() < OUTER_DEADLINE);
+    assert!(
+        matches!(
+            outcome,
+            ProbeOutcome::Answer(WorkerResult::WellFormed { well_formed: false })
+        ),
+        "the trigger is answered with a defective tree, not contained (timed out: {})",
+        matches!(outcome, ProbeOutcome::TimedOut)
+    );
+    assert!(
+        incident_rows(&db).is_empty(),
+        "an answered probe is no incident"
+    );
+    assert_eq!(
+        worker.current_generation(),
+        1,
+        "the same worker keeps serving"
+    );
+}
+
+/// A contained request: the probe returns within the outer deadline, the
+/// exact input lands in the timeout table, and the controller keeps
+/// answering. The nonresponsive request is modelled through the stall seam
+/// (one request, one worker), so every replacement worker is healthy and
+/// the survival half of the law is real, not a coincidence of scheduling.
+#[test]
+fn a_stalled_request_is_contained_captured_and_survivable() {
     let db = Arc::new(ClientDatabase::open_on(Mode::Other).expect("live database"));
     let (worker, policy) = controller_with_policy(Some(Arc::clone(&db)));
 
-    // Warm the worker so the trigger meets a healthy generation-1 process.
+    // Warm the worker so the stall meets a healthy generation-1 process.
     assert_eq!(well_formed(&worker, "users(*)"), Some(true));
     assert_eq!(worker.current_generation(), 1);
 
     let started = Instant::now();
-    let outcome = worker.probe(ReplParserOperation::PromptWellFormed, TOXIC, None);
+    worker.stall_next_request_for_tests();
+    let outcome = worker.probe(ReplParserOperation::PromptWellFormed, STALLED, None);
     assert!(
         started.elapsed() < OUTER_DEADLINE,
-        "containment must bound the trigger"
+        "containment must bound the stalled request"
     );
     assert!(matches!(outcome, ProbeOutcome::TimedOut));
 
@@ -136,7 +187,7 @@ fn the_real_trigger_is_contained_captured_and_survivable() {
     let rows = incident_rows(&db);
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
-    assert_eq!(row.input, TOXIC, "the EXACT input is the evidence");
+    assert_eq!(row.input, STALLED, "the EXACT input is the evidence");
     assert_eq!(row.operation, "prompt_well_formed");
     assert!(
         row.containment == "cooperative_cancel" || row.containment == "worker_kill",
@@ -144,12 +195,23 @@ fn the_real_trigger_is_contained_captured_and_survivable() {
         row.containment
     );
     if row.containment == "cooperative_cancel" {
-        assert_eq!(worker.current_generation(), 1, "a cooperative worker survives");
+        assert_eq!(
+            worker.current_generation(),
+            1,
+            "a cooperative worker survives"
+        );
     } else {
-        assert_eq!(worker.current_generation(), 2, "a killed worker is replaced");
+        assert_eq!(
+            worker.current_generation(),
+            2,
+            "a killed worker is replaced"
+        );
     }
     assert_eq!(row.occurrence_count, 1);
-    assert_eq!(row.worker_generation, 1, "the generation that served the request");
+    assert_eq!(
+        row.worker_generation, 1,
+        "the generation that served the request"
+    );
     assert_eq!(
         row.budget_ms as u128,
         ReplParserBudgets::measured_defaults()
@@ -168,13 +230,14 @@ fn the_real_trigger_is_contained_captured_and_survivable() {
     policy.set_enabled(true);
     assert_eq!(well_formed(&worker, "users(*)"), Some(true));
 
-    // Deduplication: the identical toxic input under the same containment
+    // Deduplication: the identical stalled input under the same containment
     // upserts one row. Containment is scheduler-dependent (a cooperative
     // reply that misses the grace window becomes a kill), so the pin is
     // key-shaped, not count-of-rows-shaped: total occurrences sum to 2,
     // and no two rows share a (operation, containment) key.
+    worker.stall_next_request_for_tests();
     assert!(matches!(
-        worker.probe(ReplParserOperation::PromptWellFormed, TOXIC, None),
+        worker.probe(ReplParserOperation::PromptWellFormed, STALLED, None),
         ProbeOutcome::TimedOut
     ));
     let rows = incident_rows(&db);
@@ -199,8 +262,9 @@ fn the_real_trigger_is_contained_captured_and_survivable() {
     // and a mandatory-preflight incident refuses without touching helper
     // state: re-arm first, and the helpers stay enabled through it.
     policy.set_enabled(true);
+    worker.stall_next_request_for_tests();
     assert!(matches!(
-        worker.probe(ReplParserOperation::SubmissionPreflight, TOXIC, None),
+        worker.probe(ReplParserOperation::SubmissionPreflight, STALLED, None),
         ProbeOutcome::TimedOut
     ));
     assert!(
@@ -229,7 +293,10 @@ fn a_nonresponsive_worker_is_killed_reaped_and_replaced() {
     let contained_in = started.elapsed();
 
     assert!(matches!(outcome, ProbeOutcome::TimedOut));
-    assert!(contained_in < OUTER_DEADLINE, "the kill road must bound the wait");
+    assert!(
+        contained_in < OUTER_DEADLINE,
+        "the kill road must bound the wait"
+    );
     assert_eq!(worker.current_generation(), 2, "killed and replaced");
 
     let rows = incident_rows(&db);
@@ -244,7 +311,11 @@ fn a_nonresponsive_worker_is_killed_reaped_and_replaced() {
     assert!(!policy.helpers_enabled(), "the kill tripped the breaker");
     let started = Instant::now();
     assert!(matches!(
-        worker.probe(ReplParserOperation::PromptWellFormed, "users(*) |> (id)", None),
+        worker.probe(
+            ReplParserOperation::PromptWellFormed,
+            "users(*) |> (id)",
+            None
+        ),
         ProbeOutcome::Disabled
     ));
     assert!(
@@ -260,11 +331,19 @@ fn a_nonresponsive_worker_is_killed_reaped_and_replaced() {
     // editor never waits unboundedly.
     let started = Instant::now();
     assert!(matches!(
-        worker.probe(ReplParserOperation::SubmissionPreflight, "users(*) |> (id)", None),
+        worker.probe(
+            ReplParserOperation::SubmissionPreflight,
+            "users(*) |> (id)",
+            None
+        ),
         ProbeOutcome::TimedOut
     ));
     assert!(started.elapsed() < OUTER_DEADLINE);
-    assert_eq!(worker.current_generation(), 3, "each kill spawns a replacement");
+    assert_eq!(
+        worker.current_generation(),
+        3,
+        "each kill spawns a replacement"
+    );
 }
 
 #[derive(Debug)]
@@ -323,13 +402,20 @@ fn incident_rows(db: &ClientDatabase) -> Vec<IncidentRow> {
 
 /// A submission preflight that times out refuses the submission before the
 /// in-process compiler sees the bytes, closes the ledger row as refused,
-/// and captures the incident.
+/// and captures the incident. The preflight is the first probe a submission
+/// makes, so the stall seam lands on it.
 #[test]
 fn a_timed_out_preflight_refuses_the_submission() {
     use delightql_cli::output_format::OutputFormat;
     use delightql_cli::repl::commands::{process_query, ReplState};
 
-    let mut state = ReplState::new_over(None, OutputFormat::Table, None, Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap()))).expect("repl state");
+    let mut state = ReplState::new_over(
+        None,
+        OutputFormat::Table,
+        None,
+        Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap())),
+    )
+    .expect("repl state");
     state.parser_worker = Arc::new(ParserWorkerController::new_with_executable(
         dql_exe(),
         ReplParserBudgets::measured_defaults(),
@@ -340,24 +426,33 @@ fn a_timed_out_preflight_refuses_the_submission() {
 
     let flag = std::sync::atomic::AtomicBool::new(false);
     let started = Instant::now();
-    let result = process_query(TOXIC, &mut state, &flag);
-    assert!(started.elapsed() < OUTER_DEADLINE, "preflight must bound the trigger");
+    state.parser_worker.stall_next_request_for_tests();
+    let result = process_query(STALLED, &mut state, &flag);
+    assert!(
+        started.elapsed() < OUTER_DEADLINE,
+        "preflight must bound the stalled request"
+    );
     assert!(result.is_ok(), "a refused submission is not a REPL error");
 
     let db = state.repl_db.as_ref().expect("live database");
     let history = db.history_rows().expect("ledger");
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].outcome, "refused");
-    assert_eq!(history[0].input, TOXIC);
+    assert_eq!(history[0].input, STALLED);
 
     // Two rows: the budget incident with its worker evidence, and the
-    // refusal it caused — both carrying the exact input.
+    // refusal it caused — both carrying the exact input the preflight
+    // parsed, which is the host's wrap of what was typed.
+    let submitted = delightql_cst::prompt_wrap(STALLED);
     let rows = incident_rows(db);
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(rows[0].operation, "submission_preflight");
-    assert_eq!(rows[0].input, TOXIC);
-    assert_eq!((rows[1].kind.as_str(), rows[1].road.as_str()), ("error", "preflight"));
-    assert_eq!(rows[1].input, TOXIC);
+    assert_eq!(rows[0].input, submitted);
+    assert_eq!(
+        (rows[1].kind.as_str(), rows[1].road.as_str()),
+        ("error", "preflight")
+    );
+    assert_eq!(rows[1].input, submitted);
 
     // The mandatory incident left the optional breaker alone.
     assert!(
@@ -437,8 +532,14 @@ fn an_optional_worker_failure_trips_without_fabricating_evidence() {
         worker.probe(ReplParserOperation::SyntaxHighlight, "users(*)", None),
         ProbeOutcome::Unavailable
     ));
-    assert!(!policy.helpers_enabled(), "the failure disables the helpers");
-    assert!(incident_rows(&db).is_empty(), "no fabricated timeout evidence");
+    assert!(
+        !policy.helpers_enabled(),
+        "the failure disables the helpers"
+    );
+    assert!(
+        incident_rows(&db).is_empty(),
+        "no fabricated timeout evidence"
+    );
     let (value, source) = option_row(&db, "editor_parser_helpers");
     assert_eq!(value, "false");
     assert_eq!(source, "auto:syntax_highlight worker_failure");
@@ -454,7 +555,11 @@ fn a_tripped_breaker_projects_the_incident_reference_and_goes_quiet() {
     worker.hang_workers_for_tests();
 
     assert!(matches!(
-        worker.probe(ReplParserOperation::ContinuationNavigation, "users(*)", None),
+        worker.probe(
+            ReplParserOperation::ContinuationNavigation,
+            "users(*)",
+            None
+        ),
         ProbeOutcome::TimedOut
     ));
     assert!(!policy.helpers_enabled());
@@ -475,7 +580,11 @@ fn a_tripped_breaker_projects_the_incident_reference_and_goes_quiet() {
         ));
     }
     assert_eq!(incident_rows(&db).len(), 1, "no incident while disabled");
-    assert_eq!(worker.current_generation(), 2, "the kill's replacement stands unused");
+    assert_eq!(
+        worker.current_generation(),
+        2,
+        "the kill's replacement stands unused"
+    );
 }
 
 /// Ordinary malformed/incomplete answers are parser results, not
@@ -485,7 +594,11 @@ fn ordinary_malformed_answers_do_not_trip_the_breaker() {
     let (worker, policy) = controller_with_policy(None);
     assert_eq!(well_formed(&worker, "users(*) |>"), Some(false));
     assert!(policy.helpers_enabled());
-    match worker.probe(ReplParserOperation::SubmissionPreflight, "users(*) |>", None) {
+    match worker.probe(
+        ReplParserOperation::SubmissionPreflight,
+        "users(*) |>",
+        None,
+    ) {
         ProbeOutcome::Answer(WorkerResult::Preflight { defects, .. }) => {
             assert!(defects, "the malformed submission reports defects")
         }
@@ -502,7 +615,13 @@ fn preflight_still_crosses_and_fails_closed_with_helpers_off() {
     use delightql_cli::output_format::OutputFormat;
     use delightql_cli::repl::commands::{process_query, ReplState};
 
-    let mut state = ReplState::new_over(None, OutputFormat::Table, None, Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap()))).expect("repl state");
+    let mut state = ReplState::new_over(
+        None,
+        OutputFormat::Table,
+        None,
+        Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap())),
+    )
+    .expect("repl state");
     let worker = Arc::new(ParserWorkerController::new_with_executable(
         dql_exe(),
         ReplParserBudgets::uniform(Duration::from_millis(100)),
@@ -531,7 +650,10 @@ fn preflight_still_crosses_and_fails_closed_with_helpers_off() {
     // ... and the mandatory incident left the manual helper row alone.
     assert!(!state.config().editor_helpers_enabled());
     let (value, source) = option_row(db, "editor_parser_helpers");
-    assert_eq!((value.as_str(), source.as_str()), ("false", ".repl helpers"));
+    assert_eq!(
+        (value.as_str(), source.as_str()),
+        ("false", ".repl helpers")
+    );
 }
 
 /// Generation discipline at the worker itself: a mismatched request
@@ -558,6 +680,7 @@ fn the_worker_refuses_a_stale_generation() {
         input: "users(*)".to_string(),
         cursor_byte: None,
         cooperative_budget_ms: 1_000,
+        stall_for_tests: false,
     };
 
     // Matched: answers, echoing id and generation.
@@ -587,7 +710,10 @@ fn the_worker_refuses_a_stale_generation() {
         "no answer crosses a stale generation"
     );
     let status = child.wait().unwrap();
-    assert!(!status.success(), "a stale generation is fatal to the worker");
+    assert!(
+        !status.success(),
+        "a stale generation is fatal to the worker"
+    );
 
     // A garbage frame is equally fatal — protocol violations never get a
     // guessed answer.
@@ -604,7 +730,10 @@ fn the_worker_refuses_a_stale_generation() {
 /// `cli::surface` command inventory.
 #[test]
 fn the_hidden_entrance_is_absent_from_help_and_surface() {
-    let help = Command::new(dql_exe()).arg("--help").output().expect("dql --help");
+    let help = Command::new(dql_exe())
+        .arg("--help")
+        .output()
+        .expect("dql --help");
     let text = String::from_utf8_lossy(&help.stdout);
     assert!(
         !text.contains("__repl-parser-worker"),
@@ -656,7 +785,13 @@ fn an_unavailable_worker_refuses_the_submission_without_execution() {
     use delightql_cli::output_format::OutputFormat;
     use delightql_cli::repl::commands::{process_query, ReplState};
 
-    let mut state = ReplState::new_over(None, OutputFormat::Table, None, Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap()))).expect("repl state");
+    let mut state = ReplState::new_over(
+        None,
+        OutputFormat::Table,
+        None,
+        Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap())),
+    )
+    .expect("repl state");
     state.parser_worker = Arc::new(ParserWorkerController::new_with_executable(
         PathBuf::from("/nonexistent/dql-worker-binary"),
         ReplParserBudgets::measured_defaults(),
@@ -690,8 +825,11 @@ fn an_unavailable_worker_refuses_the_submission_without_execution() {
     // submission, so this row is the only trace of it being turned away.
     let rows = incident_rows(db);
     assert_eq!(rows.len(), 1, "one refusal row: {rows:?}");
-    assert_eq!((rows[0].kind.as_str(), rows[0].road.as_str()), ("error", "preflight"));
-    assert_eq!(rows[0].input, "users(*)");
+    assert_eq!(
+        (rows[0].kind.as_str(), rows[0].road.as_str()),
+        ("error", "preflight")
+    );
+    assert_eq!(rows[0].input, "?- users(*)");
     // And a mandatory-operation failure never touches the optional breaker.
     assert!(state.config().editor_helpers_enabled());
 }
@@ -746,11 +884,17 @@ fn a_kill_incident_is_recorded_even_when_the_replacement_cannot_spawn() {
 /// HEALTHY session — no Core recovery involved.
 #[test]
 fn the_ordinary_prompt_boundary_flushes_queued_writes() {
+    use delightql_cli::client::database::InputKind;
     use delightql_cli::output_format::OutputFormat;
     use delightql_cli::repl::commands::{prompt_recovery_boundary, CommandResult, ReplState};
-    use delightql_cli::client::database::InputKind;
 
-    let mut state = ReplState::new_over(None, OutputFormat::Table, None, Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap()))).expect("repl state");
+    let mut state = ReplState::new_over(
+        None,
+        OutputFormat::Table,
+        None,
+        Some(Arc::new(ClientDatabase::open_on(Mode::Other).unwrap())),
+    )
+    .expect("repl state");
     let db = state.repl_db.clone().expect("live database");
 
     // Queue a ledger write behind a held connection, then release.
@@ -896,16 +1040,12 @@ fn the_worker_answers_every_operation_over_unshaped_input_without_dying() {
                     input: input.to_string(),
                     cursor_byte: None,
                     cooperative_budget_ms: 200,
+                    stall_for_tests: false,
                 };
                 write_frame(&mut stdin, &serde_json::to_vec(&request).unwrap()).unwrap();
-                let payload = read_frame(&mut stdout)
-                    .unwrap()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "worker died on {} / {entrance} over {input:?}",
-                            op.as_str()
-                        )
-                    });
+                let payload = read_frame(&mut stdout).unwrap().unwrap_or_else(|| {
+                    panic!("worker died on {} / {entrance} over {input:?}", op.as_str())
+                });
                 let response: WorkerResponse = serde_json::from_slice(&payload).unwrap();
                 assert_eq!(response.request_id, request_id);
                 // Whatever the verdict, it is one of the closed answers —
@@ -926,7 +1066,10 @@ fn the_worker_answers_every_operation_over_unshaped_input_without_dying() {
     }
     drop(stdin);
     let status = child.wait().unwrap();
-    assert!(status.success(), "EOF after {request_id} answers is a clean exit");
+    assert!(
+        status.success(),
+        "EOF after {request_id} answers is a clean exit"
+    );
 }
 
 /// A panic inside the worker is an ANSWER: the worker survives, the parent
@@ -953,8 +1096,15 @@ fn a_worker_panic_is_forwarded_recorded_and_the_worker_survives() {
     // An optional probe: the panic is recorded, the caller gets its
     // neutral fallback, and the breaker is untouched (the worker is fine).
     let outcome = worker.probe(ReplParserOperation::PromptWellFormed, "users(*)", None);
-    assert!(matches!(outcome, ProbeOutcome::Panicked { .. }), "{outcome:?}");
-    assert_eq!(worker.current_generation(), 1, "the worker was not replaced");
+    assert!(
+        matches!(outcome, ProbeOutcome::Panicked { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        worker.current_generation(),
+        1,
+        "the worker was not replaced"
+    );
     assert!(state.config().editor_helpers_enabled());
 
     // The same worker answers the next request: it survived its panic.
@@ -970,7 +1120,10 @@ fn a_worker_panic_is_forwarded_recorded_and_the_worker_survives() {
     assert_eq!(rows[0].containment, "worker_panic");
     assert_eq!(rows[0].input, "users(*)");
     assert_eq!(rows[0].occurrence_count, 2);
-    assert_eq!(rows[0].grammar_fingerprint, delightql_cst::GRAMMAR_FINGERPRINT);
+    assert_eq!(
+        rows[0].grammar_fingerprint,
+        delightql_cst::GRAMMAR_FINGERPRINT
+    );
 
     // The mandatory preflight refuses rather than cross the in-process
     // parser with the bytes the worker panicked on.
@@ -984,7 +1137,8 @@ fn a_worker_panic_is_forwarded_recorded_and_the_worker_survives() {
     assert!(reason.contains("repl::errors.incident #"), "{reason}");
     let rows = incident_rows(&db);
     assert!(
-        rows.iter().any(|r| r.road == "preflight" && r.kind == "error"),
+        rows.iter()
+            .any(|r| r.road == "preflight" && r.kind == "error"),
         "the refusal is its own row: {rows:?}"
     );
     assert!(

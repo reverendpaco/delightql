@@ -8,9 +8,11 @@
 //!
 //! ## Behavior
 //!
-//! 1. Validates the namespace is lib/grounded/scratch (not data or system)
-//! 2. For lib namespaces, checks no grounded namespace borrows from it
-//! 3. Cascade-deletes all bootstrap metadata
+//! 1. Admits the namespace's kind: lib, scratch, grounded, a structural
+//!    node, or an imprint archive (not data, system, or container)
+//! 2. Checks no grounded namespace borrows from it or from beneath it
+//! 3. Refuses while any namespace stands beneath it
+//! 4. Deletes the namespace's bootstrap metadata
 
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
@@ -45,16 +47,16 @@ impl BinEntity for UnconsultPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for UnconsultPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],

@@ -10,21 +10,21 @@ functions, though they look like syntax. Their behavior depends on context:
 : Compound data constructor behavior by position
 
 ```delightql
--- scalar constructors
+// scalar constructors
 employee(*) |>
-  ( [LastName,FirstName] as interior_tuple )
+  ( [last_name,first_name] as interior_tuple )
 employee(*) |>
-  ( {LastName,FirstName} as interior_record )
+  ( {last_name,first_name} as interior_record )
 
--- aggregate constructors
+// aggregate constructors
 employee(*)
-  |> ( Department
+  |> %( title
         ~>
-      [LastName,FirstName] as table_of_tuples )
+      [last_name,first_name] as table_of_tuples )
 employee(*)
-  |> ( Department
+  |> %( title
         ~>
-      { LastName,FirstName } as table_of_records )
+      { last_name,first_name } as table_of_records )
 ```
 
 These constructors transpile to JSON in most SQL dialects. [SQLite and Postgres
@@ -33,7 +33,7 @@ JSON1.]{.sidenote} But the concept is not about JSON per se but about nested
 structure.
 
 > The compound data types introduced here provide groundwork for pivots, melts,
-> and tree-grouping (covered later). Programmers needing arbitrary JSON
+> and tree grouping (covered later). Programmers needing arbitrary JSON
 > manipulation can call SQL's JSON functions directly:
 >
 >    `json_array:(last_name, first_name)`.
@@ -44,15 +44,15 @@ The INTERIOR-RECORD enclyph `{ }`{.delightql .sigil} creates a nested row addres
 
 ```delightql
 employee(*)
-  |> (Department , { LastName,FirstName } as name  )
+  |> (title , { last_name,first_name } as name  )
 ```
 
 +--------------------------+-------------------------------------------------+
-| Department               | name                                            |
+| title                    | name                                            |
 +--------------------------+-------------------------------------------------+
-| Accounting               | `{"FirstName":"Erhard","LastName":"Moorrud"}`   |
+| General Manager          | `{"last_name":"Adams","first_name":"Andrew"}`   |
 +--------------------------+-------------------------------------------------+
-| Product Management       | `{"FirstName":"Anson","LastName":"Woodall"}`    |
+| Sales Manager            | `{"last_name":"Edwards","first_name":"Nancy"}`  |
 +--------------------------+-------------------------------------------------+
 
 : Scalar interior record result
@@ -61,32 +61,32 @@ Column names become keys. To specify different keys:
 
 ```delightql
 employee(*)
-  |> (Department ,
-      { "FirstName": FirstName ,
-        "LastName" : LastName} as name  )
+  |> (title ,
+      { "first_name": first_name ,
+        "last_name" : last_name} as name  )
 ```
 
 Access nested fields with JSON-access notation (see next section).
 
 ```delightql
 employee(*)
-  |> (Department ,
-      { "FirstName": FirstName ,
-        "LastName" : LastName} as name  )
-  |> ( Department, name:{.FirstName})
+  |> (title ,
+      { "first_name": first_name ,
+        "last_name" : last_name} as name  )
+  |> ( title, name:{.first_name})
 ```
 
 ```sql
 with
     _cpr0 as (
         select
-          Department,
-          json_object('FirstName',FirstName,
-                      'LastName' ,LastName) as name
+          title,
+          json_object('first_name',first_name,
+                      'last_name' ,last_name) as name
         from employee)
     select
-        Department,
-        name ->> "$.FirstName" as FirstName
+        title,
+        name ->> "$.first_name" as first_name
     from _cpr0;
 ```
 
@@ -96,31 +96,28 @@ In a reduction position, `{ }`{.delightql .sigil} collects multiple records into
 
 ```delightql
 employee(*)
-  |> %(Department ~> { LastName,FirstName } as name )
+  |> %(title ~> { last_name,first_name } as name )
 ```
 
 +---------------+-----------------------------------------------------+
-|  Department   | name                                                |
+|  title        | name                                                |
 +===============+=====================================================+
-| ```           | ```                                                 |
-|   Accounting  |   [                                                 |
-| ```           |     {"LastName":"Moorrud","FirstName":"Erhard"},    |
-|               |     {"LastName":"Cowwell","FirstName":"Orlando"},   |
-|               | {"LastName":"Tuley","FirstName":"Hanan"},           |
-|               | {"LastName":"Unstead","FirstName":"Gretchen"}       |
+| ```text       | ```json                                             |
+|   IT Staff    |   [                                                 |
+| ```           |     {"last_name":"King","first_name":"Robert"},     |
+|               |     {"last_name":"Callahan","first_name":"Laura"}   |
 |               |   ]                                                 |
 |               | ```                                                 |
 +---------------+-----------------------------------------------------+
-| ```           | ```                                                 |
-|   Business    |   [                                                 |
-|   Development |     {"LastName":"Marcone","FirstName":"Dinnie"},    |
-| ```           |     {"LastName":"Tuffell","FirstName":"Mathias"},   |
-|               |     {"LastName":"Harbord","FirstName":"Venita"},    |
-|               |     {"LastName":"Hinstock","FirstName":"Ashli"}     |
+| ```text       | ```json                                             |
+|   Sales       |   [                                                 |
+|   Support     |     {"last_name":"Peacock","first_name":"Jane"},    |
+|   Agent       |     {"last_name":"Park","first_name":"Margaret"},   |
+| ```           |     {"last_name":"Johnson","first_name":"Steve"}    |
 |               |   ]                                                 |
 |               | ```                                                 |
 +---------------+-----------------------------------------------------+
-: Aggregate interior record result -- grouped by Department
+: Aggregate interior record result -- grouped by `title`
 
 The outer `[ ]`{.delightql .sigil} in the JSON represents multiplicity -- a
 list of rows. The interior table has a uniform schema of named columns
@@ -132,15 +129,15 @@ The **INTERIOR-TUPLE** enclyph `[ ]`{.delightql .sigil} creates a nested row add
 
 ```delightql
 employee(*)
-  |> (Department , [LastName,FirstName] as name )
+  |> (title , [last_name,first_name] as name )
 ```
 
 +--------------------------+----------------------------+
-| Department               | name                       |
+| title                    | name                       |
 +--------------------------+----------------------------+
-| Accounting               |  `["Erhard","Moorrud"]`    |
+| General Manager          |  `["Adams","Andrew"]`      |
 +--------------------------+----------------------------+
-| Product Management       |  `["Anson","Woodall"]`     |
+| Sales Manager            |  `["Edwards","Nancy"]`     |
 +--------------------------+----------------------------+
 
 : Scalar interior tuple result
@@ -149,8 +146,8 @@ Access elements by index:
 
 ```delightql
 employee(*)
-  |> (Department , [LastName,FirstName] as name )
-  |> ( Department, name:{.1} as first_name)
+  |> (title , [last_name,first_name] as name )
+  |> ( title, name:{.1} as first_name)
 ```
 
 
@@ -160,32 +157,29 @@ In a reduction position, `[ ]`{.delightql .sigil} collects multiple tuples into 
 
 ```delightql
 employee(*)
-  |> %(Department ~> [ LastName,FirstName ] as name )
+  |> %(title ~> [ last_name,first_name ] as name )
 ```
 
 +---------------+----------------------------------------------+
-| Department    | name                                         |
+| title         | name                                         |
 +===============+==============================================+
-|               | ```                                          |
-|   Accounting  |    [                                         |
-|               |     ["Erhard","Moorrud"],                    |
-|               |     ["Orlando","Cowwell"],                   |
-|               |     ["Hanan","Tuley"],                       |
-|               |     ["Gretchen","Unstead"]                   |
+|               | ```json                                      |
+|   IT Staff    |    [                                         |
+|               |     ["King","Robert"],                       |
+|               |     ["Callahan","Laura"]                     |
 |               |    ]                                         |
 |               | ```                                          |
 +---------------+----------------------------------------------+
-|               | ```                                          |
-|   Business    |   [                                          |
-|   Development |     ["Dinnie","Marcone"],                    |
-|               |     ["Mathias","Tuffell"],                   |
-|               |     ["Venita","Harbord"],                    |
-|               |     ["Ashli","Hinstock"]                     |
+|               | ```json                                      |
+|   Sales       |   [                                          |
+|   Support     |     ["Peacock","Jane"],                      |
+|   Agent       |     ["Park","Margaret"],                     |
+|               |     ["Johnson","Steve"]                      |
 |               |   ]                                          |
 |               | ```                                          |
 +---------------+----------------------------------------------+
 
-: Aggregate interior tuple result -- grouped by Department
+: Aggregate interior tuple result -- grouped by `title`
 
 JSON's `[ ]` does double duty here: the outer brackets indicate multiple rows;
 the inner brackets indicate tuples. This is a syntactic limitation of JSON, not
@@ -197,12 +191,12 @@ parentheses -- this overloading would not exist.]{.sidenote}
 The power of these constructors emerges when nested:
 
 ```delightql
-employee(*)
-  ~>  {  Title ,
+customer(*)
+  ~>  {  country ,
            "people_by_state":
-             ~>{ State ,
-                "people" : ~>{FirstName, LastName} } }
-                  as people_by_state_within_title
+             ~>{ state ,
+                "people" : ~>{first_name, last_name} } }
+                  as people_by_state_within_country
 ```
 
 This tree-structured output is covered in detail in the **Tree Groups** section.

@@ -20,6 +20,12 @@ pub enum Reference<P: Phase = Unresolved> {
     /// reference carries, so the payload is uninhabited after it.
     #[lispy("reference:ordinal")]
     Ordinal(P::ColumnOrdinal),
+    /// A DEFINITION-OWNED SCALAR REFERENCE: an authored `$.x`, selected by
+    /// normalization in the marked scopes it was read under, or a
+    /// ground-head dispatch's read of its own position. It is never a name,
+    /// and resolution consumes it into the owning invocation's actual.
+    #[lispy("reference:argument")]
+    Argument(P::FormalSelector),
     /// A physical SQL slot introduced only while lowering a refined tree.
     /// It is not semantic lookup evidence and no resolver constructs it.
     #[lispy("reference:physical")]
@@ -45,8 +51,3 @@ impl<P: Phase> Reference<P> {
     }
 }
 
-impl Reference<crate::pipeline::asts::core::Refined> {
-    pub(crate) fn physical(column: crate::names::ColId) -> Self {
-        Self::Physical(column)
-    }
-}

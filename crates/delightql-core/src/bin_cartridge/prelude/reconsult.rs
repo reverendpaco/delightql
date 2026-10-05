@@ -8,7 +8,9 @@
 //!
 //! ## Behavior
 //!
-//! 1. Validates the namespace is lib/scratch (not data, system, or grounded)
+//! 1. Admits a live lib/scratch namespace: an imprint archive and anything
+//!    inside one refuse as inert; data, system, container, and grounded
+//!    namespaces refuse by kind
 //! 2. Re-reads and re-parses the source file (or a new file if provided)
 //! 3. Replaces definitions atomically
 //! 4. Validates grounding contracts and auto-rebuilds grounded namespaces
@@ -52,16 +54,16 @@ impl BinEntity for ReconsultPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for ReconsultPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],

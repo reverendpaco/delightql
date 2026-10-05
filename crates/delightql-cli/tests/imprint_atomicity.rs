@@ -102,10 +102,10 @@ fn replace_partial_failure_preserves_survivor() {
         "broken(*) :- employees(*) |> (1 as k)\n\
          kept(*)   :- employees(*), age >= 30\n\
          (~~ddl:\"_internal\"\n\
-         schema(\"broken\" as entity, name, type) :-\n\
-           _(name, type\n\
-             -----------\n\
-             \"k\",  \"INTEGER\")\n\
+         schema(\"broken\" as entity, name, type, ordinal) :-\n\
+           _(name, type, ordinal\n\
+             --------------------\n\
+             \"k\",  \"INTEGER\", 1)\n\
          constraints(\"broken\" as entity, column, constraint, constraint_name) :-\n\
            _(`column`, `constraint`, constraint_name\n\
              ------------------------------------\n\

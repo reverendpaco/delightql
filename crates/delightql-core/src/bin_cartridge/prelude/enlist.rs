@@ -45,16 +45,16 @@ impl BinEntity for EnlistPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for EnlistPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],
@@ -88,9 +88,10 @@ impl EffectExecutable for EnlistPredicate {
         // whole error family exists to carry.
         system.enlist_namespace(&namespace)?;
 
-        Ok(EntityResult::Relation(super::descriptor_core_receipt(
-            "enlist",
-            &[Some(namespace.clone()), None],
+        Ok(EntityResult::Relation(super::input_receipt_result(
+            "enlist!",
+            &["namespace", "into"],
+            &[vec![Some(namespace.clone()), None]],
             _alias,
         )))
     }

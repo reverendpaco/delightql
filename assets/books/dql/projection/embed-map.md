@@ -4,37 +4,44 @@ The EMBED-MAP operator `+$(  )(  )`{.delightql .sigil} applies a function across
 new columns from the results (rather than replacing the originals):
 
 ```{.delightql .numberLines .am }
+tidy:(s) :- trim:(coalesce:(s, ""))
+label:(s) :- upper:(tidy:(s))
+```
 
-f_to_c:(f) :- (f - 32.0)*0.5556
-f_to_k:(f) :- f_to_c:(f)+273.15
-
-?- boston_temps(*)
-     |> +$(f_to_c:() as :"{@}_c")( /_temp/ )
-     |> +$(f_to_k:() as :"{@}_k")( /_temp/ )
+```{.delightql .numberLines}
+invoice(*)
+  |> +$(tidy:() as :"tidy_{@}")( /^billing_/ )
+  |> +$(label:() as :"label_{@}")( /^billing_/ )
 ```
 
 ```sql
 SELECT
-  month,
-  daily_max_temp,
-  daily_min_temp,
-  daily_avg_temp,
-  (daily_max_temp - 32.0) * 0.5556 AS daily_max_temp_c,
-  (daily_min_temp - 32.0) * 0.5556 AS daily_min_temp_c,
-  (daily_avg_temp - 32.0) * 0.5556 AS daily_avg_temp_c,
-  (daily_max_temp - 32.0) * 0.5556
-  + 273.15 AS daily_max_temp_k,
-  (daily_min_temp - 32.0) * 0.5556
-  + 273.15 AS daily_min_temp_k,
-  (daily_avg_temp - 32.0) * 0.5556
-  + 273.15 AS daily_avg_temp_k
-FROM boston_temps;
+  invoice_id,
+  customer_id,
+  invoice_date,
+  billing_address,
+  billing_city,
+  billing_state,
+  billing_country,
+  billing_postal_code,
+  total,
+  trim(coalesce(billing_address, '')) AS tidy_billing_address,
+  trim(coalesce(billing_city, '')) AS tidy_billing_city,
+  trim(coalesce(billing_state, '')) AS tidy_billing_state,
+  trim(coalesce(billing_country, '')) AS tidy_billing_country,
+  trim(coalesce(billing_postal_code, '')) AS tidy_billing_postal_code,
+  upper(trim(coalesce(billing_address, ''))) AS label_billing_address,
+  upper(trim(coalesce(billing_city, ''))) AS label_billing_city,
+  upper(trim(coalesce(billing_state, ''))) AS label_billing_state,
+  upper(trim(coalesce(billing_country, ''))) AS label_billing_country,
+  upper(trim(coalesce(billing_postal_code, ''))) AS label_billing_postal_code
+FROM invoice;
 ```
 
 The first parentheses contain the function and an as qualifier with an
 F-STRING. The F-PARAM sigil `@`{.delightql .sigil} stands in for the column name, generating
-`daily_max_temp_c`, `daily_min_temp_c`, etc. The second parentheses specify the
-target columns--here, all columns matching `/_temp/`{.delightql }.
+`tidy_billing_address`, `tidy_billing_city`, etc. The second parentheses specify the
+target columns--here, all columns matching `/^billing_/`{.delightql }.
 
 Unlike **MAP-COVER**, which replaces columns in place, **EMBED-MAP** preserves the
 originals and appends the transformed columns.

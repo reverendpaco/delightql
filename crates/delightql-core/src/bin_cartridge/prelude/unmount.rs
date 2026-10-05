@@ -9,9 +9,10 @@
 //! ## Behavior
 //!
 //! 1. Validates the namespace is a 'data' namespace
-//! 2. Checks no grounded namespace borrows from it
-//! 3. Cascade-deletes all bootstrap metadata
-//! 4. Detaches the database or removes the connection
+//! 2. Checks no grounded namespace borrows from it or from beneath it
+//! 3. Refuses while any namespace stands beneath it
+//! 4. Deletes the namespace's bootstrap metadata
+//! 5. Detaches the database or removes the connection
 
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
@@ -46,16 +47,16 @@ impl BinEntity for UnmountPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for UnmountPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],

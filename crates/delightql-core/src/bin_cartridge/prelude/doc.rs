@@ -19,9 +19,10 @@
 use crate::bin_cartridge::{
     BinEntity, EffectExecutable, EntityResult, EntitySignature, OutputSchema, Parameter,
 };
-use crate::diagnostic::{DirectiveBinding, Runtime};
+use crate::diagnostic::DirectiveBinding;
 use crate::enums::EntityType;
 use crate::error::{DelightQLError, Result};
+use crate::host::CompilerExecutionHost;
 use crate::pipeline::asts::unresolved::*;
 
 /// doc!() pseudo-predicate entity
@@ -57,16 +58,16 @@ impl BinEntity for DocPredicate {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
-        true
-    }
-
     fn as_effect_executable(&self) -> Option<&dyn EffectExecutable> {
         Some(self)
     }
 }
 
 impl EffectExecutable for DocPredicate {
+    fn class(&self) -> crate::bin_cartridge::ExecutionClass {
+        crate::bin_cartridge::ExecutionClass::Effect
+    }
+
     fn execute(
         &self,
         arguments: &[DomainExpression],
@@ -92,15 +93,16 @@ impl EffectExecutable for DocPredicate {
             }));
         }
 
-        let (target, doc) = system.set_entity_doc(&target, &doc)?;
+        let mut applied = CompilerExecutionHost::set_entity_docs_atomic(system, &[(target, doc)])?;
+        let (target, doc) = applied
+            .pop()
+            .expect("one validated documentation entry produces one applied entry");
 
-        // One receipt — the guaranteed core
-        // plus the interior `input` echo of the (here one-row) lifted
-        // argument table.
-        Ok(EntityResult::Relation(super::input_receipt_result(
-            "doc!",
-            &["target", "doc"],
-            &[vec![Some(target), Some(doc)]],
+        // One receipt: the guaranteed core and the flat echoes of its
+        // two arguments.
+        Ok(EntityResult::Relation(super::descriptor_core_receipt(
+            "doc",
+            &[Some(target), Some(doc)],
             alias,
         )))
     }
@@ -141,45 +143,16 @@ impl EffectExecutable for DocPredicate {
             }
             validated.push((target, doc));
         }
-        // ALL-OR-NOTHING: shape validation above cannot
-        // see target existence/ambiguity — those resolve inside
-        // set_entity_doc — so the apply batch runs in ONE bootstrap
-        // transaction: any failing element rolls back every earlier
-        // update, keeping the single setwise invocation atomic. Pinned by
-        // directive_contract 47 (a valid-then-invalid batch leaves the
-        // valid target undocumented).
-        fn bootstrap_txn(system: &crate::system::DelightQLSystem, sql: &str) -> Result<()> {
-            let conn = system.get_bootstrap_connection();
-            let guard = conn.lock().map_err(|e| {
-                Runtime::poisoned(
-                    "Failed to acquire bootstrap lock for doc! batch",
-                    format!("Connection was poisoned: {}", e),
-                )
-            })?;
-            guard
-                .execute_batch(sql)
-                .map_err(|e| Runtime::catalog(format!("doc! batch {sql}: {e}"), "doc! atomicity"))
-        }
-        bootstrap_txn(system, "BEGIN")?;
-        let mut echo_rows: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len().max(1));
-        for (target, doc) in validated {
-            match system.set_entity_doc(&target, &doc) {
-                Ok((target, doc)) => echo_rows.push(vec![Some(target), Some(doc)]),
-                Err(e) => {
-                    let _ = bootstrap_txn(system, "ROLLBACK");
-                    return Err(e);
-                }
-            }
-        }
-        bootstrap_txn(system, "COMMIT")?;
-        if echo_rows.is_empty() {
-            // Finding 1: an EMPTY lifted argument still reaches doc! once
-            // (pipe is application) — one YES receipt whose `input` echo
-            // is the empty interior (an all-NULL contributor row, elided
-            // to `[]` by the tree-group constructor). Documenting zero
-            // elements succeeds vacuously.
-            echo_rows.push(vec![None, None]);
-        }
+        // Target lookup and writes are one host-owned catalog transaction:
+        // any failing element rolls back every earlier update.
+        let applied = CompilerExecutionHost::set_entity_docs_atomic(system, &validated)?;
+        // An EMPTY lifted argument still reaches doc! once (pipe is
+        // application): one YES receipt whose `input` echo is the empty
+        // interior. Documenting zero elements succeeds vacuously.
+        let echo_rows: Vec<Vec<Option<String>>> = applied
+            .into_iter()
+            .map(|(target, doc)| vec![Some(target), Some(doc)])
+            .collect();
         Ok(EntityResult::Relation(super::input_receipt_result(
             "doc!",
             &["target", "doc"],

@@ -45,7 +45,7 @@ fn fatboy_full_lifecycle_over_stdio() {
     // Version handshake.
     let client = Client::new(transport);
     let VersionResult::Accepted(mut session) = client
-        .version(1_000_000, b"relay0".to_vec(), 0, vec![Orientation::Rows])
+        .version(1_000_000, delightql_protocol::PROTOCOL_VERSION.to_vec(), 0, vec![Orientation::Rows])
         .expect("handshake transport")
     else {
         panic!("handshake rejected")

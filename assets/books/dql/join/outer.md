@@ -6,28 +6,28 @@ may contribute nulls when no match exists.
 
 **Left outer** (right table optional):
 ```delightql
-employee(*), department?(*.(DepartmentId))
+artist(*), album?(*.(artist_id))
 ```
 ```sql
-SELECT * FROM employee LEFT OUTER JOIN department USING (DepartmentId);
+SELECT * FROM artist LEFT OUTER JOIN album USING (artist_id);
 ```
 
 **Right outer** (left table optional):
 ```delightql
-employee?(*), department(*.(DepartmentId))
+album?(*), artist(*.(artist_id))
 ```
 
 **Full outer** (either optional):
 ```delightql
-employee?(*), department?(*.(DepartmentId))
+album?(*), artist?(*.(artist_id))
 ```
 
 Outer joins work with explicit conditions:
 ```delightql
-employee(*), department?(*), employee.DepartmentId = department.DepartmentId
+artist(*), album?(*), artist.artist_id = album.artist_id
 ```
 ```sql
-SELECT * FROM employee
-  LEFT OUTER JOIN department ON employee.DepartmentId = department.DepartmentId;
+SELECT * FROM artist
+  LEFT OUTER JOIN album ON artist.artist_id = album.artist_id;
 ```
 

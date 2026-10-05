@@ -227,24 +227,6 @@ fn term_of<'t>(
     canonicalize_term(&tree.source()[range]).ok()
 }
 
-/// The reads of a STORED edge declaration's body, from its own bytes: at
-/// use the same question is asked of the same text as at declaration.
-pub(crate) fn edge_body_reads(source: &str) -> Result<BodyReads> {
-    let tree = crate::pipeline::parse::definition_file(source)?;
-    let edge = crate::pipeline::syntax::walk(&tree)
-        .find_map(|node| cst::EdgeDeclaration::cast(node.node()))
-        .ok_or_else(|| {
-            crate::diagnostic::Internal::invariant(
-                "er edge",
-                "a stored edge definition is an edge declaration",
-            )
-        })?;
-    let body = edge.body().ok_or_else(|| {
-        crate::diagnostic::Internal::invariant("er edge", "an edge declaration has a body")
-    })?;
-    Ok(body_reads(&tree, body))
-}
-
 /// The reads of a query submitted as one relex — the shape judgment's
 /// witnesses spell a body this way.
 #[cfg(test)]

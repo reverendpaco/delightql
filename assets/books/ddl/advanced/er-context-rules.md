@@ -11,15 +11,15 @@ and `&&`{.delightql .sigil} operators reference them concisely.
 An ER-rule declares how two tables join. The head uses `&`{.delightql .sigil}
 between table names; the body is the join expression:
 
-```delightql
-users(*) & orders(*) :-
-  users(*), orders(*), users.id = orders.user_id
+```{.delightql .am}
+customer(*) & invoice(*) :-
+  customer(*), invoice(*), customer.customer_id = invoice.customer_id
 
-orders(*) & items(*) :-
-  orders(*), items(*), orders.id = items.order_id
+invoice(*) & invoice_line(*) :-
+  invoice(*), invoice_line(*), invoice.invoice_id = invoice_line.invoice_id
 
-items(*) & products(*) :-
-  items(*), products(*), items.product_id = products.id
+invoice_line(*) & track(*) :-
+  invoice_line(*), track(*), invoice_line.track_id = track.track_id
 ```
 
 The `&` alone assigns this join to the default context `::normal`.
@@ -28,23 +28,20 @@ The `&` alone assigns this join to the default context `::normal`.
 
 The same table pair can have different join semantics in different contexts:
 
-```delightql
-users(*) & orders(*) :-
-  users(*), orders(*), users.id = orders.user_id
+```{.delightql .am}
+customer(*) &(::support) employee(*) :-
+  customer(*), employee(*), customer.support_rep_id = employee.employee_id
 
-users(*) &(::audit) orders(*) :-
-  users(*), orders(*), users.id = orders.created_by
-
-orders(*) &(::audit) audit_log(*) :-
-  orders(*), audit_log(*), orders.id = audit_log.order_id
+customer(*) &(::local) employee(*) :-
+  customer(*), employee(*), customer.city = employee.city
 ```
 
 The context name is a symbol, i.e. a `::` followed by a valid identifier.
 The lack of a symbol means `::normal`.  The following are the same:
 
 ```delightql
-users(*) & orders(*) :-  // body
-users(*) &(::normal) orders(*) :-  // body
+customer(*) & invoice(*)
+customer(*) &(::normal) invoice(*)
 ```
 
 ## Using Contexts {.dqlh}
@@ -52,9 +49,9 @@ users(*) &(::normal) orders(*) :-  // body
 Calling the join mirrors the way in which the rule was defined:
 
 ```delightql
-users(*) & orders(*)
+customer(*) & invoice(*)
 
-users(*) &(::audit) orders(*)
+customer(*) &(::local) employee(*)
 ```
 
 ## Direct Join (`&`{.delightql .sigil}) {.dqlh}
@@ -63,25 +60,25 @@ The `&`{.delightql .sigil} operator performs a direct lookup in the written
 context, or `::normal` when omitted. It does not search every context:
 
 ```delightql
-users(*) & orders(*)
+customer(*) & invoice(*)
 ```
 
 Equivalent to:
 ```delightql
-users(*), orders(*), users.id = orders.user_id
+customer(*), invoice(*), customer.customer_id = invoice.customer_id
 ```
 
-Multiple `&`{.delightql .sigil} operators chain left-to-right. Each consecutive pair must have a defined ER-rule:
+Multiple `&`{.delightql .sigil} operators chain left to right. Each consecutive pair must have a defined ER-rule:
 
 ```delightql
-users(*) & orders(*) & items(*)
+customer(*) & invoice(*) & invoice_line(*)
 ```
 
 Compiles to:
 ```delightql
-users(*), orders(*), items(*),
-  users.id = orders.user_id,
-  orders.id = items.order_id
+customer(*), invoice(*), invoice_line(*),
+  customer.customer_id = invoice.customer_id,
+  invoice.invoice_id = invoice_line.invoice_id
 ```
 
 ## Transitive Join (`&&`) {.dqlh}
@@ -89,21 +86,26 @@ users(*), orders(*), items(*),
 The `&&` operator finds a path through the ER-graph:
 
 ```delightql
-users(*) && products(*)
+customer(*) && track(*)
 ```
 
-No direct `users(*)&products(*)` rule exists, but the path does: `users -> orders ->
-items -> products`.
+No direct `customer(*)&track(*)` rule exists, but the path does: `customer -> invoice ->
+invoice_line -> track`.
 
 **Ambiguity is an error.** If multiple paths exist, the query fails:
 
-```delightql
-users(*)&orders(*) :- ...
-orders(*)&items(*) :- ...
-users(*)&items(*) :- ...   // creates a cycle
+```{.delightql .am}
+employee(*) &(::sales) customer(*) :-
+  employee(*), customer(*), employee.employee_id = customer.support_rep_id
+customer(*) &(::sales) invoice(*) :-
+  customer(*), invoice(*), customer.customer_id = invoice.customer_id
+employee(*) &(::sales) invoice(*) :-   // creates a cycle
+  employee(*), invoice(*), employee.city = invoice.billing_city
+```
 
-users(*) && items(*)
-// Error: Ambiguous join path from 'users' to 'items':
-//   Path 1: users -> orders -> items
-//   Path 2: users -> items (direct)
+```{.delightql .bad}
+employee(*) &&(::sales) invoice(*)
+// Error: Ambiguous: 2 paths from 'employee(*)' to 'invoice(*)':
+//   employee(*) -> invoice(*)
+//   employee(*) -> customer(*) -> invoice(*)
 ```

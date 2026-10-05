@@ -6,24 +6,24 @@ definition. [Array languages are the closest analog in other programming
 paradigms.]{.sidenote}
 
 ```delightql
-employee(*)
-    |> (EmployeeId,
-        DepartmentId,
-        Salary,
-        dense_rank:( <~ %(DepartmentId),#(Salary)) as ranking )
+invoice(*)
+    |> (invoice_id,
+        customer_id,
+        total,
+        dense_rank:( <~ %(customer_id),#(total)) as ranking )
 ```
 
 ```sql
 SELECT
-  EmployeeId,
-  DepartmentId,
-  Salary,
+  invoice_id,
+  customer_id,
+  total,
   dense_rank() OVER (
     PARTITION BY
-      DepartmentId
-    ORDER BY Salary
+      customer_id
+    ORDER BY total
   ) AS ranking
-FROM employee;
+FROM invoice;
 ```
 
 The **F-OVER** sigil `<~`{.delightql .sigil} introduces the window specification. Everything before `<~`
@@ -41,41 +41,42 @@ is passed to the function; everything after defines the window frame.
 |--------|---------|
 | `.` | current row |
 | `_` | unbounded |
-| *n* | *n* preceding |
 | `+`*n* | *n* following |
-| `-`*n* | *n* preceding (explicit) |
+| `-`*n* | *n* preceding |
 
 : Window frame bound syntax
 
 `Examples:`
 
 ```delightql
-  ntile:( 10  <~  %(DepartmentId),#(Salary desc), groups(_,_))
-  ntile:( 10  <~  %(DepartmentId),#(Salary desc), groups(+1,_))
-  ntile:( 10  <~  %(DepartmentId),#(Salary desc), rows(1,.))
-  ntile:( 10  <~  %(DepartmentId),#(Salary desc), rows(_,-(upto*2)))
-  ntile:( 10  <~  %(DepartmentId),#(Salary desc), range(.,upto*2) )
+invoice(*)
+    |> (invoice_id, customer_id, total,
+        ntile:( 10  <~  %(customer_id),#(total desc), groups(_,_))      as g_all,
+        ntile:( 10  <~  %(customer_id),#(total desc), groups(+1,_))     as g_after,
+        ntile:( 10  <~  %(customer_id),#(total desc), rows(-1,.))       as r_prev,
+        ntile:( 10  <~  %(customer_id),#(total desc), rows(_,-(2*2)))   as r_upto,
+        ntile:( 10  <~  %(customer_id),#(total desc), range(.,+(2*2)) ) as rg)
 ```
 
 
 :::::{.widen}
 ```sql
   ntile(10) over
-    ( partition by DepartmentId order by Salary desc
+    ( partition by customer_id order by total desc
       groups between
         unbounded preceding and unbounded following)
   ntile(10) over
-    ( partition by DepartmentId order by Salary desc
+    ( partition by customer_id order by total desc
       groups between 1 following and unbounded following)
   ntile(10) over
-    ( partition by DepartmentId order by Salary desc
+    ( partition by customer_id order by total desc
       rows between 1 preceding and current row)
   ntile(10) over
-    ( partition by DepartmentId order by Salary desc
-      rows between unbounded preceding and (upto*2) preceding)
+    ( partition by customer_id order by total desc
+      rows between unbounded preceding and (2*2) preceding)
   ntile(10) over
-    ( partition by DepartmentId order by Salary desc
-      range between current row and (upto*2) following)
+    ( partition by customer_id order by total desc
+      range between current row and (2*2) following)
 ```
 ::::::
 

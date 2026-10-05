@@ -308,11 +308,7 @@ fn an_access_beside_a_destructure_stays_one_run() {
 #[test]
 fn a_ground_relation_has_no_access_field() {
     let read = chain("users(*)");
-    let GroundForm::Reference(Relation::Ground {
-        mention: _,
-        outer: _,
-    }) = read.head().form()
-    else {
+    let GroundForm::Reference(Relation::Ground { mention: _ }) = read.head().form() else {
         panic!("expected a ground read");
     };
 }
