@@ -51,7 +51,7 @@ ensure-cargo:
 ensure-uv:
 	@if ! command -v uv >/dev/null 2>&1; then \
 		echo "❌ uv not found (the asset bundler runs under it; see assets/Makefile)."; \
-		echo "   Install: mise install   or   https://docs.astral.sh/uv/"; \
+		echo "   Install: https://docs.astral.sh/uv/getting-started/installation/"; \
 		exit 1; \
 	fi
 
@@ -100,14 +100,10 @@ ensure-duckdb:
 .PHONY: ensure-node
 ensure-node:
 	@if ! command -v node >/dev/null 2>&1; then \
-		echo "Installing Node.js..."; \
-		if command -v mise >/dev/null 2>&1; then \
-			mise install node; \
-		else \
-			brew install node; \
-		fi; \
+		echo "❌ node not found (only the node binding needs it). Install: https://nodejs.org/"; \
+		exit 1; \
 	else \
-		echo "✓ Node.js $(shell node --version)"; \
+		echo "✓ Node.js $$(node --version)"; \
 	fi
 
 # Installs on first use and again whenever the pin moves; the user's own
@@ -160,7 +156,7 @@ dist: dist-linux dist-macos
 	@cat $(DIST_DIR)/SHA256SUMS
 
 # One-time: the Rust targets and cargo-zigbuild. zig itself comes from the
-# system package manager, `mise install`, or `pip install ziglang`.
+# system package manager or `pip install ziglang`.
 dist-setup: ensure-cargo ensure-zig
 	rustup target add $(DIST_LINUX) $(if $(filter Darwin,$(HOST_OS)),$(DIST_MACOS))
 	@command -v cargo-zigbuild >/dev/null 2>&1 || cargo install --locked cargo-zigbuild
@@ -203,10 +199,22 @@ dist-pack:
 dist-clean:
 	rm -rf $(DIST_DIR) $(DIST_TARGET_DIR)
 
+# cargo-zigbuild takes the first of `python3 -m ziglang version` and
+# `zig version` that prints a version, so this asks the same two. A `zig`
+# that merely exists proves nothing: a version manager's shim prints no
+# version for a directory it has no usable zig for.
 ensure-zig:
-	@if ! command -v zig >/dev/null 2>&1 && ! python3 -c 'import ziglang' 2>/dev/null; then \
-		echo "❌ zig not found (cargo-zigbuild uses it to cross-compile the Linux targets)."; \
-		echo "   Install: mise install   or   your package manager   or   pip install ziglang"; \
+	@if v=$$(python3 -m ziglang version 2>/dev/null) && [ -n "$$v" ]; then \
+		echo "✓ zig $$v (python ziglang)"; \
+	elif v=$$(zig version 2>/dev/null) && [ -n "$$v" ]; then \
+		echo "✓ zig $$v"; \
+	else \
+		echo "❌ no working zig (cargo-zigbuild uses it to cross-compile the Linux targets)."; \
+		if command -v zig >/dev/null 2>&1; then \
+			echo "   $$(command -v zig) prints no version for 'zig version':"; \
+			zig version 2>&1 | head -3 | sed 's/^/     /'; \
+		fi; \
+		echo "   Install: your package manager (e.g. brew install zig)   or   pip install ziglang"; \
 		exit 1; \
 	fi
 
@@ -226,7 +234,7 @@ help::
 	@echo "  make [build]           - Check cargo+uv, build dql -> target/debug/dql"
 	@echo "  make ship              - Optimized build (fat LTO, stripped) -> target/release-ship/dql"
 	@echo "  make dist              - Release tarballs for every platform this host can build -> dist/"
-	@echo "  make dist-setup        - One-time: Rust targets + cargo-zigbuild (zig itself: mise/pkg/pip)"
+	@echo "  make dist-setup        - One-time: Rust targets + cargo-zigbuild (zig itself: package manager or pip)"
 	@echo "  make dist-linux        - Only the three Linux tarballs (x86_64/aarch64 musl, aarch64 glibc)"
 	@echo "  make dist-macos        - Only the macOS universal tarball (skipped off macOS)"
 	@echo "  make setup             - Ensure all build dependencies are installed"
